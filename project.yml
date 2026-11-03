@@ -1,0 +1,25 @@
+name: IOSurfaceSafeProbe
+options:
+  bundleIdPrefix: org.iosurface.research
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    CODE_SIGNING_ALLOWED: "NO"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  IOSurfaceSafeProbe:
+    type: application
+    platform: iOS
+    sources:
+      - IOSurfaceSafeProbe
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.iosurface.research.safeprobe
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: "IOSurface Probe"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+    dependencies:
+      - sdk: IOSurface.framework

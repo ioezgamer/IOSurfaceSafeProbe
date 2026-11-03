@@ -1,0 +1,36 @@
+name: Compilar IPA para SideStore
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preparar XcodeGen
+        run: brew install xcodegen
+      - name: Generar proyecto Xcode
+        run: xcodegen generate
+      - name: Compilar app iPhone sin firma
+        run: |
+          xcodebuild \
+            -project IOSurfaceSafeProbe.xcodeproj \
+            -scheme IOSurfaceSafeProbe \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+      - name: Empaquetar IPA sin firma
+        run: |
+          mkdir -p dist/Payload
+          cp -R build/Build/Products/Release-iphoneos/IOSurfaceSafeProbe.app dist/Payload/
+          (cd dist && zip -qr IOSurfaceSafeProbe-unsigned.ipa Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IOSurfaceSafeProbe-unsigned
+          path: dist/IOSurfaceSafeProbe-unsigned.ipa
+          if-no-files-found: error
