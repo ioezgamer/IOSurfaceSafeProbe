@@ -60,7 +60,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v2";
+    title.text = @"IOSurface Preflight v3";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -80,6 +80,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
       [self button:@"1. API pública IOSurface" action:@selector(publicProbe:)],
       [self button:@"2. Servicio IOSurfaceRoot" action:@selector(rootProbe:)],
       [self button:@"3. Ciclo de vida público (3 pruebas)" action:@selector(lifecycleProbe:)],
+      [self button:@"4. Identificadores simultáneos (A/B/C)" action:@selector(idReuseProbe:)],
       [self button:@"Exportar registro" action:@selector(shareLog:)],
       self.logView
     ]];
@@ -102,7 +103,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v2"]; 
+    [self note:@"app=IOSurfacePreflight-v3"]; 
     [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
 }
 
@@ -220,6 +221,106 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     }
     [self note:[NSString stringWithFormat:@"LIFECYCLE: fin %u/3 ciclos de lectura/bloqueo correctos", successes]];
     [self note:@"LIFECYCLE: el resultado no mide retainCount del kernel, ni prueba UAF o KernelRW."];
+    dlclose(framework);
+}
+
+
+- (void)idReuseProbe:(id)sender {
+    [self note:@"IDS: inicio. Prueba secuencial con tres objetos vivos simultáneamente."];
+    [self note:@"IDS: un ID repetido entre objetos ya cerrados puede ser reciclaje legítimo."];
+    void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY | RTLD_LOCAL);
+    if (!framework) { [self note:@"IDS: FAIL no se puede cargar IOSurface"]; return; }
+    CreateSurfaceFn create = (CreateSurfaceFn)dlsym(framework, "IOSurfaceCreate");
+    LookupSurfaceFn lookup = (LookupSurfaceFn)dlsym(framework, "IOSurfaceLookup");
+    GetSurfaceIDFn getID = (GetSurfaceIDFn)dlsym(framework, "IOSurfaceGetID");
+    GetSurfaceDimensionFn getWidth = (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetWidth");
+    if (!create || !lookup || !getID || !getWidth) {
+        [self note:@"IDS: FAIL faltan APIs públicas"];
+        dlclose(framework);
+        return;
+    }
+    NSDictionary *params = @{
+        @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+        @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @256,
+        @"IOSurfaceAllocSize": @(64 * 64 * 4), @"IOSurfacePixelFormat": @(0x42475241)
+    };
+
+    IOSurfaceRef a = create((__bridge CFDictionaryRef)params);
+    IOSurfaceRef b = create((__bridge CFDictionaryRef)params);
+    if (!a || !b) {
+        [self note:@"IDS: FAIL no se pudieron crear A/B"];
+        if (a) CFRelease(a);
+        if (b) CFRelease(b);
+        dlclose(framework);
+        return;
+    }
+    IOSurfaceID ia = getID(a), ib = getID(b);
+    [self note:[NSString stringWithFormat:@"IDS: A=%u B=%u (ambas vivas)", (unsigned)ia, (unsigned)ib]];
+    if (ia == ib) {
+        [self note:@"IDS: ANOMALIA A y B vivas tienen el mismo ID"];
+    } else {
+        [self note:@"IDS: PASS A/B vivas con IDs diferentes"];
+    }
+
+    IOSurfaceRef heldA = lookup(ia);
+    if (!heldA) {
+        [self note:@"IDS: FAIL lookup(A) mientras A está viva"];
+        CFRelease(a); CFRelease(b); dlclose(framework);
+        return;
+    }
+    CFRelease(a);
+    a = NULL;
+    [self note:@"IDS: referencia de creación A liberada, lookup(A) retenido"];
+    IOSurfaceRef c = create((__bridge CFDictionaryRef)params);
+    if (!c) {
+        [self note:@"IDS: FAIL no se pudo crear C"];
+        CFRelease(heldA); CFRelease(b); dlclose(framework);
+        return;
+    }
+    IOSurfaceID ic = getID(c);
+    BOOL distinct = (ia != ib && ia != ic && ib != ic);
+    [self note:[NSString stringWithFormat:@"IDS: A=%u (retenida) B=%u C=%u (tres vivas) distintas=%@",
+                (unsigned)ia, (unsigned)ib, (unsigned)ic, distinct ? @"SI" : @"NO"]];
+    [self note:[NSString stringWithFormat:@"IDS: lookup A retenida, ancho=%zu", getWidth(heldA)]];
+
+    CFRelease(heldA);
+    heldA = NULL;
+    IOSurfaceRef lookA = lookup(ia);
+    [self note:[NSString stringWithFormat:@"IDS: lookup(A) tras soltar ambas referencias=%@",
+                lookA ? @"DISPONIBLE" : @"NO DISPONIBLE"]];
+    if (lookA) CFRelease(lookA);
+
+    IOSurfaceRef lookB = lookup(ib);
+    IOSurfaceRef lookC = lookup(ic);
+    BOOL othersAlive = (lookB != NULL && lookC != NULL);
+    [self note:[NSString stringWithFormat:@"IDS: B/C intactas tras cerrar A=%@",
+                othersAlive ? @"SI" : @"NO"]];
+    if (lookB) CFRelease(lookB);
+    if (lookC) CFRelease(lookC);
+    CFRelease(b);
+    CFRelease(c);
+
+    IOSurfaceRef postB = lookup(ib);
+    IOSurfaceRef postC = lookup(ic);
+    [self note:[NSString stringWithFormat:@"IDS: lookup(B) después de cierre=%@, lookup(C)=%@",
+                postB ? @"DISPONIBLE" : @"NO DISPONIBLE",
+                postC ? @"DISPONIBLE" : @"NO DISPONIBLE"]];
+    if (postB) CFRelease(postB);
+    if (postC) CFRelease(postC);
+
+    IOSurfaceRef d = create((__bridge CFDictionaryRef)params);
+    if (d) {
+        IOSurfaceID id = getID(d);
+        BOOL reused = (id == ia || id == ib || id == ic);
+        [self note:[NSString stringWithFormat:@"IDS: D nueva ID=%u. ID anterior reutilizado=%@",
+                    (unsigned)id, reused ? @"SI" : @"NO"]];
+        CFRelease(d);
+    } else {
+        [self note:@"IDS: INFO D no pudo crearse"];
+    }
+    [self note:[NSString stringWithFormat:@"IDS: RESULTADO IDs vivos distintos=%@, independencia B/C=%@",
+                distinct ? @"SI" : @"NO", othersAlive ? @"SI" : @"NO"]];
+    [self note:@"IDS: reciclar un ID no implica acceder a memoria liberada ni demuestra KernelRW."];
     dlclose(framework);
 }
 
