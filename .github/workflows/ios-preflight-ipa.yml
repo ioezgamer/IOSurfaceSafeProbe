@@ -1,7 +1,7 @@
 name: Compilar IOSurface Preflight IPA
 on:
   push:
-    branches: [preflight-ipa]
+    branches: [main, preflight-ipa]
     paths:
       - 'IOSurfacePreflight/**'
       - '.github/workflows/ios-preflight-ipa.yml'
