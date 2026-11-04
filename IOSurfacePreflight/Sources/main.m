@@ -13,6 +13,8 @@ typedef uint32_t IOSurfaceID;
 typedef IOSurfaceRef (*CreateSurfaceFn)(CFDictionaryRef);
 typedef IOSurfaceID (*GetSurfaceIDFn)(IOSurfaceRef);
 typedef IOSurfaceRef (*LookupSurfaceFn)(IOSurfaceID);
+typedef size_t (*GetSurfaceDimensionFn)(IOSurfaceRef);
+typedef kern_return_t (*SurfaceLockFn)(IOSurfaceRef, uint32_t, uint32_t *);
 typedef uint32_t io_object_t;
 typedef io_object_t io_service_t;
 typedef io_object_t io_connect_t;
@@ -58,7 +60,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight";
+    title.text = @"IOSurface Preflight v2";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -77,6 +79,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
       title, subtitle,
       [self button:@"1. API pública IOSurface" action:@selector(publicProbe:)],
       [self button:@"2. Servicio IOSurfaceRoot" action:@selector(rootProbe:)],
+      [self button:@"3. Ciclo de vida público (3 pruebas)" action:@selector(lifecycleProbe:)],
       [self button:@"Exportar registro" action:@selector(shareLog:)],
       self.logView
     ]];
@@ -99,6 +102,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
+    [self note:@"app=IOSurfacePreflight-v2"]; 
     [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
 }
 
@@ -130,6 +134,93 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     CFRelease(first);
     dlclose(framework);
     [self note:@"PUBLIC: referencias válidas liberadas."];
+}
+
+
+- (void)lifecycleProbe:(id)sender {
+    [self note:@"LIFECYCLE: inicio de tres operaciones secuenciales con referencias propias."];
+    [self note:@"LIFECYCLE: una búsqueda por ID nunca usa directamente un puntero liberado."];
+    void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY | RTLD_LOCAL);
+    if (!framework) { [self note:@"LIFECYCLE: FAIL framework no disponible"]; return; }
+
+    CreateSurfaceFn createSurface = (CreateSurfaceFn)dlsym(framework, "IOSurfaceCreate");
+    GetSurfaceIDFn getID = (GetSurfaceIDFn)dlsym(framework, "IOSurfaceGetID");
+    LookupSurfaceFn lookup = (LookupSurfaceFn)dlsym(framework, "IOSurfaceLookup");
+    GetSurfaceDimensionFn getWidth = (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetWidth");
+    GetSurfaceDimensionFn getHeight = (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetHeight");
+    GetSurfaceDimensionFn getAllocSize = (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetAllocSize");
+    SurfaceLockFn lock = (SurfaceLockFn)dlsym(framework, "IOSurfaceLock");
+    SurfaceLockFn unlock = (SurfaceLockFn)dlsym(framework, "IOSurfaceUnlock");
+    if (!createSurface || !getID || !lookup || !getWidth || !getHeight ||
+        !getAllocSize || !lock || !unlock) {
+        [self note:@"LIFECYCLE: FAIL faltan funciones públicas"];
+        dlclose(framework);
+        return;
+    }
+
+    NSDictionary *params = @{
+        @"IOSurfaceWidth": @64,
+        @"IOSurfaceHeight": @64,
+        @"IOSurfaceBytesPerElement": @4,
+        @"IOSurfaceBytesPerRow": @256,
+        @"IOSurfaceAllocSize": @(64 * 64 * 4),
+        @"IOSurfacePixelFormat": @(0x42475241)
+    };
+    unsigned successes = 0;
+    for (unsigned i = 1; i <= 3; i++) {
+        @autoreleasepool {
+            IOSurfaceRef original = createSurface((__bridge CFDictionaryRef)params);
+            if (!original) {
+                [self note:[NSString stringWithFormat:@"LIFECYCLE #%u: FAIL create=NULL", i]];
+                continue;
+            }
+            IOSurfaceID identifier = getID(original);
+            size_t width = getWidth(original), height = getHeight(original);
+            size_t bytes = getAllocSize(original);
+            [self note:[NSString stringWithFormat:@"LIFECYCLE #%u: create ID=%u size=%zux%zu bytes=%zu",
+                        i, (unsigned)identifier, width, height, bytes]];
+
+            IOSurfaceRef ownedLookup = lookup(identifier);
+            if (!ownedLookup) {
+                [self note:[NSString stringWithFormat:@"LIFECYCLE #%u: FAIL lookup antes del cierre", i]];
+                CFRelease(original);
+                continue;
+            }
+
+            // Dropping one owned reference must not invalidate the retained lookup.
+            CFRelease(original);
+            [self note:[NSString stringWithFormat:@"LIFECYCLE #%u: referencia de creación liberada; lookup retenido", i]];
+
+            size_t retainedWidth = getWidth(ownedLookup), retainedHeight = getHeight(ownedLookup);
+            uint32_t seed = 0;
+            const uint32_t readOnly = 1; // kIOSurfaceLockReadOnly on lock AND unlock.
+            kern_return_t lockCode = lock(ownedLookup, readOnly, &seed);
+            [self note:[NSString stringWithFormat:@"LIFECYCLE #%u: retenido=%zux%zu LOCK kr=0x%08x",
+                        i, retainedWidth, retainedHeight, (unsigned)lockCode]];
+            kern_return_t unlockCode = KERN_SUCCESS;
+            if (lockCode == KERN_SUCCESS) {
+                unlockCode = unlock(ownedLookup, readOnly, NULL);
+                [self note:[NSString stringWithFormat:@"LIFECYCLE #%u: UNLOCK kr=0x%08x",
+                            i, (unsigned)unlockCode]];
+            }
+
+            // This is an ID lookup, not a dereference of the released pointer.
+            CFRelease(ownedLookup);
+            IOSurfaceRef afterRelease = lookup(identifier);
+            [self note:[NSString stringWithFormat:@"LIFECYCLE #%u: lookup tras liberar referencias=%@",
+                        i, afterRelease ? @"DISPONIBLE" : @"NO DISPONIBLE"]];
+            if (afterRelease) CFRelease(afterRelease);
+
+            if (width == 64 && height == 64 && bytes >= 16384 &&
+                retainedWidth == width && retainedHeight == height &&
+                lockCode == KERN_SUCCESS && unlockCode == KERN_SUCCESS) {
+                successes++;
+            }
+        }
+    }
+    [self note:[NSString stringWithFormat:@"LIFECYCLE: fin %u/3 ciclos de lectura/bloqueo correctos", successes]];
+    [self note:@"LIFECYCLE: el resultado no mide retainCount del kernel, ni prueba UAF o KernelRW."];
+    dlclose(framework);
 }
 
 - (void)rootProbe:(id)sender {
