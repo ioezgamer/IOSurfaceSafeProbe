@@ -1,0 +1,43 @@
+name: Compilar IOSurface Preflight IPA
+on:
+  push:
+    branches: [preflight-ipa]
+    paths:
+      - 'IOSurfacePreflight/**'
+      - '.github/workflows/ios-preflight-ipa.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: xcodebuild -version
+      - name: Instalar XcodeGen
+        run: brew install xcodegen
+      - name: Generar proyecto
+        working-directory: IOSurfacePreflight
+        run: xcodegen generate
+      - name: Compilar iPhone (sin firma)
+        run: |
+          xcodebuild -project IOSurfacePreflight/IOSurfacePreflight.xcodeproj \
+            -scheme IOSurfacePreflight -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/preflight-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Crear IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/preflight-pkg/Payload"
+          cp -R "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app" \
+            "$RUNNER_TEMP/preflight-pkg/Payload/"
+          (cd "$RUNNER_TEMP/preflight-pkg" && zip -qr "$GITHUB_WORKSPACE/IOSurfacePreflight-unsigned.ipa" Payload)
+          shasum -a 256 "$GITHUB_WORKSPACE/IOSurfacePreflight-unsigned.ipa"
+      - name: Publicar artefacto IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: IOSurfacePreflight-unsigned-ipa
+          path: IOSurfacePreflight-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
