@@ -1,6 +1,5 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <IOSurface/IOSurface.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <mach/mach.h>
 #import <sys/utsname.h>
@@ -9,6 +8,11 @@
 
 // Non-exploit, read-only preflight: one valid public surface and one IOKit connection.
 // No method dispatch, intentional race, stale pointer use or kernel modification.
+typedef struct __IOSurface * IOSurfaceRef;
+typedef uint32_t IOSurfaceID;
+typedef IOSurfaceRef (*CreateSurfaceFn)(CFDictionaryRef);
+typedef IOSurfaceID (*GetSurfaceIDFn)(IOSurfaceRef);
+typedef IOSurfaceRef (*LookupSurfaceFn)(IOSurfaceID);
 typedef uint32_t io_object_t;
 typedef io_object_t io_service_t;
 typedef io_object_t io_connect_t;
@@ -100,22 +104,31 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
 
 - (void)publicProbe:(id)sender {
     [self note:@"PUBLIC: comenzando operación secuencial."];
+    void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY | RTLD_LOCAL);
+    if (!framework) { [self note:@"PUBLIC: IOSurface.framework no cargable"]; return; }
+    CreateSurfaceFn createSurface = (CreateSurfaceFn)dlsym(framework, "IOSurfaceCreate");
+    GetSurfaceIDFn getID = (GetSurfaceIDFn)dlsym(framework, "IOSurfaceGetID");
+    LookupSurfaceFn lookup = (LookupSurfaceFn)dlsym(framework, "IOSurfaceLookup");
+    if (!createSurface || !getID || !lookup) {
+        [self note:@"PUBLIC: funciones IOSurface no exportadas"]; dlclose(framework); return;
+    }
     NSDictionary *params = @{
-      (__bridge NSString *)kIOSurfaceWidth: @64,
-      (__bridge NSString *)kIOSurfaceHeight: @64,
-      (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
-      (__bridge NSString *)kIOSurfaceBytesPerRow: @256,
-      (__bridge NSString *)kIOSurfaceAllocSize: @(64 * 64 * 4),
-      (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241)
+      @"IOSurfaceWidth": @64,
+      @"IOSurfaceHeight": @64,
+      @"IOSurfaceBytesPerElement": @4,
+      @"IOSurfaceBytesPerRow": @256,
+      @"IOSurfaceAllocSize": @(64 * 64 * 4),
+      @"IOSurfacePixelFormat": @(0x42475241)
     };
-    IOSurfaceRef first = IOSurfaceCreate((__bridge CFDictionaryRef)params);
-    if (!first) { [self note:@"PUBLIC: FAIL IOSurfaceCreate=NULL"]; return; }
-    IOSurfaceID identifier = IOSurfaceGetID(first);
+    IOSurfaceRef first = createSurface((__bridge CFDictionaryRef)params);
+    if (!first) { [self note:@"PUBLIC: FAIL IOSurfaceCreate=NULL"]; dlclose(framework); return; }
+    IOSurfaceID identifier = getID(first);
     [self note:[NSString stringWithFormat:@"PUBLIC: PASS create ID=%u", (unsigned)identifier]];
-    IOSurfaceRef second = IOSurfaceLookup(identifier);
+    IOSurfaceRef second = lookup(identifier);
     [self note:second ? @"PUBLIC: PASS lookup" : @"PUBLIC: INFO lookup no disponible"];
     if (second) CFRelease(second);
     CFRelease(first);
+    dlclose(framework);
     [self note:@"PUBLIC: referencias válidas liberadas."];
 }
 
