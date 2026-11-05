@@ -29,3 +29,22 @@ La opción **Exportar** incluye ambos archivos. Tras relanzar la app se informa 
 
 **Alcance:** la conexión que abrimos explícitamente puede ser distinta de la conexión privada que usa internamente `IOSurfaceCreate`. La pausa ocurre **fuera** del kernel y la prueba no ejecuta carreras ni interrumpe una rutina interna a voluntad. Ni la conclusión PASS ni un cierre inesperado de la app demuestran liberación prematura del objeto, use-after-free, kernel panic o KernelRW. Para demostrar eso hace falta una traza interna del kernel que correlacione referencia y generación del objeto con `register`, `close`, `free` y `dereference`.
 
+
+
+## Prueba 18: concurrencia de API publica (v14)
+
+La opcion **18. Concurrencia publica controlada (256 x 2)** lanza dos hilos, comenzando a la vez:
+
+1. Uno crea hasta 256 superficies validas de 32x32 pixeles, comprueba la referencia obtenida mediante `IOSurfaceLookup` y libera exclusivamente referencias propias.
+2. El otro abre y cierra hasta 256 conexiones **independientes** a `IOSurfaceRoot` mediante IOKit publico.
+
+La prueba no usa metodos privados, referencias caducadas ni escritura arbitraria en memoria. El boton **Detener prueba activa** solicita una salida limpia entre iteraciones.
+
+Cuando `IOServiceClose` empieza y termina dentro de una misma llamada observable a `IOSurfaceCreate`, la aplicacion cuenta `observedCreateOverlap` en su checkpoint. Se registra con el numero de iteracion del hilo creador, que nunca representa una direccion de memoria.
+
+Los archivos exportados son:
+- `IOSurfaceConcurrency-checkpoint.json` (intentos, operaciones exitosas, errores y solapamientos).
+- `IOSurfaceConcurrency-trace.csv` (resultados y marcas temporales de cada cierre).
+
+**Interpretacion estricta:** `observedCreateOverlap > 0` demuestra como maximo un solapamiento temporal de dos llamadas desde la aplicacion. La conexion cerrada es **independiente** de la gestion interna de `IOSurfaceCreate`. No comprueba que `register` y `stop` se ejecutaran en el mismo `IOSurfaceRootUserClient`, no indica una liberacion de objeto del kernel y no constituye prueba de una carrera explotable, UAF, kernel panic ni KernelRW. El resultado `DONE_NO_APP_OVERLAP_OBSERVED` tampoco descarta una vulnerabilidad en otras circunstancias.
+
