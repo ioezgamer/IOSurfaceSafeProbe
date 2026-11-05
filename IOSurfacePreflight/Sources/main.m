@@ -5,6 +5,8 @@
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
 #import <dlfcn.h>
+#import <string.h>
+#import <unistd.h>
 
 // Non-exploit, read-only preflight: one valid public surface and one IOKit connection.
 // No method dispatch, intentional race, stale pointer use or kernel modification.
@@ -14,6 +16,7 @@ typedef IOSurfaceRef (*CreateSurfaceFn)(CFDictionaryRef);
 typedef IOSurfaceID (*GetSurfaceIDFn)(IOSurfaceRef);
 typedef IOSurfaceRef (*LookupSurfaceFn)(IOSurfaceID);
 typedef size_t (*GetSurfaceDimensionFn)(IOSurfaceRef);
+typedef void *(*GetSurfaceBaseFn)(IOSurfaceRef);
 typedef kern_return_t (*SurfaceLockFn)(IOSurfaceRef, uint32_t, uint32_t *);
 typedef uint32_t io_object_t;
 typedef io_object_t io_service_t;
@@ -24,10 +27,29 @@ typedef kern_return_t (*OpenServiceFn)(io_service_t, task_t, uint32_t, io_connec
 typedef kern_return_t (*CloseServiceFn)(io_connect_t);
 typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
 
+typedef struct {
+    IOSurfaceRef held;
+    IOSurfaceID identifier;
+    size_t width, height, rowBytes, allocated;
+    uint64_t marker;
+} ProbeLiveSurface;
+
+static uint32_t probeRandom(uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
 @interface ProbeController : UIViewController
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) NSMutableString *events;
 @property(nonatomic, assign) BOOL matrixRunning;
+@property(nonatomic, assign) BOOL stressRunning;
+@property(atomic, assign) BOOL stressStopRequested;
+@property(nonatomic, strong) NSString *stressCSV;
 @end
 
 @implementation ProbeController
@@ -61,7 +83,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v5";
+    title.text = @"IOSurface Preflight v6";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -84,6 +106,8 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
       [self button:@"4. Identificadores simultáneos (A/B/C)" action:@selector(idReuseProbe:)],
       [self button:@"5. Firma, permisos y servicio" action:@selector(accessPolicyProbe:)],
       [self button:@"6. Matriz IOSurface 484 casos" action:@selector(matrixProbe:)],
+      [self button:@"7. Fuzzing controlado (20.000 operaciones)" action:@selector(stressProbe:)],
+      [self button:@"Detener fuzzing" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro" action:@selector(shareLog:)],
       self.logView
     ]];
@@ -106,7 +130,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v5"]; 
+    [self note:@"app=IOSurfacePreflight-v6"]; 
     [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
 }
 
@@ -598,6 +622,263 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     });
 }
 
+
+- (void)stopStressProbe:(id)sender {
+    if (!self.stressRunning) {
+        [self note:@"FUZZ: no hay prueba activa."];
+        return;
+    }
+    self.stressStopRequested = YES;
+    [self note:@"FUZZ: detención solicitada; se liberarán las referencias vigentes."];
+}
+
+- (void)stressProbe:(id)sender {
+    if (self.stressRunning || self.matrixRunning) {
+        [self note:@"FUZZ: otra prueba está en curso; evitamos solaparlas."];
+        return;
+    }
+    self.stressRunning = YES;
+    self.stressStopRequested = NO;
+    self.stressCSV = nil;
+    [self note:@"FUZZ: inicio. 20000 operaciones deterministas sobre API pública; semilla 0xA17E2026."];
+    [self note:@"FUZZ: 12 superficies vivas como máximo, dimensiones de 8 a 128, memoria de superficies menor de 1 MiB."];
+    [self note:@"FUZZ: crea, escribe marcas de 64 bits, verifica con lookup, libera y vuelve a crear."];
+    [self note:@"FUZZ: sin punteros liberados, métodos privados, carreras ni manipulación del kernel."];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            const unsigned capacity = 12;
+            const unsigned totalSteps = 20000;
+            const uint32_t initialSeed = 0xA17E2026;
+            uint32_t state = initialSeed;
+            const size_t dimensions[] = {8, 16, 24, 32, 48, 64, 96, 128};
+            const size_t paddings[] = {0, 16, 32, 64};
+            ProbeLiveSurface slots[12] = {0};
+            unsigned executed = 0, creates = 0, checks = 0, releases = 0;
+            unsigned anomalies = 0, maxLive = 0, live = 0;
+            unsigned postReleaseAvailable = 0, postReleaseMissing = 0;
+            unsigned createNull = 0, lookupNull = 0, contentMismatch = 0, dimensionsMismatch = 0, lockFailures = 0;
+            unsigned duplicateIds = 0;
+            CFAbsoluteTime begin = CFAbsoluteTimeGetCurrent();
+            NSMutableString *csv = [NSMutableString stringWithString:
+                @"step,operation,slot,id,width,height,row_bytes,alloc_size,expected_marker,observed_marker,result\n"];
+            void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                                     RTLD_LAZY | RTLD_LOCAL);
+            CreateSurfaceFn create = framework ? (CreateSurfaceFn)dlsym(framework, "IOSurfaceCreate") : NULL;
+            GetSurfaceIDFn getID = framework ? (GetSurfaceIDFn)dlsym(framework, "IOSurfaceGetID") : NULL;
+            LookupSurfaceFn lookup = framework ? (LookupSurfaceFn)dlsym(framework, "IOSurfaceLookup") : NULL;
+            GetSurfaceDimensionFn getWidth = framework ? (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetWidth") : NULL;
+            GetSurfaceDimensionFn getHeight = framework ? (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetHeight") : NULL;
+            GetSurfaceDimensionFn getAlloc = framework ? (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetAllocSize") : NULL;
+            GetSurfaceBaseFn getBase = framework ? (GetSurfaceBaseFn)dlsym(framework, "IOSurfaceGetBaseAddress") : NULL;
+            SurfaceLockFn lock = framework ? (SurfaceLockFn)dlsym(framework, "IOSurfaceLock") : NULL;
+            SurfaceLockFn unlock = framework ? (SurfaceLockFn)dlsym(framework, "IOSurfaceUnlock") : NULL;
+            BOOL available = create && getID && lookup && getWidth && getHeight && getAlloc &&
+                             getBase && lock && unlock;
+            if (!available) {
+                if (framework) dlclose(framework);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.stressRunning = NO;
+                    [self note:@"FUZZ: ERROR: faltan funciones públicas, no se ejecutó la prueba."];
+                });
+                return;
+            }
+            BOOL stopped = NO;
+            for (unsigned step = 1; step <= totalSteps; step++) {
+                if (self.stressStopRequested) {
+                    stopped = YES;
+                    break;
+                }
+                @autoreleasepool {
+                    unsigned selected = probeRandom(&state) % capacity;
+                    unsigned choice = probeRandom(&state) % 100;
+                    ProbeLiveSurface *slot = &slots[selected];
+                    const char *action = "NONE";
+                    const char *result = "PASS";
+                    IOSurfaceID reportID = slot->identifier;
+                    size_t width = slot->width, height = slot->height;
+                    size_t rowBytes = slot->rowBytes, bytes = slot->allocated;
+                    uint64_t expected = slot->marker, observed = 0;
+                    if (!slot->held) {
+                        action = "CREATE";
+                        width = dimensions[probeRandom(&state) % 8];
+                        height = dimensions[probeRandom(&state) % 8];
+                        size_t padding = paddings[probeRandom(&state) % 4];
+                        rowBytes = width * 4 + padding;
+                        bytes = rowBytes * height;
+                        expected = 0xA17E2026F00D0000ULL ^
+                                  (((uint64_t)step) << 17) ^
+                                  (((uint64_t)selected) << 8) ^
+                                  (uint64_t)probeRandom(&state);
+                        NSDictionary *settings = @{
+                            @"IOSurfaceWidth": @(width),
+                            @"IOSurfaceHeight": @(height),
+                            @"IOSurfaceBytesPerElement": @4,
+                            @"IOSurfaceBytesPerRow": @(rowBytes),
+                            @"IOSurfaceAllocSize": @(bytes),
+                            @"IOSurfacePixelFormat": @(0x42475241)
+                        };
+                        IOSurfaceRef original = create((__bridge CFDictionaryRef)settings);
+                        if (!original) {
+                            result = "CREATE_NULL";
+                            createNull++;
+                        } else {
+                            reportID = getID(original);
+                            IOSurfaceRef retained = lookup(reportID);
+                            CFRelease(original);
+                            if (!retained) {
+                                result = "LOOKUP_NULL";
+                                lookupNull++;
+                            } else {
+                                uint32_t seed = 0;
+                                kern_return_t lockResult = lock(retained, 0, &seed);
+                                if (lockResult != KERN_SUCCESS) {
+                                    result = "WRITE_LOCK_FAILED";
+                                    lockFailures++;
+                                } else {
+                                    void *ptr = getBase(retained);
+                                    if (!ptr) {
+                                        result = "WRITE_BASE_NULL";
+                                        lockFailures++;
+                                    } else {
+                                        memcpy(ptr, &expected, sizeof(expected));
+                                    }
+                                    kern_return_t unlockResult = unlock(retained, 0, NULL);
+                                    if (unlockResult != KERN_SUCCESS) {
+                                        result = "WRITE_UNLOCK_FAILED";
+                                        lockFailures++;
+                                    }
+                                }
+                                if (strcmp(result, "PASS") == 0) {
+                                    for (unsigned k = 0; k < capacity; k++) {
+                                        if (slots[k].held && slots[k].identifier == reportID) {
+                                            result = "DUPLICATE_LIVE_ID";
+                                            duplicateIds++;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (strcmp(result, "PASS") == 0) {
+                                    slot->held = retained;
+                                    slot->identifier = reportID;
+                                    slot->width = width;
+                                    slot->height = height;
+                                    slot->rowBytes = rowBytes;
+                                    slot->allocated = bytes;
+                                    slot->marker = expected;
+                                    creates++;
+                                    live++;
+                                    if (live > maxLive) maxLive = live;
+                                } else {
+                                    CFRelease(retained);
+                                }
+                            }
+                        }
+                    } else if (choice < 29) {
+                        action = "RELEASE";
+                        CFRelease(slot->held);
+                        slot->held = NULL;
+                        releases++;
+                        live--;
+                        IOSurfaceRef after = lookup(reportID);
+                        if (after) {
+                            postReleaseAvailable++;
+                            CFRelease(after);
+                            result = "RELEASED_LOOKUP_AVAILABLE";
+                        } else {
+                            postReleaseMissing++;
+                            result = "RELEASED_LOOKUP_MISSING";
+                        }
+                        memset(slot, 0, sizeof(*slot));
+                    } else {
+                        action = "VERIFY";
+                        checks++;
+                        IOSurfaceRef ref = lookup(reportID);
+                        if (!ref) {
+                            result = "LOOKUP_NULL_WHILE_RETAINED";
+                            lookupNull++;
+                        } else {
+                            size_t observedWidth = getWidth(ref), observedHeight = getHeight(ref);
+                            size_t observedAlloc = getAlloc(ref);
+                            if (observedWidth != width || observedHeight != height || observedAlloc < bytes) {
+                                result = "DIMENSIONS_MISMATCH";
+                                dimensionsMismatch++;
+                            }
+                            kern_return_t lockResult = lock(ref, 1, NULL);
+                            if (lockResult != KERN_SUCCESS) {
+                                result = "READ_LOCK_FAILED";
+                                lockFailures++;
+                            } else {
+                                void *ptr = getBase(ref);
+                                if (!ptr) {
+                                    result = "READ_BASE_NULL";
+                                    lockFailures++;
+                                } else {
+                                    memcpy(&observed, ptr, sizeof(observed));
+                                    if (observed != expected) {
+                                        result = "CONTENT_MISMATCH";
+                                        contentMismatch++;
+                                    }
+                                }
+                                kern_return_t unlockResult = unlock(ref, 1, NULL);
+                                if (unlockResult != KERN_SUCCESS) {
+                                    result = "READ_UNLOCK_FAILED";
+                                    lockFailures++;
+                                }
+                            }
+                            CFRelease(ref);
+                        }
+                    }
+                    if (strcmp(result, "PASS") != 0 &&
+                        strcmp(result, "RELEASED_LOOKUP_AVAILABLE") != 0 &&
+                        strcmp(result, "RELEASED_LOOKUP_MISSING") != 0) {
+                        anomalies++;
+                    }
+                    [csv appendFormat:@"%u,%s,%u,%u,%zu,%zu,%zu,%zu,0x%016llx,0x%016llx,%s\n",
+                        step, action, selected, (unsigned)reportID, width, height,
+                        rowBytes, bytes, (unsigned long long)expected,
+                        (unsigned long long)observed, result];
+                    executed++;
+                    if ((step % 1000) == 0) {
+                        unsigned done = executed, issues = anomalies, maximum = maxLive;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [self note:[NSString stringWithFormat:
+                                @"FUZZ: progreso %u/%u, anomalías=%u, máximo simultáneo=%u",
+                                done, totalSteps, issues, maximum]];
+                        });
+                    }
+                    if ((step % 250) == 0) usleep(1000);
+                }
+            }
+            for (unsigned j = 0; j < capacity; j++) {
+                if (slots[j].held) {
+                    CFRelease(slots[j].held);
+                    slots[j].held = NULL;
+                }
+            }
+            if (framework) dlclose(framework);
+            double elapsed = CFAbsoluteTimeGetCurrent() - begin;
+            NSString *savedCSV = [csv copy];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressCSV = savedCSV;
+                self.stressRunning = NO;
+                [self note:[NSString stringWithFormat:
+                    @"FUZZ: RESULTADO pasos=%u/%u creaciones=%u verificaciones=%u liberaciones=%u anomalías=%u",
+                    executed, totalSteps, creates, checks, releases, anomalies]];
+                [self note:[NSString stringWithFormat:
+                    @"FUZZ: detalles create_null=%u lookup_null=%u contenido=%u dimensiones=%u bloqueo=%u ids_vivos_duplicados=%u",
+                    createNull, lookupNull, contentMismatch, dimensionsMismatch,
+                    lockFailures, duplicateIds]];
+                [self note:[NSString stringWithFormat:
+                    @"FUZZ: consultas tras liberar disponible=%u ausente=%u; máximo_vivas=%u; duracion=%.3fs",
+                    postReleaseAvailable, postReleaseMissing, maxLive, elapsed]];
+                [self note:stopped ? @"FUZZ: DETENIDO por usuario; todos los objetos retenidos fueron liberados."
+                                   : @"FUZZ: COMPLETADO; todos los objetos retenidos fueron liberados."];
+                [self note:@"FUZZ: exporta registro y CSV para revisar cada operación. Ninguna señal equivale a KernelRW sin confirmación independiente."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -605,8 +886,18 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
         [self note:[NSString stringWithFormat:@"EXPORT: %@", error.localizedDescription]];
         return;
     }
+    NSMutableArray *filesToShare = [NSMutableArray arrayWithObject:[NSURL fileURLWithPath:p]];
+    if (self.stressCSV.length > 0) {
+        NSString *csvPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-v6-fuzz.csv"];
+        NSError *csvError = nil;
+        if ([self.stressCSV writeToFile:csvPath atomically:YES encoding:NSUTF8StringEncoding error:&csvError]) {
+            [filesToShare addObject:[NSURL fileURLWithPath:csvPath]];
+        } else {
+            [self note:[NSString stringWithFormat:@"FUZZ: error exportando CSV: %@", csvError.localizedDescription]];
+        }
+    }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
-      initWithActivityItems:@[[NSURL fileURLWithPath:p]] applicationActivities:nil];
+      initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
         sharing.popoverPresentationController.sourceView = (UIView *)sender;
     [self presentViewController:sharing animated:YES completion:nil];
