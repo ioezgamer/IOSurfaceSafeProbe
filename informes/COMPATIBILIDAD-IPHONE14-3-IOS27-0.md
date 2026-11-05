@@ -3,7 +3,7 @@
 **Fecha:** 5 de noviembre de 2026  
 **Dispositivo:** iPhone 13 Pro Max, `iPhone14,3`  
 **Versión reportada por el dispositivo:** iOS 27.0, compilación `24A437`  
-**Estado:** comparación de identidad de frameworks pendiente del resultado medido por Backboardd Evidence v3. No hay exploit ni jailbreak demostrado.
+**Estado (actualizado 2026-11-05):** comparación de UUIDs medida en el dispositivo mediante Backboardd Evidence v3. QuartzCore no coincide con la referencia pública de iOS 27.1. No hay exploit ni jailbreak demostrado.
 
 ## 1. No confundir dos vulnerabilidades
 
@@ -55,10 +55,28 @@ El resultado se incorpora al campo `frameworkCompatibility` del archivo exportab
 
 El parche oficial de iOS 27.2 permite establecer el riesgo general, pero no sustituye una reproducción verificada en este dispositivo.
 
-## 6. Siguiente dato necesario
+## 6. Resultado real de la prueba en iPhone14,3
 
-Instalar la IPA v3 con SideStore, pulsar **5. Comparar frameworks de mi iOS**, luego **3. Exportar informe y checkpoint** y compartir `BackboarddEvidence-dictamen.json`.
+El usuario compartió `BackboarddEvidence-dictamen 2.json`, generado por Backboardd Evidence v3 en el propio equipo.
 
-**Dictamen actual:** la investigación de iOS 27.1 no puede declararse compatible ni incompatible con `24A437` sin comparar al menos los identificadores reales de los binarios. Una coincidencia de UUID tampoco basta para confirmar explotación.
+| Componente | UUID Mach-O observada |
+|---|---|
+| QuartzCore | `76CE2A6E-DBA4-335D-A5AC-77A1C1B286A6` |
+| CoreMedia | `A1E3885B-22BE-3C76-95C1-7821276212F6` |
+| IOSurface | `5933A7C7-F136-3DE3-83F4-34A5451F9C1E` |
 
-**Restricción:** esta auditoría no crea ni adapta cargas de corrupción de memoria ni proporciona un jailbreak.
+La referencia QuartzCore declarada en el proyecto público es:
+`21FA0104-F308-3BB3-8F3F-E9DE66F7CDEC`.
+
+**Resultado:** las UUID de QuartzCore son distintas. La rutina pública `SupportedQuartzCore` del autor compara con la UUID de referencia y la función `FixedByteRPU` rechaza una compilación distinta antes de preparar las modalidades de escritura limitada y lectura posterior.
+
+**Distinción importante:** esta comprobación no alcanza automáticamente al modo de prueba de dirección de retorno, que el código fuente selecciona de otra manera. La desigualdad de UUID tampoco prueba ausencia de CVE-2026-112688, ni demuestra que otra carga sea compatible, ni valida corrupción de memoria.
+
+## 7. Alcance que permanece pendiente
+
+- No existe aún una reproducción independiente y comprobada de un fallo de memoria en `backboardd` en `24A437`.
+- No tenemos comparaciones instrucción por instrucción entre QuartzCore y CoreMedia de ambas compilaciones en esta revisión.
+- La IPA v3 se limitó a lectura de identificadores Mach-O de frameworks en su propio proceso.
+- El checkpoint histórico de SIGABRT pertenece a la app de diagnóstico, no a `backboardd`.
+
+**Dictamen actualizado:** confirmada la diferencia de identidad de QuartzCore; una modalidad concreta del PoC público no supera su control de compatibilidad en el dispositivo. No es prueba de explotación ni de inmunidad.
