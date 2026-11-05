@@ -28,7 +28,7 @@
 }
 
 - (NSString *)stamp {
-    return [NSISO8601DateFormatter new].stringFromDate([NSDate date]);
+    return [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
 }
 
 - (void)append:(NSString *)line {
