@@ -8,8 +8,8 @@
 #import <string.h>
 #import <unistd.h>
 
-// Non-exploit, read-only preflight: one valid public surface and one IOKit connection.
-// No method dispatch, intentional race, stale pointer use or kernel modification.
+// Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
+// No direct externalMethod dispatch, intentional races, stale pointers or kernel modification.
 typedef struct __IOSurface * IOSurfaceRef;
 typedef uint32_t IOSurfaceID;
 typedef IOSurfaceRef (*CreateSurfaceFn)(CFDictionaryRef);
@@ -109,7 +109,7 @@ static uint32_t probeRandom(uint32_t *state) {
       [self button:@"6. Matriz IOSurface 484 casos" action:@selector(matrixProbe:)],
       [self button:@"7. Campaña de estados (30.000 operaciones)" action:@selector(campaignProbe:)],
       [self button:@"8. Repetir última campaña" action:@selector(replayCampaignProbe:)],
-      [self button:@"Detener fuzzing" action:@selector(stopStressProbe:)],
+      [self button:@"Detener campaña" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro" action:@selector(shareLog:)],
       self.logView
     ]];
@@ -929,6 +929,13 @@ static uint32_t probeRandom(uint32_t *state) {
     [self note:@"CAMPAIGN: cada 500 casos se guarda el progreso en Documents; si se interrumpe, queda un checkpoint."];
     [self note:@"CAMPAIGN: se intercalan aperturas/cierres válidos de IOSurfaceRoot sin selector privado."];
     [self note:@"CAMPAIGN: no hay llamadas con punteros liberados ni competencia intencional entre hilos."];
+    // Persist the initial marker before any work starts: early exits are visible on relaunch.
+    NSDictionary *initialCheckpoint = @{
+        @"run":runID, @"seed":@(seed), @"step":@0, @"status":@"RUNNING",
+        @"anomalies":@0, @"timestamp":[NSDate date].description
+    };
+    NSData *initialData = [NSJSONSerialization dataWithJSONObject:initialCheckpoint options:0 error:NULL];
+    if (initialData) [initialData writeToFile:checkPath options:NSDataWritingAtomic error:NULL];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
             const unsigned limit=30000, capacity=20;
@@ -965,6 +972,12 @@ static uint32_t probeRandom(uint32_t *state) {
 
             BOOL ready=create && getID && lookup && getW && getH && getAlloc && base && lock && unlock;
             if (!ready) {
+                NSDictionary *failed=@{
+                    @"run":runID,@"seed":@(seed),@"step":@0,@"status":@"ERROR",
+                    @"reason":@"MISSING_PUBLIC_SYMBOLS"
+                };
+                NSData *failedBytes=[NSJSONSerialization dataWithJSONObject:failed options:0 error:NULL];
+                if(failedBytes) [failedBytes writeToFile:checkPath options:NSDataWritingAtomic error:NULL];
                 if (framework) dlclose(framework);
                 if (io) dlclose(io);
                 dispatch_async(dispatch_get_main_queue(), ^{
