@@ -17,6 +17,12 @@ jobs:
         run: xcodebuild -version
       - name: Instalar XcodeGen
         run: brew install xcodegen
+      - name: Pruebas del clasificador de reinicios (C11)
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror \
+            IOSurfacePreflight/Tests/PFBootClassifierTests.c -lm \
+            -o "$RUNNER_TEMP/pf-boot-tests"
+          "$RUNNER_TEMP/pf-boot-tests"
       - name: Generar proyecto
         working-directory: IOSurfacePreflight
         run: xcodegen generate
