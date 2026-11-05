@@ -2,6 +2,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
+#import <stdlib.h>
 
 @interface EvidenceController : UIViewController <UIDocumentPickerDelegate>
 @property(nonatomic, strong) UITextView *output;
@@ -56,7 +57,7 @@
     self.machine = [self modelIdentifier];
     self.build = [self systemBuild];
     self.analysis = [@{
-        @"tool": @"Backboardd Evidence Inspector v1",
+        @"tool": @"Backboardd Evidence Inspector v2",
         @"purpose": @"Local crash report review; no exploit payload",
         @"created": [self stamp],
         @"device": self.machine,
@@ -68,12 +69,12 @@
     } mutableCopy];
 
     UILabel *heading = [UILabel new];
-    heading.text = @"Backboardd Evidence";
+    heading.text = @"Backboardd Evidence v2";
     heading.font = [UIFont systemFontOfSize:25 weight:UIFontWeightBold];
     heading.numberOfLines = 0;
 
     UILabel *subtitle = [UILabel new];
-    subtitle.text = @"CVE-2026-112688 | Inspección local de registros. No ejecuta cargas de explotación ni modifica el kernel.";
+    subtitle.text = @"Inspector local de registros y prueba de cierre controlado. No ejecuta exploit, no causa corrupción de memoria y no modifica el kernel.";
     subtitle.numberOfLines = 0;
     subtitle.textColor = UIColor.secondaryLabelColor;
     subtitle.font = [UIFont systemFontOfSize:14];
@@ -90,7 +91,8 @@
         heading,subtitle,
         [self action:@"1. Revisar dispositivo" selector:@selector(checkDevice:)],
         [self action:@"2. Importar registro .ips / .txt / .json" selector:@selector(importReport:)],
-        [self action:@"3. Exportar dictamen JSON" selector:@selector(exportReport:)],
+        [self action:@"3. Exportar informe y checkpoint" selector:@selector(exportReport:)],
+        [self action:@"4. Prueba activa: cierre de esta app (SIGABRT)" selector:@selector(confirmSelfCrash:)],
         self.output
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -115,10 +117,12 @@
         [self.output.heightAnchor constraintEqualToConstant:380]
     ]];
 
-    [self append:@"Backboardd Evidence Inspector v1"];
+    [self append:@"Backboardd Evidence Inspector v2"];
     [self append:@"Funciona completamente sin red."];
     [self append:@"No accede a backboardd, CoreMedia privado ni métodos del kernel."];
-    [self append:@"Importá un crash report real desde Archivos para revisar sus indicadores."];
+    [self append:@"Prueba activa: cierre intencional solo de la aplicación, sin dañar la memoria del kernel."];
+    [self showPreviousSelfCrash];
+    [self append:@"Podés importar el registro .ips real tras reabrirla."];
     [self checkDevice:nil];
 }
 
@@ -216,6 +220,71 @@
     }
 }
 
+
+- (NSString *)selfCrashCheckpointPath {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+        stringByAppendingPathComponent:@"BackboarddEvidence-SelfCrash-checkpoint.json"];
+}
+
+- (void)showPreviousSelfCrash {
+    NSData *data=[NSData dataWithContentsOfFile:[self selfCrashCheckpointPath]];
+    if(!data)return;
+    NSDictionary *report=[NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if(![report isKindOfClass:NSDictionary.class])return;
+    [self append:[NSString stringWithFormat:
+        @"SELF-CRASH: checkpoint anterior %@ estado=%@",
+        report[@"run"]?:@"?",report[@"status"]?:@"?"]];
+    [self append:@"SELF-CRASH: un checkpoint previo no demuestra la causa del cierre; verificá el .ips de iOS."];
+    self.analysis[@"selfCrashCheckpoint"]=report;
+}
+
+- (void)confirmSelfCrash:(id)sender {
+    UIAlertController *alert=[UIAlertController
+        alertControllerWithTitle:@"Cerrar esta aplicación"
+        message:@"Esta prueba guarda un checkpoint y finaliza voluntariamente esta misma app con SIGABRT. El proceso se cerrará. No utiliza errores de memoria, no toca backboardd ni el kernel y no es una prueba de CVE-2026-112688."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancelar"
+        style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf=self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Ejecutar cierre local"
+        style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a){
+            [weakSelf runSelfCrash];
+        }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)runSelfCrash {
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSDictionary *checkpoint=@{
+        @"tool":@"Backboardd Evidence Inspector v2",
+        @"run":run,@"status":@"CHECKPOINT_BEFORE_TERMINATION",
+        @"test":@"APPLICATION_SELF_TERMINATION_SIGABRT",
+        @"expectedResult":@"EXC_CRASH / SIGABRT in this app only",
+        @"device":self.machine?:@"?",
+        @"iosBuild":self.build?:@"?",
+        @"iosVersion":UIDevice.currentDevice.systemVersion?:@"?",
+        @"timestamp":[self stamp],
+        @"memoryCorruptionAttempted":@NO,
+        @"kernelAccessAttempted":@NO,
+        @"otherProcessTouched":@NO
+    };
+    NSError *err=nil;
+    NSData *data=[NSJSONSerialization dataWithJSONObject:checkpoint
+                            options:NSJSONWritingPrettyPrinted error:&err];
+    if(!data || ![data writeToFile:[self selfCrashCheckpointPath]
+                          options:NSDataWritingAtomic error:&err]) {
+        [self append:[NSString stringWithFormat:
+            @"SELF-CRASH: no se guardó checkpoint; prueba cancelada: %@",
+            err.localizedDescription?:@"error desconocido"]];
+        return;
+    }
+    [self append:[NSString stringWithFormat:
+        @"SELF-CRASH: checkpoint guardado para %@. Cerrando esta app.",run]];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{
+        abort();
+    });
+}
+
 - (void)exportReport:(id)sender {
     NSError *jsonError=nil;
     NSData *json=[NSJSONSerialization dataWithJSONObject:self.analysis
@@ -231,8 +300,12 @@
         [self append:[NSString stringWithFormat:@"EXPORT: %@",saveError.localizedDescription]];
         return;
     }
+    NSMutableArray *items=[NSMutableArray arrayWithObject:[NSURL fileURLWithPath:path]];
+    NSString *checkpointPath=[self selfCrashCheckpointPath];
+    if([[NSFileManager defaultManager] fileExistsAtPath:checkpointPath])
+        [items addObject:[NSURL fileURLWithPath:checkpointPath]];
     UIActivityViewController *share=[[UIActivityViewController alloc]
-        initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+        initWithActivityItems:items applicationActivities:nil];
     share.popoverPresentationController.sourceView=self.view;
     [self presentViewController:share animated:YES completion:nil];
 }
