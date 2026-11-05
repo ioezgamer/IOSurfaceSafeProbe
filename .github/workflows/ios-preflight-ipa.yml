@@ -41,8 +41,8 @@ jobs:
       - name: Verificar versión real del Info.plist
         run: |
           INFO="$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/Info.plist"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.0"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "19"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.1"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "20"
           test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
       - name: Crear IPA
         run: |
