@@ -96,7 +96,7 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v10";
+    title.text = @"IOSurface Preflight v11";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -126,6 +126,7 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
       [self button:@"11. Fuzzing dirigido IOSurfaceRoot selector 17 (256 casos)" action:@selector(selector17Probe:)],
       [self button:@"12. Repetir selector 17 (misma semilla)" action:@selector(replaySelector17Probe:)],
       [self button:@"13. Comprobar contrato asíncrono (1 intento)" action:@selector(asyncContractProbe:)],
+      [self button:@"14. Observar respuesta asíncrona (3 s)" action:@selector(asyncObserverProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -158,8 +159,20 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v10"]; 
+    [self note:@"app=IOSurfacePreflight-v11"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *observerCheckpointPath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceAsyncObserver-checkpoint.json"];
+    NSData *observerPrevious=[NSData dataWithContentsOfFile:observerCheckpointPath];
+    if(observerPrevious) {
+        NSDictionary *last=[NSJSONSerialization JSONObjectWithData:observerPrevious options:0 error:NULL];
+        if([last isKindOfClass:NSDictionary.class]) {
+            [self note:[NSString stringWithFormat:
+                @"OBSERVE: previo status=%@ phase=%@ resultado=%@ mensajes=%@",
+                last[@"status"] ?: @"?", last[@"phase"] ?: @"?",
+                last[@"callReturn"] ?: @"?", last[@"messages"] ?: @"?"]];
+        }
+    }
     NSString *asyncCheckpointPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceAsyncContract-checkpoint.json"];
     NSData *asyncPrevious = [NSData dataWithContentsOfFile:asyncCheckpointPath];
     if (asyncPrevious) {
@@ -1705,6 +1718,194 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     });
 }
 
+
+- (void)asyncObserverProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning) {
+        [self note:@"OBSERVE: ya existe una prueba activa."];
+        return;
+    }
+    self.stressRunning=YES;
+    self.stressStopRequested=NO;
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *checkpointPath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceAsyncObserver-checkpoint.json"];
+    NSString *tracePath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceAsyncObserver-trace.csv"];
+    [self note:[NSString stringWithFormat:@"OBSERVE: inicio run=%@",run]];
+    [self note:@"OBSERVE: 1 llamada asíncrona al selector 17, estructura de 24 bytes cero."];
+    [self note:@"OBSERVE: conexión y puerto Mach permanecen abiertos mientras escuchamos hasta 3 segundos."];
+    [self note:@"OBSERVE: registramos cabeceras de mensajes, no interpretamos su contenido ni modificamos memoria del kernel."];
+    [self note:@"OBSERVE: sin carreras, sin métodos adicionales, sin punteros liberados."];
+
+    NSDictionary *initial=@{
+        @"run":run,@"status":@"RUNNING",@"phase":@"PREPARING",
+        @"selector":@17,@"timestamp":[NSDate date].description
+    };
+    NSData *initialBytes=[NSJSONSerialization dataWithJSONObject:initial options:0 error:NULL];
+    if(initialBytes)[initialBytes writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            void *lib=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_LAZY|RTLD_LOCAL);
+            MatchingFn matching=lib?(MatchingFn)dlsym(lib,"IOServiceMatching"):NULL;
+            GetMatchingFn getService=lib?(GetMatchingFn)dlsym(lib,"IOServiceGetMatchingService"):NULL;
+            OpenServiceFn open=lib?(OpenServiceFn)dlsym(lib,"IOServiceOpen"):NULL;
+            CloseServiceFn close=lib?(CloseServiceFn)dlsym(lib,"IOServiceClose"):NULL;
+            ReleaseObjectFn release=lib?(ReleaseObjectFn)dlsym(lib,"IOObjectRelease"):NULL;
+            typedef kern_return_t (*CallAsyncStructFn)(
+                io_connect_t,uint32_t,mach_port_t,uint64_t*,uint32_t,
+                const void*,size_t,void*,size_t*);
+            CallAsyncStructFn call=lib?(CallAsyncStructFn)dlsym(lib,"IOConnectCallAsyncStructMethod"):NULL;
+
+            mach_port_t replyPort=MACH_PORT_NULL;
+            io_service_t service=MACH_PORT_NULL;
+            io_connect_t connection=MACH_PORT_NULL;
+            kern_return_t openCode=KERN_FAILURE,portCode=KERN_FAILURE;
+            kern_return_t sendCode=KERN_FAILURE,callCode=KERN_FAILURE;
+            kern_return_t closeCode=KERN_FAILURE,portDestroyCode=KERN_FAILURE;
+            unsigned received=0,timeouts=0,receiveErrors=0,polls=0;
+            BOOL invoked=NO;
+            BOOL stopped=NO;
+            NSString *phase=@"SETUP",*status=@"ERROR";
+            CFAbsoluteTime started=CFAbsoluteTimeGetCurrent();
+            NSMutableString *trace=[NSMutableString stringWithFormat:
+                @"run,event,poll,receive_code,message_id,message_size,message_bits,elapsed_ms\n"];
+            BOOL available=matching && getService && open && close && release && call;
+            if(available) {
+                CFMutableDictionaryRef request=matching("IOSurfaceRoot");
+                if(request)service=getService(MACH_PORT_NULL,request);
+                if(service)openCode=open(service,mach_task_self(),0,&connection);
+                if(openCode==KERN_SUCCESS && connection!=MACH_PORT_NULL) {
+                    portCode=mach_port_allocate(mach_task_self(),MACH_PORT_RIGHT_RECEIVE,&replyPort);
+                    if(portCode==KERN_SUCCESS) {
+                        sendCode=mach_port_insert_right(mach_task_self(),replyPort,
+                                                      replyPort,MACH_MSG_TYPE_MAKE_SEND);
+                        if(sendCode==KERN_SUCCESS) {
+                            phase=@"BEFORE_IPC";
+                            NSDictionary *before=@{
+                                @"run":run,@"status":@"RUNNING",@"phase":phase,
+                                @"selector":@17,@"inputBytes":@24,
+                                @"referenceCount":@8,@"payload":@"ZERO",
+                                @"timestamp":[NSDate date].description
+                            };
+                            NSData *pre=[NSJSONSerialization dataWithJSONObject:before
+                                                                        options:0 error:NULL];
+                            if(pre)[pre writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+                            [trace appendFormat:@"%@,BEFORE_IPC,0,0x00000000,0,0,0,%.1f\n",
+                                run,(CFAbsoluteTimeGetCurrent()-started)*1000.0];
+                            [trace writeToFile:tracePath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+                            uint8_t payload[24]={0};
+                            uint64_t reference[8]={0};
+                            size_t outputLength=0;
+                            invoked=YES;
+                            callCode=call(connection,17,replyPort,reference,8,
+                                          payload,sizeof(payload),NULL,&outputLength);
+                            phase=@"AFTER_IPC";
+                            [trace appendFormat:@"%@,AFTER_IPC,0,0x%08x,0,0,0,%.1f\n",
+                                run,(unsigned)callCode,(CFAbsoluteTimeGetCurrent()-started)*1000.0];
+                            [trace writeToFile:tracePath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                            NSDictionary *after=@{
+                                @"run":run,@"status":@"RUNNING",@"phase":phase,
+                                @"callReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)callCode],
+                                @"timestamp":[NSDate date].description
+                            };
+                            NSData *afterBytes=[NSJSONSerialization dataWithJSONObject:after
+                                                                                 options:0 error:NULL];
+                            if(afterBytes)[afterBytes writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+
+                            if(callCode==KERN_SUCCESS) {
+                                phase=@"LISTENING";
+                                // One thread, one outstanding read; bounded to three 1-second polls.
+                                for(unsigned n=1;n<=3;n++) {
+                                    if(self.stressStopRequested) {stopped=YES;break;}
+                                    typedef struct {
+                                        mach_msg_header_t header;
+                                        uint8_t payload[4096];
+                                    } ObserverMessage;
+                                    ObserverMessage incoming={0};
+                                    mach_msg_return_t result=mach_msg(&incoming.header,
+                                        MACH_RCV_MSG|MACH_RCV_TIMEOUT,
+                                        0,(mach_msg_size_t)sizeof(incoming),replyPort,1000,MACH_PORT_NULL);
+                                    polls++;
+                                    uint32_t msgID=0,msgBytes=0,msgBits=0;
+                                    if(result==MACH_MSG_SUCCESS) {
+                                        received++;
+                                        msgID=(uint32_t)incoming.header.msgh_id;
+                                        msgBytes=incoming.header.msgh_size;
+                                        msgBits=incoming.header.msgh_bits;
+                                        // The message is untrusted data. Read only its bounded header.
+                                        // Dispose of any rights/descriptors it contains.
+                                        mach_msg_destroy(&incoming.header);
+                                    } else if(result==MACH_RCV_TIMED_OUT) {
+                                        timeouts++;
+                                    } else {
+                                        receiveErrors++;
+                                    }
+                                    [trace appendFormat:
+                                        @"%@,RECEIVE,%u,0x%08x,%u,%u,%u,%.1f\n",
+                                        run,n,(unsigned)result,msgID,msgBytes,msgBits,
+                                        (CFAbsoluteTimeGetCurrent()-started)*1000.0];
+                                    [trace writeToFile:tracePath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                                    NSDictionary *pollData=@{
+                                        @"run":run,@"status":@"RUNNING",@"phase":@"LISTENING",
+                                        @"poll":@(n),@"messages":@(received),@"timeouts":@(timeouts),
+                                        @"receiveErrors":@(receiveErrors),
+                                        @"callReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)callCode],
+                                        @"timestamp":[NSDate date].description
+                                    };
+                                    NSData *pollBytes=[NSJSONSerialization dataWithJSONObject:pollData
+                                                                                      options:0 error:NULL];
+                                    if(pollBytes)[pollBytes writeToFile:checkpointPath
+                                                                options:NSDataWritingAtomic error:NULL];
+                                }
+                            }
+                            status=stopped?@"STOPPED":@"DONE";
+                        }
+                    }
+                }
+            }
+            phase=@"CLEANUP";
+            // Close the connection only after receive timeouts/notifications are recorded.
+            if(connection!=MACH_PORT_NULL && close)closeCode=close(connection);
+            if(service!=MACH_PORT_NULL && release)release(service);
+            if(replyPort!=MACH_PORT_NULL)portDestroyCode=mach_port_destroy(mach_task_self(),replyPort);
+            if(lib)dlclose(lib);
+            [trace appendFormat:@"%@,CLEANUP,%u,0x%08x,0,0,0,%.1f\n",
+                run,polls,(unsigned)closeCode,(CFAbsoluteTimeGetCurrent()-started)*1000.0];
+            [trace writeToFile:tracePath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+            NSDictionary *finished=@{
+                @"run":run,@"status":status,@"phase":@"FINISHED",
+                @"called":@(invoked),@"selector":@17,@"messages":@(received),
+                @"polls":@(polls),@"timeouts":@(timeouts),
+                @"receiveErrors":@(receiveErrors),
+                @"openReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)openCode],
+                @"portReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)portCode],
+                @"sendReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)sendCode],
+                @"callReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)callCode],
+                @"closeReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)closeCode],
+                @"portDestroyReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)portDestroyCode],
+                @"elapsedMs":@((CFAbsoluteTimeGetCurrent()-started)*1000.0),
+                @"timestamp":[NSDate date].description
+            };
+            NSData *end=[NSJSONSerialization dataWithJSONObject:finished
+                                                        options:NSJSONWritingPrettyPrinted error:NULL];
+            if(end)[end writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"OBSERVE: %@ llamada=%@ retorno=0x%08x mensajes=%u timeouts=%u errores_recepcion=%u",
+                    status,invoked?@"SI":@"NO",(unsigned)callCode,received,timeouts,receiveErrors]];
+                [self note:[NSString stringWithFormat:
+                    @"OBSERVE: cierre=0x%08x puerto_destroy=0x%08x",
+                    (unsigned)closeCode,(unsigned)portDestroyCode]];
+                [self note:@"OBSERVE: exportá el checkpoint y trace CSV. Sin mensajes en 3 s no demuestra que no existan respuestas posteriores."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -1740,6 +1941,14 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
         @"Documents/IOSurfaceAsyncContract-checkpoint.json"];
     if([[NSFileManager defaultManager] fileExistsAtPath:asyncCheckpoint])
         [filesToShare addObject:[NSURL fileURLWithPath:asyncCheckpoint]];
+    NSString *observerCheckpoint=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceAsyncObserver-checkpoint.json"];
+    NSString *observerTrace=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceAsyncObserver-trace.csv"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:observerCheckpoint])
+        [filesToShare addObject:[NSURL fileURLWithPath:observerCheckpoint]];
+    if([[NSFileManager defaultManager] fileExistsAtPath:observerTrace])
+        [filesToShare addObject:[NSURL fileURLWithPath:observerTrace]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
