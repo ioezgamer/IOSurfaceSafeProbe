@@ -78,6 +78,8 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
 @property(nonatomic, assign) BOOL stressRunning;
 @property(atomic, assign) BOOL stressStopRequested;
 @property(nonatomic, strong) NSString *stressCSV;
+@property(atomic, assign) BOOL controlledCloseRequested;
+@property(atomic, assign) BOOL controlledCloseRunning;
 @end
 
 @implementation ProbeController
@@ -111,7 +113,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v12";
+    title.text = @"IOSurface Preflight v13";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -143,6 +145,8 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
       [self button:@"13. Comprobar contrato asíncrono (1 intento)" action:@selector(asyncContractProbe:)],
       [self button:@"14. Observar respuesta asíncrona (3 s)" action:@selector(asyncObserverProbe:)],
       [self button:@"15. Verificar integridad de buffers (256 casos)" action:@selector(integrityProbe:)],
+      [self button:@"16. Preparar cierre controlado (superficie viva)" action:@selector(controlledCloseProbe:)],
+      [self button:@"17. Ejecutar cierre ahora" action:@selector(fireControlledClose:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -175,8 +179,22 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v12"]; 
+    [self note:@"app=IOSurfacePreflight-v13"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *closeCheckpointPath = [NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceControlledClose-checkpoint.json"];
+    NSData *closePrevData=[NSData dataWithContentsOfFile:closeCheckpointPath];
+    if(closePrevData) {
+        NSDictionary *previousClose=[NSJSONSerialization JSONObjectWithData:closePrevData options:0 error:NULL];
+        if([previousClose isKindOfClass:NSDictionary.class]) {
+            NSString *lastStatus=previousClose[@"status"] ?: @"?";
+            NSString *lastPhase=previousClose[@"phase"] ?: @"?";
+            [self note:[NSString stringWithFormat:
+                @"CIERRE: ejecución anterior status=%@ phase=%@", lastStatus,lastPhase]];
+            if([lastStatus isEqualToString:@"RUNNING"])
+                [self note:@"CIERRE: ejecución incompleta; no demuestra fallo ni liberación de memoria kernel."];
+        }
+    }
     NSString *integrityPath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceIntegrity-checkpoint.json"];
     NSData *integrityPrevious=[NSData dataWithContentsOfFile:integrityPath];
@@ -2122,6 +2140,165 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     });
 }
 
+
+- (void)fireControlledClose:(id)sender {
+    if (!self.controlledCloseRunning) {
+        [self note:@"CIERRE: primero iniciá la prueba 16."];
+        return;
+    }
+    self.controlledCloseRequested = YES;
+    [self note:@"CIERRE: señal del usuario recibida. El worker cerrará su propia conexión en un punto de pausa de usuario."];
+}
+
+- (void)controlledCloseProbe:(id)sender {
+    if (self.stressRunning || self.matrixRunning || self.controlledCloseRunning) {
+        [self note:@"CIERRE: otra prueba está activa; no se solapan pruebas."];
+        return;
+    }
+    self.stressRunning = YES;
+    self.controlledCloseRunning = YES;
+    self.controlledCloseRequested = NO;
+    NSString *run = NSUUID.UUID.UUIDString;
+    NSString *checkpointPath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceControlledClose-checkpoint.json"];
+    NSString *tracePath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceControlledClose-trace.csv"];
+    [self note:[NSString stringWithFormat:@"CIERRE: inicio run=%@", run]];
+    [self note:@"CIERRE: se crea una IOSurface válida y se retiene una referencia por lookup."];
+    [self note:@"CIERRE: botón 17 causa el cierre de una conexión IOSurfaceRoot explícita, con referencias vivas."];
+    [self note:@"CIERRE: punto de pausa fuera del kernel. La conexión explícita NO se identifica con la conexión interna de IOSurfaceCreate."];
+    [self note:@"CIERRE: no intenta carrera, corrupción, punteros obsoletos ni KernelRW."];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            __block uint32_t sid=0;
+            __block kern_return_t openCode=KERN_FAILURE;
+            __block kern_return_t closeCode=KERN_FAILURE;
+            __block size_t retainedWidth=0;
+            __block size_t afterCloseWidth=0;
+            __block size_t afterReleaseWidth=0;
+            __block BOOL userTriggered=NO;
+            CFAbsoluteTime t0=CFAbsoluteTimeGetCurrent();
+            NSMutableString *trace=[NSMutableString stringWithString:
+                @"run,elapsed_ms,phase,status,id,open_kr,close_kr,source\n"];
+            void (^checkpoint)(NSString *,NSString *) = ^(NSString *phase, NSString *status) {
+                double ms=(CFAbsoluteTimeGetCurrent()-t0)*1000.0;
+                NSDictionary *data=@{
+                    @"run":run, @"phase":phase, @"status":status,
+                    @"surfaceID":@(sid), @"openReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)openCode],
+                    @"closeReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)closeCode],
+                    @"userTriggered":@(userTriggered), @"elapsedMs":@(ms),
+                    @"bootStamp":preflightBootStamp(),
+                    @"timestamp":[NSDate date].description,
+                    @"scope":@"User-space barrier, public IOSurface API, separately opened IOSurfaceRoot client",
+                    @"noKernelTrace":@YES
+                };
+                NSData *json=[NSJSONSerialization dataWithJSONObject:data
+                                            options:NSJSONWritingPrettyPrinted error:NULL];
+                if(json)[json writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+                [trace appendFormat:@"%@,%.1f,%@,%@,%u,0x%08x,0x%08x,%@\n",
+                    run,ms,phase,status,(unsigned)sid,
+                    (unsigned)openCode,(unsigned)closeCode,
+                    userTriggered?@"USER":@"AUTO_OR_SETUP"];
+                [trace writeToFile:tracePath atomically:YES
+                          encoding:NSUTF8StringEncoding error:NULL];
+            };
+            checkpoint(@"SETUP",@"RUNNING");
+
+            void *surfLib=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                                RTLD_LAZY|RTLD_LOCAL);
+            void *ioLib=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
+                              RTLD_LAZY|RTLD_LOCAL);
+            CreateSurfaceFn create=surfLib?(CreateSurfaceFn)dlsym(surfLib,"IOSurfaceCreate"):NULL;
+            GetSurfaceIDFn getID=surfLib?(GetSurfaceIDFn)dlsym(surfLib,"IOSurfaceGetID"):NULL;
+            LookupSurfaceFn lookup=surfLib?(LookupSurfaceFn)dlsym(surfLib,"IOSurfaceLookup"):NULL;
+            GetSurfaceDimensionFn getWidth=surfLib?(GetSurfaceDimensionFn)dlsym(surfLib,"IOSurfaceGetWidth"):NULL;
+            MatchingFn matching=ioLib?(MatchingFn)dlsym(ioLib,"IOServiceMatching"):NULL;
+            GetMatchingFn getService=ioLib?(GetMatchingFn)dlsym(ioLib,"IOServiceGetMatchingService"):NULL;
+            OpenServiceFn open=ioLib?(OpenServiceFn)dlsym(ioLib,"IOServiceOpen"):NULL;
+            CloseServiceFn close=ioLib?(CloseServiceFn)dlsym(ioLib,"IOServiceClose"):NULL;
+            ReleaseObjectFn release=ioLib?(ReleaseObjectFn)dlsym(ioLib,"IOObjectRelease"):NULL;
+            IOSurfaceRef first=NULL,held=NULL;
+            io_service_t service=MACH_PORT_NULL;
+            io_connect_t connection=MACH_PORT_NULL;
+            NSString *status=@"ERROR_SETUP";
+            BOOL complete=create && getID && lookup && getWidth &&
+                          matching && getService && open && close && release;
+            if(complete) {
+                NSDictionary *params=@{
+                    @"IOSurfaceWidth":@64,@"IOSurfaceHeight":@64,
+                    @"IOSurfaceBytesPerElement":@4,@"IOSurfaceBytesPerRow":@256,
+                    @"IOSurfaceAllocSize":@(64*64*4),@"IOSurfacePixelFormat":@(0x42475241)
+                };
+                first=create((__bridge CFDictionaryRef)params);
+                if(first) {
+                    sid=getID(first);
+                    held=lookup(sid);
+                    if(held) {
+                        retainedWidth=getWidth(held);
+                        checkpoint(@"SURFACE_RETAINED",@"RUNNING");
+                        CFMutableDictionaryRef request=matching("IOSurfaceRoot");
+                        if(request) service=getService(MACH_PORT_NULL,request);
+                        if(service) openCode=open(service,mach_task_self(),0,&connection);
+                        if(openCode==KERN_SUCCESS && connection!=MACH_PORT_NULL) {
+                            checkpoint(@"WAITING_USER_CLOSE",@"RUNNING");
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [self note:[NSString stringWithFormat:
+                                    @"CIERRE: ID=%u retenida, IOSurfaceRoot abierta; pulsá 17 para cerrar.",
+                                    (unsigned)sid]];
+                            });
+                            // Voluntary user-space pause; it does not stop or preempt a kernel routine.
+                            for(unsigned i=0;i<300;i++) {
+                                if(self.controlledCloseRequested) {userTriggered=YES;break;}
+                                usleep(100000);
+                            }
+                            checkpoint(@"BEFORE_CLIENT_CLOSE",@"RUNNING");
+                            closeCode=close(connection);
+                            connection=MACH_PORT_NULL;
+                            checkpoint(@"AFTER_CLIENT_CLOSE",@"RUNNING");
+                            // Both accesses use a live CF-owned IOSurfaceRef.
+                            afterCloseWidth=getWidth(held);
+                            CFRelease(first);
+                            first=NULL;
+                            afterReleaseWidth=getWidth(held);
+                            CFRelease(held);
+                            held=NULL;
+                            checkpoint(@"REFERENCES_RELEASED",@"RUNNING");
+                            status=closeCode==KERN_SUCCESS &&
+                                   retainedWidth==64 && afterCloseWidth==64 &&
+                                   afterReleaseWidth==64
+                                  ? @"PASS_PUBLIC_LIFECYCLE" : @"OBSERVATION_NONPASS";
+                        } else {
+                            status=@"ERROR_OPEN_CONNECTION";
+                        }
+                    } else {
+                        status=@"ERROR_LOOKUP";
+                    }
+                } else {
+                    status=@"ERROR_CREATE_SURFACE";
+                }
+            }
+            if(connection!=MACH_PORT_NULL && close)close(connection);
+            if(held)CFRelease(held);
+            if(first)CFRelease(first);
+            if(service!=MACH_PORT_NULL && release)release(service);
+            if(ioLib)dlclose(ioLib);
+            if(surfLib)dlclose(surfLib);
+            checkpoint(@"FINISHED",status);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressRunning=NO;
+                self.controlledCloseRunning=NO;
+                self.controlledCloseRequested=NO;
+                [self note:[NSString stringWithFormat:
+                    @"CIERRE: %@ ID=%u, open=0x%08x close=0x%08x, ancho retenido=%zu, tras cierre=%zu, tras soltar creación=%zu, cierre voluntario=%@",
+                    status,(unsigned)sid,(unsigned)openCode,(unsigned)closeCode,
+                    retainedWidth,afterCloseWidth,afterReleaseWidth,userTriggered?@"SI":@"NO"]];
+                [self note:@"CIERRE: exportá JSON y CSV. Este resultado NO implica interrupción dentro del kernel, UAF ni KernelRW."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -2173,6 +2350,14 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
         [filesToShare addObject:[NSURL fileURLWithPath:integrityFile]];
     if([[NSFileManager defaultManager] fileExistsAtPath:integrityCSV])
         [filesToShare addObject:[NSURL fileURLWithPath:integrityCSV]];
+    NSString *closeFile=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceControlledClose-checkpoint.json"];
+    NSString *closeTrace=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceControlledClose-trace.csv"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:closeFile])
+        [filesToShare addObject:[NSURL fileURLWithPath:closeFile]];
+    if([[NSFileManager defaultManager] fileExistsAtPath:closeTrace])
+        [filesToShare addObject:[NSURL fileURLWithPath:closeTrace]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
