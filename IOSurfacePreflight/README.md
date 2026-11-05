@@ -69,3 +69,15 @@ clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFBootClassifierTe
 ```
 
 La compilación de la app iOS se ejecuta en GitHub Actions con `xcodebuild`. El artefacto no está firmado.
+
+## v19.1: correlación temporal de cada campaña con el monitor
+
+Una campaña de 100.000 casos ahora registra en el **mismo monitor de actividad**:
+- `BOUNDARY_BEGIN_<run-uuid>` antes de iniciar la ejecución.
+- `BOUNDARY_PROGRESS_<run-uuid>_<case>` en cada múltiplo de 10.000 casos.
+- `BOUNDARY_END_<run-uuid>_<status>` cuando se completa o se detiene.
+- `BOUNDARY_ERROR_<run-uuid>` si fallan las dependencias de API pública.
+
+Estos eventos permiten cruzar el tiempo de actividad y el identificador de campaña con los archivos `IOSurfaceBruteForce-v18-trace.csv` y `IOSurfaceBruteForce-v18-checkpoint.json` (el nombre del CSV se conserva por compatibilidad). El hecho de que existan eventos `BEGIN` y `END` no demuestra ausencia de errores del kernel; solo mejora la trazabilidad de lo observado desde la aplicación. Los eventos del monitor no son trazas internas del kernel.
+
+Para verificar esta mejora, ejecutar una campaña controlada y exportar `IOSurfaceBootMonitor-trace.csv`, `IOSurfaceBootMonitor-checkpoint.json`, la traza y el checkpoint de campaña. No repetir automáticamente el mismo conjunto de 100.000 casos salvo que se busque reproducibilidad.
