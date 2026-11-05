@@ -48,3 +48,24 @@ Los archivos exportados son:
 
 **Interpretacion estricta:** `observedCreateOverlap > 0` demuestra como maximo un solapamiento temporal de dos llamadas desde la aplicacion. La conexion cerrada es **independiente** de la gestion interna de `IOSurfaceCreate`. No comprueba que `register` y `stop` se ejecutaran en el mismo `IOSurfaceRootUserClient`, no indica una liberacion de objeto del kernel y no constituye prueba de una carrera explotable, UAF, kernel panic ni KernelRW. El resultado `DONE_NO_APP_OVERLAP_OBSERVED` tampoco descarta una vulnerabilidad en otras circunstancias.
 
+
+## v19: evidencia de reinicio sin falsos positivos
+
+La v18 comparaba cadenas de `kern.boottime` exactamente y podía anunciar un reinicio cuando el sello cambiaba por un ajuste del reloj. Además, su checkpoint de integridad no guardaba `systemUptime`; ese historial queda explícitamente marcado como `LEGACY_INDETERMINATE`.
+
+La v19 registra al abrir, entrar en segundo plano, volver a primer plano y cambiar de estado activo:
+- `IOSurfaceBootMonitor-checkpoint.json`: última observación atómica (uptime del sistema, sello de arranque, sesión y diagnóstico).
+- `IOSurfaceBootMonitor-trace.csv`: historial acotado de eventos, disponible con **Exportar registro, CSV y checkpoint**.
+
+Resultados posibles: `BASELINE_CREATED`, `INDETERMINATE`, `NO_UPTIME_ROLLBACK_OBSERVED`, `BOOT_EPOCH_SHIFT_UNCONFIRMED`, `UPTIME_ROLLBACK_REBOOT_INDICATED`. Un retroceso de uptime indica que el dispositivo probablemente se reinició entre observaciones, pero ni la causa ni un kernel panic se pueden inferir con estos datos. Ausencia de retroceso tampoco excluye un reinicio si transcurrió mucho tiempo entre muestras.
+
+**Privacidad:** la aplicación registra estas medidas localmente y solo las exporta cuando el usuario pulsa Exportar; el manifiesto declara las razones de uso de `systemUptime` y `UserDefaults` correspondientes al diagnóstico. No hay envío automático a servidores.
+
+**Prueba del clasificador:**
+
+```sh
+clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFBootClassifierTests.c -lm -o /tmp/pf-boot-tests
+/tmp/pf-boot-tests
+```
+
+La compilación de la app iOS se ejecuta en GitHub Actions con `xcodebuild`. El artefacto no está firmado.
