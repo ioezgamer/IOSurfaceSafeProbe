@@ -115,7 +115,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v17";
+    title.text = @"IOSurface Preflight v18";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -152,7 +152,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
       [self button:@"18. Concurrencia publica controlada (256 x 2)" action:@selector(publicConcurrencyProbe:)],
       [self button:@"19. Mismo cliente: llamada 17 y cierre (12 ensayos)" action:@selector(sameClientProbe:)],
       [self button:@"20. Controles IPC: abierto y cerrado (3 pares)" action:@selector(ipcControlsProbe:)],
-      [self button:@"21. Fuerza bruta IOSurface (100.000 casos)" action:@selector(bruteForceProbe:)],
+      [self button:@"21. Fuzzing corregido IOSurface (100.000 casos)" action:@selector(bruteForceProbe:)],
       [self button:@"22. Repetir fuerza bruta (misma semilla)" action:@selector(replayBruteForceProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
@@ -186,7 +186,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v17"]; 
+    [self note:@"app=IOSurfacePreflight-v18"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
     NSString *brutePath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceBruteForce-checkpoint.json"];
@@ -196,11 +196,20 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                                                             options:0 error:NULL];
         if([prior isKindOfClass:NSDictionary.class]) {
             [self note:[NSString stringWithFormat:
-                @"BRUTE: anterior status=%@ paso=%@ seed=%@",
+                @"BRUTE (v17): anterior status=%@ paso=%@ seed=%@",
                 prior[@"status"] ?: @"?",prior[@"step"] ?: @"?",prior[@"seed"] ?: @"?"]];
             if([prior[@"status"] isEqualToString:@"RUNNING"])
                 [self note:@"BRUTE: ejecución previa incompleta; no significa vulnerabilidad por si sola."];
         }
+    }
+    NSString *v18Path=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceBruteForce-v18-checkpoint.json"];
+    NSData *v18Bytes=[NSData dataWithContentsOfFile:v18Path];
+    if(v18Bytes) {
+        NSDictionary *prior=[NSJSONSerialization JSONObjectWithData:v18Bytes options:0 error:NULL];
+        if([prior isKindOfClass:NSDictionary.class])
+            [self note:[NSString stringWithFormat:@"BRUTE v18: previo status=%@ paso=%@ seed=%@",
+                prior[@"status"]?:@"?",prior[@"step"]?:@"?",prior[@"seed"]?:@"?"]];
     }
     NSString *ipcControlsPath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceIPCControls-checkpoint.json"];
@@ -1387,7 +1396,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     }
     UIAlertController *confirm=[UIAlertController alertControllerWithTitle:
         @"Fuzzing de fuerza bruta: 100.000 casos"
-        message:@"Ejecuta 100.000 combinaciones reproducibles contra la API pública IOSurfaceCreate. Utiliza una única superficie por caso y registra resultados, semilla y progreso. Las entradas casi inválidas pueden causar cierres inesperados. Guardá tus datos antes de comenzar."
+        message:@"Ejecuta 100.000 combinaciones reproducibles de la API pública, con clasificación corregida y lectura/escritura/restauración de un solo píxel dentro de superficies nuevas y válidas (muestreo). Puede causar cierres inesperados. Guardá tus datos antes de comenzar."
         preferredStyle:UIAlertControllerStyleAlert];
     [confirm addAction:[UIAlertAction actionWithTitle:@"Cancelar"
            style:UIAlertActionStyleCancel handler:nil]];
@@ -1434,7 +1443,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.stressStopRequested = NO;
     self.stressCSV = nil;
     NSString *run = NSUUID.UUID.UUIDString;
-    NSString *checkpointName=limit>50000?@"IOSurfaceBruteForce-checkpoint.json":
+    NSString *checkpointName=limit>50000?@"IOSurfaceBruteForce-v18-checkpoint.json":
                                                @"IOSurfaceBoundary-checkpoint.json";
     NSString *checkpoint=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                               stringByAppendingPathComponent:checkpointName];
@@ -1446,6 +1455,9 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     [self note:[NSString stringWithFormat:
         @"BOUNDARY: %u entradas públicas con combinaciones válidas y casi inválidas; memoria acotada.",limit]];
     [self note:@"BOUNDARY: longitudes 0..256, stride y allocSize alrededor del límite, formatos distintos."];
+    [self note:@"BOUNDARY: se diferencia relleno de fila de la huella mínima del último píxel."];
+    [self note:@"BOUNDARY: dimensiones cero son datos de borde; no son un fallo de seguridad."];
+    [self note:@"BOUNDARY: muestreo limitado de escritura/lectura únicamente dentro de superficies BGRA propias."];
     [self note:@"BOUNDARY: un rechazo de entrada inválida es NORMAL, no una anomalía."];
     [self note:@"BOUNDARY: sin llamadas privadas ni punteros obsoletos; checkpoints cada 100 casos."];
     NSDictionary *initial = @{@"run":run,@"seed":@(seed),@"step":@0,@"status":@"RUNNING",
@@ -1460,11 +1472,14 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
             const uint32_t formats[] = {0x42475241,0x52474241,0,0x41414141};
             uint32_t state = seed;
             unsigned attempts=0,accepted=0,rejected=0,exceptions=0,unusual=0;
-            unsigned normalized=0,zeroDimensionAccepted=0,invalidCoverage=0;
-            unsigned regular=0,missingSize=0,missingStride=0;
+            unsigned normalized=0,zeroDimensionAccepted=0,footprintShort=0,shortRow=0;
+            unsigned legacyFullRowShort=0,invalidId=0,unexpectedBounds=0;
+            unsigned review=0,regular=0,missingSize=0,missingStride=0;
+            unsigned sampled=0,samplePassed=0,sampleMismatch=0,sampleLockFailed=0;
+            unsigned sampleBaseNull=0,sampleUnlockFailed=0;
             CFAbsoluteTime start=CFAbsoluteTimeGetCurrent();
             NSMutableString *csv = [NSMutableString stringWithFormat:
-                @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,result\n"];
+                @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,min_pixel_span,classification,integrity,result\n"];
             void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_LOCAL);
             CreateSurfaceFn create=framework ? (CreateSurfaceFn)dlsym(framework,"IOSurfaceCreate") : NULL;
             GetSurfaceIDFn getID=framework ? (GetSurfaceIDFn)dlsym(framework,"IOSurfaceGetID") : NULL;
@@ -1472,6 +1487,9 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
             GetSurfaceDimensionFn getH=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetHeight") : NULL;
             GetSurfaceDimensionFn getRow=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetBytesPerRow") : NULL;
             GetSurfaceDimensionFn getAlloc=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetAllocSize") : NULL;
+            GetSurfaceBaseFn getBase=framework ? (GetSurfaceBaseFn)dlsym(framework,"IOSurfaceGetBaseAddress") : NULL;
+            SurfaceLockFn lock=framework ? (SurfaceLockFn)dlsym(framework,"IOSurfaceLock") : NULL;
+            SurfaceLockFn unlock=framework ? (SurfaceLockFn)dlsym(framework,"IOSurfaceUnlock") : NULL;
             if (!create || !getID || !getW || !getH || !getRow || !getAlloc) {
                 if (framework) dlclose(framework);
                 NSDictionary *failure=@{@"run":run,@"seed":@(seed),@"step":@0,
@@ -1527,8 +1545,11 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                     }
                     attempts++;
                     IOSurfaceID id=0;
-                    size_t actualW=0,actualH=0,actualRow=0,actualAlloc=0;
+                    size_t actualW=0,actualH=0,actualRow=0,actualAlloc=0,minimumSpan=0;
                     const char *outcome="REJECTED";
+                    const char *classification="NONE";
+                    const char *integrityResult="NOT_SAMPLED";
+                    BOOL stopOnMismatch=NO;
                     if (threw) {
                         exceptions++;
                         outcome="NS_EXCEPTION";
@@ -1543,40 +1564,118 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                         actualAlloc=getAlloc(surface);
                         BOOL changed=(actualW!=width || actualH!=height || (!omitRow && actualRow!=row));
                         BOOL zero=(actualW==0 || actualH==0);
-                        BOOL undercovered=(actualH>0 && actualRow>0 && actualAlloc<actualRow*actualH);
+                        // Bound unexpected metadata before arithmetic or memory access.
+                        BOOL inRange=(actualW<=4096 && actualH<=4096 && actualRow<=(1ULL<<24));
+                        BOOL rowTooSmall=(!zero && inRange && actualRow<actualW*elem);
+                        if(!zero && inRange) minimumSpan=(actualH-1)*actualRow+actualW*elem;
+                        BOOL spanTooSmall=(!zero && inRange && actualAlloc<minimumSpan);
+                        BOOL fullRowsShort=(inRange && actualH>0 && actualRow>0 &&
+                                            actualAlloc<actualH*actualRow);
                         if(changed) normalized++;
                         if(zero) zeroDimensionAccepted++;
-                        if(undercovered) invalidCoverage++;
-                        if(zero || undercovered || id==0) {
-                            unusual++;
-                            outcome="REVIEW_METADATA";
-                        } else if(changed) {
-                            outcome="ACCEPTED_NORMALIZED";
-                        } else {
-                            regular++;
-                            outcome="ACCEPTED";
+                        if(fullRowsShort) legacyFullRowShort++;
+                        if(rowTooSmall) shortRow++;
+                        if(spanTooSmall) footprintShort++;
+                        if(id==0) invalidId++;
+                        if(!inRange) unexpectedBounds++;
+                        outcome="ACCEPTED";
+                        if(id==0) {classification="REVIEW_ID_ZERO";review++;}
+                        else if(zero) {classification="EDGE_ZERO_DIMENSION";}
+                        else if(!inRange) {classification="REVIEW_METADATA_RANGE";review++;}
+                        else if(rowTooSmall) {classification="REVIEW_ROW_STRIDE";review++;}
+                        else if(spanTooSmall) {classification="REVIEW_LAST_PIXEL_SPAN";review++;}
+                        else if(changed) {classification="NORMALIZED";}
+                        else {classification="OK";regular++;}
+
+                        // Probe fresh owned surfaces, never stale objects or bytes beyond
+                        // the last declared pixel. Only uncompressed BGRA, 4 bytes/pixel.
+                        BOOL sample=(n%8==0 && format==0x42475241 && elem==4 &&
+                                     !zero && inRange && actualW<=256 && actualH<=256 &&
+                                     !rowTooSmall && !spanTooSmall && id!=0 &&
+                                     minimumSpan>0 && getBase && lock && unlock);
+                        if(sample) {
+                            sampled++;
+                            NSDictionary *pre=@{@"run":run,@"seed":@(seed),@"step":@(n),
+                                @"status":@"RUNNING",@"phase":@"BEFORE_SAFE_INTEGRITY",
+                                @"minimum_span":@(minimumSpan),@"observed_alloc":@(actualAlloc),
+                                @"timestamp":[NSDate date].description};
+                            NSData *preData=[NSJSONSerialization dataWithJSONObject:pre
+                                                                         options:0 error:NULL];
+                            if(preData)[preData writeToFile:checkpoint
+                                                   options:NSDataWritingAtomic error:NULL];
+                            kern_return_t lockCode=lock(surface,0,NULL);
+                            if(lockCode!=KERN_SUCCESS) {
+                                sampleLockFailed++;
+                                integrityResult="LOCK_FAILED";
+                            } else {
+                                void *memory=getBase(surface);
+                                if(!memory) {
+                                    sampleBaseNull++;
+                                    integrityResult="NO_CPU_MAPPING";
+                                } else {
+                                    // minimumSpan - 1 is a pixel byte within the mapped
+                                    // allocation, never padding and never past allocSize.
+                                    size_t offset=minimumSpan-1;
+                                    volatile uint8_t *bytes=(volatile uint8_t *)memory;
+                                    uint8_t original=bytes[offset];
+                                    uint8_t marker=(uint8_t)(original ^ 0xA5);
+                                    bytes[offset]=marker;
+                                    uint8_t observed=bytes[offset];
+                                    bytes[offset]=original;
+                                    if(observed!=marker) {
+                                        sampleMismatch++;
+                                        integrityResult="MISMATCH";
+                                        stopOnMismatch=YES;
+                                    } else {
+                                        samplePassed++;
+                                        integrityResult="PASS";
+                                    }
+                                }
+                                if(unlock(surface,0,NULL)!=KERN_SUCCESS) {
+                                    sampleUnlockFailed++;
+                                    integrityResult="UNLOCK_FAILED";
+                                    stopOnMismatch=YES;
+                                }
+                            }
                         }
                         CFRelease(surface);
                     }
-                    [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%s\n",
+                    [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%zu,%s,%s,%s\n",
                         run,seed,n,width,height,elem,row,alloc,(unsigned)format,omitRow,omitAlloc,
-                        (unsigned)id,actualW,actualH,actualRow,actualAlloc,outcome];
+                        (unsigned)id,actualW,actualH,actualRow,actualAlloc,
+                        minimumSpan,classification,integrityResult,outcome];
                     if(n%100==0) {
                         NSDictionary *saved=@{
                             @"run":run,@"seed":@(seed),@"step":@(n),@"status":@"RUNNING",
+                            @"schema":@"v18-pixel-span",@"phase":@"IN_PROGRESS",
                             @"accepted":@(accepted),@"rejected":@(rejected),
-                            @"exceptions":@(exceptions),@"review":@(unusual),
+                            @"exceptions":@(exceptions),@"review":@(review),
+                            @"edge_zero_dimension":@(zeroDimensionAccepted),
+                            @"legacy_full_rows_short":@(legacyFullRowShort),
+                            @"integrity_tested":@(sampled),@"integrity_mismatch":@(sampleMismatch),
                             @"timestamp":[NSDate date].description
                         };
                         NSData *data=[NSJSONSerialization dataWithJSONObject:saved options:0 error:NULL];
                         if(data) [data writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
                     }
+                    if(stopOnMismatch) {
+                        stopped=YES;
+                        NSDictionary *incident=@{@"run":run,@"seed":@(seed),@"step":@(n),
+                            @"status":@"STOPPED_ON_INTEGRITY_ERROR",
+                            @"integrity":@(sampleMismatch),@"unlock_errors":@(sampleUnlockFailed),
+                            @"timestamp":[NSDate date].description};
+                        NSData *incidentData=[NSJSONSerialization dataWithJSONObject:incident
+                                                                          options:0 error:NULL];
+                        if(incidentData)[incidentData writeToFile:checkpoint
+                                                           options:NSDataWritingAtomic error:NULL];
+                        break;
+                    }
                     if(n%2500==0) {
-                        unsigned done=n,ok=accepted,no=rejected,review=unusual;
+                        unsigned done=n,ok=accepted,no=rejected,needsReview=review,passed=samplePassed;
                         dispatch_async(dispatch_get_main_queue(), ^{
                             [self note:[NSString stringWithFormat:
-                                @"BOUNDARY: %u/%u aceptadas=%u rechazadas=%u revisar=%u",
-                                done,limit,ok,no,review]];
+                                @"BOUNDARY: %u/%u aceptadas=%u rechazadas=%u alertas=%u integridad_ok=%u",
+                                done,limit,ok,no,needsReview,passed]];
                         });
                         usleep(50000);
                     }
@@ -1585,17 +1684,29 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
             if(framework) dlclose(framework);
             NSDictionary *final=@{
                 @"run":run,@"seed":@(seed),@"step":@(attempts),
-                @"status":stopped?@"STOPPED":@"DONE",
+                @"schema":@"v18-pixel-span",
+                @"status":sampleMismatch||sampleUnlockFailed?@"STOPPED_ON_INTEGRITY_ERROR":(stopped?@"STOPPED":@"DONE"),
                 @"accepted":@(accepted),@"rejected":@(rejected),@"exceptions":@(exceptions),
-                @"review":@(unusual),@"normalized":@(normalized),
+                @"review":@(review),@"normalized":@(normalized),
                 @"zero_dim_accepted":@(zeroDimensionAccepted),
-                @"undercovered":@(invalidCoverage),
+                @"undercovered":@(footprintShort),
+                @"short_row_bytes":@(shortRow),@"invalid_id":@(invalidId),
+                @"unexpected_metadata_range":@(unexpectedBounds),
+                @"legacy_full_rows_short":@(legacyFullRowShort),
+                @"integrity_tested":@(sampled),@"integrity_passed":@(samplePassed),
+                @"integrity_mismatch":@(sampleMismatch),
+                @"integrity_lock_failed":@(sampleLockFailed),
+                @"integrity_base_null":@(sampleBaseNull),
+                @"integrity_unlock_failed":@(sampleUnlockFailed),
                 @"missing_stride_cases":@(missingStride),@"missing_alloc_cases":@(missingSize),
                 @"elapsed":@(CFAbsoluteTimeGetCurrent()-start)
             };
             NSData *finalBytes=[NSJSONSerialization dataWithJSONObject:final options:NSJSONWritingPrettyPrinted error:NULL];
             if(finalBytes) [finalBytes writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
             NSString *exportCSV=[csv copy];
+            NSString *persistedCSV=[NSHomeDirectory() stringByAppendingPathComponent:
+                @"Documents/IOSurfaceBruteForce-v18-trace.csv"];
+            [exportCSV writeToFile:persistedCSV atomically:YES encoding:NSUTF8StringEncoding error:NULL];
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.stressCSV=exportCSV;
                 self.stressRunning=NO;
@@ -1603,11 +1714,14 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                     @"BOUNDARY: %@ %u/%u seed=%u aceptadas=%u rechazadas=%u excepciones=%u",
                     stopped?@"STOPPED":@"DONE",attempts,limit,seed,accepted,rejected,exceptions]];
                 [self note:[NSString stringWithFormat:
-                    @"BOUNDARY: normalizadas=%u cero-dimension=%u undercoverage=%u revisar=%u normales=%u",
-                    normalized,zeroDimensionAccepted,invalidCoverage,unusual,regular]];
-                [self note:[NSString stringWithFormat:@"BOUNDARY: tiempo=%.3fs; CSV y checkpoint guardados.",
+                    @"BOUNDARY: zero-dimension=%u full-rows-short(INFO)=%u min-pixel-span-short=%u stride-short=%u alertas=%u normales=%u",
+                    zeroDimensionAccepted,legacyFullRowShort,footprintShort,shortRow,review,regular]];
+                [self note:[NSString stringWithFormat:
+                    @"BOUNDARY: muestras memoria=%u OK=%u error=%u lock_fallo=%u base_nula=%u unlock_fallo=%u",
+                    sampled,samplePassed,sampleMismatch,sampleLockFailed,sampleBaseNull,sampleUnlockFailed]];
+                [self note:[NSString stringWithFormat:@"BOUNDARY: tiempo=%.3fs; CSV persistente y checkpoint guardados.",
                     CFAbsoluteTimeGetCurrent()-start]];
-                [self note:@"BOUNDARY: un resultado REVIEW_METADATA requiere validación; no implica fallo de kernel ni KernelRW."];
+                [self note:@"BOUNDARY: una anomalía de API no equivale a fallo del kernel, UAF o KernelRW."];
             });
         }
     });
@@ -3058,6 +3172,13 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
         @"Documents/IOSurfaceBruteForce-checkpoint.json"];
     if([[NSFileManager defaultManager] fileExistsAtPath:bruteCheckpoint])
         [filesToShare addObject:[NSURL fileURLWithPath:bruteCheckpoint]];
+    for(NSString *file in @[@"IOSurfaceBruteForce-v18-checkpoint.json",
+                            @"IOSurfaceBruteForce-v18-trace.csv"]) {
+        NSString *path=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                            stringByAppendingPathComponent:file];
+        if([[NSFileManager defaultManager] fileExistsAtPath:path])
+            [filesToShare addObject:[NSURL fileURLWithPath:path]];
+    }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
