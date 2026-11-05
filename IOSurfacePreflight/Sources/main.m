@@ -27,6 +27,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
 @interface ProbeController : UIViewController
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) NSMutableString *events;
+@property(nonatomic, assign) BOOL matrixRunning;
 @end
 
 @implementation ProbeController
@@ -60,7 +61,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v4";
+    title.text = @"IOSurface Preflight v5";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -82,6 +83,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
       [self button:@"3. Ciclo de vida público (3 pruebas)" action:@selector(lifecycleProbe:)],
       [self button:@"4. Identificadores simultáneos (A/B/C)" action:@selector(idReuseProbe:)],
       [self button:@"5. Firma, permisos y servicio" action:@selector(accessPolicyProbe:)],
+      [self button:@"6. Matriz IOSurface 484 casos" action:@selector(matrixProbe:)],
       [self button:@"Exportar registro" action:@selector(shareLog:)],
       self.logView
     ]];
@@ -104,7 +106,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v4"]; 
+    [self note:@"app=IOSurfacePreflight-v5"]; 
     [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
 }
 
@@ -474,6 +476,126 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     dlclose(io);
     [self note:@"POLICY: sin IOConnectCallMethod, sin selector, sin carreras."];
     [self note:@"POLICY: no es posible determinar tabla interna A/B con estos metadatos por si solos."];
+}
+
+
+- (void)matrixProbe:(id)sender {
+    if (self.matrixRunning) {
+        [self note:@"MATRIX: prueba ya en curso; no se ejecuta en paralelo."];
+        return;
+    }
+    self.matrixRunning = YES;
+    [self note:@"MATRIX: iniciando 484 casos con parámetros válidos, secuenciales y deterministas."];
+    [self note:@"MATRIX: 11 anchuras x 11 alturas x 2 paddings x 2 pasadas. Máximo 294912 bytes por superficie."];
+    [self note:@"MATRIX: sin métodos privados, sin carreras, sin referencias obsoletas."];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY | RTLD_LOCAL);
+            CreateSurfaceFn create = framework ? (CreateSurfaceFn)dlsym(framework, "IOSurfaceCreate") : NULL;
+            GetSurfaceIDFn getID = framework ? (GetSurfaceIDFn)dlsym(framework, "IOSurfaceGetID") : NULL;
+            LookupSurfaceFn lookup = framework ? (LookupSurfaceFn)dlsym(framework, "IOSurfaceLookup") : NULL;
+            GetSurfaceDimensionFn getWidth = framework ? (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetWidth") : NULL;
+            GetSurfaceDimensionFn getHeight = framework ? (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetHeight") : NULL;
+            GetSurfaceDimensionFn getSize = framework ? (GetSurfaceDimensionFn)dlsym(framework, "IOSurfaceGetAllocSize") : NULL;
+            SurfaceLockFn lock = framework ? (SurfaceLockFn)dlsym(framework, "IOSurfaceLock") : NULL;
+            SurfaceLockFn unlock = framework ? (SurfaceLockFn)dlsym(framework, "IOSurfaceUnlock") : NULL;
+            if (!create || !getID || !lookup || !getWidth || !getHeight || !getSize || !lock || !unlock) {
+                if (framework) dlclose(framework);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.matrixRunning = NO;
+                    [self note:@"MATRIX: ERROR; faltan funciones públicas de IOSurface."];
+                });
+                return;
+            }
+
+            // Valid inputs only: all widths/heights are multiples of 8;
+            // each row has width*4 or width*4+32 bytes, and allocSize covers all rows.
+            const size_t dims[] = {8,16,24,32,48,64,96,128,160,192,256};
+            const size_t n = sizeof(dims) / sizeof(dims[0]);
+            const size_t paddings[] = {0,32};
+            const unsigned total = 484;
+            unsigned attempted = 0, passed = 0, anomalies = 0;
+            NSMutableString *details = [NSMutableString stringWithString:
+                @"MATRIX: sample,pass,width,height,padding,id,allocation,observed,lock,unlock,result\n"];
+            CFAbsoluteTime begin = CFAbsoluteTimeGetCurrent();
+
+            for (unsigned pass = 0; pass < 2; pass++) {
+                for (size_t wi = 0; wi < n; wi++) {
+                    for (size_t hi = 0; hi < n; hi++) {
+                        for (size_t pi = 0; pi < 2; pi++) {
+                            @autoreleasepool {
+                                size_t width = dims[wi], height = dims[hi];
+                                size_t padding = paddings[pi];
+                                size_t rowBytes = width * 4 + padding;
+                                size_t allocation = rowBytes * height;
+                                NSDictionary *params = @{
+                                    @"IOSurfaceWidth": @(width),
+                                    @"IOSurfaceHeight": @(height),
+                                    @"IOSurfaceBytesPerElement": @4,
+                                    @"IOSurfaceBytesPerRow": @(rowBytes),
+                                    @"IOSurfaceAllocSize": @(allocation),
+                                    @"IOSurfacePixelFormat": @(0x42475241)
+                                };
+                                attempted++;
+                                IOSurfaceRef surface = create((__bridge CFDictionaryRef)params);
+                                IOSurfaceID identifier = 0;
+                                size_t actualSize = 0;
+                                kern_return_t lockCode = KERN_FAILURE, unlockCode = KERN_FAILURE;
+                                const char *result = "CREATE_NULL";
+                                BOOL ok = NO;
+                                if (surface) {
+                                    identifier = getID(surface);
+                                    IOSurfaceRef retained = lookup(identifier);
+                                    if (!retained) {
+                                        result = "LOOKUP_NULL";
+                                    } else {
+                                        size_t observedWidth = getWidth(retained);
+                                        size_t observedHeight = getHeight(retained);
+                                        actualSize = getSize(retained);
+                                        uint32_t seed = 0;
+                                        const uint32_t readOnly = 1;
+                                        lockCode = lock(retained, readOnly, &seed);
+                                        if (lockCode == KERN_SUCCESS)
+                                            unlockCode = unlock(retained, readOnly, NULL);
+                                        ok = observedWidth == width && observedHeight == height &&
+                                             actualSize >= allocation && lockCode == KERN_SUCCESS &&
+                                             unlockCode == KERN_SUCCESS;
+                                        result = ok ? "PASS" : "DIMENSION_OR_LOCK_MISMATCH";
+                                        CFRelease(retained);
+                                    }
+                                    CFRelease(surface);
+                                }
+                                if (ok) passed++; else anomalies++;
+                                [details appendFormat:
+                                    @"MATRIX: %u,%u,%zu,%zu,%zu,%u,%zu,%zu,0x%08x,0x%08x,%s\n",
+                                    attempted,pass+1,width,height,padding,(unsigned)identifier,
+                                    allocation,actualSize,(unsigned)lockCode,(unsigned)unlockCode,result];
+                                if (attempted % 64 == 0) {
+                                    unsigned now = attempted;
+                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                        [self note:[NSString stringWithFormat:
+                                            @"MATRIX: progreso %u/%u casos completados.",now,total]];
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            double elapsed = CFAbsoluteTimeGetCurrent() - begin;
+            dlclose(framework);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.events appendString:details];
+                self.matrixRunning = NO;
+                [self note:[NSString stringWithFormat:
+                    @"MATRIX: RESULTADO intentos=%u correctos=%u anomalias=%u duracion=%.3fs",
+                    attempted,passed,anomalies,elapsed]];
+                [self note:@"MATRIX: exporta el registro para inspeccionar los 484 casos individuales."];
+                [self note:@"MATRIX: una anomalía pública no demuestra por sí sola corrupción de memoria ni KernelRW."];
+            });
+        }
+    });
 }
 
 - (void)shareLog:(id)sender {
