@@ -115,7 +115,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v15";
+    title.text = @"IOSurface Preflight v16";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -151,6 +151,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
       [self button:@"17. Ejecutar cierre ahora" action:@selector(fireControlledClose:)],
       [self button:@"18. Concurrencia publica controlada (256 x 2)" action:@selector(publicConcurrencyProbe:)],
       [self button:@"19. Mismo cliente: llamada 17 y cierre (12 ensayos)" action:@selector(sameClientProbe:)],
+      [self button:@"20. Controles IPC: abierto y cerrado (3 pares)" action:@selector(ipcControlsProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -183,8 +184,21 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v15"]; 
+    [self note:@"app=IOSurfacePreflight-v16"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *ipcControlsPath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceIPCControls-checkpoint.json"];
+    NSData *previousControlBytes=[NSData dataWithContentsOfFile:ipcControlsPath];
+    if(previousControlBytes) {
+        NSDictionary *oldControl=[NSJSONSerialization JSONObjectWithData:previousControlBytes options:0 error:NULL];
+        if([oldControl isKindOfClass:NSDictionary.class]) {
+            [self note:[NSString stringWithFormat:
+                @"IPCCTRL: anterior status=%@ caso=%@",
+                oldControl[@"status"] ?: @"?",oldControl[@"case"] ?: @"?"]];
+            if([oldControl[@"status"] isEqualToString:@"RUNNING"])
+                [self note:@"IPCCTRL: ejecucion anterior incompleta, sin evidencia de panic por si sola."];
+        }
+    }
     NSString *samePath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceSameClient-checkpoint.json"];
     NSData *sameBytes=[NSData dataWithContentsOfFile:samePath];
@@ -2730,6 +2744,181 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     });
 }
 
+
+- (void)ipcControlsProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning) {
+        [self note:@"IPCCTRL: otra prueba esta activa."];
+        return;
+    }
+    self.stressRunning=YES;
+    self.stressStopRequested=NO;
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSString *boot=preflightBootStamp();
+    NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *checkpointPath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceIPCControls-checkpoint.json"];
+    NSString *csvPath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceIPCControls-trace.csv"];
+    [self note:[NSString stringWithFormat:@"IPCCTRL: run=%@ boot=%@",run,boot]];
+    [self note:@"IPCCTRL: prueba causal. Control A: llamada al selector 17 con conexion abierta."];
+    [self note:@"IPCCTRL: control B: cierre terminado y despues llamada al puerto ya cerrado."];
+    [self note:@"IPCCTRL: 3 pares, sin simultaneidad, sin punteros de memoria de usuario liberados."];
+    [self note:@"IPCCTRL: si B devuelve 0x10000003 como v15, eso respalda un fallo de transporte Mach, NO un UAF."];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            void *io=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
+                            RTLD_LAZY|RTLD_LOCAL);
+            MatchingFn matching=io?(MatchingFn)dlsym(io,"IOServiceMatching"):NULL;
+            GetMatchingFn getService=io?(GetMatchingFn)dlsym(io,"IOServiceGetMatchingService"):NULL;
+            OpenServiceFn open=io?(OpenServiceFn)dlsym(io,"IOServiceOpen"):NULL;
+            CloseServiceFn close=io?(CloseServiceFn)dlsym(io,"IOServiceClose"):NULL;
+            ReleaseObjectFn release=io?(ReleaseObjectFn)dlsym(io,"IOObjectRelease"):NULL;
+            typedef kern_return_t (*CallAsyncStructFn)(io_connect_t,uint32_t,
+                 mach_port_t,uint64_t*,uint32_t,const void*,size_t,void*,size_t*);
+            CallAsyncStructFn call=io?(CallAsyncStructFn)dlsym(io,
+                                               "IOConnectCallAsyncStructMethod"):NULL;
+            BOOL available=matching && getService && open && close && release && call;
+            const unsigned totalPairs=3;
+            unsigned attempts=0,openSuccess=0,healthyCall=0,closedInvalidDest=0;
+            unsigned closeSuccess=0,setupErrors=0,unexpectedCodes=0;
+            CFAbsoluteTime began=CFAbsoluteTimeGetCurrent();
+            NSMutableString *csv=[NSMutableString stringWithString:
+                 @"run,pair,control,open_kr,port_kr,send_kr,call_kr,close_kr,port_before_kr,port_after_kr,port_before_type,port_after_type,elapsed_ms\n"];
+            void (^writeCheckpoint)(NSString*,NSString*,NSNumber*)=
+            ^(NSString *phase,NSString *status,NSNumber *caseNumber) {
+                NSDictionary *data=@{
+                    @"run":run,@"phase":phase,@"status":status,
+                    @"case":caseNumber,@"bootStamp":boot,
+                    @"timestamp":[NSDate date].description,
+                    @"attempts":@(attempts),@"openSuccess":@(openSuccess),
+                    @"healthyCall":@(healthyCall),@"closedInvalidDest":@(closedInvalidDest),
+                    @"closeSuccess":@(closeSuccess),@"setupErrors":@(setupErrors),
+                    @"unexpectedCodes":@(unexpectedCodes),
+                    @"interpretation":@"Transport-level sequential controls; no race, no kernel lifetime observation",
+                    @"uafProven":@NO
+                };
+                NSData *bytes=[NSJSONSerialization dataWithJSONObject:data
+                                             options:NSJSONWritingPrettyPrinted error:NULL];
+                if(bytes)[bytes writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+            };
+            writeCheckpoint(@"SETUP",@"RUNNING",@0);
+            BOOL cancelled=NO;
+            if(available) {
+                for(unsigned pair=1;pair<=totalPairs;pair++) {
+                    for(unsigned condition=0;condition<2;condition++) {
+                        if(self.stressStopRequested) {cancelled=YES;break;}
+                        @autoreleasepool {
+                            BOOL closedFirst=(condition==1);
+                            attempts++;
+                            writeCheckpoint(closedFirst?@"BEFORE_CLOSED_CONTROL":@"BEFORE_OPEN_CONTROL",
+                                            @"RUNNING",@(attempts));
+                            io_service_t service=MACH_PORT_NULL;
+                            io_connect_t connection=MACH_PORT_NULL;
+                            mach_port_t replyPort=MACH_PORT_NULL;
+                            kern_return_t openCode=KERN_FAILURE,portCode=KERN_FAILURE;
+                            kern_return_t sendCode=KERN_FAILURE,callCode=KERN_FAILURE;
+                            kern_return_t closeCode=KERN_FAILURE;
+                            kern_return_t typeBeforeCode=KERN_FAILURE,typeAfterCode=KERN_FAILURE;
+                            mach_port_type_t typeBefore=0,typeAfter=0;
+                            BOOL closed=NO;
+                            CFMutableDictionaryRef request=matching("IOSurfaceRoot");
+                            if(request)service=getService(MACH_PORT_NULL,request);
+                            if(service)openCode=open(service,mach_task_self(),0,&connection);
+                            if(openCode==KERN_SUCCESS && connection!=MACH_PORT_NULL) {
+                                openSuccess++;
+                                typeBeforeCode=mach_port_type(mach_task_self(),connection,&typeBefore);
+                                portCode=mach_port_allocate(mach_task_self(),
+                                    MACH_PORT_RIGHT_RECEIVE,&replyPort);
+                                if(portCode==KERN_SUCCESS)
+                                    sendCode=mach_port_insert_right(mach_task_self(),replyPort,
+                                        replyPort,MACH_MSG_TYPE_MAKE_SEND);
+                                if(portCode==KERN_SUCCESS && sendCode==KERN_SUCCESS) {
+                                    uint8_t input[24]={0};
+                                    uint64_t reference[8]={0};
+                                    size_t outputBytes=0;
+                                    if(closedFirst) {
+                                        closeCode=close(connection);
+                                        closed=closeCode==KERN_SUCCESS;
+                                        typeAfterCode=mach_port_type(mach_task_self(),connection,&typeAfter);
+                                        if(closed) {
+                                            callCode=call(connection,17,replyPort,reference,8,
+                                                          input,sizeof(input),NULL,&outputBytes);
+                                        }
+                                    } else {
+                                        callCode=call(connection,17,replyPort,reference,8,
+                                                      input,sizeof(input),NULL,&outputBytes);
+                                        closeCode=close(connection);
+                                        closed=closeCode==KERN_SUCCESS;
+                                        typeAfterCode=mach_port_type(mach_task_self(),connection,&typeAfter);
+                                    }
+                                    if(closedFirst && callCode==(kern_return_t)0x10000003)
+                                        closedInvalidDest++;
+                                    if(!closedFirst && callCode==KERN_SUCCESS)
+                                        healthyCall++;
+                                    if(callCode!=(closedFirst?(kern_return_t)0x10000003:KERN_SUCCESS))
+                                        unexpectedCodes++;
+                                } else setupErrors++;
+                            } else setupErrors++;
+                            if(connection!=MACH_PORT_NULL && !closed) {
+                                // Normal cleanup if setup failed or close itself returned an error.
+                                if(closeCode==KERN_FAILURE)closeCode=close(connection);
+                                if(closeCode==KERN_SUCCESS)closed=YES;
+                            }
+                            if(closeCode==KERN_SUCCESS)closeSuccess++;
+                            if(replyPort!=MACH_PORT_NULL)mach_port_destroy(mach_task_self(),replyPort);
+                            if(service!=MACH_PORT_NULL)release(service);
+                            [csv appendFormat:
+                                @"%@,%u,%@,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,%.3f\n",
+                                run,pair,closedFirst?@"CLOSED_FIRST":@"OPEN_FIRST",
+                                (unsigned)openCode,(unsigned)portCode,(unsigned)sendCode,
+                                (unsigned)callCode,(unsigned)closeCode,
+                                (unsigned)typeBeforeCode,(unsigned)typeAfterCode,
+                                (unsigned)typeBefore,(unsigned)typeAfter,
+                                (CFAbsoluteTimeGetCurrent()-began)*1000.0];
+                            [csv writeToFile:csvPath atomically:YES
+                                          encoding:NSUTF8StringEncoding error:NULL];
+                            writeCheckpoint(@"AFTER_CASE",@"RUNNING",@(attempts));
+                            if(setupErrors>0)break;
+                        }
+                    }
+                    if(cancelled || setupErrors>0)break;
+                }
+            }
+            NSString *status=!available?@"ERROR_MISSING_SYMBOLS":
+                             cancelled?@"STOPPED":
+                             setupErrors>0?@"ERROR_SETUP":
+                             healthyCall==3 && closedInvalidDest==3?
+                             @"EXPECTED_MACH_TRANSPORT_BEHAVIOR":
+                             @"MIXED_RESULTS_REVIEW_REQUIRED";
+            NSDictionary *summary=@{
+                @"run":run,@"phase":@"FINISHED",@"status":status,
+                @"case":@(attempts),@"bootStamp":boot,
+                @"timestamp":[NSDate date].description,
+                @"plannedPairs":@(totalPairs),@"attempts":@(attempts),
+                @"healthyCall":@(healthyCall),@"closedInvalidDest":@(closedInvalidDest),
+                @"openSuccess":@(openSuccess),@"closeSuccess":@(closeSuccess),
+                @"setupErrors":@(setupErrors),@"unexpectedCodes":@(unexpectedCodes),
+                @"elapsedMs":@((CFAbsoluteTimeGetCurrent()-began)*1000.0),
+                @"kernelMemoryObserved":@NO,@"uafProven":@NO,
+                @"meaning":@"Positive versus negative sequential controls for 0x10000003. Does not test UAF."
+            };
+            NSData *result=[NSJSONSerialization dataWithJSONObject:summary
+                                          options:NSJSONWritingPrettyPrinted error:NULL];
+            if(result)[result writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+            if(io)dlclose(io);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"IPCCTRL: %@ openSuccess=%u callWhileOpen=%u closedInvalidDest=%u closeSuccess=%u attempts=%u",
+                    status,openSuccess,healthyCall,closedInvalidDest,closeSuccess,attempts]];
+                [self note:@"IPCCTRL: exportá IOSurfaceIPCControls-checkpoint.json y trace.csv."];
+                [self note:@"IPCCTRL: si el control B reproduce el error de v15, su origen puede ser IPC sin ningun acceso a un objeto liberado."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -2805,6 +2994,14 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
         [filesToShare addObject:[NSURL fileURLWithPath:sameCheckpoint]];
     if([[NSFileManager defaultManager] fileExistsAtPath:sameCSV])
         [filesToShare addObject:[NSURL fileURLWithPath:sameCSV]];
+    NSString *controlsCheckpoint=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceIPCControls-checkpoint.json"];
+    NSString *controlsCSV=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceIPCControls-trace.csv"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:controlsCheckpoint])
+        [filesToShare addObject:[NSURL fileURLWithPath:controlsCheckpoint]];
+    if([[NSFileManager defaultManager] fileExistsAtPath:controlsCSV])
+        [filesToShare addObject:[NSURL fileURLWithPath:controlsCSV]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
