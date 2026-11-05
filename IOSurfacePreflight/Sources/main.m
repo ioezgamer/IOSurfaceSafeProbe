@@ -84,7 +84,7 @@ static uint32_t probeRandom(uint32_t *state) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v7";
+    title.text = @"IOSurface Preflight v8";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -109,22 +109,33 @@ static uint32_t probeRandom(uint32_t *state) {
       [self button:@"6. Matriz IOSurface 484 casos" action:@selector(matrixProbe:)],
       [self button:@"7. Campaña de estados (30.000 operaciones)" action:@selector(campaignProbe:)],
       [self button:@"8. Repetir última campaña" action:@selector(replayCampaignProbe:)],
-      [self button:@"Detener campaña" action:@selector(stopStressProbe:)],
-      [self button:@"Exportar registro" action:@selector(shareLog:)],
+      [self button:@"9. Fuzzing de límites (50.000 casos)" action:@selector(boundaryProbe:)],
+      [self button:@"10. Repetir fuzzing de límites" action:@selector(replayBoundaryProbe:)],
+      [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
+      [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
     ]];
     layout.axis = UILayoutConstraintAxisVertical;
     layout.spacing = 12;
     layout.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:layout];
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.alwaysBounceVertical = YES;
+    [scroll addSubview:layout];
+    [self.view addSubview:scroll];
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-      [layout.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
-      [layout.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
-      [layout.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
-      [layout.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16]
+      [scroll.topAnchor constraintEqualToAnchor:safe.topAnchor],
+      [scroll.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
+      [scroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+      [scroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+      [layout.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:12],
+      [layout.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-12],
+      [layout.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor constant:16],
+      [layout.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor constant:-16],
+      [layout.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32],
+      [self.logView.heightAnchor constraintEqualToConstant:280]
     ]];
-    [self.logView setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisVertical];
 
     struct utsname info = {0};
     uname(&info);
@@ -132,8 +143,17 @@ static uint32_t probeRandom(uint32_t *state) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v7"]; 
+    [self note:@"app=IOSurfacePreflight-v8"]; 
     [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
+    NSString *boundaryPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceBoundary-checkpoint.json"];
+    NSData *boundaryBytes = [NSData dataWithContentsOfFile:boundaryPath];
+    if (boundaryBytes) {
+        NSDictionary *b = [NSJSONSerialization JSONObjectWithData:boundaryBytes options:0 error:NULL];
+        if ([b isKindOfClass:NSDictionary.class]) {
+            [self note:[NSString stringWithFormat:@"BOUNDARY: última campaña %@ seed=%@ paso=%@",
+                b[@"status"] ?: @"?", b[@"seed"] ?: @"?", b[@"step"] ?: @"?"]];
+        }
+    }
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceCampaign-checkpoint.json"];
     NSData *previous = [NSData dataWithContentsOfFile:p];
     if (previous) {
@@ -1191,6 +1211,205 @@ static uint32_t probeRandom(uint32_t *state) {
     });
 }
 
+
+- (void)replayBoundaryProbe:(id)sender {
+    NSNumber *last = [NSUserDefaults.standardUserDefaults objectForKey:@"IOSurfaceV8BoundarySeed"];
+    if (![last isKindOfClass:NSNumber.class]) {
+        [self note:@"BOUNDARY: todavía no hay semilla guardada."];
+        return;
+    }
+    [self runBoundaryProbeSeed:(uint32_t)last.unsignedIntValue replay:YES];
+}
+
+- (void)boundaryProbe:(id)sender {
+    uint32_t seed = arc4random();
+    if (seed == 0) seed = 0xB80A2026;
+    [self runBoundaryProbeSeed:seed replay:NO];
+}
+
+- (void)runBoundaryProbeSeed:(uint32_t)seed replay:(BOOL)replay {
+    if (self.stressRunning || self.matrixRunning) {
+        [self note:@"BOUNDARY: ya hay una prueba activa."];
+        return;
+    }
+    self.stressRunning = YES;
+    self.stressStopRequested = NO;
+    self.stressCSV = nil;
+    NSString *run = NSUUID.UUID.UUIDString;
+    NSString *checkpoint = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceBoundary-checkpoint.json"];
+    [NSUserDefaults.standardUserDefaults setObject:@(seed) forKey:@"IOSurfaceV8BoundarySeed"];
+    [self note:[NSString stringWithFormat:@"BOUNDARY: %@ run=%@ semilla=%u",
+        replay ? @"REPLAY" : @"NEW",run,seed]];
+    [self note:@"BOUNDARY: 50000 entradas públicas con combinaciones válidas y casi inválidas; memoria acotada."];
+    [self note:@"BOUNDARY: longitudes 0..256, stride y allocSize alrededor del límite, formatos distintos."];
+    [self note:@"BOUNDARY: un rechazo de entrada inválida es NORMAL, no una anomalía."];
+    [self note:@"BOUNDARY: sin llamadas privadas ni punteros obsoletos; checkpoints cada 100 casos."];
+    NSDictionary *initial = @{@"run":run,@"seed":@(seed),@"step":@0,@"status":@"RUNNING",
+                              @"phase":@"STARTED",@"timestamp":[NSDate date].description};
+    NSData *first = [NSJSONSerialization dataWithJSONObject:initial options:0 error:NULL];
+    if (first) [first writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            const unsigned limit = 50000;
+            const size_t lengths[] = {0,1,2,3,7,8,15,16,31,32,63,64,127,128,255,256};
+            const size_t elements[] = {1,2,3,4,8};
+            const uint32_t formats[] = {0x42475241,0x52474241,0,0x41414141};
+            uint32_t state = seed;
+            unsigned attempts=0,accepted=0,rejected=0,exceptions=0,unusual=0;
+            unsigned normalized=0,zeroDimensionAccepted=0,invalidCoverage=0;
+            unsigned regular=0,missingSize=0,missingStride=0;
+            CFAbsoluteTime start=CFAbsoluteTimeGetCurrent();
+            NSMutableString *csv = [NSMutableString stringWithFormat:
+                @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,result\n"];
+            void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_LOCAL);
+            CreateSurfaceFn create=framework ? (CreateSurfaceFn)dlsym(framework,"IOSurfaceCreate") : NULL;
+            GetSurfaceIDFn getID=framework ? (GetSurfaceIDFn)dlsym(framework,"IOSurfaceGetID") : NULL;
+            GetSurfaceDimensionFn getW=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetWidth") : NULL;
+            GetSurfaceDimensionFn getH=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetHeight") : NULL;
+            GetSurfaceDimensionFn getRow=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetBytesPerRow") : NULL;
+            GetSurfaceDimensionFn getAlloc=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetAllocSize") : NULL;
+            if (!create || !getID || !getW || !getH || !getRow || !getAlloc) {
+                if (framework) dlclose(framework);
+                NSDictionary *failure=@{@"run":run,@"seed":@(seed),@"step":@0,
+                                        @"status":@"ERROR",@"reason":@"PUBLIC_API_UNAVAILABLE"};
+                NSData *encoded=[NSJSONSerialization dataWithJSONObject:failure options:0 error:NULL];
+                if(encoded) [encoded writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.stressRunning=NO;
+                    [self note:@"BOUNDARY: no están disponibles todas las funciones públicas; prueba cancelada."];
+                });
+                return;
+            }
+
+            BOOL stopped=NO;
+            for (unsigned n=1;n<=limit;n++) {
+                if (self.stressStopRequested) {stopped=YES;break;}
+                @autoreleasepool {
+                    // Xorshift PRNG with a saved seed; the same run can be replayed.
+                    size_t width=lengths[probeRandom(&state)%16];
+                    size_t height=lengths[probeRandom(&state)%16];
+                    size_t elem=elements[probeRandom(&state)%5];
+                    size_t nominalRow=width*elem;
+                    size_t rowCandidates[6]={
+                        0,nominalRow>0?nominalRow-1:0,nominalRow,
+                        nominalRow+1,((nominalRow+15)/16)*16,nominalRow+64
+                    };
+                    size_t row=rowCandidates[probeRandom(&state)%6];
+                    size_t nominalAlloc=row*height;
+                    size_t allocCandidates[6]={
+                        0,nominalAlloc>0?nominalAlloc-1:0,nominalAlloc,
+                        nominalAlloc+1,nominalAlloc+64,nominalAlloc+256
+                    };
+                    size_t alloc=allocCandidates[probeRandom(&state)%6];
+                    uint32_t format=formats[probeRandom(&state)%4];
+                    BOOL omitRow=(n%37==0),omitAlloc=(n%41==0);
+                    if (omitRow) missingStride++;
+                    if (omitAlloc) missingSize++;
+                    NSMutableDictionary *params=[@{
+                        @"IOSurfaceWidth":@(width),@"IOSurfaceHeight":@(height),
+                        @"IOSurfaceBytesPerElement":@(elem),
+                        @"IOSurfaceBytesPerRow":@(row),
+                        @"IOSurfaceAllocSize":@(alloc),
+                        @"IOSurfacePixelFormat":@(format)
+                    } mutableCopy];
+                    if (omitRow) [params removeObjectForKey:@"IOSurfaceBytesPerRow"];
+                    if (omitAlloc) [params removeObjectForKey:@"IOSurfaceAllocSize"];
+                    IOSurfaceRef surface=NULL;
+                    BOOL threw=NO;
+                    @try {
+                        surface=create((__bridge CFDictionaryRef)params);
+                    } @catch(NSException *exception) {
+                        threw=YES;
+                    }
+                    attempts++;
+                    IOSurfaceID id=0;
+                    size_t actualW=0,actualH=0,actualRow=0,actualAlloc=0;
+                    const char *outcome="REJECTED";
+                    if (threw) {
+                        exceptions++;
+                        outcome="NS_EXCEPTION";
+                    } else if (!surface) {
+                        rejected++;
+                    } else {
+                        accepted++;
+                        id=getID(surface);
+                        actualW=getW(surface);
+                        actualH=getH(surface);
+                        actualRow=getRow(surface);
+                        actualAlloc=getAlloc(surface);
+                        BOOL changed=(actualW!=width || actualH!=height || (!omitRow && actualRow!=row));
+                        BOOL zero=(actualW==0 || actualH==0);
+                        BOOL undercovered=(actualH>0 && actualRow>0 && actualAlloc<actualRow*actualH);
+                        if(changed) normalized++;
+                        if(zero) zeroDimensionAccepted++;
+                        if(undercovered) invalidCoverage++;
+                        if(zero || undercovered || id==0) {
+                            unusual++;
+                            outcome="REVIEW_METADATA";
+                        } else if(changed) {
+                            outcome="ACCEPTED_NORMALIZED";
+                        } else {
+                            regular++;
+                            outcome="ACCEPTED";
+                        }
+                        CFRelease(surface);
+                    }
+                    [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%s\n",
+                        run,seed,n,width,height,elem,row,alloc,(unsigned)format,omitRow,omitAlloc,
+                        (unsigned)id,actualW,actualH,actualRow,actualAlloc,outcome];
+                    if(n%100==0) {
+                        NSDictionary *saved=@{
+                            @"run":run,@"seed":@(seed),@"step":@(n),@"status":@"RUNNING",
+                            @"accepted":@(accepted),@"rejected":@(rejected),
+                            @"exceptions":@(exceptions),@"review":@(unusual),
+                            @"timestamp":[NSDate date].description
+                        };
+                        NSData *data=[NSJSONSerialization dataWithJSONObject:saved options:0 error:NULL];
+                        if(data) [data writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                    }
+                    if(n%2500==0) {
+                        unsigned done=n,ok=accepted,no=rejected,review=unusual;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [self note:[NSString stringWithFormat:
+                                @"BOUNDARY: %u/%u aceptadas=%u rechazadas=%u revisar=%u",
+                                done,limit,ok,no,review]];
+                        });
+                        usleep(50000);
+                    }
+                }
+            }
+            if(framework) dlclose(framework);
+            NSDictionary *final=@{
+                @"run":run,@"seed":@(seed),@"step":@(attempts),
+                @"status":stopped?@"STOPPED":@"DONE",
+                @"accepted":@(accepted),@"rejected":@(rejected),@"exceptions":@(exceptions),
+                @"review":@(unusual),@"normalized":@(normalized),
+                @"zero_dim_accepted":@(zeroDimensionAccepted),
+                @"undercovered":@(invalidCoverage),
+                @"missing_stride_cases":@(missingStride),@"missing_alloc_cases":@(missingSize),
+                @"elapsed":@(CFAbsoluteTimeGetCurrent()-start)
+            };
+            NSData *finalBytes=[NSJSONSerialization dataWithJSONObject:final options:NSJSONWritingPrettyPrinted error:NULL];
+            if(finalBytes) [finalBytes writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+            NSString *exportCSV=[csv copy];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressCSV=exportCSV;
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"BOUNDARY: %@ %u/%u seed=%u aceptadas=%u rechazadas=%u excepciones=%u",
+                    stopped?@"STOPPED":@"DONE",attempts,limit,seed,accepted,rejected,exceptions]];
+                [self note:[NSString stringWithFormat:
+                    @"BOUNDARY: normalizadas=%u cero-dimension=%u undercoverage=%u revisar=%u normales=%u",
+                    normalized,zeroDimensionAccepted,invalidCoverage,unusual,regular]];
+                [self note:[NSString stringWithFormat:@"BOUNDARY: tiempo=%.3fs; CSV y checkpoint guardados.",
+                    CFAbsoluteTimeGetCurrent()-start]];
+                [self note:@"BOUNDARY: un resultado REVIEW_METADATA requiere validación; no implica fallo de kernel ni KernelRW."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -1200,7 +1419,7 @@ static uint32_t probeRandom(uint32_t *state) {
     }
     NSMutableArray *filesToShare = [NSMutableArray arrayWithObject:[NSURL fileURLWithPath:p]];
     if (self.stressCSV.length > 0) {
-        NSString *csvPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-v7-campaign.csv"];
+        NSString *csvPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-latest-campaign.csv"];
         NSError *csvError = nil;
         if ([self.stressCSV writeToFile:csvPath atomically:YES encoding:NSUTF8StringEncoding error:&csvError]) {
             [filesToShare addObject:[NSURL fileURLWithPath:csvPath]];
@@ -1211,6 +1430,10 @@ static uint32_t probeRandom(uint32_t *state) {
     NSString *checkpoint = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceCampaign-checkpoint.json"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:checkpoint]) {
         [filesToShare addObject:[NSURL fileURLWithPath:checkpoint]];
+    }
+    NSString *boundaryCheckpoint = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceBoundary-checkpoint.json"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:boundaryCheckpoint]) {
+        [filesToShare addObject:[NSURL fileURLWithPath:boundaryCheckpoint]];
     }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
