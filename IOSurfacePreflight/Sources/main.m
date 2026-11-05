@@ -44,6 +44,18 @@ static uint32_t probeRandom(uint32_t *state) {
     return x;
 }
 
+
+static NSString *selector17Hex(const uint8_t *data, size_t len) {
+    const char *digits="0123456789abcdef";
+    char buf[49]={0};
+    if (len!=24) return @"INVALID";
+    for (size_t i=0;i<len;i++) {
+        buf[i*2]=digits[data[i] >> 4];
+        buf[i*2+1]=digits[data[i] & 15];
+    }
+    return [NSString stringWithUTF8String:buf];
+}
+
 @interface ProbeController : UIViewController
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) NSMutableString *events;
@@ -84,7 +96,7 @@ static uint32_t probeRandom(uint32_t *state) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v8";
+    title.text = @"IOSurface Preflight v9";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -111,6 +123,8 @@ static uint32_t probeRandom(uint32_t *state) {
       [self button:@"8. Repetir última campaña" action:@selector(replayCampaignProbe:)],
       [self button:@"9. Fuzzing de límites (50.000 casos)" action:@selector(boundaryProbe:)],
       [self button:@"10. Repetir fuzzing de límites" action:@selector(replayBoundaryProbe:)],
+      [self button:@"11. Fuzzing dirigido IOSurfaceRoot selector 17 (256 casos)" action:@selector(selector17Probe:)],
+      [self button:@"12. Repetir selector 17 (misma semilla)" action:@selector(replaySelector17Probe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -143,8 +157,22 @@ static uint32_t probeRandom(uint32_t *state) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v8"]; 
-    [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
+    [self note:@"app=IOSurfacePreflight-v9"]; 
+    [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *selectorCheckpointPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceSelector17-checkpoint.json"];
+    NSData *selectorCheckpointBytes = [NSData dataWithContentsOfFile:selectorCheckpointPath];
+    if (selectorCheckpointBytes) {
+        NSDictionary *last = [NSJSONSerialization JSONObjectWithData:selectorCheckpointBytes options:0 error:NULL];
+        if ([last isKindOfClass:NSDictionary.class]) {
+            NSString *status = last[@"status"] ?: @"?";
+            NSString *phase = last[@"phase"] ?: @"?";
+            NSString *warning = [status isEqualToString:@"RUNNING"] && [phase isEqualToString:@"BEFORE_IPC"]
+                ? @" | ejecución interrumpida antes de registrar retorno; motivo NO confirmado" : @"";
+            [self note:[NSString stringWithFormat:
+                @"SELECTOR17: previo status=%@ phase=%@ caso=%@%@",
+                status,phase,last[@"case"] ?: @"?",warning]];
+        }
+    }
     NSString *boundaryPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceBoundary-checkpoint.json"];
     NSData *boundaryBytes = [NSData dataWithContentsOfFile:boundaryPath];
     if (boundaryBytes) {
@@ -1410,6 +1438,166 @@ static uint32_t probeRandom(uint32_t *state) {
     });
 }
 
+
+- (void)selector17Probe:(id)sender {
+    uint32_t seed=arc4random();
+    if(!seed) seed=0x17172026;
+    [self selector17RunWithSeed:seed replay:NO];
+}
+
+- (void)replaySelector17Probe:(id)sender {
+    NSNumber *value=[NSUserDefaults.standardUserDefaults objectForKey:@"Selector17LastSeed"];
+    if(![value isKindOfClass:NSNumber.class]) {
+        [self note:@"SELECTOR17: no hay semilla guardada para repetir."];
+        return;
+    }
+    [self selector17RunWithSeed:(uint32_t)value.unsignedIntValue replay:YES];
+}
+
+- (void)selector17RunWithSeed:(uint32_t)seed replay:(BOOL)replay {
+    if(self.stressRunning || self.matrixRunning) {
+        [self note:@"SELECTOR17: otra prueba está activa; no iniciamos otra."];
+        return;
+    }
+    self.stressRunning=YES;
+    self.stressStopRequested=NO;
+    self.stressCSV=nil;
+    [NSUserDefaults.standardUserDefaults setObject:@(seed) forKey:@"Selector17LastSeed"];
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSString *rootPath=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *checkpointPath=[rootPath stringByAppendingPathComponent:@"IOSurfaceSelector17-checkpoint.json"];
+    NSString *csvPath=[rootPath stringByAppendingPathComponent:@"IOSurfaceSelector17-trace.csv"];
+    [self note:[NSString stringWithFormat:@"SELECTOR17: %@ run=%@ seed=%u",replay?@"REPLAY":@"NEW",run,seed]];
+    [self note:@"SELECTOR17: 256 llamadas REALES de IOConnectCallStructMethod(selector=17, struct=24 bytes), una conexión por caso."];
+    [self note:@"SELECTOR17: entradas negativas, zeros, patrones de bits y valores aleatorios. Sin concurrencia ni punteros liberados."];
+    [self note:@"SELECTOR17: ATENCIÓN: estos métodos del kernel no son APIs públicas y pueden reiniciar el iPhone."];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            const unsigned total=256;
+            uint32_t randomState=seed;
+            unsigned attempted=0,opened=0,failedOpen=0,accepted=0,denied=0,badarg=0,other=0;
+            BOOL stopped=NO;
+            CFAbsoluteTime began=CFAbsoluteTimeGetCurrent();
+            NSMutableString *csv=[NSMutableString stringWithString:
+                @"run,seed,case,payload_hex,open_code,call_code,result\n"];
+            void *lib=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_LAZY|RTLD_LOCAL);
+            MatchingFn matching=lib?(MatchingFn)dlsym(lib,"IOServiceMatching"):NULL;
+            GetMatchingFn getService=lib?(GetMatchingFn)dlsym(lib,"IOServiceGetMatchingService"):NULL;
+            OpenServiceFn open=lib?(OpenServiceFn)dlsym(lib,"IOServiceOpen"):NULL;
+            CloseServiceFn close=lib?(CloseServiceFn)dlsym(lib,"IOServiceClose"):NULL;
+            ReleaseObjectFn release=lib?(ReleaseObjectFn)dlsym(lib,"IOObjectRelease"):NULL;
+            typedef kern_return_t (*StructFn)(io_connect_t,uint32_t,const void*,size_t,void*,size_t*);
+            StructFn call=lib?(StructFn)dlsym(lib,"IOConnectCallStructMethod"):NULL;
+            if(!matching||!getService||!open||!close||!release||!call) {
+                [@{@"run":run,@"seed":@(seed),@"status":@"ERROR",
+                   @"reason":@"MISSING_IOKIT_SYMBOL",@"case":@0}
+                    writeToFile:checkpointPath atomically:YES];
+                if(lib)dlclose(lib);
+                dispatch_async(dispatch_get_main_queue(),^{
+                    self.stressRunning=NO;
+                    [self note:@"SELECTOR17: faltan funciones IOKit. No se llamó al selector."];
+                });
+                return;
+            }
+            [csv writeToFile:csvPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            for(unsigned i=0;i<total;i++) {
+                if(self.stressStopRequested){stopped=YES;break;}
+                @autoreleasepool {
+                    uint8_t payload[24]={0};
+                    if(i==1) memset(payload,0xff,sizeof(payload));
+                    else if(i==2) memset(payload,1,sizeof(payload));
+                    else if(i==3) memset(payload,0x80,sizeof(payload));
+                    else if(i>=4 && i<196) {
+                        unsigned bit=i-4;
+                        payload[bit/8]=(uint8_t)(1U<<(bit%8));
+                    } else if(i>=196) {
+                        for(unsigned j=0;j<24;j++)payload[j]=(uint8_t)probeRandom(&randomState);
+                    }
+                    NSString *hex=selector17Hex(payload,sizeof(payload));
+                    // Commit BEFORE entering kernel IPC. If the phone panics, this payload remains.
+                    NSDictionary *before=@{
+                        @"run":run,@"seed":@(seed),@"case":@(i),
+                        @"status":@"RUNNING",@"phase":@"BEFORE_IPC",
+                        @"selector":@17,@"inputLength":@24,@"payloadHex":hex,
+                        @"timestamp":[NSDate date].description
+                    };
+                    NSData *state=[NSJSONSerialization dataWithJSONObject:before options:0 error:NULL];
+                    if(state)[state writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+                    io_service_t service=MACH_PORT_NULL;
+                    CFMutableDictionaryRef query=matching("IOSurfaceRoot");
+                    if(query)service=getService(MACH_PORT_NULL,query);
+                    io_connect_t conn=MACH_PORT_NULL;
+                    kern_return_t openCode=KERN_FAILURE, callCode=KERN_FAILURE;
+                    if(service) openCode=open(service,mach_task_self(),0,&conn);
+                    if(openCode==KERN_SUCCESS && conn) {
+                        opened++;
+                        size_t outputLen=0;
+                        callCode=call(conn,17,payload,sizeof(payload),NULL,&outputLen);
+                        close(conn);
+                    } else failedOpen++;
+                    if(service)release(service);
+                    attempted++;
+                    const char *tag="OTHER";
+                    if(openCode!=KERN_SUCCESS){tag="OPEN_FAILED";}
+                    else if(callCode==KERN_SUCCESS){accepted++;tag="CALL_SUCCESS";}
+                    else if((uint32_t)callCode==0xe00002e2){denied++;tag="NOT_PERMITTED";}
+                    else if((uint32_t)callCode==0xe00002c2){badarg++;tag="BAD_ARGUMENT";}
+                    else{other++;}
+                    [csv appendFormat:@"%@,%u,%u,%@,0x%08x,0x%08x,%s\n",
+                        run,seed,i,hex,(unsigned)openCode,(unsigned)callCode,tag];
+                    [csv writeToFile:csvPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                    NSDictionary *after=@{
+                        @"run":run,@"seed":@(seed),@"case":@(i),
+                        @"status":@"RUNNING",@"phase":@"AFTER_IPC",
+                        @"selector":@17,@"inputLength":@24,
+                        @"lastReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)callCode],
+                        @"timestamp":[NSDate date].description
+                    };
+                    NSData *end=[NSJSONSerialization dataWithJSONObject:after options:0 error:NULL];
+                    if(end)[end writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+                    if((i+1)%16==0) {
+                        unsigned count=attempted,success=accepted,d=denied;
+                        dispatch_async(dispatch_get_main_queue(),^{
+                            [self note:[NSString stringWithFormat:
+                                @"SELECTOR17: %u/%u llamadas, success=%u, no_permitido=%u",count,total,success,d]];
+                        });
+                    }
+                    // Do not continue after a successful mutating call of unknown semantics.
+                    if(callCode==KERN_SUCCESS){
+                        dispatch_async(dispatch_get_main_queue(),^{
+                            [self note:@"SELECTOR17: la llamada devolvió éxito. Campaña terminada preventivamente para analizarla."];
+                        });
+                        break;
+                    }
+                    usleep(20000);
+                }
+            }
+            if(lib)dlclose(lib);
+            NSString *status=stopped?@"STOPPED":(accepted?@"STOPPED_ON_SUCCESS":@"DONE");
+            NSDictionary *finish=@{
+                @"run":run,@"seed":@(seed),@"case":@(attempted),
+                @"status":status,@"phase":@"FINISHED",
+                @"attempted":@(attempted),@"opened":@(opened),
+                @"openErrors":@(failedOpen),@"success":@(accepted),
+                @"notPermitted":@(denied),@"badArgument":@(badarg),
+                @"other":@(other),@"duration":@(CFAbsoluteTimeGetCurrent()-began),
+                @"timestamp":[NSDate date].description
+            };
+            NSData *data=[NSJSONSerialization dataWithJSONObject:finish options:NSJSONWritingPrettyPrinted error:NULL];
+            if(data)[data writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+            NSString *trace=[csv copy];
+            dispatch_async(dispatch_get_main_queue(),^{
+                self.stressCSV=trace;
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"SELECTOR17: %@ intentos=%u abierta=%u fallos_apertura=%u éxito=%u negadas=%u arg_inválido=%u otros=%u",
+                    status,attempted,opened,failedOpen,accepted,denied,badarg,other]];
+                [self note:@"SELECTOR17: exportá el checkpoint y CSV para identificar la ruta y sus resultados. Un retorno no demuestra UAF o KernelRW."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -1435,6 +1623,12 @@ static uint32_t probeRandom(uint32_t *state) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:boundaryCheckpoint]) {
         [filesToShare addObject:[NSURL fileURLWithPath:boundaryCheckpoint]];
     }
+    NSString *selectorFile=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceSelector17-checkpoint.json"];
+    NSString *selectorCSV=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceSelector17-trace.csv"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:selectorFile])
+        [filesToShare addObject:[NSURL fileURLWithPath:selectorFile]];
+    if([[NSFileManager defaultManager] fileExistsAtPath:selectorCSV])
+        [filesToShare addObject:[NSURL fileURLWithPath:selectorCSV]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
