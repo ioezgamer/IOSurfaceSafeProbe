@@ -1,0 +1,44 @@
+name: Backboardd Evidence unsigned IPA
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'BackboarddEvidence/**'
+      - '.github/workflows/backboardd-evidence-ipa.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode version
+        run: xcodebuild -version
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: BackboarddEvidence
+        run: xcodegen generate
+      - name: Build iOS app unsigned
+        run: |
+          xcodebuild -project BackboarddEvidence/BackboarddEvidence.xcodeproj \
+            -scheme BackboarddEvidence -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/backboardd-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Assemble IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/backboardd-package/Payload"
+          cp -R "$RUNNER_TEMP/backboardd-build/Build/Products/Release-iphoneos/BackboarddEvidence.app" \
+            "$RUNNER_TEMP/backboardd-package/Payload/"
+          (cd "$RUNNER_TEMP/backboardd-package" && zip -qr "$GITHUB_WORKSPACE/BackboarddEvidence-unsigned.ipa" Payload)
+          unzip -t "$GITHUB_WORKSPACE/BackboarddEvidence-unsigned.ipa"
+          shasum -a 256 "$GITHUB_WORKSPACE/BackboarddEvidence-unsigned.ipa"
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BackboarddEvidence-unsigned-ipa
+          path: BackboarddEvidence-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
