@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <mach/mach.h>
+#import <mach/mach_time.h>
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
 #import <sys/time.h>
@@ -114,7 +115,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v14";
+    title.text = @"IOSurface Preflight v15";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -149,6 +150,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
       [self button:@"16. Preparar cierre controlado (superficie viva)" action:@selector(controlledCloseProbe:)],
       [self button:@"17. Ejecutar cierre ahora" action:@selector(fireControlledClose:)],
       [self button:@"18. Concurrencia publica controlada (256 x 2)" action:@selector(publicConcurrencyProbe:)],
+      [self button:@"19. Mismo cliente: llamada 17 y cierre (12 ensayos)" action:@selector(sameClientProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -181,8 +183,21 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v14"]; 
+    [self note:@"app=IOSurfacePreflight-v15"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *samePath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceSameClient-checkpoint.json"];
+    NSData *sameBytes=[NSData dataWithContentsOfFile:samePath];
+    if(sameBytes) {
+        NSDictionary *prior=[NSJSONSerialization JSONObjectWithData:sameBytes options:0 error:NULL];
+        if([prior isKindOfClass:NSDictionary.class]) {
+            [self note:[NSString stringWithFormat:@"SAMECLIENT: anterior=%@ intento=%@ solapamiento=%@",
+                prior[@"status"] ?: @"?",prior[@"trial"] ?: @"?",
+                prior[@"userSpaceOverlap"] ?: @"?"]];
+            if([prior[@"status"] isEqualToString:@"RUNNING"])
+                [self note:@"SAMECLIENT: ejecución incompleta; no implica kernel panic ni UAF."];
+        }
+    }
     NSString *concurrentCheckpointPath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceConcurrency-checkpoint.json"];
     NSData *concurrentPrevious=[NSData dataWithContentsOfFile:concurrentCheckpointPath];
@@ -2503,6 +2518,218 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     });
 }
 
+
+- (void)sameClientProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning) {
+        [self note:@"SAMECLIENT: otra prueba sigue activa."];
+        return;
+    }
+    UIAlertController *warning=[UIAlertController alertControllerWithTitle:
+        @"Ensayo de concurrencia sobre el mismo cliente"
+        message:@"Esta prueba hace coincidir una llamada asíncrona real al selector 17 y el cierre de ESA misma conexión IOSurfaceRoot, en hasta 12 ensayos. Podría cerrar la app o reiniciar el dispositivo si existe un fallo. Guardá tus datos antes de continuar. No es un jailbreak."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [warning addAction:[UIAlertAction actionWithTitle:@"Cancelar"
+        style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf=self;
+    [warning addAction:[UIAlertAction actionWithTitle:@"Iniciar los 12 ensayos"
+        style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+            [weakSelf runSameClientProbe];
+        }]];
+    [self presentViewController:warning animated:YES completion:nil];
+}
+
+- (void)runSameClientProbe {
+    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning)return;
+    self.stressRunning=YES;
+    self.stressStopRequested=NO;
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *checkpoint=[directory stringByAppendingPathComponent:
+        @"IOSurfaceSameClient-checkpoint.json"];
+    NSString *csvPath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceSameClient-trace.csv"];
+    NSString *boot=preflightBootStamp();
+    [self note:[NSString stringWithFormat:@"SAMECLIENT: inicio run=%@ boot=%@",run,boot]];
+    [self note:@"SAMECLIENT: llamada asíncrona selector 17 con payload cero y cierre del MISMO io_connect_t."];
+    [self note:@"SAMECLIENT: 12 ensayos máximo, cada uno usa una conexión nueva y un puerto de respuesta válido."];
+    [self note:@"SAMECLIENT: barrera de hilos en usuario; solapamiento temporal NO implica solapamiento interno ni UAF."];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            void *lib=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
+                              RTLD_LAZY|RTLD_LOCAL);
+            MatchingFn matching=lib?(MatchingFn)dlsym(lib,"IOServiceMatching"):NULL;
+            GetMatchingFn getService=lib?(GetMatchingFn)dlsym(lib,"IOServiceGetMatchingService"):NULL;
+            OpenServiceFn open=lib?(OpenServiceFn)dlsym(lib,"IOServiceOpen"):NULL;
+            CloseServiceFn close=lib?(CloseServiceFn)dlsym(lib,"IOServiceClose"):NULL;
+            ReleaseObjectFn release=lib?(ReleaseObjectFn)dlsym(lib,"IOObjectRelease"):NULL;
+            typedef kern_return_t (*CallAsyncStructFn)(io_connect_t,uint32_t,
+                       mach_port_t,uint64_t *,uint32_t,const void *,size_t,void *,size_t *);
+            CallAsyncStructFn call=lib?(CallAsyncStructFn)dlsym(lib,
+                                  "IOConnectCallAsyncStructMethod"):NULL;
+            BOOL available=matching && getService && open && close && release && call;
+            const unsigned maxTrials=12;
+            unsigned attempts=0,openSuccess=0,callSuccess=0,closeSuccess=0;
+            unsigned observedOverlap=0,errors=0;
+            BOOL stopped=NO;
+            CFAbsoluteTime began=CFAbsoluteTimeGetCurrent();
+            mach_timebase_info_data_t tb={0,0};
+            mach_timebase_info(&tb);
+            NSMutableString *csv=[NSMutableString stringWithString:
+                @"run,trial,open_kr,port_kr,call_kr,close_kr,call_start_us,call_end_us,close_start_us,close_end_us,user_space_overlap\n"];
+
+            if(available) {
+                dispatch_queue_t q=dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0);
+                for(unsigned trial=1;trial<=maxTrials;trial++) {
+                    if(self.stressStopRequested){stopped=YES;break;}
+                    @autoreleasepool {
+                        attempts++;
+                        NSDictionary *progress=@{
+                            @"run":run,@"status":@"RUNNING",@"phase":@"BEFORE_TRIAL",
+                            @"trial":@(trial),@"attempts":@(attempts),
+                            @"userSpaceOverlap":@(observedOverlap),
+                            @"bootStamp":boot,@"timestamp":[NSDate date].description,
+                            @"sameConnection":@YES,@"sameKernelObjectProven":@NO,
+                            @"kernelMemoryObserved":@NO
+                        };
+                        NSData *progressData=[NSJSONSerialization dataWithJSONObject:progress
+                                             options:NSJSONWritingPrettyPrinted error:NULL];
+                        if(progressData)[progressData writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+
+                        CFMutableDictionaryRef request=matching("IOSurfaceRoot");
+                        io_service_t service=request?
+                             getService(MACH_PORT_NULL,request):MACH_PORT_NULL;
+                        io_connect_t connection=MACH_PORT_NULL;
+                        kern_return_t openCode=service?
+                             open(service,mach_task_self(),0,&connection):KERN_FAILURE;
+                        kern_return_t portCode=KERN_FAILURE;
+                        kern_return_t sendCode=KERN_FAILURE;
+                        kern_return_t callCode=KERN_FAILURE;
+                        kern_return_t closeCode=KERN_FAILURE;
+                        mach_port_t replyPort=MACH_PORT_NULL;
+                        uint64_t callStart=0,callEnd=0,closeStart=0,closeEnd=0;
+                        BOOL overlap=NO;
+                        if(openCode==KERN_SUCCESS && connection!=MACH_PORT_NULL) {
+                            openSuccess++;
+                            portCode=mach_port_allocate(mach_task_self(),
+                                MACH_PORT_RIGHT_RECEIVE,&replyPort);
+                            if(portCode==KERN_SUCCESS) {
+                                sendCode=mach_port_insert_right(mach_task_self(),
+                                    replyPort,replyPort,MACH_MSG_TYPE_MAKE_SEND);
+                            }
+                            if(portCode==KERN_SUCCESS && sendCode==KERN_SUCCESS) {
+                                dispatch_semaphore_t barrier=dispatch_semaphore_create(0);
+                                dispatch_group_t group=dispatch_group_create();
+                                __block kern_return_t asyncResult=KERN_FAILURE;
+                                __block kern_return_t closeResult=KERN_FAILURE;
+                                __block uint64_t tCall0=0,tCall1=0,tClose0=0,tClose1=0;
+                                // Keep replyPort and payload alive until both tasks have completed.
+                                dispatch_group_async(group,q,^{
+                                    uint8_t payload[24]={0};
+                                    uint64_t reference[8]={0};
+                                    size_t outputBytes=0;
+                                    tCall0=mach_absolute_time();
+                                    dispatch_semaphore_signal(barrier);
+                                    asyncResult=call(connection,17,replyPort,reference,8,
+                                                     payload,sizeof(payload),NULL,&outputBytes);
+                                    tCall1=mach_absolute_time();
+                                });
+                                dispatch_group_async(group,q,^{
+                                    dispatch_semaphore_wait(barrier,DISPATCH_TIME_FOREVER);
+                                    tClose0=mach_absolute_time();
+                                    closeResult=close(connection);
+                                    tClose1=mach_absolute_time();
+                                });
+                                dispatch_group_wait(group,DISPATCH_TIME_FOREVER);
+                                callCode=asyncResult;
+                                closeCode=closeResult;
+                                callStart=tCall0;
+                                callEnd=tCall1;
+                                closeStart=tClose0;
+                                closeEnd=tClose1;
+                                overlap=callStart>0 && callEnd>=callStart &&
+                                    closeStart>0 && closeEnd>=closeStart &&
+                                    callStart<=closeEnd && closeStart<=callEnd;
+                                if(overlap)observedOverlap++;
+                                if(callCode==KERN_SUCCESS)callSuccess++;
+                                if(closeCode==KERN_SUCCESS)closeSuccess++;
+                            } else {
+                                // The client is not shared with another thread if setup failed.
+                                closeCode=close(connection);
+                                if(closeCode==KERN_SUCCESS)closeSuccess++;
+                            }
+                        }
+                        if(openCode!=KERN_SUCCESS || portCode!=KERN_SUCCESS ||
+                           sendCode!=KERN_SUCCESS ||
+                           callCode!=KERN_SUCCESS || closeCode!=KERN_SUCCESS)errors++;
+                        if(replyPort!=MACH_PORT_NULL)
+                            mach_port_destroy(mach_task_self(),replyPort);
+                        if(service!=MACH_PORT_NULL)release(service);
+                        double mul=(tb.denom!=0)?(double)tb.numer/(double)tb.denom/1000.0:0.0;
+                        uint64_t base=callStart?callStart:closeStart;
+                        [csv appendFormat:
+                            @"%@,%u,0x%08x,0x%08x,0x%08x,0x%08x,%.3f,%.3f,%.3f,%.3f,%u\n",
+                            run,trial,(unsigned)openCode,(unsigned)portCode,
+                            (unsigned)callCode,(unsigned)closeCode,
+                            callStart>=base?(callStart-base)*mul:0,
+                            callEnd>=base?(callEnd-base)*mul:0,
+                            closeStart>=base?(closeStart-base)*mul:0,
+                            closeEnd>=base?(closeEnd-base)*mul:0,
+                            overlap?1:0];
+                        [csv writeToFile:csvPath atomically:YES
+                            encoding:NSUTF8StringEncoding error:NULL];
+                        // Checkpoint proves which iteration completed even after a later crash.
+                        NSDictionary *after=@{
+                            @"run":run,@"status":@"RUNNING",@"phase":@"AFTER_TRIAL",
+                            @"trial":@(trial),@"attempts":@(attempts),
+                            @"callReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)callCode],
+                            @"closeReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)closeCode],
+                            @"userSpaceOverlap":@(observedOverlap),
+                            @"bootStamp":boot,@"timestamp":[NSDate date].description,
+                            @"sameConnection":@YES,@"sameKernelObjectProven":@NO,
+                            @"kernelMemoryObserved":@NO
+                        };
+                        NSData *afterData=[NSJSONSerialization dataWithJSONObject:after
+                                        options:NSJSONWritingPrettyPrinted error:NULL];
+                        if(afterData)[afterData writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                        if(errors>0) {
+                            // Keep anomalies inspectable; do not continue probing after an error.
+                            break;
+                        }
+                    }
+                }
+            }
+            NSString *status=!available?@"ERROR_MISSING_SYMBOLS":
+                stopped?@"STOPPED":errors>0?@"STOPPED_ON_API_ERROR":
+                @"DONE_NO_API_ERRORS";
+            NSDictionary *summary=@{
+                @"run":run,@"status":status,@"phase":@"FINISHED",
+                @"timestamp":[NSDate date].description,
+                @"bootStamp":boot,@"trial":@(attempts),@"maxTrials":@(maxTrials),
+                @"openPasses":@(openSuccess),@"callPasses":@(callSuccess),
+                @"closePasses":@(closeSuccess),@"apiErrors":@(errors),
+                @"userSpaceOverlap":@(observedOverlap),
+                @"elapsedMs":@((CFAbsoluteTimeGetCurrent()-began)*1000.0),
+                @"sameConnection":@YES,
+                @"sameKernelObjectProven":@NO,
+                @"kernelMemoryObserved":@NO,@"uafProven":@NO,
+                @"scope":@"same explicit io_connect_t, selector17 async vs IOServiceClose; user-space clock only"
+            };
+            NSData *result=[NSJSONSerialization dataWithJSONObject:summary
+                                     options:NSJSONWritingPrettyPrinted error:NULL];
+            if(result)[result writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+            if(lib)dlclose(lib);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"SAMECLIENT: %@ intentos=%u open=%u call17=%u close=%u err=%u overlap-usuario=%u",
+                    status,attempts,openSuccess,callSuccess,closeSuccess,errors,observedOverlap]];
+                [self note:@"SAMECLIENT: exportá IOSurfaceSameClient-checkpoint.json y trace.csv."];
+                [self note:@"SAMECLIENT: misma conexión, pero sin inspección del kernel. Ningún solapamiento usuario demuestra UAF."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -2570,6 +2797,14 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
         [filesToShare addObject:[NSURL fileURLWithPath:concurrentCheckpoint]];
     if([[NSFileManager defaultManager] fileExistsAtPath:concurrentTrace])
         [filesToShare addObject:[NSURL fileURLWithPath:concurrentTrace]];
+    NSString *sameCheckpoint=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceSameClient-checkpoint.json"];
+    NSString *sameCSV=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceSameClient-trace.csv"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:sameCheckpoint])
+        [filesToShare addObject:[NSURL fileURLWithPath:sameCheckpoint]];
+    if([[NSFileManager defaultManager] fileExistsAtPath:sameCSV])
+        [filesToShare addObject:[NSURL fileURLWithPath:sameCSV]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
