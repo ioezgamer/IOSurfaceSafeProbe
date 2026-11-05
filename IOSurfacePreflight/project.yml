@@ -14,12 +14,14 @@ targets:
     platform: iOS
     sources:
       - Sources
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.iosurface.preflight
         GENERATE_INFOPLIST_FILE: "YES"
-        INFOPLIST_KEY_CFBundleShortVersionString: "0.18.0"
-        INFOPLIST_KEY_CFBundleVersion: "18"
+        INFOPLIST_KEY_CFBundleShortVersionString: "0.19.0"
+        INFOPLIST_KEY_CFBundleVersion: "19"
         INFOPLIST_KEY_CFBundleDisplayName: "IOSurface Preflight"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "NO"
