@@ -486,7 +486,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     }
     self.matrixRunning = YES;
     [self note:@"MATRIX: iniciando 484 casos con parámetros válidos, secuenciales y deterministas."];
-    [self note:@"MATRIX: 11 anchuras x 11 alturas x 2 paddings x 2 pasadas. Máximo 294912 bytes por superficie."];
+    [self note:@"MATRIX: 11 anchuras x 11 alturas x 2 paddings x 2 pasadas. Máximo 270336 bytes por superficie."];
     [self note:@"MATRIX: sin métodos privados, sin carreras, sin referencias obsoletas."];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
