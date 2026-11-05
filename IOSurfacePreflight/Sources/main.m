@@ -8,9 +8,10 @@
 #import <dlfcn.h>
 #import <string.h>
 #import <unistd.h>
+#import <stdatomic.h>
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
-// No direct externalMethod dispatch, intentional races, stale pointers or kernel modification.
+// No private externalMethod dispatch, stale pointers or kernel modification.
 typedef struct __IOSurface * IOSurfaceRef;
 typedef uint32_t IOSurfaceID;
 typedef IOSurfaceRef (*CreateSurfaceFn)(CFDictionaryRef);
@@ -113,7 +114,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v13";
+    title.text = @"IOSurface Preflight v14";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -147,6 +148,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
       [self button:@"15. Verificar integridad de buffers (256 casos)" action:@selector(integrityProbe:)],
       [self button:@"16. Preparar cierre controlado (superficie viva)" action:@selector(controlledCloseProbe:)],
       [self button:@"17. Ejecutar cierre ahora" action:@selector(fireControlledClose:)],
+      [self button:@"18. Concurrencia publica controlada (256 x 2)" action:@selector(publicConcurrencyProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -179,8 +181,21 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v13"]; 
+    [self note:@"app=IOSurfacePreflight-v14"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *concurrentCheckpointPath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceConcurrency-checkpoint.json"];
+    NSData *concurrentPrevious=[NSData dataWithContentsOfFile:concurrentCheckpointPath];
+    if(concurrentPrevious) {
+        NSDictionary *prior=[NSJSONSerialization JSONObjectWithData:concurrentPrevious
+                                                             options:0 error:NULL];
+        if([prior isKindOfClass:NSDictionary.class]) {
+            [self note:[NSString stringWithFormat:@"CONCURRENT: previo status=%@ overlapped=%@",
+                prior[@"status"] ?: @"?",prior[@"observedCreateOverlap"] ?: @"?"]];
+            if([prior[@"status"] isEqualToString:@"RUNNING"])
+                [self note:@"CONCURRENT: ejecucion anterior incompleta; no confirma reinicio causado por el kernel."];
+        }
+    }
     NSString *closeCheckpointPath = [NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceControlledClose-checkpoint.json"];
     NSData *closePrevData=[NSData dataWithContentsOfFile:closeCheckpointPath];
@@ -2299,6 +2314,195 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     });
 }
 
+
+- (void)publicConcurrencyProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning) {
+        [self note:@"CONCURRENT: otra prueba esta activa."];
+        return;
+    }
+    self.stressRunning=YES;
+    self.stressStopRequested=NO;
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *checkpointPath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceConcurrency-checkpoint.json"];
+    NSString *tracePath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceConcurrency-trace.csv"];
+    [self note:[NSString stringWithFormat:@"CONCURRENT: inicio run=%@",run]];
+    [self note:@"CONCURRENT: 2 hilos, hasta 256 IOSurfaceCreate y 256 conexiones IOSurfaceRoot abiertas/cerradas."];
+    [self note:@"CONCURRENT: superficies propias, referencias validas, sin metodos privados ni acceso tras liberar."];
+    [self note:@"CONCURRENT: el cierre se realiza sobre una conexion INDEPENDIENTE; no demuestra identidad del objeto kernel."];
+    [self note:@"CONCURRENT: el solapamiento se mide a nivel aplicacion, NO demuestra carrera dentro del kernel."];
+
+    NSDictionary *initial=@{
+        @"run":run,@"status":@"RUNNING",@"phase":@"PREPARING",
+        @"bootStamp":preflightBootStamp(),
+        @"plannedCreate":@256,@"plannedClose":@256,
+        @"timestamp":[NSDate date].description,
+        @"sameKernelObjectEstablished":@NO,
+        @"kernelLifetimeInstrumented":@NO
+    };
+    NSData *initialData=[NSJSONSerialization dataWithJSONObject:initial
+                                        options:NSJSONWritingPrettyPrinted error:NULL];
+    if(initialData)[initialData writeToFile:checkpointPath
+                                   options:NSDataWritingAtomic error:NULL];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            CFAbsoluteTime begin=CFAbsoluteTimeGetCurrent();
+            void *surfLib=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                                RTLD_LAZY|RTLD_LOCAL);
+            void *ioLib=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
+                              RTLD_LAZY|RTLD_LOCAL);
+            CreateSurfaceFn create=surfLib?(CreateSurfaceFn)dlsym(surfLib,"IOSurfaceCreate"):NULL;
+            GetSurfaceIDFn getID=surfLib?(GetSurfaceIDFn)dlsym(surfLib,"IOSurfaceGetID"):NULL;
+            LookupSurfaceFn lookup=surfLib?(LookupSurfaceFn)dlsym(surfLib,"IOSurfaceLookup"):NULL;
+            GetSurfaceDimensionFn getWidth=surfLib?(GetSurfaceDimensionFn)dlsym(surfLib,"IOSurfaceGetWidth"):NULL;
+            MatchingFn matching=ioLib?(MatchingFn)dlsym(ioLib,"IOServiceMatching"):NULL;
+            GetMatchingFn getService=ioLib?(GetMatchingFn)dlsym(ioLib,"IOServiceGetMatchingService"):NULL;
+            OpenServiceFn open=ioLib?(OpenServiceFn)dlsym(ioLib,"IOServiceOpen"):NULL;
+            CloseServiceFn close=ioLib?(CloseServiceFn)dlsym(ioLib,"IOServiceClose"):NULL;
+            ReleaseObjectFn release=ioLib?(ReleaseObjectFn)dlsym(ioLib,"IOObjectRelease"):NULL;
+            BOOL available=create && getID && lookup && getWidth &&
+                           matching && getService && open && close && release;
+            __block unsigned createAttempts=0,createPasses=0,createErrors=0;
+            __block unsigned closeAttempts=0,openPasses=0,closePasses=0;
+            __block unsigned openErrors=0,closeErrors=0,overlaps=0;
+            __block unsigned cancelledCreate=0,cancelledClose=0;
+            NSMutableString *csv=[NSMutableString stringWithString:
+                @"run,close_attempt,open_code,close_code,active_create_before,active_create_after,create_spanned_close,close_elapsed_ms\n"];
+            if(available) {
+                atomic_uint inCreate;
+                atomic_init(&inCreate,0);
+                atomic_uint *active=&inCreate;
+                dispatch_group_t group=dispatch_group_create();
+                dispatch_semaphore_t start=dispatch_semaphore_create(0);
+                dispatch_queue_t q=dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0);
+
+                dispatch_group_async(group,q,^{
+                    @autoreleasepool {
+                        NSDictionary *params=@{
+                            @"IOSurfaceWidth":@32,@"IOSurfaceHeight":@32,
+                            @"IOSurfaceBytesPerElement":@4,@"IOSurfaceBytesPerRow":@128,
+                            @"IOSurfaceAllocSize":@(32*32*4),
+                            @"IOSurfacePixelFormat":@(0x42475241)
+                        };
+                        dispatch_semaphore_wait(start,DISPATCH_TIME_FOREVER);
+                        for(unsigned i=1;i<=256;i++) {
+                            if(self.stressStopRequested) {
+                                cancelledCreate=1;
+                                break;
+                            }
+                            @autoreleasepool {
+                                createAttempts++;
+                                // The value is a unique iteration index, not a kernel pointer.
+                                atomic_store_explicit(active,i,memory_order_release);
+                                IOSurfaceRef first=create((__bridge CFDictionaryRef)params);
+                                atomic_store_explicit(active,0,memory_order_release);
+                                if(!first) {createErrors++;continue;}
+                                IOSurfaceID sid=getID(first);
+                                IOSurfaceRef held=lookup(sid);
+                                BOOL ok=held && getWidth(held)==32;
+                                if(held)CFRelease(held);
+                                CFRelease(first);
+                                if(ok)createPasses++;else createErrors++;
+                            }
+                            usleep(1000);
+                        }
+                    }
+                });
+
+                dispatch_group_async(group,q,^{
+                    @autoreleasepool {
+                        dispatch_semaphore_wait(start,DISPATCH_TIME_FOREVER);
+                        for(unsigned i=1;i<=256;i++) {
+                            if(self.stressStopRequested) {
+                                cancelledClose=1;
+                                break;
+                            }
+                            @autoreleasepool {
+                                closeAttempts++;
+                                CFMutableDictionaryRef request=matching("IOSurfaceRoot");
+                                io_service_t service=request?getService(MACH_PORT_NULL,request):MACH_PORT_NULL;
+                                io_connect_t connection=MACH_PORT_NULL;
+                                kern_return_t openCode=service?
+                                    open(service,mach_task_self(),0,&connection):KERN_FAILURE;
+                                kern_return_t closeCode=KERN_FAILURE;
+                                unsigned before=0,after=0;
+                                BOOL spanned=NO;
+                                double closeMs=0.0;
+                                if(openCode==KERN_SUCCESS && connection!=MACH_PORT_NULL) {
+                                    openPasses++;
+                                    before=atomic_load_explicit(active,memory_order_acquire);
+                                    CFAbsoluteTime closeBegin=CFAbsoluteTimeGetCurrent();
+                                    closeCode=close(connection);
+                                    closeMs=(CFAbsoluteTimeGetCurrent()-closeBegin)*1000.0;
+                                    after=atomic_load_explicit(active,memory_order_acquire);
+                                    spanned=before!=0 && before==after;
+                                    if(spanned)overlaps++;
+                                    if(closeCode==KERN_SUCCESS)closePasses++;
+                                    else closeErrors++;
+                                } else {
+                                    openErrors++;
+                                    if(connection!=MACH_PORT_NULL)close(connection);
+                                }
+                                if(service!=MACH_PORT_NULL)release(service);
+                                [csv appendFormat:
+                                    @"%@,%u,0x%08x,0x%08x,%u,%u,%u,%.3f\n",
+                                    run,i,(unsigned)openCode,(unsigned)closeCode,
+                                    before,after,spanned?1:0,closeMs];
+                            }
+                            usleep(1000);
+                        }
+                    }
+                });
+
+                dispatch_semaphore_signal(start);
+                dispatch_semaphore_signal(start);
+                dispatch_group_wait(group,DISPATCH_TIME_FOREVER);
+            }
+
+            NSString *status=!available?@"ERROR_MISSING_SYMBOLS":
+                    (cancelledCreate || cancelledClose)?@"STOPPED":
+                    (createErrors || openErrors || closeErrors)?@"DONE_WITH_API_ERRORS":
+                    overlaps>0?@"DONE_APP_OVERLAP_OBSERVED":@"DONE_NO_APP_OVERLAP_OBSERVED";
+            NSData *traceBytes=[csv dataUsingEncoding:NSUTF8StringEncoding];
+            if(traceBytes)[traceBytes writeToFile:tracePath options:NSDataWritingAtomic error:NULL];
+            NSDictionary *summary=@{
+                @"run":run, @"status":status, @"phase":@"FINISHED",
+                @"timestamp":[NSDate date].description,
+                @"bootStamp":preflightBootStamp(),
+                @"createAttempts":@(createAttempts),
+                @"createPasses":@(createPasses),@"createErrors":@(createErrors),
+                @"closeAttempts":@(closeAttempts),
+                @"openPasses":@(openPasses),@"closePasses":@(closePasses),
+                @"openErrors":@(openErrors),@"closeErrors":@(closeErrors),
+                @"observedCreateOverlap":@(overlaps),
+                @"elapsedMs":@((CFAbsoluteTimeGetCurrent()-begin)*1000.0),
+                @"sameKernelObjectEstablished":@NO,
+                @"kernelLifetimeInstrumented":@NO,
+                @"uafProven":@NO,
+                @"scope":@"Public IOSurface create/lookup versus separately opened and closed IOSurfaceRoot connection; app-level overlap only"
+            };
+            NSData *report=[NSJSONSerialization dataWithJSONObject:summary
+                                             options:NSJSONWritingPrettyPrinted error:NULL];
+            if(report)[report writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+            if(surfLib)dlclose(surfLib);
+            if(ioLib)dlclose(ioLib);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"CONCURRENT: %@ create=%u/%u, open=%u/%u, close=%u/%u, overlap-app=%u, %.1fms",
+                    status,createPasses,createAttempts,openPasses,closeAttempts,
+                    closePasses,closeAttempts,overlaps,
+                    (CFAbsoluteTimeGetCurrent()-begin)*1000.0]];
+                [self note:@"CONCURRENT: exporta IOSurfaceConcurrency-checkpoint.json y trace.csv."];
+                [self note:@"CONCURRENT: overlap-app > 0 NO demuestra que register/stop compartan cliente ni que exista UAF."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -2358,6 +2562,14 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
         [filesToShare addObject:[NSURL fileURLWithPath:closeFile]];
     if([[NSFileManager defaultManager] fileExistsAtPath:closeTrace])
         [filesToShare addObject:[NSURL fileURLWithPath:closeTrace]];
+    NSString *concurrentCheckpoint=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceConcurrency-checkpoint.json"];
+    NSString *concurrentTrace=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceConcurrency-trace.csv"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:concurrentCheckpoint])
+        [filesToShare addObject:[NSURL fileURLWithPath:concurrentCheckpoint]];
+    if([[NSFileManager defaultManager] fileExistsAtPath:concurrentTrace])
+        [filesToShare addObject:[NSURL fileURLWithPath:concurrentTrace]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
