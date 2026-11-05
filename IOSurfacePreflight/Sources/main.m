@@ -2780,8 +2780,8 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                                                "IOConnectCallAsyncStructMethod"):NULL;
             BOOL available=matching && getService && open && close && release && call;
             const unsigned totalPairs=3;
-            unsigned attempts=0,openSuccess=0,healthyCall=0,closedInvalidDest=0;
-            unsigned closeSuccess=0,setupErrors=0,unexpectedCodes=0;
+            __block unsigned attempts=0,openSuccess=0,healthyCall=0,closedInvalidDest=0;
+            __block unsigned closeSuccess=0,setupErrors=0,unexpectedCodes=0;
             CFAbsoluteTime began=CFAbsoluteTimeGetCurrent();
             NSMutableString *csv=[NSMutableString stringWithString:
                  @"run,pair,control,open_kr,port_kr,send_kr,call_kr,close_kr,port_before_kr,port_after_kr,port_before_type,port_after_type,elapsed_ms\n"];
