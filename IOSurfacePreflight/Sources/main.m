@@ -193,7 +193,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19";
+    title.text = @"IOSurface Preflight v19.1";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -264,7 +264,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19"]; 
+    [self note:@"app=IOSurfacePreflight-v19.1"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -1545,6 +1545,9 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                               @"phase":@"STARTED",@"timestamp":[NSDate date].description};
     NSData *first = [NSJSONSerialization dataWithJSONObject:initial options:0 error:NULL];
     if (first) [first writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+    // Campaign UUID in the event allows time correlation with the separate trace.
+    // A bracket is created before running any public IOSurface API operations.
+    [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_BEGIN_%@",run]];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
@@ -1579,6 +1582,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                 if(encoded) [encoded writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.stressRunning=NO;
+                    [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_ERROR_%@",run]];
                     [self note:@"BOUNDARY: no están disponibles todas las funciones públicas; prueba cancelada."];
                 });
                 return;
@@ -1754,6 +1758,9 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                     if(n%2500==0) {
                         unsigned done=n,ok=accepted,no=rejected,needsReview=review,passed=samplePassed;
                         dispatch_async(dispatch_get_main_queue(), ^{
+                            if(done%10000==0)
+                                [self recordBootEvent:[NSString stringWithFormat:
+                                    @"BOUNDARY_PROGRESS_%@_%u",run,done]];
                             [self note:[NSString stringWithFormat:
                                 @"BOUNDARY: %u/%u aceptadas=%u rechazadas=%u alertas=%u integridad_ok=%u",
                                 done,limit,ok,no,needsReview,passed]];
@@ -1791,6 +1798,10 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.stressCSV=exportCSV;
                 self.stressRunning=NO;
+                NSString *endStatus=(sampleMismatch||sampleUnlockFailed)?
+                    @"STOPPED_ON_INTEGRITY_ERROR":stopped?@"STOPPED":@"DONE";
+                [self recordBootEvent:[NSString stringWithFormat:
+                    @"BOUNDARY_END_%@_%@",run,endStatus]];
                 [self note:[NSString stringWithFormat:
                     @"BOUNDARY: %@ %u/%u seed=%u aceptadas=%u rechazadas=%u excepciones=%u",
                     stopped?@"STOPPED":@"DONE",attempts,limit,seed,accepted,rejected,exceptions]];
