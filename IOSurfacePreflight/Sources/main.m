@@ -96,7 +96,7 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v9";
+    title.text = @"IOSurface Preflight v10";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -125,6 +125,7 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
       [self button:@"10. Repetir fuzzing de límites" action:@selector(replayBoundaryProbe:)],
       [self button:@"11. Fuzzing dirigido IOSurfaceRoot selector 17 (256 casos)" action:@selector(selector17Probe:)],
       [self button:@"12. Repetir selector 17 (misma semilla)" action:@selector(replaySelector17Probe:)],
+      [self button:@"13. Comprobar contrato asíncrono (1 intento)" action:@selector(asyncContractProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -157,8 +158,18 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v9"]; 
+    [self note:@"app=IOSurfacePreflight-v10"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *asyncCheckpointPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceAsyncContract-checkpoint.json"];
+    NSData *asyncPrevious = [NSData dataWithContentsOfFile:asyncCheckpointPath];
+    if (asyncPrevious) {
+        NSDictionary *previous = [NSJSONSerialization JSONObjectWithData:asyncPrevious options:0 error:NULL];
+        if ([previous isKindOfClass:NSDictionary.class]) {
+            [self note:[NSString stringWithFormat:
+                @"ASYNC: checkpoint anterior %@ fase=%@ retorno=%@",
+                previous[@"status"] ?: @"?", previous[@"phase"] ?: @"?", previous[@"callReturn"] ?: @"?"]];
+        }
+    }
     NSString *selectorCheckpointPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceSelector17-checkpoint.json"];
     NSData *selectorCheckpointBytes = [NSData dataWithContentsOfFile:selectorCheckpointPath];
     if (selectorCheckpointBytes) {
@@ -1598,6 +1609,102 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     });
 }
 
+
+- (void)asyncContractProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning) {
+        [self note:@"ASYNC: ya hay una prueba activa."];
+        return;
+    }
+    self.stressRunning=YES;
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSString *checkpointPath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceAsyncContract-checkpoint.json"];
+    [self note:[NSString stringWithFormat:@"ASYNC: inicio run=%@",run]];
+    [self note:@"ASYNC: exactamente 1 llamada IOConnectCallAsyncStructMethod, selector 17 y 24 bytes cero."];
+    [self note:@"ASYNC: referencia asíncrona de 8 valores y puerto Mach de respuesta válido."];
+    [self note:@"ASYNC: sin fuzz, sin concurrencia, sin referencias liberadas; puede devolver error de validación."];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            void *lib=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_LAZY|RTLD_LOCAL);
+            MatchingFn matching=lib ? (MatchingFn)dlsym(lib,"IOServiceMatching") : NULL;
+            GetMatchingFn getService=lib ? (GetMatchingFn)dlsym(lib,"IOServiceGetMatchingService") : NULL;
+            OpenServiceFn open=lib ? (OpenServiceFn)dlsym(lib,"IOServiceOpen") : NULL;
+            CloseServiceFn close=lib ? (CloseServiceFn)dlsym(lib,"IOServiceClose") : NULL;
+            ReleaseObjectFn release=lib ? (ReleaseObjectFn)dlsym(lib,"IOObjectRelease") : NULL;
+            typedef kern_return_t (*CallAsyncStructFn)(io_connect_t,uint32_t,mach_port_t,
+                      uint64_t *,uint32_t,const void *,size_t,void *,size_t *);
+            CallAsyncStructFn call=lib ? (CallAsyncStructFn)dlsym(lib,
+                                 "IOConnectCallAsyncStructMethod") : NULL;
+            NSString *status=@"ERROR";
+            NSString *phase=@"SETUP";
+            kern_return_t openCode=KERN_FAILURE;
+            kern_return_t callCode=KERN_FAILURE;
+            kern_return_t portCode=KERN_FAILURE;
+            kern_return_t sendCode=KERN_FAILURE;
+            BOOL called=NO;
+            mach_port_t replyPort=MACH_PORT_NULL;
+            io_service_t service=MACH_PORT_NULL;
+            io_connect_t connection=MACH_PORT_NULL;
+            if(matching && getService && open && close && release && call) {
+                CFMutableDictionaryRef query=matching("IOSurfaceRoot");
+                if(query) service=getService(MACH_PORT_NULL,query);
+                if(service) openCode=open(service,mach_task_self(),0,&connection);
+                if(openCode==KERN_SUCCESS && connection!=MACH_PORT_NULL) {
+                    portCode=mach_port_allocate(mach_task_self(),MACH_PORT_RIGHT_RECEIVE,&replyPort);
+                    if(portCode==KERN_SUCCESS) {
+                        sendCode=mach_port_insert_right(mach_task_self(),replyPort,
+                                                      replyPort,MACH_MSG_TYPE_MAKE_SEND);
+                        if(sendCode==KERN_SUCCESS) {
+                            phase=@"BEFORE_ASYNC_IPC";
+                            NSDictionary *before=@{
+                                @"run":run,@"status":@"RUNNING",@"phase":phase,
+                                @"selector":@17,@"inputBytes":@24,
+                                @"referenceCount":@8,@"payload":@"ZERO",
+                                @"timestamp":[NSDate date].description
+                            };
+                            NSData *pre=[NSJSONSerialization dataWithJSONObject:before options:0 error:NULL];
+                            if(pre)[pre writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+
+                            uint8_t payload[24]={0};
+                            uint64_t reference[8]={0};
+                            size_t outputBytes=0;
+                            called=YES;
+                            callCode=call(connection,17,replyPort,reference,8,
+                                          payload,sizeof(payload),NULL,&outputBytes);
+                            phase=@"AFTER_ASYNC_IPC";
+                            status=@"DONE";
+                        }
+                    }
+                }
+            }
+            if(connection!=MACH_PORT_NULL && close) close(connection);
+            if(service!=MACH_PORT_NULL && release) release(service);
+            if(replyPort!=MACH_PORT_NULL) mach_port_destroy(mach_task_self(),replyPort);
+            if(lib)dlclose(lib);
+            NSDictionary *final=@{
+                @"run":run,@"status":status,@"phase":phase,
+                @"called":@(called),@"selector":@17,
+                @"openReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)openCode],
+                @"portReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)portCode],
+                @"sendReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)sendCode],
+                @"callReturn":[NSString stringWithFormat:@"0x%08x",(unsigned)callCode],
+                @"timestamp":[NSDate date].description
+            };
+            NSData *out=[NSJSONSerialization dataWithJSONObject:final
+                                            options:NSJSONWritingPrettyPrinted error:NULL];
+            if(out)[out writeToFile:checkpointPath options:NSDataWritingAtomic error:NULL];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                   @"ASYNC: %@ ejecutada=%@ open=0x%08x puerto=0x%08x send=0x%08x retorno=0x%08x",
+                   status,called?@"SI":@"NO",(unsigned)openCode,(unsigned)portCode,
+                   (unsigned)sendCode,(unsigned)callCode]];
+                [self note:@"ASYNC: exportá IOSurfaceAsyncContract-checkpoint.json; no se intentó obtener KernelRW."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -1629,6 +1736,10 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
         [filesToShare addObject:[NSURL fileURLWithPath:selectorFile]];
     if([[NSFileManager defaultManager] fileExistsAtPath:selectorCSV])
         [filesToShare addObject:[NSURL fileURLWithPath:selectorCSV]];
+    NSString *asyncCheckpoint=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceAsyncContract-checkpoint.json"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:asyncCheckpoint])
+        [filesToShare addObject:[NSURL fileURLWithPath:asyncCheckpoint]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
