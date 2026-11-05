@@ -4,6 +4,7 @@
 #import <mach/mach.h>
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
+#import <sys/time.h>
 #import <dlfcn.h>
 #import <string.h>
 #import <unistd.h>
@@ -56,6 +57,20 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     return [NSString stringWithUTF8String:buf];
 }
 
+
+static NSString *preflightBootStamp(void) {
+    struct timeval boot={0};
+    size_t bytes=sizeof(boot);
+    if(sysctlbyname("kern.boottime",&boot,&bytes,NULL,0)!=0) return @"UNAVAILABLE";
+    return [NSString stringWithFormat:@"%lld.%06d",
+             (long long)boot.tv_sec,(int)boot.tv_usec];
+}
+
+static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
+    return (uint8_t)(((uint64_t)caseNo*37ULL +
+                      (uint64_t)offset*19ULL + (offset>>7))&255ULL);
+}
+
 @interface ProbeController : UIViewController
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) NSMutableString *events;
@@ -96,7 +111,7 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v11";
+    title.text = @"IOSurface Preflight v12";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -127,6 +142,7 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
       [self button:@"12. Repetir selector 17 (misma semilla)" action:@selector(replaySelector17Probe:)],
       [self button:@"13. Comprobar contrato asíncrono (1 intento)" action:@selector(asyncContractProbe:)],
       [self button:@"14. Observar respuesta asíncrona (3 s)" action:@selector(asyncObserverProbe:)],
+      [self button:@"15. Verificar integridad de buffers (256 casos)" action:@selector(integrityProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -159,8 +175,29 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v11"]; 
+    [self note:@"app=IOSurfacePreflight-v12"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *integrityPath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceIntegrity-checkpoint.json"];
+    NSData *integrityPrevious=[NSData dataWithContentsOfFile:integrityPath];
+    if(integrityPrevious) {
+        NSDictionary *last=[NSJSONSerialization JSONObjectWithData:integrityPrevious options:0 error:NULL];
+        if([last isKindOfClass:NSDictionary.class]) {
+            NSString *bootNow=preflightBootStamp();
+            NSString *bootThen=last[@"bootStamp"];
+            [self note:[NSString stringWithFormat:
+                @"INTEGRITY: checkpoint previo status=%@ caso=%@ discrepancias=%@",
+                last[@"status"] ?: @"?",last[@"case"] ?: @"?",last[@"mismatches"] ?: @"?"]];
+            if([bootThen isKindOfClass:NSString.class] &&
+               ![bootNow isEqualToString:@"UNAVAILABLE"] &&
+               ![bootThen isEqualToString:@"UNAVAILABLE"] &&
+               ![bootThen isEqualToString:bootNow]) {
+                [self note:@"INTEGRITY: el dispositivo se reinició desde el checkpoint previo. La causa no está determinada."];
+            } else if([last[@"status"] isEqualToString:@"RUNNING"]) {
+                [self note:@"INTEGRITY: la ejecución anterior quedó incompleta; no equivale a kernel panic."];
+            }
+        }
+    }
     NSString *observerCheckpointPath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceAsyncObserver-checkpoint.json"];
     NSData *observerPrevious=[NSData dataWithContentsOfFile:observerCheckpointPath];
@@ -1906,6 +1943,185 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
     });
 }
 
+
+- (void)integrityProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning) {
+        [self note:@"INTEGRITY: otra prueba está activa."];return;
+    }
+    self.stressRunning=YES;
+    self.stressStopRequested=NO;
+    NSString *run=NSUUID.UUID.UUIDString;
+    NSString *boot=preflightBootStamp();
+    NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *checkpoint=[directory stringByAppendingPathComponent:
+        @"IOSurfaceIntegrity-checkpoint.json"];
+    NSString *tracePath=[directory stringByAppendingPathComponent:
+        @"IOSurfaceIntegrity-trace.csv"];
+    [self note:[NSString stringWithFormat:@"INTEGRITY: inicio run=%@ arranque=%@",run,boot]];
+    [self note:@"INTEGRITY: 256 casos secuenciales; solo IOSurface APIs públicas y memoria de la aplicación."];
+    [self note:@"INTEGRITY: escritura con patrón determinista, desbloqueo, segunda referencia válida y lectura de verificación."];
+    [self note:@"INTEGRITY: ningún acceso fuera del tamaño asignado, sin carreras, sin referencias liberadas."];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
+        @autoreleasepool {
+            void *framework=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                                    RTLD_LAZY|RTLD_LOCAL);
+            CreateSurfaceFn create=framework?(CreateSurfaceFn)dlsym(framework,"IOSurfaceCreate"):NULL;
+            GetSurfaceIDFn getID=framework?(GetSurfaceIDFn)dlsym(framework,"IOSurfaceGetID"):NULL;
+            LookupSurfaceFn lookup=framework?(LookupSurfaceFn)dlsym(framework,"IOSurfaceLookup"):NULL;
+            GetSurfaceDimensionFn getWidth=framework?(GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetWidth"):NULL;
+            GetSurfaceDimensionFn getHeight=framework?(GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetHeight"):NULL;
+            GetSurfaceDimensionFn getSize=framework?(GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetAllocSize"):NULL;
+            GetSurfaceDimensionFn getRow=framework?(GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetBytesPerRow"):NULL;
+            GetSurfaceBaseFn getBase=framework?(GetSurfaceBaseFn)dlsym(framework,"IOSurfaceGetBaseAddress"):NULL;
+            SurfaceLockFn lock=framework?(SurfaceLockFn)dlsym(framework,"IOSurfaceLock"):NULL;
+            SurfaceLockFn unlock=framework?(SurfaceLockFn)dlsym(framework,"IOSurfaceUnlock"):NULL;
+            NSMutableString *trace=[NSMutableString stringWithString:
+                @"run,case,width,height,id,bytes,created,write_lock,write_unlock,lookup,read_lock,read_unlock,mismatches,first_mismatch,result\n"];
+            const unsigned total=256;
+            unsigned passed=0,errors=0,issues=0,attempted=0;
+            BOOL stopped=NO;
+            CFAbsoluteTime began=CFAbsoluteTimeGetCurrent();
+            BOOL available=create&&getID&&lookup&&getWidth&&getHeight&&getSize&&getRow&&getBase&&lock&&unlock;
+            if(available) {
+                for(unsigned i=0;i<total;i++) {
+                    if(self.stressStopRequested){stopped=YES;break;}
+                    @autoreleasepool {
+                        const size_t dims[]={16,32,64,128};
+                        size_t w=dims[i%4],h=dims[(i/4)%4];
+                        size_t bytes=w*h*4; // Max 65536 bytes. All accesses are checked.
+                        size_t rowBytes=w*4;
+                        NSDictionary *properties=@{
+                            @"IOSurfaceWidth":@(w),@"IOSurfaceHeight":@(h),
+                            @"IOSurfaceBytesPerElement":@4,
+                            @"IOSurfaceBytesPerRow":@(rowBytes),
+                            @"IOSurfaceAllocSize":@(bytes),
+                            @"IOSurfacePixelFormat":@(0x42475241)
+                        };
+                        NSDictionary *before=@{
+                            @"run":run,@"status":@"RUNNING",
+                            @"phase":@"BEFORE_CASE",@"case":@(i),
+                            @"tested":@(attempted),@"passed":@(passed),
+                            @"mismatches":@(issues),@"errors":@(errors),
+                            @"bootStamp":boot,@"timestamp":[NSDate date].description
+                        };
+                        NSData *b=[NSJSONSerialization dataWithJSONObject:before options:0 error:NULL];
+                        if(b)[b writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+
+                        IOSurfaceRef surf=create((__bridge CFDictionaryRef)properties);
+                        IOSurfaceID identifier=0;
+                        kern_return_t writeCode=KERN_FAILURE,writeUnlock=KERN_FAILURE;
+                        kern_return_t readCode=KERN_FAILURE,readUnlock=KERN_FAILURE;
+                        BOOL found=NO,created=surf!=NULL,valid=NO;
+                        unsigned bad=0;
+                        long long first=-1;
+                        NSString *result=@"ERROR";
+                        if(surf) {
+                            identifier=getID(surf);
+                            size_t allocated=getSize(surf);
+                            size_t actualRow=getRow(surf);
+                            size_t actualWidth=getWidth(surf);
+                            size_t actualHeight=getHeight(surf);
+                            valid=allocated>=bytes && actualRow==rowBytes &&
+                                  actualWidth==w && actualHeight==h;
+                            if(valid) {
+                                uint32_t writeSeed=0;
+                                writeCode=lock(surf,0,&writeSeed);
+                                if(writeCode==KERN_SUCCESS) {
+                                    uint8_t *address=(uint8_t *)getBase(surf);
+                                    if(address!=NULL) {
+                                        for(size_t offset=0;offset<bytes;offset++)
+                                            address[offset]=preflightExpectedByte(i,offset);
+                                    } else valid=NO;
+                                    writeUnlock=unlock(surf,0,&writeSeed);
+                                }
+                                if(writeCode==KERN_SUCCESS &&
+                                   writeUnlock==KERN_SUCCESS && valid) {
+                                    IOSurfaceRef second=lookup(identifier);
+                                    found=second!=NULL;
+                                    if(second) {
+                                        if(getSize(second)>=bytes &&
+                                           getRow(second)==rowBytes &&
+                                           getWidth(second)==w &&
+                                           getHeight(second)==h) {
+                                            uint32_t readSeed=0;
+                                            readCode=lock(second,0,&readSeed);
+                                            if(readCode==KERN_SUCCESS) {
+                                                uint8_t *readPtr=(uint8_t *)getBase(second);
+                                                if(readPtr) {
+                                                    for(size_t offset=0;offset<bytes;offset++) {
+                                                        if(readPtr[offset]!=preflightExpectedByte(i,offset)) {
+                                                            bad++;
+                                                            if(first<0)first=(long long)offset;
+                                                        }
+                                                    }
+                                                } else valid=NO;
+                                                readUnlock=unlock(second,0,&readSeed);
+                                            }
+                                        } else valid=NO;
+                                        CFRelease(second);
+                                    }
+                                }
+                            }
+                            CFRelease(surf);
+                        }
+                        if(created&&valid&&found&&writeCode==KERN_SUCCESS&&
+                           writeUnlock==KERN_SUCCESS&&readCode==KERN_SUCCESS&&
+                           readUnlock==KERN_SUCCESS) {
+                            if(bad==0) { passed++; result=@"PASS"; }
+                            else { issues++;result=@"DATA_MISMATCH"; }
+                        } else { errors++;result=@"API_OR_METADATA_ERROR"; }
+                        attempted++;
+                        [trace appendFormat:
+                            @"%@,%u,%zu,%zu,%u,%zu,%u,0x%08x,0x%08x,%u,0x%08x,0x%08x,%u,%lld,%@\n",
+                            run,i,w,h,(unsigned)identifier,bytes,created?1U:0U,
+                            (unsigned)writeCode,(unsigned)writeUnlock,found?1U:0U,
+                            (unsigned)readCode,(unsigned)readUnlock,bad,first,result];
+                        [trace writeToFile:tracePath atomically:YES
+                                               encoding:NSUTF8StringEncoding error:NULL];
+                        if((i+1)%32==0||bad>0) {
+                            unsigned count=attempted,ok=passed,problems=issues,apiErrors=errors;
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [self note:[NSString stringWithFormat:
+                                    @"INTEGRITY: %u/%u PASS=%u diferencias=%u errores_API=%u",
+                                    count,total,ok,problems,apiErrors]];
+                            });
+                        }
+                        if(bad>0) {
+                            unsigned idx=i,number=bad;long long offset=first;
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [self note:[NSString stringWithFormat:
+                                    @"INTEGRITY: diferencia caso=%u bytes=%u primer_offset=%lld",
+                                    idx,number,offset]];
+                            });
+                        }
+                    }
+                }
+            }
+            if(framework)dlclose(framework);
+            NSString *status=!available?@"ERROR_MISSING_SYMBOLS":stopped?@"STOPPED":@"DONE";
+            NSDictionary *summary=@{
+                @"run":run,@"status":status,@"phase":@"FINISHED",
+                @"case":@(attempted),@"total":@(total),@"passed":@(passed),
+                @"mismatches":@(issues),@"errors":@(errors),
+                @"bootStamp":boot,@"elapsedMs":@((CFAbsoluteTimeGetCurrent()-began)*1000),
+                @"timestamp":[NSDate date].description,
+                @"interpretation":@"A mismatch is not proof of a kernel vulnerability or UAF"
+            };
+            NSData *end=[NSJSONSerialization dataWithJSONObject:summary
+                                            options:NSJSONWritingPrettyPrinted error:NULL];
+            if(end)[end writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"INTEGRITY: %@ total=%u PASS=%u discrepancias=%u errores_API=%u",
+                    status,attempted,passed,issues,errors]];
+                [self note:@"INTEGRITY: exportá IOSurfaceIntegrity-checkpoint.json y trace.csv. Una diferencia aislada no demuestra vulnerabilidad."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -1949,6 +2165,14 @@ static NSString *selector17Hex(const uint8_t *data, size_t len) {
         [filesToShare addObject:[NSURL fileURLWithPath:observerCheckpoint]];
     if([[NSFileManager defaultManager] fileExistsAtPath:observerTrace])
         [filesToShare addObject:[NSURL fileURLWithPath:observerTrace]];
+    NSString *integrityFile=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceIntegrity-checkpoint.json"];
+    NSString *integrityCSV=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceIntegrity-trace.csv"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:integrityFile])
+        [filesToShare addObject:[NSURL fileURLWithPath:integrityFile]];
+    if([[NSFileManager defaultManager] fileExistsAtPath:integrityCSV])
+        [filesToShare addObject:[NSURL fileURLWithPath:integrityCSV]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
