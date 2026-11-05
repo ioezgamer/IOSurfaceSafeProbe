@@ -115,7 +115,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v16";
+    title.text = @"IOSurface Preflight v17";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -152,6 +152,8 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
       [self button:@"18. Concurrencia publica controlada (256 x 2)" action:@selector(publicConcurrencyProbe:)],
       [self button:@"19. Mismo cliente: llamada 17 y cierre (12 ensayos)" action:@selector(sameClientProbe:)],
       [self button:@"20. Controles IPC: abierto y cerrado (3 pares)" action:@selector(ipcControlsProbe:)],
+      [self button:@"21. Fuerza bruta IOSurface (100.000 casos)" action:@selector(bruteForceProbe:)],
+      [self button:@"22. Repetir fuerza bruta (misma semilla)" action:@selector(replayBruteForceProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -184,8 +186,22 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v16"]; 
+    [self note:@"app=IOSurfacePreflight-v17"]; 
     [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    NSString *brutePath=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceBruteForce-checkpoint.json"];
+    NSData *bruteBytes=[NSData dataWithContentsOfFile:brutePath];
+    if(bruteBytes) {
+        NSDictionary *prior=[NSJSONSerialization JSONObjectWithData:bruteBytes
+                                                            options:0 error:NULL];
+        if([prior isKindOfClass:NSDictionary.class]) {
+            [self note:[NSString stringWithFormat:
+                @"BRUTE: anterior status=%@ paso=%@ seed=%@",
+                prior[@"status"] ?: @"?",prior[@"step"] ?: @"?",prior[@"seed"] ?: @"?"]];
+            if([prior[@"status"] isEqualToString:@"RUNNING"])
+                [self note:@"BRUTE: ejecución previa incompleta; no significa vulnerabilidad por si sola."];
+        }
+    }
     NSString *ipcControlsPath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceIPCControls-checkpoint.json"];
     NSData *previousControlBytes=[NSData dataWithContentsOfFile:ipcControlsPath];
@@ -1363,22 +1379,53 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
 }
 
 
+
+- (void)bruteForceProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning) {
+        [self note:@"BRUTE: ya se esta ejecutando otra prueba."];
+        return;
+    }
+    UIAlertController *confirm=[UIAlertController alertControllerWithTitle:
+        @"Fuzzing de fuerza bruta: 100.000 casos"
+        message:@"Ejecuta 100.000 combinaciones reproducibles contra la API pública IOSurfaceCreate. Utiliza una única superficie por caso y registra resultados, semilla y progreso. Las entradas casi inválidas pueden causar cierres inesperados. Guardá tus datos antes de comenzar."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Cancelar"
+           style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf=self;
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Ejecutar fuzzing"
+           style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        uint32_t seed=arc4random();
+        if(seed==0)seed=0xA1172026;
+        [weakSelf runBoundaryProbeSeed:seed replay:NO totalCases:100000];
+    }]];
+    [self presentViewController:confirm animated:YES completion:nil];
+}
+
+- (void)replayBruteForceProbe:(id)sender {
+    NSNumber *last=[NSUserDefaults.standardUserDefaults objectForKey:@"IOSurfaceBruteForceSeed"];
+    if(![last isKindOfClass:NSNumber.class]) {
+        [self note:@"BRUTE: todavía no existe una semilla guardada."];
+        return;
+    }
+    [self runBoundaryProbeSeed:(uint32_t)last.unsignedIntValue replay:YES totalCases:100000];
+}
+
 - (void)replayBoundaryProbe:(id)sender {
     NSNumber *last = [NSUserDefaults.standardUserDefaults objectForKey:@"IOSurfaceV8BoundarySeed"];
     if (![last isKindOfClass:NSNumber.class]) {
         [self note:@"BOUNDARY: todavía no hay semilla guardada."];
         return;
     }
-    [self runBoundaryProbeSeed:(uint32_t)last.unsignedIntValue replay:YES];
+    [self runBoundaryProbeSeed:(uint32_t)last.unsignedIntValue replay:YES totalCases:50000];
 }
 
 - (void)boundaryProbe:(id)sender {
     uint32_t seed = arc4random();
     if (seed == 0) seed = 0xB80A2026;
-    [self runBoundaryProbeSeed:seed replay:NO];
+    [self runBoundaryProbeSeed:seed replay:NO totalCases:50000];
 }
 
-- (void)runBoundaryProbeSeed:(uint32_t)seed replay:(BOOL)replay {
+- (void)runBoundaryProbeSeed:(uint32_t)seed replay:(BOOL)replay totalCases:(unsigned)limit {
     if (self.stressRunning || self.matrixRunning) {
         [self note:@"BOUNDARY: ya hay una prueba activa."];
         return;
@@ -1387,11 +1434,17 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.stressStopRequested = NO;
     self.stressCSV = nil;
     NSString *run = NSUUID.UUID.UUIDString;
-    NSString *checkpoint = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceBoundary-checkpoint.json"];
+    NSString *checkpointName=limit>50000?@"IOSurfaceBruteForce-checkpoint.json":
+                                               @"IOSurfaceBoundary-checkpoint.json";
+    NSString *checkpoint=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                              stringByAppendingPathComponent:checkpointName];
     [NSUserDefaults.standardUserDefaults setObject:@(seed) forKey:@"IOSurfaceV8BoundarySeed"];
+    if(limit>50000) [NSUserDefaults.standardUserDefaults setObject:@(seed)
+                                                         forKey:@"IOSurfaceBruteForceSeed"];
     [self note:[NSString stringWithFormat:@"BOUNDARY: %@ run=%@ semilla=%u",
         replay ? @"REPLAY" : @"NEW",run,seed]];
-    [self note:@"BOUNDARY: 50000 entradas públicas con combinaciones válidas y casi inválidas; memoria acotada."];
+    [self note:[NSString stringWithFormat:
+        @"BOUNDARY: %u entradas públicas con combinaciones válidas y casi inválidas; memoria acotada.",limit]];
     [self note:@"BOUNDARY: longitudes 0..256, stride y allocSize alrededor del límite, formatos distintos."];
     [self note:@"BOUNDARY: un rechazo de entrada inválida es NORMAL, no una anomalía."];
     [self note:@"BOUNDARY: sin llamadas privadas ni punteros obsoletos; checkpoints cada 100 casos."];
@@ -1402,7 +1455,6 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
-            const unsigned limit = 50000;
             const size_t lengths[] = {0,1,2,3,7,8,15,16,31,32,63,64,127,128,255,256};
             const size_t elements[] = {1,2,3,4,8};
             const uint32_t formats[] = {0x42475241,0x52474241,0,0x41414141};
@@ -3002,6 +3054,10 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
         [filesToShare addObject:[NSURL fileURLWithPath:controlsCheckpoint]];
     if([[NSFileManager defaultManager] fileExistsAtPath:controlsCSV])
         [filesToShare addObject:[NSURL fileURLWithPath:controlsCSV]];
+    NSString *bruteCheckpoint=[NSHomeDirectory() stringByAppendingPathComponent:
+        @"Documents/IOSurfaceBruteForce-checkpoint.json"];
+    if([[NSFileManager defaultManager] fileExistsAtPath:bruteCheckpoint])
+        [filesToShare addObject:[NSURL fileURLWithPath:bruteCheckpoint]];
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
     if (sharing.popoverPresentationController)
