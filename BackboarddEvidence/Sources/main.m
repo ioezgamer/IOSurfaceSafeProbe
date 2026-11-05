@@ -3,6 +3,10 @@
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
 #import <stdlib.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+
 
 @interface EvidenceController : UIViewController <UIDocumentPickerDelegate>
 @property(nonatomic, strong) UITextView *output;
@@ -57,7 +61,7 @@
     self.machine = [self modelIdentifier];
     self.build = [self systemBuild];
     self.analysis = [@{
-        @"tool": @"Backboardd Evidence Inspector v2",
+        @"tool": @"Backboardd Evidence Inspector v3",
         @"purpose": @"Local crash report review; no exploit payload",
         @"created": [self stamp],
         @"device": self.machine,
@@ -69,12 +73,12 @@
     } mutableCopy];
 
     UILabel *heading = [UILabel new];
-    heading.text = @"Backboardd Evidence v2";
+    heading.text = @"Backboardd Evidence v3";
     heading.font = [UIFont systemFontOfSize:25 weight:UIFontWeightBold];
     heading.numberOfLines = 0;
 
     UILabel *subtitle = [UILabel new];
-    subtitle.text = @"Inspector local de registros y prueba de cierre controlado. No ejecuta exploit, no causa corrupción de memoria y no modifica el kernel.";
+    subtitle.text = @"Comparación local de QuartzCore, CoreMedia e IOSurface para iOS 27.0. Solo lee información de los frameworks; no ejecuta exploit ni modifica el sistema.";
     subtitle.numberOfLines = 0;
     subtitle.textColor = UIColor.secondaryLabelColor;
     subtitle.font = [UIFont systemFontOfSize:14];
@@ -93,6 +97,7 @@
         [self action:@"2. Importar registro .ips / .txt / .json" selector:@selector(importReport:)],
         [self action:@"3. Exportar informe y checkpoint" selector:@selector(exportReport:)],
         [self action:@"4. Prueba activa: cierre de esta app (SIGABRT)" selector:@selector(confirmSelfCrash:)],
+        [self action:@"5. Comparar frameworks de mi iOS" selector:@selector(checkFrameworkUUIDs:)],
         self.output
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -117,11 +122,13 @@
         [self.output.heightAnchor constraintEqualToConstant:380]
     ]];
 
-    [self append:@"Backboardd Evidence Inspector v2"];
+    [self append:@"Backboardd Evidence Inspector v3"];
     [self append:@"Funciona completamente sin red."];
     [self append:@"No accede a backboardd, CoreMedia privado ni métodos del kernel."];
     [self append:@"Prueba activa: cierre intencional solo de la aplicación, sin dañar la memoria del kernel."];
     [self showPreviousSelfCrash];
+    [self append:@"NUEVO: botón 5 compara las UUID reales de QuartzCore, CoreMedia e IOSurface."];
+    [self append:@"La comparación lee solo metadatos de bibliotecas públicas cargadas en esta app."];
     [self append:@"Podés importar el registro .ips real tras reabrirla."];
     [self checkDevice:nil];
 }
@@ -220,6 +227,76 @@
     }
 }
 
+
+
+static NSString *FrameworkMachOUUID(NSString *component) {
+    NSString *part=[NSString stringWithFormat:@"/%@.framework/%@",component,component];
+    uint32_t imageCount=_dyld_image_count();
+    for(uint32_t i=0;i<imageCount;i++) {
+        const char *fullName=_dyld_get_image_name(i);
+        if(!fullName)continue;
+        NSString *name=[NSString stringWithUTF8String:fullName];
+        if(![name containsString:part])continue;
+        const struct mach_header *head=_dyld_get_image_header(i);
+        if(!head || head->magic!=MH_MAGIC_64) return @"NO_MACHO64";
+        const struct mach_header_64 *mach=(const struct mach_header_64 *)head;
+        const uint8_t *cursor=(const uint8_t *)(mach+1);
+        const uint8_t *limit=cursor+mach->sizeofcmds;
+        for(uint32_t index=0;index<mach->ncmds;index++){
+            if(cursor+sizeof(struct load_command)>limit)break;
+            const struct load_command *cmd=(const struct load_command *)cursor;
+            if(cmd->cmdsize<sizeof(struct load_command)||cursor+cmd->cmdsize>limit)break;
+            if(cmd->cmd==LC_UUID && cmd->cmdsize>=sizeof(struct uuid_command)){
+                const struct uuid_command *record=(const struct uuid_command *)cursor;
+                NSUUID *uuid=[[NSUUID alloc] initWithUUIDBytes:record->uuid];
+                return uuid.UUIDString?:@"UUID_NO_DISPONIBLE";
+            }
+            cursor+=cmd->cmdsize;
+        }
+        return @"UUID_NO_DISPONIBLE";
+    }
+    return @"NO_CARGADO";
+}
+
+- (void)checkFrameworkUUIDs:(id)sender {
+    [self append:@"FRAMEWORKS: leyendo UUID Mach-O del proceso local. Sin IPC a backboardd."];
+    NSString *expectedQuartz=@"21FA0104-F308-3BB3-8F3F-E9DE66F7CDEC";
+    NSDictionary *libraries=@{
+        @"QuartzCore":@"/System/Library/Frameworks/QuartzCore.framework/QuartzCore",
+        @"CoreMedia":@"/System/Library/Frameworks/CoreMedia.framework/CoreMedia",
+        @"IOSurface":@"/System/Library/Frameworks/IOSurface.framework/IOSurface"
+    };
+    NSMutableDictionary *observed=[NSMutableDictionary new];
+    for(NSString *component in @[@"QuartzCore",@"CoreMedia",@"IOSurface"]){
+        NSString *path=libraries[component];
+        void *library=dlopen(path.UTF8String,RTLD_LAZY|RTLD_LOCAL);
+        NSString *uuid=FrameworkMachOUUID(component);
+        [self append:[NSString stringWithFormat:@"FRAMEWORKS: %@ UUID=%@",component,uuid]];
+        observed[component]=uuid;
+        if(library)dlclose(library);
+    }
+    NSString *actual=observed[@"QuartzCore"]?:@"NO_CARGADO";
+    BOOL valid=[actual length]==36 && [actual containsString:@"-"];
+    BOOL match=valid && [actual caseInsensitiveCompare:expectedQuartz]==NSOrderedSame;
+    NSString *verdict=@"No se pudo leer QuartzCore; compatibilidad desconocida.";
+    if(valid && match) verdict=@"UUID de QuartzCore coincide con la muestra pública de iOS 27.1. Eso no prueba explotación.";
+    else if(valid) verdict=@"UUID de QuartzCore distinta a la muestra pública de iOS 27.1. La compatibilidad de cargas específicas no está demostrada.";
+    NSDictionary *report=@{
+        @"device":self.machine?:@"?",
+        @"iosBuild":self.build?:@"?",
+        @"iosVersion":UIDevice.currentDevice.systemVersion?:@"?",
+        @"reference":@"0xjohnnydev/CVE-2026-112688-backboardd (public research, iOS 27.1)",
+        @"expectedQuartzCoreUUID":expectedQuartz,
+        @"loadedFrameworkUUIDs":observed,
+        @"quartzCoreUUIDMatchesReference":@(match),
+        @"verdict":verdict,
+        @"checkedAt":[self stamp],
+        @"limitations":@"Local UUID inspection only. Does not compare symbols, determine vulnerability, trigger a crash, or access backboardd/kernel."
+    };
+    self.analysis[@"frameworkCompatibility"]=report;
+    [self append:[NSString stringWithFormat:@"FRAMEWORKS: %@",verdict]];
+    [self append:@"FRAMEWORKS: exportá el informe JSON y compartí el bloque frameworkCompatibility."];
+}
 
 - (NSString *)selfCrashCheckpointPath {
     return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
