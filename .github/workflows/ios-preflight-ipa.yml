@@ -38,6 +38,12 @@ jobs:
             -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/preflight-build" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Verificar versión real del Info.plist
+        run: |
+          INFO="$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.0"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "19"
+          test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
       - name: Crear IPA
         run: |
           mkdir -p "$RUNNER_TEMP/preflight-pkg/Payload"
