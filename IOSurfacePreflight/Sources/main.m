@@ -60,7 +60,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v3";
+    title.text = @"IOSurface Preflight v4";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -81,6 +81,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
       [self button:@"2. Servicio IOSurfaceRoot" action:@selector(rootProbe:)],
       [self button:@"3. Ciclo de vida público (3 pruebas)" action:@selector(lifecycleProbe:)],
       [self button:@"4. Identificadores simultáneos (A/B/C)" action:@selector(idReuseProbe:)],
+      [self button:@"5. Firma, permisos y servicio" action:@selector(accessPolicyProbe:)],
       [self button:@"Exportar registro" action:@selector(shareLog:)],
       self.logView
     ]];
@@ -103,7 +104,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v3"]; 
+    [self note:@"app=IOSurfacePreflight-v4"]; 
     [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
 }
 
@@ -355,6 +356,124 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
     release(service);
     dlclose(lib);
     [self note:@"ROOT: finalizado."];
+}
+
+
+- (void)accessPolicyProbe:(id)sender {
+    [self note:@"POLICY: inicio. Solo lectura de metadatos y entitlements propios."];
+    [self note:[NSString stringWithFormat:@"POLICY: bundle-id=%@", NSBundle.mainBundle.bundleIdentifier ?: @"NO_DISPONIBLE"]];
+    void *security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY | RTLD_LOCAL);
+    if (!security) {
+        [self note:@"POLICY: Security.framework NO_DISPONIBLE"];
+    } else {
+        typedef CFTypeRef (*SelfTaskFn)(CFAllocatorRef);
+        typedef CFTypeRef (*ReadEntitlementFn)(CFTypeRef, CFStringRef, CFErrorRef *);
+        SelfTaskFn createSelf = (SelfTaskFn)dlsym(security, "SecTaskCreateFromSelf");
+        ReadEntitlementFn readEntitlement = (ReadEntitlementFn)dlsym(security, "SecTaskCopyValueForEntitlement");
+        if (!createSelf || !readEntitlement) {
+            [self note:@"POLICY: interfaz SecTask NO_DISPONIBLE"];
+        } else {
+            CFTypeRef task = createSelf(kCFAllocatorDefault);
+            if (!task) {
+                [self note:@"POLICY: task de firma NO_DISPONIBLE"];
+            } else {
+                const CFStringRef keys[] = {
+                    CFSTR("com.apple.private.gpu-restricted"),
+                    CFSTR("com.apple.developer.gpu-restricted"),
+                    CFSTR("get-task-allow"),
+                    CFSTR("application-identifier")
+                };
+                const NSString *names[] = {
+                    @"gpu-restricted(private)", @"gpu-restricted(developer)",
+                    @"get-task-allow", @"application-identifier"
+                };
+                for (int i = 0; i < 4; i++) {
+                    CFErrorRef err = NULL;
+                    CFTypeRef value = readEntitlement(task, keys[i], &err);
+                    NSString *state = @"AUSENTE";
+                    if (value) {
+                        state = @"PRESENTE";
+                        if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+                            state = CFBooleanGetValue((CFBooleanRef)value) ? @"TRUE" : @"FALSE";
+                        }
+                        CFRelease(value);
+                    } else if (err) {
+                        state = @"NO_DETERMINABLE";
+                    }
+                    [self note:[NSString stringWithFormat:@"POLICY: entitlement %@=%@", names[i], state]];
+                    if (err) CFRelease(err);
+                }
+                CFRelease(task);
+            }
+        }
+        dlclose(security);
+    }
+    void *io = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY | RTLD_LOCAL);
+    if (!io) {
+        [self note:@"POLICY: IOKit.framework NO_DISPONIBLE"];
+        return;
+    }
+    MatchingFn matching = (MatchingFn)dlsym(io, "IOServiceMatching");
+    GetMatchingFn get = (GetMatchingFn)dlsym(io, "IOServiceGetMatchingService");
+    OpenServiceFn open = (OpenServiceFn)dlsym(io, "IOServiceOpen");
+    CloseServiceFn close = (CloseServiceFn)dlsym(io, "IOServiceClose");
+    ReleaseObjectFn release = (ReleaseObjectFn)dlsym(io, "IOObjectRelease");
+    typedef kern_return_t (*ClassFn)(io_object_t, char *);
+    typedef kern_return_t (*GetConnectionServiceFn)(io_connect_t, io_service_t *);
+    ClassFn getClass = (ClassFn)dlsym(io, "IOObjectGetClass");
+    GetConnectionServiceFn connectService = (GetConnectionServiceFn)dlsym(io, "IOConnectGetService");
+    if (!matching || !get || !open || !close || !release) {
+        [self note:@"POLICY: simbolos IOKit esenciales NO_DISPONIBLES"];
+        dlclose(io);
+        return;
+    }
+    CFMutableDictionaryRef query = matching("IOSurfaceRoot");
+    if (!query) {
+        [self note:@"POLICY: diccionario de busqueda NO_DISPONIBLE"];
+        dlclose(io);
+        return;
+    }
+    io_service_t service = get(MACH_PORT_NULL, query);
+    if (!service) {
+        [self note:@"POLICY: IOSurfaceRoot no visible"];
+        dlclose(io);
+        return;
+    }
+    if (getClass) {
+        char cls[128] = {0};
+        kern_return_t code = getClass(service, cls);
+        [self note:[NSString stringWithFormat:@"POLICY: service-class kr=0x%08x class=%s",
+                    (unsigned)code, code == KERN_SUCCESS ? cls : "NO_DISPONIBLE"]];
+    }
+    io_connect_t connection = MACH_PORT_NULL;
+    kern_return_t code = open(service, mach_task_self(), 0, &connection);
+    [self note:[NSString stringWithFormat:@"POLICY: IOServiceOpen kr=0x%08x", (unsigned)code]];
+    if (code == KERN_SUCCESS && connection != MACH_PORT_NULL) {
+        if (connectService) {
+            io_service_t owner = MACH_PORT_NULL;
+            kern_return_t ownerCode = connectService(connection, &owner);
+            [self note:[NSString stringWithFormat:@"POLICY: IOConnectGetService kr=0x%08x",
+                        (unsigned)ownerCode]];
+            if (ownerCode == KERN_SUCCESS && owner) {
+                if (getClass) {
+                    char ownerClass[128] = {0};
+                    kern_return_t classCode = getClass(owner, ownerClass);
+                    [self note:[NSString stringWithFormat:@"POLICY: connection-owner-class kr=0x%08x class=%s",
+                                (unsigned)classCode,
+                                classCode == KERN_SUCCESS ? ownerClass : "NO_DISPONIBLE"]];
+                }
+                release(owner);
+            }
+        } else {
+            [self note:@"POLICY: IOConnectGetService no exportado"];
+        }
+        kern_return_t closed = close(connection);
+        [self note:[NSString stringWithFormat:@"POLICY: IOServiceClose kr=0x%08x", (unsigned)closed]];
+    }
+    release(service);
+    dlclose(io);
+    [self note:@"POLICY: sin IOConnectCallMethod, sin selector, sin carreras."];
+    [self note:@"POLICY: no es posible determinar tabla interna A/B con estos metadatos por si solos."];
 }
 
 - (void)shareLog:(id)sender {
