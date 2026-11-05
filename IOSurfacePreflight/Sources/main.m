@@ -29,6 +29,7 @@ typedef kern_return_t (*ReleaseObjectFn)(io_object_t);
 
 typedef struct {
     IOSurfaceRef held;
+    IOSurfaceRef extra;
     IOSurfaceID identifier;
     size_t width, height, rowBytes, allocated;
     uint64_t marker;
@@ -83,7 +84,7 @@ static uint32_t probeRandom(uint32_t *state) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v6";
+    title.text = @"IOSurface Preflight v7";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -106,7 +107,8 @@ static uint32_t probeRandom(uint32_t *state) {
       [self button:@"4. Identificadores simultáneos (A/B/C)" action:@selector(idReuseProbe:)],
       [self button:@"5. Firma, permisos y servicio" action:@selector(accessPolicyProbe:)],
       [self button:@"6. Matriz IOSurface 484 casos" action:@selector(matrixProbe:)],
-      [self button:@"7. Fuzzing controlado (20.000 operaciones)" action:@selector(stressProbe:)],
+      [self button:@"7. Campaña de estados (30.000 operaciones)" action:@selector(campaignProbe:)],
+      [self button:@"8. Repetir última campaña" action:@selector(replayCampaignProbe:)],
       [self button:@"Detener fuzzing" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro" action:@selector(shareLog:)],
       self.logView
@@ -130,8 +132,22 @@ static uint32_t probeRandom(uint32_t *state) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v6"]; 
+    [self note:@"app=IOSurfacePreflight-v7"]; 
     [self note:@"Modo diagnóstico: sin carreras ni externalMethod."];
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceCampaign-checkpoint.json"];
+    NSData *previous = [NSData dataWithContentsOfFile:p];
+    if (previous) {
+        NSDictionary *state = [NSJSONSerialization JSONObjectWithData:previous options:0 error:NULL];
+        NSString *status = [state isKindOfClass:NSDictionary.class] ? state[@"status"] : nil;
+        if ([status isEqualToString:@"RUNNING"]) {
+            [self note:[NSString stringWithFormat:
+                @"CAMPAIGN: EJECUCIÓN PREVIA INCOMPLETA seed=%@ paso=%@ (puede ser cierre, suspensión o reinicio)",
+                state[@"seed"] ?: @"?",state[@"step"] ?: @"?"]];
+        } else if ([status isEqualToString:@"DONE"] || [status isEqualToString:@"STOPPED"]) {
+            [self note:[NSString stringWithFormat:@"CAMPAIGN: registro anterior %@ seed=%@",
+                status,state[@"seed"] ?: @"?"]];
+        }
+    }
 }
 
 - (void)publicProbe:(id)sender {
@@ -625,11 +641,11 @@ static uint32_t probeRandom(uint32_t *state) {
 
 - (void)stopStressProbe:(id)sender {
     if (!self.stressRunning) {
-        [self note:@"FUZZ: no hay prueba activa."];
+        [self note:@"CAMPAIGN: no hay prueba activa."];
         return;
     }
     self.stressStopRequested = YES;
-    [self note:@"FUZZ: detención solicitada; se liberarán las referencias vigentes."];
+    [self note:@"CAMPAIGN: detención solicitada; se liberarán las referencias vigentes."];
 }
 
 - (void)stressProbe:(id)sender {
@@ -879,6 +895,289 @@ static uint32_t probeRandom(uint32_t *state) {
     });
 }
 
+
+- (void)replayCampaignProbe:(id)sender {
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:@"IOSurfaceV7LastSeed"];
+    if (![value isKindOfClass:NSNumber.class]) {
+        [self note:@"CAMPAIGN: no hay una semilla anterior para repetir."];
+        return;
+    }
+    uint32_t seed = (uint32_t)[(NSNumber *)value unsignedIntValue];
+    [self runCampaignWithSeed:seed replay:YES];
+}
+
+- (void)campaignProbe:(id)sender {
+    uint32_t seed = arc4random();
+    if (!seed) seed = 0x71A72345;
+    [self runCampaignWithSeed:seed replay:NO];
+}
+
+- (void)runCampaignWithSeed:(uint32_t)seed replay:(BOOL)replay {
+    if (self.stressRunning || self.matrixRunning) {
+        [self note:@"CAMPAIGN: ya hay una prueba activa; no ejecutamos simultáneamente."];
+        return;
+    }
+    self.stressRunning = YES;
+    self.stressStopRequested = NO;
+    self.stressCSV = nil;
+    [NSUserDefaults.standardUserDefaults setObject:@(seed) forKey:@"IOSurfaceV7LastSeed"];
+    NSString *runID = NSUUID.UUID.UUIDString;
+    NSString *checkPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceCampaign-checkpoint.json"];
+    [self note:[NSString stringWithFormat:@"CAMPAIGN: %@ run=%@ seed=%u (0x%08x)",
+        replay ? @"REPLAY" : @"NEW", runID, seed, seed]];
+    [self note:@"CAMPAIGN: 30000 operaciones, 20 objetos vivos máximo, referencias independientes, mutaciones y verificaciones."];
+    [self note:@"CAMPAIGN: cada 500 casos se guarda el progreso en Documents; si se interrumpe, queda un checkpoint."];
+    [self note:@"CAMPAIGN: se intercalan aperturas/cierres válidos de IOSurfaceRoot sin selector privado."];
+    [self note:@"CAMPAIGN: no hay llamadas con punteros liberados ni competencia intencional entre hilos."];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            const unsigned limit=30000, capacity=20;
+            const size_t dimensions[]={8,16,24,32,48,64,96,128};
+            const size_t paddings[]={0,16,32,64};
+            ProbeLiveSurface objects[20]={0};
+            uint32_t state=seed;
+            unsigned executed=0, created=0, verified=0, modified=0;
+            unsigned closed=0, droppedExtra=0, retainedExtra=0, anomalies=0, peak=0, alive=0;
+            unsigned badCreate=0, badLookup=0, badContent=0, badMetadata=0, badLock=0, duplicateLive=0;
+            unsigned rootOpenOk=0, rootOpenError=0, postCloseAvailable=0;
+            CFAbsoluteTime began=CFAbsoluteTimeGetCurrent();
+            NSMutableString *records=[NSMutableString stringWithFormat:
+                @"run,seed,step,action,slot,id,expected,observed,result\n%@,%u,0,START,-1,0,0,0,START\n",
+                runID,seed];
+
+            void *framework=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY|RTLD_LOCAL);
+            CreateSurfaceFn create=framework ? (CreateSurfaceFn)dlsym(framework,"IOSurfaceCreate") : NULL;
+            GetSurfaceIDFn getID=framework ? (GetSurfaceIDFn)dlsym(framework,"IOSurfaceGetID") : NULL;
+            LookupSurfaceFn lookup=framework ? (LookupSurfaceFn)dlsym(framework,"IOSurfaceLookup") : NULL;
+            GetSurfaceDimensionFn getW=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetWidth") : NULL;
+            GetSurfaceDimensionFn getH=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetHeight") : NULL;
+            GetSurfaceDimensionFn getAlloc=framework ? (GetSurfaceDimensionFn)dlsym(framework,"IOSurfaceGetAllocSize") : NULL;
+            GetSurfaceBaseFn base=framework ? (GetSurfaceBaseFn)dlsym(framework,"IOSurfaceGetBaseAddress") : NULL;
+            SurfaceLockFn lock=framework ? (SurfaceLockFn)dlsym(framework,"IOSurfaceLock") : NULL;
+            SurfaceLockFn unlock=framework ? (SurfaceLockFn)dlsym(framework,"IOSurfaceUnlock") : NULL;
+
+            void *io=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_LAZY|RTLD_LOCAL);
+            MatchingFn matching=io ? (MatchingFn)dlsym(io,"IOServiceMatching") : NULL;
+            GetMatchingFn getService=io ? (GetMatchingFn)dlsym(io,"IOServiceGetMatchingService") : NULL;
+            OpenServiceFn openService=io ? (OpenServiceFn)dlsym(io,"IOServiceOpen") : NULL;
+            CloseServiceFn closeService=io ? (CloseServiceFn)dlsym(io,"IOServiceClose") : NULL;
+            ReleaseObjectFn releaseService=io ? (ReleaseObjectFn)dlsym(io,"IOObjectRelease") : NULL;
+
+            BOOL ready=create && getID && lookup && getW && getH && getAlloc && base && lock && unlock;
+            if (!ready) {
+                if (framework) dlclose(framework);
+                if (io) dlclose(io);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.stressRunning=NO;
+                    [self note:@"CAMPAIGN: faltan símbolos IOSurface públicos; ejecución cancelada."];
+                });
+                return;
+            }
+            BOOL stopped=NO;
+            for (unsigned step=1;step<=limit;step++) {
+                if (self.stressStopRequested) { stopped=YES; break; }
+                @autoreleasepool {
+                    unsigned index=probeRandom(&state)%capacity;
+                    unsigned op=probeRandom(&state)%100;
+                    ProbeLiveSurface *v=&objects[index];
+                    const char *action="CREATE", *result="PASS";
+                    IOSurfaceID id=v->identifier;
+                    uint64_t expected=v->marker,observed=0;
+
+                    if (!v->held) {
+                        size_t w=dimensions[probeRandom(&state)%8];
+                        size_t h=dimensions[probeRandom(&state)%8];
+                        size_t row=w*4+paddings[probeRandom(&state)%4];
+                        size_t alloc=row*h;
+                        expected=0x71A72026ABCD0000ULL ^ ((uint64_t)step<<21) ^
+                                 ((uint64_t)index<<15) ^ probeRandom(&state);
+                        NSDictionary *params=@{
+                            @"IOSurfaceWidth":@(w),@"IOSurfaceHeight":@(h),
+                            @"IOSurfaceBytesPerElement":@4,@"IOSurfaceBytesPerRow":@(row),
+                            @"IOSurfaceAllocSize":@(alloc),@"IOSurfacePixelFormat":@(0x42475241)
+                        };
+                        IOSurfaceRef original=create((__bridge CFDictionaryRef)params);
+                        if (!original) {
+                            badCreate++; result="CREATE_NULL";
+                        } else {
+                            id=getID(original);
+                            IOSurfaceRef held=lookup(id);
+                            IOSurfaceRef extra=held ? lookup(id) : NULL;
+                            CFRelease(original);
+                            if (!held || !extra) {
+                                badLookup++;result="LOOKUP_NULL";
+                                if (held) CFRelease(held);
+                                if (extra) CFRelease(extra);
+                            } else {
+                                kern_return_t kr=lock(held,0,NULL);
+                                if (kr!=KERN_SUCCESS) {
+                                    badLock++;result="INITIAL_LOCK";
+                                } else {
+                                    void *ptr=base(held);
+                                    if (ptr) memcpy(ptr,&expected,sizeof(expected));
+                                    else {badLock++;result="INITIAL_BASE_NULL";}
+                                    kern_return_t u=unlock(held,0,NULL);
+                                    if (u!=KERN_SUCCESS) {badLock++;result="INITIAL_UNLOCK";}
+                                }
+                                if (strcmp(result,"PASS")==0) {
+                                    for(unsigned j=0;j<capacity;j++)
+                                        if(objects[j].held && objects[j].identifier==id) {
+                                            duplicateLive++;result="DUPLICATE_LIVE_ID";break;
+                                        }
+                                }
+                                if (strcmp(result,"PASS")==0) {
+                                    v->held=held;v->extra=extra;v->identifier=id;
+                                    v->width=w;v->height=h;v->rowBytes=row;v->allocated=alloc;v->marker=expected;
+                                    created++;alive++;if(alive>peak)peak=alive;
+                                } else {
+                                    CFRelease(held);CFRelease(extra);
+                                }
+                            }
+                        }
+                    } else if (op<20) {
+                        action="RELEASE";
+                        if(v->extra) CFRelease(v->extra);
+                        CFRelease(v->held);
+                        memset(v,0,sizeof(*v));
+                        alive--;closed++;
+                        IOSurfaceRef found=lookup(id);
+                        if(found){postCloseAvailable++;CFRelease(found);result="RELEASED_ID_AVAILABLE";}
+                        else result="RELEASED_ID_UNAVAILABLE";
+                    } else if (op<34) {
+                        action="EXTRA_REF";
+                        if(v->extra) {
+                            CFRelease(v->extra);v->extra=NULL;droppedExtra++;
+                            result="DROPPED_ONE_REFERENCE";
+                        } else {
+                            v->extra=lookup(id);
+                            if(!v->extra){badLookup++;result="EXTRA_LOOKUP_NULL";}
+                            else {retainedExtra++;result="ACQUIRED_SECOND_REFERENCE";}
+                        }
+                    } else if (op<58) {
+                        action="WRITE";
+                        IOSurfaceRef ref=lookup(id);
+                        if(!ref) {badLookup++;result="WRITE_LOOKUP_NULL";}
+                        else {
+                            uint64_t next=expected ^ ((uint64_t)step<<7) ^ probeRandom(&state);
+                            kern_return_t kr=lock(ref,0,NULL);
+                            if(kr!=KERN_SUCCESS){badLock++;result="WRITE_LOCK";}
+                            else {
+                                void *ptr=base(ref);
+                                if(!ptr){badLock++;result="WRITE_BASE_NULL";}
+                                else {memcpy(ptr,&next,sizeof(next));v->marker=next;expected=next;modified++;}
+                                kern_return_t u=unlock(ref,0,NULL);
+                                if(u!=KERN_SUCCESS){badLock++;result="WRITE_UNLOCK";}
+                            }
+                            CFRelease(ref);
+                        }
+                    } else {
+                        action="VERIFY";verified++;
+                        IOSurfaceRef ref=lookup(id);
+                        if(!ref){badLookup++;result="VERIFY_LOOKUP_NULL";}
+                        else {
+                            if(getW(ref)!=v->width || getH(ref)!=v->height || getAlloc(ref)<v->allocated) {
+                                badMetadata++;result="BAD_DIMENSIONS";
+                            }
+                            kern_return_t kr=lock(ref,1,NULL);
+                            if(kr!=KERN_SUCCESS){badLock++;result="READ_LOCK";}
+                            else {
+                                void *ptr=base(ref);
+                                if(!ptr){badLock++;result="READ_BASE_NULL";}
+                                else {
+                                    memcpy(&observed,ptr,sizeof(observed));
+                                    if(observed!=expected){badContent++;result="BAD_CONTENT";}
+                                }
+                                kern_return_t u=unlock(ref,1,NULL);
+                                if(u!=KERN_SUCCESS){badLock++;result="READ_UNLOCK";}
+                            }
+                            CFRelease(ref);
+                        }
+                    }
+                    if(strcmp(result,"PASS")!=0 &&
+                       strcmp(result,"DROPPED_ONE_REFERENCE")!=0 &&
+                       strcmp(result,"ACQUIRED_SECOND_REFERENCE")!=0 &&
+                       strcmp(result,"RELEASED_ID_AVAILABLE")!=0 &&
+                       strcmp(result,"RELEASED_ID_UNAVAILABLE")!=0)
+                        anomalies++;
+                    [records appendFormat:@"%@,%u,%u,%s,%u,%u,0x%016llx,0x%016llx,%s\n",
+                        runID,seed,step,action,index,(unsigned)id,
+                        (unsigned long long)expected,(unsigned long long)observed,result];
+                    executed++;
+                }
+
+                if ((step % 500)==0) {
+                    // Close an independent, valid service connection while surfaces are alive.
+                    if (matching && getService && openService && closeService && releaseService) {
+                        CFMutableDictionaryRef dict=matching("IOSurfaceRoot");
+                        if(dict) {
+                            io_service_t service=getService(MACH_PORT_NULL,dict);
+                            if(service) {
+                                io_connect_t conn=MACH_PORT_NULL;
+                                kern_return_t k=openService(service,mach_task_self(),0,&conn);
+                                if(k==KERN_SUCCESS && conn) {
+                                    rootOpenOk++;
+                                    closeService(conn);
+                                } else rootOpenError++;
+                                releaseService(service);
+                            } else rootOpenError++;
+                        } else rootOpenError++;
+                    }
+                    NSDictionary *checkpoint=@{
+                        @"run":runID,@"seed":@(seed),@"step":@(step),
+                        @"status":@"RUNNING",@"created":@(created),@"verified":@(verified),
+                        @"anomalies":@(anomalies),@"timestamp":[NSDate date].description
+                    };
+                    NSData *bytes=[NSJSONSerialization dataWithJSONObject:checkpoint options:0 error:NULL];
+                    if(bytes) [bytes writeToFile:checkPath options:NSDataWritingAtomic error:NULL];
+                    unsigned count=executed, issues=anomalies, aliveNow=alive;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self note:[NSString stringWithFormat:
+                            @"CAMPAIGN: %u/%u casos, anomalías=%u, objetos_vivos=%u",
+                            count,limit,issues,aliveNow]];
+                    });
+                    usleep(200000);
+                }
+            }
+            for(unsigned j=0;j<capacity;j++) {
+                if(objects[j].extra) CFRelease(objects[j].extra);
+                if(objects[j].held) CFRelease(objects[j].held);
+                memset(&objects[j],0,sizeof(objects[j]));
+            }
+            if(framework) dlclose(framework);
+            if(io) dlclose(io);
+            NSDictionary *finish=@{
+                @"run":runID,@"seed":@(seed),@"step":@(executed),
+                @"status":stopped ? @"STOPPED" : @"DONE",
+                @"created":@(created),@"verified":@(verified),@"modified":@(modified),
+                @"released":@(closed),@"anomalies":@(anomalies),
+                @"rootOpenOk":@(rootOpenOk),@"rootOpenError":@(rootOpenError),
+                @"elapsed":@(CFAbsoluteTimeGetCurrent()-began),
+                @"timestamp":[NSDate date].description
+            };
+            NSData *output=[NSJSONSerialization dataWithJSONObject:finish options:NSJSONWritingPrettyPrinted error:NULL];
+            if(output) [output writeToFile:checkPath options:NSDataWritingAtomic error:NULL];
+            NSString *csv=[records copy];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.stressCSV=csv;
+                self.stressRunning=NO;
+                [self note:[NSString stringWithFormat:
+                    @"CAMPAIGN: FINAL %@ run=%@ seed=%u pasos=%u/%u anomalias=%u",
+                    stopped?@"STOPPED":@"DONE",runID,seed,executed,limit,anomalies]];
+                [self note:[NSString stringWithFormat:
+                    @"CAMPAIGN: create=%u verify=%u write=%u released=%u drop_ref=%u add_ref=%u peak=%u",
+                    created,verified,modified,closed,droppedExtra,retainedExtra,peak]];
+                [self note:[NSString stringWithFormat:
+                    @"CAMPAIGN: ERR create=%u lookup=%u content=%u metadata=%u lock=%u duplicateID=%u",
+                    badCreate,badLookup,badContent,badMetadata,badLock,duplicateLive]];
+                [self note:[NSString stringWithFormat:
+                    @"CAMPAIGN: IOSurfaceRoot open=%u failed=%u IDs disponibles tras cierre=%u",
+                    rootOpenOk,rootOpenError,postCloseAvailable]];
+                [self note:@"CAMPAIGN: exportá TXT, CSV y checkpoint JSON. Un cierre inesperado no demuestra corrupción del kernel."];
+            });
+        }
+    });
+}
+
 - (void)shareLog:(id)sender {
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
@@ -888,13 +1187,17 @@ static uint32_t probeRandom(uint32_t *state) {
     }
     NSMutableArray *filesToShare = [NSMutableArray arrayWithObject:[NSURL fileURLWithPath:p]];
     if (self.stressCSV.length > 0) {
-        NSString *csvPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-v6-fuzz.csv"];
+        NSString *csvPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-v7-campaign.csv"];
         NSError *csvError = nil;
         if ([self.stressCSV writeToFile:csvPath atomically:YES encoding:NSUTF8StringEncoding error:&csvError]) {
             [filesToShare addObject:[NSURL fileURLWithPath:csvPath]];
         } else {
             [self note:[NSString stringWithFormat:@"FUZZ: error exportando CSV: %@", csvError.localizedDescription]];
         }
+    }
+    NSString *checkpoint = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceCampaign-checkpoint.json"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:checkpoint]) {
+        [filesToShare addObject:[NSURL fileURLWithPath:checkpoint]];
     }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
