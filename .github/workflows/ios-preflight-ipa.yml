@@ -50,6 +50,15 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.3"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "22"
           test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
+          python3 - "$INFO" <<'PY'
+          import plistlib
+          import sys
+          with open(sys.argv[1], 'rb') as fp:
+              p = plistlib.load(fp)
+          assert p.get("UIFileSharingEnabled") is True, p.get("UIFileSharingEnabled")
+          assert p.get("LSSupportsOpeningDocumentsInPlace") is True, p.get("LSSupportsOpeningDocumentsInPlace")
+          print("Files app access: enabled")
+          PY
       - name: Crear IPA
         run: |
           mkdir -p "$RUNNER_TEMP/preflight-pkg/Payload"
