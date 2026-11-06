@@ -13,6 +13,7 @@
 #import "PFBootClassifier.h"
 #import "PFMemoryEligibility.h"
 #import "PFBoundedBatch.h"
+#import "PFNoveltyCoverage.h"
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -222,7 +223,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.4";
+    title.text = @"IOSurface Preflight v19.5";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -262,6 +263,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
       [self button:@"21. Fuzzing corregido IOSurface (100.000 casos)" action:@selector(bruteForceProbe:)],
       [self button:@"22. Repetir fuerza bruta (misma semilla)" action:@selector(replayBruteForceProbe:)],
       [self button:@"23. Fuerza bruta controlada: 3 x 50.000" action:@selector(startBoundedBatch:)],
+      [self button:@"24. Fuerza bruta de entradas nuevas (hasta 50.000)" action:@selector(noveltyProbe:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -294,7 +296,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.4"]; 
+    [self note:@"app=IOSurfacePreflight-v19.5"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -1690,6 +1692,103 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+
+// Historical source: only a bounded number of recent self-generated CSV files.
+// This observes user-space input coverage; it is not a kernel coverage oracle.
+- (NSDictionary<NSString *,NSNumber *> *)loadNoveltyHistory:(PFNoveltySet *)set {
+    NSFileManager *fm=NSFileManager.defaultManager;
+    NSString *root=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/IOSurfaceRuns"];
+    NSArray<NSString *> *folders=[fm contentsOfDirectoryAtPath:root error:NULL]?:@[];
+    NSMutableArray<NSDictionary *> *files=[NSMutableArray new];
+    NSUInteger ignoredLarge=0;
+    for(NSString *folder in folders) {
+        NSString *path=[[root stringByAppendingPathComponent:folder]
+                         stringByAppendingPathComponent:@"boundary-trace.csv"];
+        NSDictionary *attrs=[fm attributesOfItemAtPath:path error:NULL];
+        if(!attrs || ![attrs[NSFileType] isEqualToString:NSFileTypeRegular])
+            continue;
+        unsigned long long size=[attrs[NSFileSize] unsignedLongLongValue];
+        if(size>32ULL*1024ULL*1024ULL) { ignoredLarge++;continue; }
+        [files addObject:@{@"path":path, @"modified":attrs[NSFileModificationDate]?:[NSDate distantPast]}];
+    }
+    [files sortUsingComparator:^NSComparisonResult(NSDictionary *a,NSDictionary *b) {
+        NSComparisonResult date=[b[@"modified"] compare:a[@"modified"]];
+        return date!=NSOrderedSame?date:[a[@"path"] compare:b[@"path"]];
+    }];
+    __block NSUInteger rows=0,inserted=0,duplicateRows=0,badRows=0;
+    NSUInteger processedFiles=0;
+    __block BOOL tableFull=NO,rowLimitHit=NO;
+    for(NSDictionary *item in files) {
+        if(processedFiles>=PF_NOVELTY_HISTORY_FILE_LIMIT ||
+           rows>=PF_NOVELTY_HISTORY_ROW_LIMIT) {rowLimitHit=YES;break;}
+        NSString *csv=[NSString stringWithContentsOfFile:item[@"path"]
+                                    encoding:NSUTF8StringEncoding error:NULL];
+        if(![csv hasPrefix:@"run,seed,case,"]) { badRows++;continue; }
+        processedFiles++;
+        __block BOOL skipHeader=YES;
+        [csv enumerateLinesUsingBlock:^(NSString *line,BOOL *stop) {
+            if(skipHeader) {skipHeader=NO;return;}
+            if(rows>=PF_NOVELTY_HISTORY_ROW_LIMIT) {
+                rowLimitHit=YES;*stop=YES;return;
+            }
+            @autoreleasepool {
+                NSArray<NSString *> *fields=[line componentsSeparatedByString:@","];
+                if(fields.count<11) {badRows++;return;}
+                rows++;
+                uint32_t width=(uint32_t)[fields[3] unsignedLongLongValue];
+                uint32_t height=(uint32_t)[fields[4] unsignedLongLongValue];
+                uint32_t element=(uint32_t)[fields[5] unsignedLongLongValue];
+                uint32_t row=(uint32_t)[fields[6] unsignedLongLongValue];
+                uint32_t allocation=(uint32_t)[fields[7] unsignedLongLongValue];
+                uint32_t format=(uint32_t)strtoul([fields[8] UTF8String],NULL,0);
+                BOOL omitRow=[fields[9] boolValue],omitAlloc=[fields[10] boolValue];
+                PFEffectiveInputKey key=PFEffectiveKey(width,height,element,row,allocation,
+                                                        format,omitRow,omitAlloc);
+                int result=PFNoveltyInsertWithOrigin(set,&key,1,NULL);
+                if(result>0) inserted++;
+                else if(result==0) duplicateRows++;
+                else {tableFull=YES;*stop=YES;}
+            }
+        }];
+        if(tableFull) break;
+    }
+    return @{
+        @"files_loaded":@(processedFiles),
+        @"rows_scanned":@(rows),@"historical_unique":@(inserted),
+        @"duplicate_historical_rows":@(duplicateRows),
+        @"invalid_csv_rows":@(badRows),
+        @"skipped_large_files":@(ignoredLarge),
+        @"window_truncated":@(rowLimitHit ||
+                              files.count>PF_NOVELTY_HISTORY_FILE_LIMIT || ignoredLarge>0),
+        @"table_full":@(tableFull)
+    };
+}
+
+- (void)noveltyProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.batchRunning ||
+       self.controlledCloseRunning) {
+        [self note:@"NOVELTY: otra prueba está activa; no se solapan las campañas."];
+        return;
+    }
+    UIAlertController *alert=[UIAlertController alertControllerWithTitle:
+        @"Nuevas configuraciones IOSurface (50.000 máximo)"
+        message:@"Consulta hasta seis CSV históricos y 250.000 filas, deduplica las configuraciones efectivamente enviadas y usa un generador reproducible diferente. Examina como máximo 200.000 candidatos para buscar hasta 50.000 configuraciones nuevas. Sigue usando únicamente APIs públicas y memoria propia. Requiere espacio disponible; guardá tus datos antes de continuar."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancelar"
+        style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf=self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Ejecutar cobertura nueva"
+        style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        typeof(self) selfRef=weakSelf;
+        if(!selfRef || selfRef.stressRunning || selfRef.matrixRunning || selfRef.batchRunning ||
+           selfRef.controlledCloseRunning) return;
+        uint32_t seed=arc4random();
+        if(!seed)seed=0xA1152026;
+        [selfRef runBoundaryProbeSeed:seed replay:NO totalCases:PF_NOVELTY_TARGET_CASES novelty:YES];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (void)bruteForceProbe:(id)sender {
     if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning || self.batchRunning) {
         [self note:@"BRUTE: ya se esta ejecutando otra prueba."];
@@ -1736,6 +1835,11 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 }
 
 - (void)runBoundaryProbeSeed:(uint32_t)seed replay:(BOOL)replay totalCases:(unsigned)limit {
+    [self runBoundaryProbeSeed:seed replay:replay totalCases:limit novelty:NO];
+}
+
+- (void)runBoundaryProbeSeed:(uint32_t)seed replay:(BOOL)replay
+                 totalCases:(unsigned)limit novelty:(BOOL)noveltyMode {
     if (self.stressRunning || self.matrixRunning || (self.batchRunning && !self.batchDispatching)) {
         [self note:@"BOUNDARY: ya hay una prueba activa."];
         return;
@@ -3756,6 +3860,13 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             if([[NSFileManager defaultManager] fileExistsAtPath:file])
                 [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
+    }
+    for(NSString *file in @[@"IOSurfaceNovelty-v19_5.json",
+                            @"IOSurfaceNovelty-v19_5.csv"]) {
+        NSString *path=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                          stringByAppendingPathComponent:file];
+        if([[NSFileManager defaultManager] fileExistsAtPath:path])
+            [filesToShare addObject:[NSURL fileURLWithPath:path]];
     }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
