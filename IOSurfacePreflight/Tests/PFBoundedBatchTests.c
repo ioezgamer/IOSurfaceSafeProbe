@@ -15,6 +15,6 @@ int main(void) {
     assert(!PFBatchCanAdvance(0,3,true,false,false));
     assert(!PFBatchCanAdvance(0,3,false,true,false));
     assert(!PFBatchCanAdvance(0,3,false,false,true));
-    puts("11/11 bounded batch tests passed");
+    puts("12/12 bounded batch tests passed");
     return 0;
 }
