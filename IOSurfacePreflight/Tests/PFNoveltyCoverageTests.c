@@ -32,6 +32,15 @@ int main(void) {
     assert(PFNoveltyInsert(set,&omitAllocB)==0);
     assert(set->used==4);
 
+    uint8_t origin=0;
+    const PFEffectiveInputKey old=PFEffectiveKey(7,7,4,28,196,0x42475241,false,false);
+    assert(PFNoveltyInsertWithOrigin(set,&old,1,&origin)==1);
+    assert(PFNoveltyInsertWithOrigin(set,&old,2,&origin)==0);
+    assert(origin==1); // historic duplicate is distinguishable
+    assert(PFNoveltyInsertWithOrigin(set,&a,2,&origin)==0);
+    assert(origin==2); // same-campaign duplicate
+    assert(PFNoveltyInsertWithOrigin(set,&old,3,&origin)==-1);
+
     uint64_t state1=PFNoveltySeed(123456789U);
     uint64_t state2=PFNoveltySeed(123456789U);
     uint64_t state3=PFNoveltySeed(123456790U);
@@ -61,6 +70,6 @@ int main(void) {
     assert(small->used==6);
     PFNoveltyDestroy(small);
     PFNoveltyDestroy(set);
-    puts("28/28 effective-input/seed/guard assertions passed");
+    puts("deterministic effective-input/seed/guard assertions passed");
     return 0;
 }
