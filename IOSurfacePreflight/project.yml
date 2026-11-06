@@ -16,6 +16,14 @@ targets:
       - Sources
       - path: PrivacyInfo.xcprivacy
         buildPhase: resources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: IOSurface Preflight
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.iosurface.preflight
@@ -27,7 +35,5 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: "IOSurface Preflight"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "NO"
-        INFOPLIST_KEY_UIFileSharingEnabled: "YES"
-        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: "YES"
     dependencies:
       - sdk: IOSurface.framework
