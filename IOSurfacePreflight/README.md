@@ -81,3 +81,15 @@ Una campaña de 100.000 casos ahora registra en el **mismo monitor de actividad*
 Estos eventos permiten cruzar el tiempo de actividad y el identificador de campaña con los archivos `IOSurfaceBruteForce-v18-trace.csv` y `IOSurfaceBruteForce-v18-checkpoint.json` (el nombre del CSV se conserva por compatibilidad). El hecho de que existan eventos `BEGIN` y `END` no demuestra ausencia de errores del kernel; solo mejora la trazabilidad de lo observado desde la aplicación. Los eventos del monitor no son trazas internas del kernel.
 
 Para verificar esta mejora, ejecutar una campaña controlada y exportar `IOSurfaceBootMonitor-trace.csv`, `IOSurfaceBootMonitor-checkpoint.json`, la traza y el checkpoint de campaña. No repetir automáticamente el mismo conjunto de 100.000 casos salvo que se busque reproducibilidad.
+
+## v19.2: cobertura agrupada de memoria propia
+
+En la campaña v19.1 de 50,000 casos, hubo 1,166 superficies BGRA/4 candidatas según metadatos públicos, pero solo se verificaron 123. La v19.2 comprueba cada candidata (sin criterio `n % 8`) con un límite de 4,096 superficies por campaña, y tres posiciones de píxel por superficie: primer byte, canal del píxel central y último byte. Cada escritura es reversible y está limitada por `minimumSpan` y `IOSurfaceGetAllocSize` sobre superficies propias, con bloqueo y desbloqueo público.
+
+Nuevos archivos exportables tras una campaña:
+- `IOSurfaceCoverage-v19_2.json`: identificador y semilla de ejecución, cobertura, resultados de integridad, agrupación por entrada y clases observadas.
+- `IOSurfaceCoverage-v19_2.csv`: resultados agregados por categoría de entrada solicitada.
+
+En el checkpoint final se añaden `integrity_eligible`, `integrity_byte_checks`, `integrity_skipped_by_budget` e `integrity_coverage_pct`. Las categorías identifican atributos de entrada, NO causas demostradas de rechazo de la API. Los rechazos ordinarios NO se contabilizan como vulnerabilidades.
+
+La app no obtiene acceso al kernel, no accede a memoria liberada y no añade llamadas privadas. El artefacto IPA de CI se genera **sin firma**; se requiere firma autorizada antes de instalar en iOS.
