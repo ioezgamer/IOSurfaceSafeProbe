@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 
 enum {
     PF_NOVELTY_TARGET_CASES = 50000,
@@ -52,6 +53,18 @@ static inline bool PFEffectiveKeyEqual(const PFEffectiveInputKey *a,
         a->bytesPerRow == b->bytesPerRow &&
         a->allocationSize == b->allocationSize &&
         a->pixelFormat == b->pixelFormat && a->flags == b->flags;
+}
+
+// Validate complete decimal/hex input fields before importing user-editable
+// archived CSV. Reject negatives, truncations, and nonnumeric suffixes.
+static inline bool PFNoveltyParseU32(const char *text,int base,uint32_t *value) {
+    if(!text || !*text || !value || (*text<'0' || *text>'9')) return false;
+    errno=0;
+    char *end=NULL;
+    unsigned long long parsed=strtoull(text,&end,base);
+    if(errno!=0 || end==text || *end!='\0' || parsed>UINT32_MAX) return false;
+    *value=(uint32_t)parsed;
+    return true;
 }
 
 // Mix every exact field explicitly. Open addressing checks complete keys
