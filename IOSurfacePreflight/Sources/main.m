@@ -2430,8 +2430,12 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 @"schema":noveltyMode?@"v19.5-archived-run":@"v19.3-archived-run",
                 @"run":run,@"seed":@(seed),@"total_cases":@(attempts),
                 @"status":final[@"status"],@"timestamp":[NSDate date].description,
-                @"files":@[@"checkpoint.json",@"boundary-trace.csv",@"coverage.json",
-                           @"input-groups.csv",@"formats.csv",@"eligibility.csv"],
+                @"files":noveltyMode ?
+                    @[@"checkpoint.json",@"boundary-trace.csv",@"coverage.json",
+                      @"input-groups.csv",@"formats.csv",@"eligibility.csv",
+                      @"novelty.json",@"novelty-duplicates.csv"] :
+                    @[@"checkpoint.json",@"boundary-trace.csv",@"coverage.json",
+                      @"input-groups.csv",@"formats.csv",@"eligibility.csv"],
                 @"scope":@"Public API + own bounded BGRA surfaces; not a kernel trace",
                 @"mode":noveltyMode?@"EFFECTIVE_NOVELTY":@"LEGACY"
             };
@@ -2440,6 +2444,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             if(manifestBytes)
                 [manifestBytes writeToFile:[runDirectory stringByAppendingPathComponent:@"manifest.json"]
                                   options:NSDataWritingAtomic error:NULL];
+            BOOL noveltyExportsOK=YES;
             if(noveltyMode) {
                 NSDictionary *noveltyReport=@{
                     @"schema":@"v19.5-effective-input-novelty",
@@ -2454,6 +2459,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                     @"skipped_current_run":@(skippedWithinRun),
                     @"skipped_duplicates_total":@(skippedHistoric+skippedWithinRun),
                     @"new_distinct_configs_tested":@(attempts),
+                    @"newness_pct_of_generated":@(generatedCandidates ?
+                          (100.0*(double)attempts/(double)generatedCandidates):0.0),
                     @"new_accepted":@(accepted),@"new_rejected":@(rejected),
                     @"exceptions":@(exceptions),@"review":@(review),
                     @"integrity_tested":@(sampled),@"integrity_passed":@(samplePassed),
@@ -2467,12 +2474,13 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 };
                 NSData *reportData=[NSJSONSerialization dataWithJSONObject:noveltyReport
                                            options:NSJSONWritingPrettyPrinted error:NULL];
-                if(reportData) {
-                    [reportData writeToFile:[docs stringByAppendingPathComponent:
-                        @"IOSurfaceNovelty-v19_5.json"] options:NSDataWritingAtomic error:NULL];
-                    [reportData writeToFile:[runDirectory stringByAppendingPathComponent:
-                        @"novelty.json"] options:NSDataWritingAtomic error:NULL];
-                }
+                BOOL savedRootJSON=reportData && [reportData writeToFile:
+                    [docs stringByAppendingPathComponent:@"IOSurfaceNovelty-v19_5.json"]
+                    options:NSDataWritingAtomic error:NULL];
+                BOOL savedArchiveJSON=reportData && [reportData writeToFile:
+                    [runDirectory stringByAppendingPathComponent:@"novelty.json"]
+                    options:NSDataWritingAtomic error:NULL];
+                noveltyExportsOK=savedRootJSON && savedArchiveJSON;
                 NSMutableString *noveltyCSV=[NSMutableString stringWithString:
                     @"requested_format,skipped_historical,skipped_within_run\n"];
                 for(NSString *name in @[@"BGRA_REQUESTED",@"RGBA_REQUESTED",
@@ -2481,12 +2489,13 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         (unsigned long)[duplicatesHistoricByFormat[name] unsignedIntegerValue],
                         (unsigned long)[duplicatesCurrentByFormat[name] unsignedIntegerValue]];
                 }
-                [noveltyCSV writeToFile:[docs stringByAppendingPathComponent:
-                    @"IOSurfaceNovelty-v19_5.csv"] atomically:YES
-                               encoding:NSUTF8StringEncoding error:NULL];
-                [noveltyCSV writeToFile:[runDirectory stringByAppendingPathComponent:
-                    @"novelty-duplicates.csv"] atomically:YES
-                               encoding:NSUTF8StringEncoding error:NULL];
+                BOOL savedRootCSV=[noveltyCSV writeToFile:
+                    [docs stringByAppendingPathComponent:@"IOSurfaceNovelty-v19_5.csv"]
+                    atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                BOOL savedArchiveCSV=[noveltyCSV writeToFile:
+                    [runDirectory stringByAppendingPathComponent:@"novelty-duplicates.csv"]
+                    atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                noveltyExportsOK=noveltyExportsOK && savedRootCSV && savedArchiveCSV;
             }
             if(noveltySet) PFNoveltyDestroy(noveltySet);
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -2497,8 +2506,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                     skippedByBudget]];
                 self.stressCSV=exportCSV;
                 self.stressRunning=NO;
-                NSString *endStatus=(sampleMismatch||sampleUnlockFailed)?
-                    @"STOPPED_ON_INTEGRITY_ERROR":stopped?@"STOPPED":@"DONE";
+                NSString *endStatus=final[@"status"];
                 [self recordBootEvent:[NSString stringWithFormat:
                     @"BOUNDARY_END_%@_%@",run,endStatus]];
                 [self note:[NSString stringWithFormat:
@@ -2519,6 +2527,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         generatedCandidates,skippedHistoric,skippedWithinRun,
                         attempts,limit,candidateBudget,final[@"status"]]];
                     [self note:@"NOVELTY: novedad relativa a los archivos recientes importados; no es cobertura interna del kernel."];
+                    if(!noveltyExportsOK)
+                        [self note:@"NOVELTY: ERROR al guardar algunos informes; revisá espacio libre antes de repetir."];
                 }
                 if(batchMode) [self boundedBatchRunCompleted:run seed:seed result:final];
             });
