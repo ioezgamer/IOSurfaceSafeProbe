@@ -114,3 +114,25 @@ clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFMemoryEligibilit
 \`\`\`
 
 En iOS, los resultados archivados se pueden consultar en **Archivos → En mi iPhone → IOSurface Preflight → IOSurfaceRuns**, gracias a `UIFileSharingEnabled` y `LSSupportsOpeningDocumentsInPlace`. Si la instalación o la firma no habilitan esa carpeta, el botón **Exportar** sigue ofreciendo los archivos de la campaña más reciente.
+
+## v19.4: fuerza bruta controlada por lotes sobre API pública
+
+La opción **23. Fuerza bruta controlada: 3 x 50.000** ejecuta tres campañas secuenciales de 50,000 casos sobre la API pública de IOSurface con semillas únicas dentro del lote, máximo 150,000 casos. Cada ejecución usa las mismas reglas de generación y comprobación acotada que la v19.3. No realiza llamadas privadas, acceso a punteros liberados ni pruebas de escalada de privilegios.
+
+- Presenta confirmación antes de iniciar la campaña; no admite solapamiento con otras pruebas.
+- Revisa resultados entre lotes y detiene la secuencia si hay excepciones, errores de integridad, alertas de revisión o problemas de persistencia. Un error registrado durante un lote lo interrumpe al terminar la iteración actual.
+- El botón **Detener prueba activa** cancela el lote en curso y evita que empiecen los restantes.
+- Cada subcampaña queda archivada en \`Documents/IOSurfaceRuns/<run-uuid>/\` con su propia semilla, checkpoint, trazas, cobertura y formatos.
+- La campaña agrupada se archiva en \`Documents/IOSurfaceBatches/<batch-uuid>/manifest.json\` y \`summary.csv\`. Sus últimas versiones también aparecen como \`IOSurfaceBruteForceBatch-v19_4.json\` y \`IOSurfaceBruteForceBatch-v19_4.csv\` en \`Documents/\`.
+- La aplicación **no** reinicia automáticamente una campaña interrumpida después de cerrarse. Los archivos persistidos permiten revisar su último estado, que puede quedar \`RUNNING\` si la aplicación se cerró inesperadamente.
+
+El archivo \`manifest.json\` conserva las semillas, los identificadores de cada subcampaña, los resultados y los totales para reproducibilidad. Todos los archivos permanecen locales hasta que el usuario los exporta.
+
+**Precaución:** es una campaña de diagnóstico más extensa y puede afectar a la estabilidad o al espacio de almacenamiento disponible. Un resultado sin anomalías no demuestra que no existan vulnerabilidades, y ninguna anomalía aislada demuestra UAF, exploit ni KernelRW.
+
+### Pruebas nuevas
+
+\`\`\`sh
+clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFBoundedBatchTests.c -o /tmp/pf-batch-tests
+/tmp/pf-batch-tests
+\`\`\`
