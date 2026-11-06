@@ -52,6 +52,35 @@ int main(void) {
         if(seq1[i]!=PFNoveltyRandom(&state3)) differs=true;
     }
     assert(differs);
+    const uint32_t golden[]={
+        975844233U,1484448984U,513616250U,4088117719U,
+        1117445609U,2249130873U,529421484U,3779317751U
+    };
+    for(size_t i=0;i<8;i++) assert(seq1[i]==golden[i]);
+    // Force an FNV bucket collision in a small table and confirm exact-key
+    // equality keeps both distinct inputs, without false deduplication.
+    PFNoveltySet *collision=PFNoveltyCreate(128);
+    assert(collision);
+    bool bucketUsed[128]={false};
+    PFEffectiveInputKey firstByBucket[128];
+    bool collisionFound=false;
+    for(uint32_t i=1000;i<2500 && !collisionFound;i++) {
+        PFEffectiveInputKey candidate=PFEffectiveKey(i,1,4,64,256,0x42475241,false,false);
+        size_t bucket=(size_t)PFEffectiveKeyHash(&candidate)&127U;
+        if(bucketUsed[bucket]) {
+            assert(!PFEffectiveKeyEqual(&firstByBucket[bucket],&candidate));
+            assert(PFNoveltyInsert(collision,&firstByBucket[bucket])==1);
+            assert(PFNoveltyInsert(collision,&candidate)==1);
+            assert(PFNoveltyInsert(collision,&firstByBucket[bucket])==0);
+            assert(PFNoveltyInsert(collision,&candidate)==0);
+            collisionFound=true;
+        } else {
+            firstByBucket[bucket]=candidate;
+            bucketUsed[bucket]=true;
+        }
+    }
+    assert(collisionFound);
+    PFNoveltyDestroy(collision);
     assert(PFNoveltyCreate(0)==NULL);
     assert(PFNoveltyCreate(7)==NULL);
     assert(PFNoveltyCreate(129)==NULL);
