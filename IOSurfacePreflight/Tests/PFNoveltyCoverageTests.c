@@ -68,6 +68,16 @@ int main(void) {
     PFEffectiveInputKey overflow=PFEffectiveKey(999,1,4,64,256,0,false,false);
     assert(PFNoveltyInsert(small,&overflow)==-1);
     assert(small->used==6);
+    uint32_t parsed=0;
+    assert(PFNoveltyParseU32("4294967295",10,&parsed) && parsed==UINT32_MAX);
+    assert(PFNoveltyParseU32("0x42475241",0,&parsed) && parsed==0x42475241U);
+    assert(!PFNoveltyParseU32("4294967296",10,&parsed));
+    assert(!PFNoveltyParseU32("-1",10,&parsed));
+    assert(!PFNoveltyParseU32("+1",10,&parsed));
+    assert(!PFNoveltyParseU32("",10,&parsed));
+    assert(!PFNoveltyParseU32("0xbadjunk",0,&parsed));
+    assert(!PFNoveltyParseU32("12.3",10,&parsed));
+    assert(!PFNoveltyParseU32("12",10,NULL));
     PFNoveltyDestroy(small);
     PFNoveltyDestroy(set);
     puts("deterministic effective-input/seed/guard assertions passed");
