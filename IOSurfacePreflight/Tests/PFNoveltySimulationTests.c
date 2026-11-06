@@ -8,15 +8,15 @@
 static void replay(PFNoveltySet *seen, uint32_t seed,
                    unsigned total, bool expectAllDuplicates,
                    unsigned *distinct, unsigned *repeats) {
-    const uint32_t lengths[]={0,1,2,3,7,8,15,16,31,32,63,64,127,128,255,256};
     const uint32_t elements[]={1,2,3,4,8};
     const uint32_t formats[]={0x42475241,0x52474241,0,0x41414141};
     uint64_t state=PFNoveltySeed(seed);
     *distinct=0;
     *repeats=0;
     for(unsigned candidate=1;candidate<=total;candidate++) {
-        uint32_t w=lengths[PFNoveltyRandom(&state)%16];
-        uint32_t h=lengths[PFNoveltyRandom(&state)%16];
+        uint32_t w=PFNoveltyDimension(&state);
+        uint32_t h=PFNoveltyDimension(&state);
+        assert(w<=256 && h<=256);
         uint32_t elem=elements[PFNoveltyRandom(&state)%5];
         uint32_t rowOptions[6]={
             0,w*elem>0?w*elem-1:0,w*elem,
@@ -46,15 +46,15 @@ int main(void) {
     PFNoveltySet *seen=PFNoveltyCreate(PF_NOVELTY_TABLE_SLOTS);
     assert(seen);
     unsigned distinct=0,repeat=0;
-    replay(seen,0xA1152026U,20000,false,&distinct,&repeat);
-    assert(distinct>0 && distinct<20000);
-    assert(distinct+repeat==20000);
+    replay(seen,0xA1152026U,200000,false,&distinct,&repeat);
+    assert(distinct>=50000 && distinct<200000);
+    assert(distinct+repeat==200000);
     assert(seen->used==distinct);
     unsigned againNew=0,againRepeat=0;
-    replay(seen,0xA1152026U,20000,true,&againNew,&againRepeat);
-    assert(againNew==0 && againRepeat==20000);
+    replay(seen,0xA1152026U,200000,true,&againNew,&againRepeat);
+    assert(againNew==0 && againRepeat==200000);
     assert(seen->used==distinct);
-    printf("20000 candidates: %u distinct, %u repeats; deterministic replay 20000/20000 detected\n",
+    printf("200000 candidates: %u distinct, %u repeats; deterministic replay 200000/200000 detected\n",
            distinct,repeat);
     PFNoveltyDestroy(seen);
     return 0;

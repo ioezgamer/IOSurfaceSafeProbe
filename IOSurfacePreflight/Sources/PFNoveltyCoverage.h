@@ -165,4 +165,23 @@ static inline uint64_t PFNoveltySeed(uint32_t seed) {
     return ((uint64_t)seed << 32) ^ UINT64_C(0x9E3779B97F4A7C15);
 }
 
+// v2 stratification: preserve boundaries, include nearby values and the
+// bounded 0..256 range. Input novelty is not a kernel-coverage measurement.
+static inline uint32_t PFNoveltyDimension(uint64_t *state) {
+    const uint32_t lengths[16] = {
+        0,1,2,3,7,8,15,16,31,32,63,64,127,128,255,256
+    };
+    uint32_t route=PFNoveltyRandom(state)%4U;
+    if(route<2U) return lengths[PFNoveltyRandom(state)%16U];
+    if(route==2U) {
+        int32_t base=(int32_t)lengths[PFNoveltyRandom(state)%16U];
+        int32_t jitter=(int32_t)(PFNoveltyRandom(state)%17U)-8;
+        int32_t value=base+jitter;
+        if(value<0) value=0;
+        if(value>256) value=256;
+        return (uint32_t)value;
+    }
+    return PFNoveltyRandom(state)%257U;
+}
+
 #endif

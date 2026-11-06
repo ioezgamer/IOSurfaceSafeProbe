@@ -107,6 +107,18 @@ int main(void) {
     assert(!PFNoveltyParseU32("0xbadjunk",0,&parsed));
     assert(!PFNoveltyParseU32("12.3",10,&parsed));
     assert(!PFNoveltyParseU32("12",10,NULL));
+    uint64_t dstate1=PFNoveltySeed(2819904857U);
+    uint64_t dstate2=PFNoveltySeed(2819904857U);
+    bool seenZero=false,seenHigh=false,seenInterior=false;
+    for(size_t i=0;i<4096;i++) {
+        uint32_t dimension=PFNoveltyDimension(&dstate1);
+        assert(dimension==PFNoveltyDimension(&dstate2));
+        assert(dimension<=256);
+        if(dimension==0) seenZero=true;
+        if(dimension==256) seenHigh=true;
+        if(dimension>32 && dimension<63) seenInterior=true;
+    }
+    assert(seenZero && seenHigh && seenInterior);
     PFNoveltyDestroy(small);
     PFNoveltyDestroy(set);
     puts("deterministic effective-input/seed/guard assertions passed");

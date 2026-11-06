@@ -223,7 +223,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.5";
+    title.text = @"IOSurface Preflight v19.6";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -296,7 +296,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.5"]; 
+    [self note:@"app=IOSurfacePreflight-v19.6"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -2013,8 +2013,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 generatedCandidates++;
                 @autoreleasepool {
                     // Xorshift PRNG with a saved seed; the same run can be replayed.
-                    size_t width=lengths[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%16];
-                    size_t height=lengths[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%16];
+                    size_t width=noveltyMode ? PFNoveltyDimension(&noveltyState) : lengths[probeRandom(&state)%16];
+                    size_t height=noveltyMode ? PFNoveltyDimension(&noveltyState) : lengths[probeRandom(&state)%16];
                     size_t elem=elements[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%5];
                     size_t nominalRow=width*elem;
                     size_t rowCandidates[6]={
@@ -2345,7 +2345,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             [exportCSV writeToFile:[runDirectory stringByAppendingPathComponent:@"boundary-trace.csv"]
                           atomically:YES encoding:NSUTF8StringEncoding error:NULL];
             NSDictionary *coverageReport=@{
-                @"schema":noveltyMode?@"v19.5-effective-coverage-owned-memory":@"v19.3-format-coverage-owned-memory",
+                @"schema":noveltyMode?@"v19.6-effective-coverage-owned-memory":@"v19.3-format-coverage-owned-memory",
                 @"run":run, @"seed":@(seed), @"total_cases":@(attempts),
                 @"accepted":@(accepted), @"rejected":@(rejected),
                 @"exceptions":@(exceptions), @"review":@(review),
@@ -2427,7 +2427,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             // Keep reports self-contained even after the "latest" compatibility
             // checkpoint and CSV are replaced by a subsequent run.
             NSDictionary *runManifest=@{
-                @"schema":noveltyMode?@"v19.5-archived-run":@"v19.3-archived-run",
+                @"schema":noveltyMode?@"v19.6-archived-run":@"v19.3-archived-run",
                 @"run":run,@"seed":@(seed),@"total_cases":@(attempts),
                 @"status":final[@"status"],@"timestamp":[NSDate date].description,
                 @"files":noveltyMode ?
@@ -2447,12 +2447,12 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             BOOL noveltyExportsOK=YES;
             if(noveltyMode) {
                 NSDictionary *noveltyReport=@{
-                    @"schema":@"v19.5-effective-input-novelty",
+                    @"schema":@"v19.6-effective-input-novelty",
                     @"run":run,@"seed":@(seed),
-                    @"generator":@"splitmix64-v1",
+                    @"generator":@"splitmix64-v2-stratified-dimensions",
                     @"signature":@"Effective dictionary: width, height, bytesPerElement, actual passed row and allocation, requested pixel format and omission flags",
                     @"history":history,
-                    @"history_scope":@"Newest 6 archived runs, capped at 250000 CSV data rows; no claim about older or unavailable history",
+                    @"history_scope":@"Newest 6 archived runs, capped at 250000 CSV data rows; stratified 0..256 dimensions without kernel-path coverage claim",
                     @"candidate_budget":@(candidateBudget),
                     @"generated_candidates":@(generatedCandidates),
                     @"skipped_historical":@(skippedHistoric),
@@ -2475,7 +2475,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 NSData *reportData=[NSJSONSerialization dataWithJSONObject:noveltyReport
                                            options:NSJSONWritingPrettyPrinted error:NULL];
                 BOOL savedRootJSON=reportData && [reportData writeToFile:
-                    [docs stringByAppendingPathComponent:@"IOSurfaceNovelty-v19_5.json"]
+                    [docs stringByAppendingPathComponent:@"IOSurfaceNovelty-v19_6.json"]
                     options:NSDataWritingAtomic error:NULL];
                 BOOL savedArchiveJSON=reportData && [reportData writeToFile:
                     [runDirectory stringByAppendingPathComponent:@"novelty.json"]
@@ -2490,7 +2490,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         (unsigned long)[duplicatesCurrentByFormat[name] unsignedIntegerValue]];
                 }
                 BOOL savedRootCSV=[noveltyCSV writeToFile:
-                    [docs stringByAppendingPathComponent:@"IOSurfaceNovelty-v19_5.csv"]
+                    [docs stringByAppendingPathComponent:@"IOSurfaceNovelty-v19_6.csv"]
                     atomically:YES encoding:NSUTF8StringEncoding error:NULL];
                 BOOL savedArchiveCSV=[noveltyCSV writeToFile:
                     [runDirectory stringByAppendingPathComponent:@"novelty-duplicates.csv"]
@@ -2523,7 +2523,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [self note:@"BOUNDARY: una anomalía de API no equivale a fallo del kernel, UAF o KernelRW."];
                 if(noveltyMode) {
                     [self note:[NSString stringWithFormat:
-                        @"NOVELTY v19.5: generadas=%u duplicadas_hist=%u duplicadas_local=%u nuevas_enviadas=%u/%u presupuesto=%u estado=%@",
+                        @"NOVELTY v19.6: generadas=%u duplicadas_hist=%u duplicadas_local=%u nuevas_enviadas=%u/%u presupuesto=%u estado=%@",
                         generatedCandidates,skippedHistoric,skippedWithinRun,
                         attempts,limit,candidateBudget,final[@"status"]]];
                     [self note:@"NOVELTY: novedad relativa a los archivos recientes importados; no es cobertura interna del kernel."];
@@ -4033,8 +4033,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
     }
-    for(NSString *file in @[@"IOSurfaceNovelty-v19_5.json",
-                            @"IOSurfaceNovelty-v19_5.csv"]) {
+    for(NSString *file in @[@"IOSurfaceNovelty-v19_6.json",
+                            @"IOSurfaceNovelty-v19_6.csv"]) {
         NSString *path=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                           stringByAppendingPathComponent:file];
         if([[NSFileManager defaultManager] fileExistsAtPath:path])

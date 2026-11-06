@@ -159,3 +159,20 @@ Si se agota el presupuesto de candidatos sin hallar 50.000 configuraciones difer
 clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFNoveltyCoverageTests.c -o /tmp/pf-novelty-tests
 /tmp/pf-novelty-tests
 ```
+
+
+## v19.6: cobertura de entradas estratificada (build 25)
+
+Después de una campaña con 200.000 candidatos y solo 40.218 diccionarios nuevos
+ejecutados, la opción 24 diversifica **solo** las dimensiones de entrada:
+50% de selecciones de ancho/alto mantienen los 16 valores límite originales,
+25% toman un límite con desplazamiento de -8 a +8 (recortado a 0..256), y
+25% toman un entero de 0..256. El resto de combinaciones y los topes de
+50.000 llamadas/200.000 candidatos no cambian. El generador se reproduce
+mediante la semilla de campaña y la prueba C11 comprueba 200.000 candidatos
+sin efectuar ninguna llamada a IOSurface. Los informes nuevos se denominan
+`IOSurfaceNovelty-v19_6.json` y `IOSurfaceNovelty-v19_6.csv`.
+Los archivos archivados conservan sus nombres.
+
+Esto mejora la **diversidad de entradas públicas**, no la cobertura de rutas
+internas del kernel, y no implementa UAF, KernelRW ni exploits.
