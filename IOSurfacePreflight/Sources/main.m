@@ -1735,13 +1735,19 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 NSArray<NSString *> *fields=[line componentsSeparatedByString:@","];
                 if(fields.count<11) {badRows++;return;}
                 rows++;
-                uint32_t width=(uint32_t)strtoull([fields[3] UTF8String],NULL,10);
-                uint32_t height=(uint32_t)strtoull([fields[4] UTF8String],NULL,10);
-                uint32_t element=(uint32_t)strtoull([fields[5] UTF8String],NULL,10);
-                uint32_t row=(uint32_t)strtoull([fields[6] UTF8String],NULL,10);
-                uint32_t allocation=(uint32_t)strtoull([fields[7] UTF8String],NULL,10);
-                uint32_t format=(uint32_t)strtoul([fields[8] UTF8String],NULL,0);
-                BOOL omitRow=[fields[9] boolValue],omitAlloc=[fields[10] boolValue];
+                uint32_t width=0,height=0,element=0,row=0,allocation=0,format=0;
+                uint32_t omittedRow=0,omittedAlloc=0;
+                BOOL valid=PFNoveltyParseU32([fields[3] UTF8String],10,&width) &&
+                    PFNoveltyParseU32([fields[4] UTF8String],10,&height) &&
+                    PFNoveltyParseU32([fields[5] UTF8String],10,&element) &&
+                    PFNoveltyParseU32([fields[6] UTF8String],10,&row) &&
+                    PFNoveltyParseU32([fields[7] UTF8String],10,&allocation) &&
+                    PFNoveltyParseU32([fields[8] UTF8String],0,&format) &&
+                    PFNoveltyParseU32([fields[9] UTF8String],10,&omittedRow) &&
+                    PFNoveltyParseU32([fields[10] UTF8String],10,&omittedAlloc) &&
+                    omittedRow<=1 && omittedAlloc<=1;
+                if(!valid) {badRows++;return;}
+                BOOL omitRow=omittedRow!=0,omitAlloc=omittedAlloc!=0;
                 PFEffectiveInputKey key=PFEffectiveKey(width,height,element,row,allocation,
                                                         format,omitRow,omitAlloc);
                 int result=PFNoveltyInsertWithOrigin(set,&key,1,NULL);
