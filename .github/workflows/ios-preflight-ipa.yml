@@ -46,6 +46,12 @@ jobs:
             IOSurfacePreflight/Tests/PFNoveltyCoverageTests.c \
             -o "$RUNNER_TEMP/pf-novelty-tests"
           "$RUNNER_TEMP/pf-novelty-tests"
+      - name: Simulacion reproducible de 20000 candidatos (sin IPC)
+        run: |
+          clang -std=c11 -O2 -Wall -Wextra -Werror \
+            IOSurfacePreflight/Tests/PFNoveltySimulationTests.c \
+            -o "$RUNNER_TEMP/pf-novelty-sim"
+          "$RUNNER_TEMP/pf-novelty-sim"
       - name: Generar proyecto
         working-directory: IOSurfacePreflight
         run: xcodegen generate
