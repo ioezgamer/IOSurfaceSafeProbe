@@ -1869,8 +1869,9 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     [NSUserDefaults.standardUserDefaults setObject:@(seed) forKey:@"IOSurfaceV8BoundarySeed"];
     if(limit>50000) [NSUserDefaults.standardUserDefaults setObject:@(seed)
                                                          forKey:@"IOSurfaceBruteForceSeed"];
-    [self note:[NSString stringWithFormat:@"BOUNDARY: %@ run=%@ semilla=%u",
-        replay ? @"REPLAY" : @"NEW",run,seed]];
+    [self note:[NSString stringWithFormat:@"BOUNDARY: %@ run=%@ semilla=%u modo=%@",
+        replay ? @"REPLAY" : @"NEW",run,seed,
+        noveltyMode ? @"EFFECTIVE_NOVELTY" : @"LEGACY"]];
     [self note:[NSString stringWithFormat:
         @"BOUNDARY: %u entradas públicas con combinaciones válidas y casi inválidas; memoria acotada.",limit]];
     [self note:@"BOUNDARY: longitudes 0..256, stride y allocSize alrededor del límite, formatos distintos."];
@@ -1880,6 +1881,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     [self note:@"BOUNDARY: un rechazo de entrada inválida es NORMAL, no una anomalía."];
     [self note:@"BOUNDARY: sin llamadas privadas ni punteros obsoletos; checkpoints cada 100 casos."];
     NSDictionary *initial = @{@"run":run,@"seed":@(seed),@"step":@0,@"status":@"RUNNING",
+                              @"mode":noveltyMode ? @"EFFECTIVE_NOVELTY":@"LEGACY",
                               @"phase":@"STARTED",@"timestamp":[NSDate date].description};
     NSData *first = [NSJSONSerialization dataWithJSONObject:initial options:0 error:NULL];
     if (first) {
@@ -1896,6 +1898,14 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             const size_t elements[] = {1,2,3,4,8};
             const uint32_t formats[] = {0x42475241,0x52474241,0,0x41414141};
             uint32_t state = seed;
+            uint64_t noveltyState=PFNoveltySeed(seed);
+            PFNoveltySet *noveltySet=NULL;
+            NSDictionary<NSString *,NSNumber *> *history=@{};
+            unsigned generatedCandidates=0,skippedHistoric=0,skippedWithinRun=0;
+            BOOL noveltyBudgetExhausted=NO,noveltyTableFull=NO;
+            const unsigned candidateBudget=noveltyMode ?
+                limit*PF_NOVELTY_CANDIDATE_MULTIPLIER : limit;
+            NSMutableDictionary<NSString *,NSNumber *> *duplicateFormats=[NSMutableDictionary new];
             unsigned attempts=0,accepted=0,rejected=0,exceptions=0,unusual=0;
             unsigned normalized=0,zeroDimensionAccepted=0,footprintShort=0,shortRow=0;
             unsigned legacyFullRowShort=0,invalidId=0,unexpectedBounds=0;
@@ -1910,7 +1920,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             NSMutableDictionary<NSString *,NSMutableDictionary<NSString *,NSNumber *> *> *reasonsByFormat=[NSMutableDictionary new];
             CFAbsoluteTime start=CFAbsoluteTimeGetCurrent();
             NSMutableString *csv = [NSMutableString stringWithFormat:
-                @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,min_pixel_span,classification,integrity,result,requested_format_group,memory_eligibility\n"];
+                @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,min_pixel_span,classification,integrity,result,requested_format_group,memory_eligibility,candidate_index\n"];
             void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_LOCAL);
             CreateSurfaceFn create=framework ? (CreateSurfaceFn)dlsym(framework,"IOSurfaceCreate") : NULL;
             GetSurfaceIDFn getID=framework ? (GetSurfaceIDFn)dlsym(framework,"IOSurfaceGetID") : NULL;
@@ -1921,8 +1931,55 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             GetSurfaceBaseFn getBase=framework ? (GetSurfaceBaseFn)dlsym(framework,"IOSurfaceGetBaseAddress") : NULL;
             SurfaceLockFn lock=framework ? (SurfaceLockFn)dlsym(framework,"IOSurfaceLock") : NULL;
             SurfaceLockFn unlock=framework ? (SurfaceLockFn)dlsym(framework,"IOSurfaceUnlock") : NULL;
+            if(noveltyMode) {
+                noveltySet=PFNoveltyCreate(PF_NOVELTY_TABLE_SLOTS);
+                if(!noveltySet) {
+                    NSDictionary *failure=@{@"run":run,@"seed":@(seed),@"step":@0,
+                        @"status":@"ERROR",@"reason":@"NOVELTY_TABLE_ALLOCATION_FAILED"};
+                    NSData *encoded=[NSJSONSerialization dataWithJSONObject:failure options:0 error:NULL];
+                    if(encoded) {
+                        [encoded writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                        [encoded writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+                    }
+                    if(framework) dlclose(framework);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.stressRunning=NO;
+                        [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_ERROR_%@",run]];
+                        [self note:@"NOVELTY: no hay memoria suficiente para la tabla de configuraciones; prueba cancelada."];
+                    });
+                    return;
+                }
+                history=[self loadNoveltyHistory:noveltySet];
+                if([history[@"table_full"] boolValue]) {
+                    NSDictionary *failure=@{@"run":run,@"seed":@(seed),@"step":@0,
+                        @"status":@"ERROR",@"reason":@"NOVELTY_HISTORY_CAPACITY_EXCEEDED"};
+                    NSData *encoded=[NSJSONSerialization dataWithJSONObject:failure options:0 error:NULL];
+                    if(encoded) {
+                        [encoded writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                        [encoded writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+                    }
+                    PFNoveltyDestroy(noveltySet);
+                    if(framework) dlclose(framework);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.stressRunning=NO;
+                        [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_ERROR_%@",run]];
+                        [self note:@"NOVELTY: historial excedió la capacidad de la tabla; prueba cancelada."];
+                    });
+                    return;
+                }
+                unsigned historicUnique=[history[@"historical_unique"] unsignedIntValue];
+                unsigned scanned=[history[@"rows_scanned"] unsignedIntValue];
+                unsigned archiveCount=[history[@"files_loaded"] unsignedIntValue];
+                BOOL limited=[history[@"window_truncated"] boolValue];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self note:[NSString stringWithFormat:
+                        @"NOVELTY: historial=%u archivos, %u filas, %u claves únicas; ventana_limitada=%@",
+                        archiveCount,scanned,historicUnique,limited?@"SÍ":@"NO"]];
+                });
+            }
             if (!create || !getID || !getW || !getH || !getRow || !getAlloc) {
                 if (framework) dlclose(framework);
+                PFNoveltyDestroy(noveltySet);
                 NSDictionary *failure=@{@"run":run,@"seed":@(seed),@"step":@0,
                                         @"status":@"ERROR",@"reason":@"PUBLIC_API_UNAVAILABLE"};
                 NSData *encoded=[NSJSONSerialization dataWithJSONObject:failure options:0 error:NULL];
@@ -1940,29 +1997,54 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             }
 
             BOOL stopped=NO;
-            for (unsigned n=1;n<=limit;n++) {
-                if (self.stressStopRequested) {stopped=YES;break;}
+            for (unsigned n=1;n<=limit;/* increment after executed API call */) {
+                if(self.stressStopRequested) {stopped=YES;break;}
+                if(noveltyMode && generatedCandidates>=candidateBudget) {
+                    noveltyBudgetExhausted=YES;
+                    break;
+                }
+                generatedCandidates++;
                 @autoreleasepool {
                     // Xorshift PRNG with a saved seed; the same run can be replayed.
-                    size_t width=lengths[probeRandom(&state)%16];
-                    size_t height=lengths[probeRandom(&state)%16];
-                    size_t elem=elements[probeRandom(&state)%5];
+                    size_t width=lengths[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%16];
+                    size_t height=lengths[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%16];
+                    size_t elem=elements[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%5];
                     size_t nominalRow=width*elem;
                     size_t rowCandidates[6]={
                         0,nominalRow>0?nominalRow-1:0,nominalRow,
                         nominalRow+1,((nominalRow+15)/16)*16,nominalRow+64
                     };
-                    size_t row=rowCandidates[probeRandom(&state)%6];
+                    size_t row=rowCandidates[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%6];
                     size_t nominalAlloc=row*height;
                     size_t allocCandidates[6]={
                         0,nominalAlloc>0?nominalAlloc-1:0,nominalAlloc,
                         nominalAlloc+1,nominalAlloc+64,nominalAlloc+256
                     };
-                    size_t alloc=allocCandidates[probeRandom(&state)%6];
-                    uint32_t format=formats[probeRandom(&state)%4];
-                    BOOL omitRow=(n%37==0),omitAlloc=(n%41==0);
-                    if (omitRow) missingStride++;
-                    if (omitAlloc) missingSize++;
+                    size_t alloc=allocCandidates[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%6];
+                    uint32_t format=formats[(noveltyMode ? PFNoveltyRandom(&noveltyState) : probeRandom(&state))%4];
+                    unsigned omissionIndex=noveltyMode ? generatedCandidates : n;
+                    BOOL omitRow=(omissionIndex%37==0),omitAlloc=(omissionIndex%41==0);
+                    if(noveltyMode) {
+                        PFEffectiveInputKey input=PFEffectiveKey(
+                            (uint32_t)width,(uint32_t)height,(uint32_t)elem,
+                            (uint32_t)row,(uint32_t)alloc,format,omitRow,omitAlloc);
+                        uint8_t priorOrigin=0;
+                        int admitted=PFNoveltyInsertWithOrigin(noveltySet,&input,2,&priorOrigin);
+                        if(admitted==0) {
+                            if(priorOrigin==1) skippedHistoric++;
+                            else skippedWithinRun++;
+                            PFCount(duplicateFormats,[NSString stringWithUTF8String:
+                                PFRequestedPixelFormat(format)]);
+                            continue;
+                        }
+                        if(admitted<0) {
+                            noveltyTableFull=YES;
+                            stopped=YES;
+                            break;
+                        }
+                    }
+                    if(omitRow) missingStride++;
+                    if(omitAlloc) missingSize++;
                     NSMutableDictionary *params=[@{
                         @"IOSurfaceWidth":@(width),@"IOSurfaceHeight":@(height),
                         @"IOSurfaceBytesPerElement":@(elem),
@@ -2146,10 +2228,10 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         strcmp(outcome,"REJECTED")==0 ? "REJECTED_INPUT" :
                         strcmp(outcome,"NS_EXCEPTION")==0 ? "NS_EXCEPTION" : classification];
                     PFCount(classificationCounts,observedClass);
-                    [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%zu,%s,%s,%s,%@,%s\n",
+                    [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%zu,%s,%s,%s,%@,%s,%u\n",
                         run,seed,n,width,height,elem,row,alloc,(unsigned)format,omitRow,omitAlloc,
                         (unsigned)id,actualW,actualH,actualRow,actualAlloc,
-                        minimumSpan,classification,integrityResult,outcome,formatLabel,eligibilityLabel];
+                        minimumSpan,classification,integrityResult,outcome,formatLabel,eligibilityLabel,generatedCandidates];
                     if(n%100==0) {
                         NSDictionary *saved=@{
                             @"run":run,@"seed":@(seed),@"step":@(n),@"status":@"RUNNING",
@@ -2181,7 +2263,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         }
                         break;
                     }
-                    if(batchMode && (exceptions>0 || review>0 || sampleLockFailed>0 ||
+                    if((batchMode || noveltyMode) && (exceptions>0 || review>0 || sampleLockFailed>0 ||
                                      sampleBaseNull>0 || sampleUnlockFailed>0 ||
                                      sampleMismatch>0)) {
                         stopped=YES;
@@ -2201,13 +2283,19 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         });
                         usleep(50000);
                     }
+                    n++;
                 }
             }
             if(framework) dlclose(framework);
             NSDictionary *final=@{
                 @"run":run,@"seed":@(seed),@"step":@(attempts),
-                @"schema":@"v19.3-format-coverage",
-                @"status":sampleMismatch||sampleUnlockFailed?@"STOPPED_ON_INTEGRITY_ERROR":((stopped && batchMode && (exceptions||review||sampleLockFailed||sampleBaseNull))?@"STOPPED_ON_ANOMALY":(stopped?@"STOPPED":@"DONE")),
+                @"schema":noveltyMode?@"v19.5-effective-coverage":@"v19.3-format-coverage",
+                @"status":sampleMismatch||sampleUnlockFailed?@"STOPPED_ON_INTEGRITY_ERROR":
+                    ((stopped && (batchMode || noveltyMode) &&
+                      (exceptions||review||sampleLockFailed||sampleBaseNull))?@"STOPPED_ON_ANOMALY":
+                    (noveltyTableFull?@"NOVELTY_TABLE_FULL":
+                    (noveltyBudgetExhausted?@"NOVELTY_CANDIDATE_BUDGET_EXHAUSTED":
+                    (stopped?@"STOPPED":@"DONE")))),
                 @"accepted":@(accepted),@"rejected":@(rejected),@"exceptions":@(exceptions),
                 @"review":@(review),@"normalized":@(normalized),
                 @"zero_dim_accepted":@(zeroDimensionAccepted),
@@ -2226,6 +2314,11 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 @"integrity_base_null":@(sampleBaseNull),
                 @"integrity_unlock_failed":@(sampleUnlockFailed),
                 @"missing_stride_cases":@(missingStride),@"missing_alloc_cases":@(missingSize),
+                @"novelty_mode":@(noveltyMode),
+                @"generated_candidates":@(generatedCandidates),
+                @"novelty_skipped_historical":@(skippedHistoric),
+                @"novelty_skipped_within_run":@(skippedWithinRun),
+                @"novelty_candidate_budget":@(candidateBudget),
                 @"elapsed":@(CFAbsoluteTimeGetCurrent()-start)
             };
             NSData *finalBytes=[NSJSONSerialization dataWithJSONObject:final options:NSJSONWritingPrettyPrinted error:NULL];
