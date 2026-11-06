@@ -176,3 +176,25 @@ Los archivos archivados conservan sus nombres.
 
 Esto mejora la **diversidad de entradas públicas**, no la cobertura de rutas
 internas del kernel, y no implementa UAF, KernelRW ni exploits.
+
+
+## v19.7: reproducción dirigida de una fila archivada
+
+La opción **25. Reproducir caso del CSV local (3 veces)** lee únicamente los
+archivos `Documents/IOSurfaceRuns/<UUID>/boundary-trace.csv` de la app.
+Se selecciona por número de caso o, si se deja vacío, automáticamente una fila
+aceptada de BGRA con dimensiones no nulas. El programa reutiliza **los parámetros
+exactos** (incluidas omisiones de stride y alloc) y realiza hasta tres
+`IOSurfaceCreate` mediante la API pública. Compara éxito/rechazo y dimensiones,
+stride y alloc observados; detiene la repetición ante una discrepancia.
+
+Solo en superficies propias BGRA elegibles realiza una comprobación mínima
+de escritura/lectura de un byte, restaurando el valor original y liberando la
+referencia. No usa selectores privados, punteros obsoletos ni acceso al kernel.
+
+Los resultados se guardan después de cada repetición en
+`Documents/IOSurfaceTargetedReplay-checkpoint.json` y
+`Documents/IOSurfaceTargetedReplay-trace.csv`, que el botón Exportar comparte.
+Un resultado `MATCH_3_OF_3` indica consistencia observada, no ausencia general de
+vulnerabilidades; `DIVERGED` o un fallo de integridad requiere revisión y no
+prueba un exploit. Si no hay CSV local válido, ejecutá antes la opción 24.
