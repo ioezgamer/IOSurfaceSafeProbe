@@ -112,3 +112,5 @@ Antes de ejecutar, comprobá que tu dispositivo dispone de almacenamiento sufici
 clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFMemoryEligibilityTests.c -o /tmp/pf-memory-tests
 /tmp/pf-memory-tests
 \`\`\`
+
+En iOS, los resultados archivados se pueden consultar en **Archivos → En mi iPhone → IOSurface Preflight → IOSurfaceRuns**, gracias a `UIFileSharingEnabled` y `LSSupportsOpeningDocumentsInPlace`. Si la instalación o la firma no habilitan esa carpeta, el botón **Exportar** sigue ofreciendo los archivos de la campaña más reciente.
