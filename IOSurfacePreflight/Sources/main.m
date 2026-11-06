@@ -12,6 +12,7 @@
 #import <stdatomic.h>
 #import "PFBootClassifier.h"
 #import "PFMemoryEligibility.h"
+#import "PFBoundedBatch.h"
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -101,6 +102,14 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 @property(nonatomic, assign) BOOL matrixRunning;
 @property(nonatomic, assign) BOOL stressRunning;
 @property(atomic, assign) BOOL stressStopRequested;
+@property(nonatomic, assign) BOOL batchRunning;
+@property(atomic, assign) BOOL batchStopRequested;
+@property(nonatomic, assign) BOOL batchDispatching;
+@property(nonatomic, copy) NSString *activeBatchRunID;
+@property(nonatomic, copy) NSString *batchID;
+@property(nonatomic, copy) NSString *batchDirectory;
+@property(nonatomic, strong) NSArray<NSNumber *> *batchSeeds;
+@property(nonatomic, strong) NSMutableArray<NSDictionary *> *batchResults;
 @property(nonatomic, strong) NSString *stressCSV;
 @property(atomic, assign) BOOL controlledCloseRequested;
 @property(atomic, assign) BOOL controlledCloseRunning;
@@ -213,7 +222,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.3";
+    title.text = @"IOSurface Preflight v19.4";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -252,6 +261,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
       [self button:@"20. Controles IPC: abierto y cerrado (3 pares)" action:@selector(ipcControlsProbe:)],
       [self button:@"21. Fuzzing corregido IOSurface (100.000 casos)" action:@selector(bruteForceProbe:)],
       [self button:@"22. Repetir fuerza bruta (misma semilla)" action:@selector(replayBruteForceProbe:)],
+      [self button:@"23. Fuerza bruta controlada: 3 x 50.000" action:@selector(startBoundedBatch:)],
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -284,7 +294,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.3"]; 
+    [self note:@"app=IOSurfacePreflight-v19.4"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -937,12 +947,13 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 
 
 - (void)stopStressProbe:(id)sender {
-    if (!self.stressRunning) {
+    if (!self.stressRunning && !self.batchRunning) {
         [self note:@"CAMPAIGN: no hay prueba activa."];
         return;
     }
+    if(self.batchRunning) self.batchStopRequested=YES;
     self.stressStopRequested = YES;
-    [self note:@"CAMPAIGN: detención solicitada; se liberarán las referencias vigentes."];
+    [self note:@"CAMPAIGN: detención solicitada; se liberarán las referencias vigentes y no se iniciarán más lotes."];
 }
 
 - (void)stressProbe:(id)sender {
@@ -1490,8 +1501,197 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 
 
 
+
+// v19.4 bounded public-API brute-force. No concurrency between runs.
+- (BOOL)persistBatchManifest:(NSString *)status {
+    if(!self.batchDirectory.length || !self.batchID.length) return NO;
+    unsigned cases=0,accepted=0,rejected=0,integrityPassed=0,exceptions=0;
+    for(NSDictionary *entry in self.batchResults) {
+        cases += [entry[@"attempts"] unsignedIntValue];
+        accepted += [entry[@"accepted"] unsignedIntValue];
+        rejected += [entry[@"rejected"] unsignedIntValue];
+        integrityPassed += [entry[@"integrity_passed"] unsignedIntValue];
+        exceptions += [entry[@"exceptions"] unsignedIntValue];
+    }
+    NSDictionary *manifest=@{
+        @"schema":@"v19.4-bounded-public-api-batch",
+        @"id":self.batchID, @"status":status,
+        @"planned_runs":@(PF_BATCH_RUNS),
+        @"cases_per_run":@(PF_BATCH_CASES_PER_RUN),
+        @"seeds":self.batchSeeds?:@[],
+        @"runs":self.batchResults?:@[],
+        @"completed_runs":@(self.batchResults.count),
+        @"completed_cases":@(cases),
+        @"accepted":@(accepted),@"rejected":@(rejected),
+        @"integrity_passed":@(integrityPassed),@"exceptions":@(exceptions),
+        @"timestamp":[NSDate date].description,
+        @"scope":@"Only IOSurface public API and bounded owned BGRA pixel checks",
+        @"kernelPanicProven":@NO,
+        @"note":@"App-visible API outcomes do not establish a kernel vulnerability."
+    };
+    NSData *json=[NSJSONSerialization dataWithJSONObject:manifest
+                        options:NSJSONWritingPrettyPrinted error:NULL];
+    NSMutableString *csv=[NSMutableString stringWithString:
+        @"index,run,seed,status,attempts,accepted,rejected,exceptions,review,integrity_passed,integrity_mismatch,integrity_lock_failed,integrity_base_null,integrity_unlock_failed,elapsed,folder\n"];
+    for(NSDictionary *entry in self.batchResults) {
+        [csv appendFormat:@"%@,%@,%@,%@,%@,%@,%@,%@,%@,%@,%@,%@,%@,%@,%@,%@\n",
+            entry[@"index"],entry[@"run"],entry[@"seed"],entry[@"status"],
+            entry[@"attempts"],entry[@"accepted"],entry[@"rejected"],
+            entry[@"exceptions"],entry[@"review"],entry[@"integrity_passed"],
+            entry[@"integrity_mismatch"],entry[@"integrity_lock_failed"],
+            entry[@"integrity_base_null"],entry[@"integrity_unlock_failed"],
+            entry[@"elapsed"],entry[@"folder"]];
+    }
+    NSString *docs=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    BOOL wroteArchive=json && [json writeToFile:[self.batchDirectory stringByAppendingPathComponent:@"manifest.json"]
+                                        options:NSDataWritingAtomic error:NULL];
+    BOOL wroteArchiveCSV=[csv writeToFile:[self.batchDirectory stringByAppendingPathComponent:@"summary.csv"]
+                         atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    BOOL wroteLatest=json && [json writeToFile:[docs stringByAppendingPathComponent:
+        @"IOSurfaceBruteForceBatch-v19_4.json"] options:NSDataWritingAtomic error:NULL];
+    BOOL wroteLatestCSV=[csv writeToFile:[docs stringByAppendingPathComponent:
+        @"IOSurfaceBruteForceBatch-v19_4.csv"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    return wroteArchive && wroteArchiveCSV && wroteLatest && wroteLatestCSV;
+}
+
+- (void)finishBoundedBatch:(NSString *)status {
+    BOOL persisted=[self persistBatchManifest:status];
+    [self note:[NSString stringWithFormat:
+        @"BATCH v19.4: %@ finalizadas=%lu/%d persistencia=%@ ruta=%@",
+        status,(unsigned long)self.batchResults.count,PF_BATCH_RUNS,
+        persisted?@"OK":@"ERROR",self.batchID?:@"?"]];
+    self.batchRunning=NO;
+    self.batchStopRequested=NO;
+    self.batchDispatching=NO;
+    self.activeBatchRunID=nil;
+}
+
+- (void)runNextBoundedBatch {
+    if(!self.batchRunning) return;
+    if(self.batchStopRequested) {
+        [self finishBoundedBatch:@"STOPPED_BY_USER"];
+        return;
+    }
+    NSUInteger index=self.batchResults.count;
+    if(index>=PF_BATCH_RUNS) {
+        [self finishBoundedBatch:@"DONE"];
+        return;
+    }
+    NSNumber *seed=self.batchSeeds[index];
+    [self note:[NSString stringWithFormat:
+        @"BATCH v19.4: inicia lote %lu/%d semilla=%u",
+        (unsigned long)(index+1),PF_BATCH_RUNS,seed.unsignedIntValue]];
+    self.batchDispatching=YES;
+    [self runBoundaryProbeSeed:seed.unsignedIntValue replay:NO
+                   totalCases:PF_BATCH_CASES_PER_RUN];
+    self.batchDispatching=NO;
+}
+
+- (void)boundedBatchRunCompleted:(NSString *)run
+                            seed:(uint32_t)seed
+                          result:(NSDictionary *)result {
+    // Called only on the main queue by the boundary completion handler.
+    if(!self.batchRunning || ![self.activeBatchRunID isEqualToString:run])
+        return;
+    self.activeBatchRunID=nil;
+    NSString *status=[result[@"status"] isKindOfClass:NSString.class]?
+        result[@"status"]:@"ERROR";
+    NSDictionary *item=@{
+        @"index":@(self.batchResults.count+1),
+        @"run":run,@"seed":@(seed),@"status":status,
+        @"attempts":result[@"step"]?:@0,
+        @"accepted":result[@"accepted"]?:@0,
+        @"rejected":result[@"rejected"]?:@0,
+        @"exceptions":result[@"exceptions"]?:@0,
+        @"review":result[@"review"]?:@0,
+        @"integrity_passed":result[@"integrity_passed"]?:@0,
+        @"integrity_mismatch":result[@"integrity_mismatch"]?:@0,
+        @"integrity_lock_failed":result[@"integrity_lock_failed"]?:@0,
+        @"integrity_base_null":result[@"integrity_base_null"]?:@0,
+        @"integrity_unlock_failed":result[@"integrity_unlock_failed"]?:@0,
+        @"elapsed":result[@"elapsed"]?:@0,
+        @"folder":run
+    };
+    [self.batchResults addObject:item];
+    BOOL anomaly = ![status isEqualToString:@"DONE"] ||
+        [item[@"exceptions"] unsignedIntValue]>0 ||
+        [item[@"review"] unsignedIntValue]>0 ||
+        [item[@"integrity_mismatch"] unsignedIntValue]>0 ||
+        [item[@"integrity_lock_failed"] unsignedIntValue]>0 ||
+        [item[@"integrity_base_null"] unsignedIntValue]>0 ||
+        [item[@"integrity_unlock_failed"] unsignedIntValue]>0;
+    if(![self persistBatchManifest:@"RUNNING"]) {
+        [self finishBoundedBatch:@"STORAGE_ERROR"];
+        return;
+    }
+    if(self.batchStopRequested) {
+        [self finishBoundedBatch:@"STOPPED_BY_USER"];
+    } else if(anomaly) {
+        [self finishBoundedBatch:@"HALTED_ON_ANOMALY"];
+    } else if(PFBatchCanAdvance(self.batchResults.count,PF_BATCH_RUNS,
+                                self.batchStopRequested,NO,NO)) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self runNextBoundedBatch]; });
+    } else {
+        [self finishBoundedBatch:@"DONE"];
+    }
+}
+
+- (void)startBoundedBatch:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning ||
+       self.batchRunning) {
+        [self note:@"BATCH: otra prueba está activa. No se solapan lotes."];
+        return;
+    }
+    UIAlertController *alert=[UIAlertController alertControllerWithTitle:
+        @"Fuerza bruta controlada (3 x 50.000)"
+        message:@"Tres campañas sucesivas con semillas nuevas y únicas; todas usan APIs públicas sobre superficies propias. Archiva cada lote por UUID y detiene la secuencia ante anomalías o cancelación. Puede provocar cierres inesperados. No ejecutes otras pruebas a la vez."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancelar"
+        style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf=self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Ejecutar 3 lotes"
+        style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        typeof(self) strongSelf=weakSelf;
+        if(!strongSelf || strongSelf.batchRunning || strongSelf.stressRunning ||
+           strongSelf.matrixRunning || strongSelf.controlledCloseRunning) return;
+        NSMutableArray<NSNumber *> *seeds=[NSMutableArray new];
+        uint32_t chosen[PF_BATCH_RUNS]={0};
+        for(size_t i=0;i<PF_BATCH_RUNS;i++) {
+            uint32_t seed=0;
+            do {seed=arc4random();} while(!PFBatchUniqueSeed(seed,chosen,i));
+            chosen[i]=seed;
+            [seeds addObject:@(seed)];
+        }
+        strongSelf.batchID=NSUUID.UUID.UUIDString;
+        strongSelf.batchDirectory=[[NSHomeDirectory() stringByAppendingPathComponent:
+             @"Documents/IOSurfaceBatches"] stringByAppendingPathComponent:strongSelf.batchID];
+        NSError *err=nil;
+        if(![[NSFileManager defaultManager] createDirectoryAtPath:strongSelf.batchDirectory
+                      withIntermediateDirectories:YES attributes:nil error:&err]) {
+            [strongSelf note:[NSString stringWithFormat:
+                @"BATCH: no se puede guardar el lote: %@",err.localizedDescription]];
+            return;
+        }
+        strongSelf.batchSeeds=[seeds copy];
+        strongSelf.batchResults=[NSMutableArray new];
+        strongSelf.batchRunning=YES;
+        strongSelf.batchStopRequested=NO;
+        [NSUserDefaults.standardUserDefaults setObject:strongSelf.batchID
+                                                forKey:@"IOSurfaceLatestBatch"];
+        if(![strongSelf persistBatchManifest:@"RUNNING"]) {
+            [strongSelf finishBoundedBatch:@"STORAGE_ERROR"];
+            return;
+        }
+        [strongSelf note:[NSString stringWithFormat:
+            @"BATCH v19.4: %@, lotes=%d, límite=%d casos/lote; semillas guardadas.",
+            strongSelf.batchID,PF_BATCH_RUNS,PF_BATCH_CASES_PER_RUN]];
+        [strongSelf runNextBoundedBatch];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (void)bruteForceProbe:(id)sender {
-    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning) {
+    if(self.stressRunning || self.matrixRunning || self.controlledCloseRunning || self.batchRunning) {
         [self note:@"BRUTE: ya se esta ejecutando otra prueba."];
         return;
     }
@@ -1536,7 +1736,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 }
 
 - (void)runBoundaryProbeSeed:(uint32_t)seed replay:(BOOL)replay totalCases:(unsigned)limit {
-    if (self.stressRunning || self.matrixRunning) {
+    if (self.stressRunning || self.matrixRunning || (self.batchRunning && !self.batchDispatching)) {
         [self note:@"BOUNDARY: ya hay una prueba activa."];
         return;
     }
@@ -1544,6 +1744,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.stressStopRequested = NO;
     self.stressCSV = nil;
     NSString *run = NSUUID.UUID.UUIDString;
+    BOOL batchMode=self.batchRunning && self.batchDispatching;
+    if(batchMode) self.activeBatchRunID=run;
     NSString *runDirectory=[[NSHomeDirectory()
         stringByAppendingPathComponent:@"Documents/IOSurfaceRuns"] stringByAppendingPathComponent:run];
     NSError *archiveError=nil;
@@ -1628,6 +1830,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                     self.stressRunning=NO;
                     [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_ERROR_%@",run]];
                     [self note:@"BOUNDARY: no están disponibles todas las funciones públicas; prueba cancelada."];
+                    if(batchMode) [self boundedBatchRunCompleted:run seed:seed result:failure];
                 });
                 return;
             }
@@ -1860,6 +2063,14 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                             [data writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
                         }
                     }
+                    if(batchMode && (exceptions>0 || review>0 || sampleLockFailed>0 ||
+                                     sampleBaseNull>0 || sampleUnlockFailed>0 ||
+                                     sampleMismatch>0)) {
+                        stopped=YES;
+                        // Finish this iteration and preserve observed counters.
+                        // No further input combinations are sent for this batch.
+                        break;
+                    }
                     if(stopOnMismatch) {
                         stopped=YES;
                         NSDictionary *incident=@{@"run":run,@"seed":@(seed),@"step":@(n),
@@ -1892,7 +2103,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             NSDictionary *final=@{
                 @"run":run,@"seed":@(seed),@"step":@(attempts),
                 @"schema":@"v19.3-format-coverage",
-                @"status":sampleMismatch||sampleUnlockFailed?@"STOPPED_ON_INTEGRITY_ERROR":(stopped?@"STOPPED":@"DONE"),
+                @"status":sampleMismatch||sampleUnlockFailed?@"STOPPED_ON_INTEGRITY_ERROR":((stopped && batchMode && (exceptions||review||sampleLockFailed||sampleBaseNull))?@"STOPPED_ON_ANOMALY":(stopped?@"STOPPED":@"DONE")),
                 @"accepted":@(accepted),@"rejected":@(rejected),@"exceptions":@(exceptions),
                 @"review":@(review),@"normalized":@(normalized),
                 @"zero_dim_accepted":@(zeroDimensionAccepted),
@@ -2043,6 +2254,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [self note:[NSString stringWithFormat:@"BOUNDARY: tiempo=%.3fs; CSV persistente y checkpoint guardados.",
                     CFAbsoluteTimeGetCurrent()-start]];
                 [self note:@"BOUNDARY: una anomalía de API no equivale a fallo del kernel, UAF o KernelRW."];
+                if(batchMode) [self boundedBatchRunCompleted:run seed:seed result:final];
             });
         }
     });
@@ -3533,6 +3745,16 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             NSString *path=[runDir stringByAppendingPathComponent:file];
             if([[NSFileManager defaultManager] fileExistsAtPath:path])
                 [filesToShare addObject:[NSURL fileURLWithPath:path]];
+        }
+    }
+    NSString *batchID=[NSUserDefaults.standardUserDefaults stringForKey:@"IOSurfaceLatestBatch"];
+    if(batchID.length) {
+        NSString *folder=[[NSHomeDirectory() stringByAppendingPathComponent:
+            @"Documents/IOSurfaceBatches"] stringByAppendingPathComponent:batchID];
+        for(NSString *name in @[@"manifest.json",@"summary.csv"]) {
+            NSString *file=[folder stringByAppendingPathComponent:name];
+            if([[NSFileManager defaultManager] fileExistsAtPath:file])
+                [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
     }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
