@@ -6,7 +6,7 @@
 int main(void) {
     const char *row[]={
         "RUN", "2819904857", "114", "16", "16", "4", "64", "1024",
-        "0x42475241", "0", "0", "221", "16", "16", "16", "64",
+        "0x42475241", "0", "0", "221", "16", "16", "64", "1024",
         "1024", "OK", "PASS", "ACCEPTED", "BGRA_REQUESTED",
         "ELIGIBLE", "245"
     };
@@ -32,7 +32,7 @@ int main(void) {
     badRange[19]="NS_EXCEPTION";
     assert(!PFReplayParseCSV(badRange,PF_REPLAY_COLS,&c));
     badRange[19]="REJECTED";
-    badRange[13]="0";badRange[14]="0";badRange[15]="0";badRange[16]="0";
+    badRange[12]="0";badRange[13]="0";badRange[14]="0";badRange[15]="0";
     assert(PFReplayParseCSV(badRange,PF_REPLAY_COLS,&c));
     assert(!c.originallyAccepted);
     assert(PFReplaySameOutcome(&c,false,0,0,0,0));

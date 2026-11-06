@@ -3968,7 +3968,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             __block PFTargetedCase target={0};
             __block BOOL found=NO;
             NSString *sourceRun=nil;
-            NSUInteger scanned=0;
+            __block NSUInteger scanned=0;
             // Try latest first. Never search arbitrary files outside the app archive.
             for(NSDictionary *archive in archives) {
                 NSError *loadError=nil;

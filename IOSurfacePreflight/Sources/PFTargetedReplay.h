@@ -48,10 +48,10 @@ static inline bool PFReplayParseCSV(const char *const *parts,
        !PFNoveltyParseU32(parts[8],0,&x.format) ||
        !PFNoveltyParseU32(parts[9],10,&x.omitRow) ||
        !PFNoveltyParseU32(parts[10],10,&x.omitAllocation) ||
-       !PFNoveltyParseU32(parts[13],10,&x.originalWidth) ||
-       !PFNoveltyParseU32(parts[14],10,&x.originalHeight) ||
-       !PFNoveltyParseU32(parts[15],10,&x.originalRow) ||
-       !PFNoveltyParseU32(parts[16],10,&x.originalAllocation) ||
+       !PFNoveltyParseU32(parts[12],10,&x.originalWidth) ||
+       !PFNoveltyParseU32(parts[13],10,&x.originalHeight) ||
+       !PFNoveltyParseU32(parts[14],10,&x.originalRow) ||
+       !PFNoveltyParseU32(parts[15],10,&x.originalAllocation) ||
        !PFNoveltyParseU32(parts[22],10,&x.candidateIndex))
         return false;
     if(x.caseNumber==0 || x.candidateIndex==0 ||
