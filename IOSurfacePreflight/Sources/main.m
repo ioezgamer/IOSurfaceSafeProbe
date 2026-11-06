@@ -11,6 +11,7 @@
 #import <unistd.h>
 #import <stdatomic.h>
 #import "PFBootClassifier.h"
+#import "PFMemoryEligibility.h"
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -212,7 +213,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.2";
+    title.text = @"IOSurface Preflight v19.3";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -283,7 +284,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.2"]; 
+    [self note:@"app=IOSurfacePreflight-v19.3"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -1543,6 +1544,18 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.stressStopRequested = NO;
     self.stressCSV = nil;
     NSString *run = NSUUID.UUID.UUIDString;
+    NSString *runDirectory=[[NSHomeDirectory()
+        stringByAppendingPathComponent:@"Documents/IOSurfaceRuns"] stringByAppendingPathComponent:run];
+    NSError *archiveError=nil;
+    if(![[NSFileManager defaultManager] createDirectoryAtPath:runDirectory
+                  withIntermediateDirectories:YES attributes:nil error:&archiveError]) {
+        self.stressRunning=NO;
+        [self note:[NSString stringWithFormat:
+            @"BOUNDARY: no se pudo crear directorio histórico: %@",archiveError.localizedDescription]];
+        return;
+    }
+    [NSUserDefaults.standardUserDefaults setObject:run forKey:@"IOSurfaceLatestRun"];
+    NSString *archiveCheckpoint=[runDirectory stringByAppendingPathComponent:@"checkpoint.json"];
     NSString *checkpointName=limit>50000?@"IOSurfaceBruteForce-v18-checkpoint.json":
                                                @"IOSurfaceBoundary-checkpoint.json";
     NSString *checkpoint=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
@@ -1563,7 +1576,10 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     NSDictionary *initial = @{@"run":run,@"seed":@(seed),@"step":@0,@"status":@"RUNNING",
                               @"phase":@"STARTED",@"timestamp":[NSDate date].description};
     NSData *first = [NSJSONSerialization dataWithJSONObject:initial options:0 error:NULL];
-    if (first) [first writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+    if (first) {
+        [first writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+        [first writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+    }
     // Campaign UUID in the event allows time correlation with the separate trace.
     // A bracket is created before running any public IOSurface API operations.
     [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_BEGIN_%@",run]];
@@ -1583,9 +1599,12 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             unsigned eligibleIntegrity=0,skippedByBudget=0,byteChecks=0;
             NSMutableDictionary<NSString *,NSMutableDictionary<NSString *,NSNumber *> *> *coverageGroups=[NSMutableDictionary new];
             NSMutableDictionary<NSString *,NSNumber *> *classificationCounts=[NSMutableDictionary new];
+            NSMutableDictionary<NSString *,NSMutableDictionary<NSString *,NSNumber *> *> *formatGroups=[NSMutableDictionary new];
+            NSMutableDictionary<NSString *,NSNumber *> *eligibilityReasons=[NSMutableDictionary new];
+            NSMutableDictionary<NSString *,NSMutableDictionary<NSString *,NSNumber *> *> *reasonsByFormat=[NSMutableDictionary new];
             CFAbsoluteTime start=CFAbsoluteTimeGetCurrent();
             NSMutableString *csv = [NSMutableString stringWithFormat:
-                @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,min_pixel_span,classification,integrity,result\n"];
+                @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,min_pixel_span,classification,integrity,result,requested_format_group,memory_eligibility\n"];
             void *framework = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_LOCAL);
             CreateSurfaceFn create=framework ? (CreateSurfaceFn)dlsym(framework,"IOSurfaceCreate") : NULL;
             GetSurfaceIDFn getID=framework ? (GetSurfaceIDFn)dlsym(framework,"IOSurfaceGetID") : NULL;
@@ -1601,7 +1620,10 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 NSDictionary *failure=@{@"run":run,@"seed":@(seed),@"step":@0,
                                         @"status":@"ERROR",@"reason":@"PUBLIC_API_UNAVAILABLE"};
                 NSData *encoded=[NSJSONSerialization dataWithJSONObject:failure options:0 error:NULL];
-                if(encoded) [encoded writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                if(encoded) {
+                    [encoded writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                    [encoded writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+                }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.stressRunning=NO;
                     [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_ERROR_%@",run]];
@@ -1651,6 +1673,14 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         coverageGroups[requestedGroup]=groupStats;
                     }
                     PFCount(groupStats,@"attempted");
+                    NSString *formatLabel=[NSString stringWithUTF8String:
+                        PFRequestedPixelFormat(format)];
+                    NSMutableDictionary<NSString *,NSNumber *> *formatStats=formatGroups[formatLabel];
+                    if(!formatStats) {
+                        formatStats=[NSMutableDictionary new];
+                        formatGroups[formatLabel]=formatStats;
+                    }
+                    PFCount(formatStats,@"attempted");
                     IOSurfaceRef surface=NULL;
                     BOOL threw=NO;
                     @try {
@@ -1664,17 +1694,21 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                     const char *outcome="REJECTED";
                     const char *classification="NONE";
                     const char *integrityResult="NOT_SAMPLED";
+                    const char *eligibilityLabel="NOT_CREATED";
                     BOOL stopOnMismatch=NO;
                     if (threw) {
                         exceptions++;
                         outcome="NS_EXCEPTION";
                         PFCount(groupStats,@"exceptions");
+                        PFCount(formatStats,@"exceptions");
                     } else if (!surface) {
                         rejected++;
                         PFCount(groupStats,@"rejected");
+                        PFCount(formatStats,@"rejected");
                     } else {
                         accepted++;
                         PFCount(groupStats,@"accepted");
+                        PFCount(formatStats,@"accepted");
                         id=getID(surface);
                         actualW=getW(surface);
                         actualH=getH(surface);
@@ -1707,13 +1741,24 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 
                         // Probe fresh owned surfaces, never stale objects or bytes beyond
                         // the last declared pixel. Only uncompressed BGRA, 4 bytes/pixel.
-                        BOOL safeCandidate=(format==0x42475241 && elem==4 &&
-                                     !zero && inRange && actualW<=256 && actualH<=256 &&
-                                     !rowTooSmall && !spanTooSmall && id!=0 &&
-                                     minimumSpan>0 && getBase && lock && unlock);
+                        PFMemoryEligibility reason=PFClassifyMemorySurface(
+                            format,elem,actualW,actualH,actualRow,actualAlloc,id,
+                            getBase && lock && unlock);
+                        eligibilityLabel=PFMemoryEligibilityLabel(reason);
+                        PFCount(eligibilityReasons,[NSString stringWithUTF8String:eligibilityLabel]);
+                        NSMutableDictionary<NSString *,NSNumber *> *formatReasonStats=
+                            reasonsByFormat[formatLabel];
+                        if(!formatReasonStats) {
+                            formatReasonStats=[NSMutableDictionary new];
+                            reasonsByFormat[formatLabel]=formatReasonStats;
+                        }
+                        PFCount(formatReasonStats,[NSString stringWithUTF8String:eligibilityLabel]);
+                        // Still only verify mapped, owned BGRA surfaces within safe bounds.
+                        BOOL safeCandidate=(reason==PFMemoryEligible);
                         if(safeCandidate) {
                             eligibleIntegrity++;
                             PFCount(groupStats,@"integrity_eligible");
+                            PFCount(formatStats,@"integrity_eligible");
                         }
                         // Each owned BGRA surface is eligible for bounded verification.
                         BOOL sample=safeCandidate && sampled<4096;
@@ -1721,14 +1766,17 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         if(sample) {
                             sampled++;
                             PFCount(groupStats,@"integrity_tested");
+                            PFCount(formatStats,@"integrity_tested");
                             NSDictionary *pre=@{@"run":run,@"seed":@(seed),@"step":@(n),
                                 @"status":@"RUNNING",@"phase":@"BEFORE_SAFE_INTEGRITY",
                                 @"minimum_span":@(minimumSpan),@"observed_alloc":@(actualAlloc),
                                 @"timestamp":[NSDate date].description};
                             NSData *preData=[NSJSONSerialization dataWithJSONObject:pre
                                                                          options:0 error:NULL];
-                            if(preData)[preData writeToFile:checkpoint
-                                                   options:NSDataWritingAtomic error:NULL];
+                            if(preData) {
+                                [preData writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                                [preData writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+                            }
                             kern_return_t lockCode=lock(surface,0,NULL);
                             if(lockCode!=KERN_SUCCESS) {
                                 sampleLockFailed++;
@@ -1780,8 +1828,10 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                             }
                         }
                         if(sample) {
-                            PFCount(groupStats,strcmp(integrityResult,"PASS")==0 ?
-                                    @"integrity_passed" : @"integrity_not_passed");
+                            NSString *key=strcmp(integrityResult,"PASS")==0 ?
+                                @"integrity_passed" : @"integrity_not_passed";
+                            PFCount(groupStats,key);
+                            PFCount(formatStats,key);
                         }
                         CFRelease(surface);
                     }
@@ -1789,14 +1839,14 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         strcmp(outcome,"REJECTED")==0 ? "REJECTED_INPUT" :
                         strcmp(outcome,"NS_EXCEPTION")==0 ? "NS_EXCEPTION" : classification];
                     PFCount(classificationCounts,observedClass);
-                    [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%zu,%s,%s,%s\n",
+                    [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%zu,%s,%s,%s,%@,%s\n",
                         run,seed,n,width,height,elem,row,alloc,(unsigned)format,omitRow,omitAlloc,
                         (unsigned)id,actualW,actualH,actualRow,actualAlloc,
-                        minimumSpan,classification,integrityResult,outcome];
+                        minimumSpan,classification,integrityResult,outcome,formatLabel,eligibilityLabel];
                     if(n%100==0) {
                         NSDictionary *saved=@{
                             @"run":run,@"seed":@(seed),@"step":@(n),@"status":@"RUNNING",
-                            @"schema":@"v18-pixel-span",@"phase":@"IN_PROGRESS",
+                            @"schema":@"v19.3-format-coverage",@"phase":@"IN_PROGRESS",
                             @"accepted":@(accepted),@"rejected":@(rejected),
                             @"exceptions":@(exceptions),@"review":@(review),
                             @"edge_zero_dimension":@(zeroDimensionAccepted),
@@ -1805,7 +1855,10 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                             @"timestamp":[NSDate date].description
                         };
                         NSData *data=[NSJSONSerialization dataWithJSONObject:saved options:0 error:NULL];
-                        if(data) [data writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                        if(data) {
+                            [data writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                            [data writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+                        }
                     }
                     if(stopOnMismatch) {
                         stopped=YES;
@@ -1815,8 +1868,10 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                             @"timestamp":[NSDate date].description};
                         NSData *incidentData=[NSJSONSerialization dataWithJSONObject:incident
                                                                           options:0 error:NULL];
-                        if(incidentData)[incidentData writeToFile:checkpoint
-                                                           options:NSDataWritingAtomic error:NULL];
+                        if(incidentData) {
+                            [incidentData writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                            [incidentData writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+                        }
                         break;
                     }
                     if(n%2500==0) {
@@ -1836,7 +1891,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             if(framework) dlclose(framework);
             NSDictionary *final=@{
                 @"run":run,@"seed":@(seed),@"step":@(attempts),
-                @"schema":@"v18-pixel-span",
+                @"schema":@"v19.3-format-coverage",
                 @"status":sampleMismatch||sampleUnlockFailed?@"STOPPED_ON_INTEGRITY_ERROR":(stopped?@"STOPPED":@"DONE"),
                 @"accepted":@(accepted),@"rejected":@(rejected),@"exceptions":@(exceptions),
                 @"review":@(review),@"normalized":@(normalized),
@@ -1859,13 +1914,18 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 @"elapsed":@(CFAbsoluteTimeGetCurrent()-start)
             };
             NSData *finalBytes=[NSJSONSerialization dataWithJSONObject:final options:NSJSONWritingPrettyPrinted error:NULL];
-            if(finalBytes) [finalBytes writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+            if(finalBytes) {
+                [finalBytes writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+                [finalBytes writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
+            }
             NSString *exportCSV=[csv copy];
             NSString *persistedCSV=[NSHomeDirectory() stringByAppendingPathComponent:
                 @"Documents/IOSurfaceBruteForce-v18-trace.csv"];
             [exportCSV writeToFile:persistedCSV atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            [exportCSV writeToFile:[runDirectory stringByAppendingPathComponent:@"boundary-trace.csv"]
+                          atomically:YES encoding:NSUTF8StringEncoding error:NULL];
             NSDictionary *coverageReport=@{
-                @"schema":@"v19.2-coverage-grouped-owned-memory",
+                @"schema":@"v19.3-format-coverage-owned-memory",
                 @"run":run, @"seed":@(seed), @"total_cases":@(attempts),
                 @"accepted":@(accepted), @"rejected":@(rejected),
                 @"exceptions":@(exceptions), @"review":@(review),
@@ -1874,16 +1934,22 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 @"integrity_byte_checks":@(byteChecks),
                 @"integrity_skipped_by_budget":@(skippedByBudget),
                 @"input_groups":coverageGroups,
+                @"requested_format_groups":formatGroups,
+                @"accepted_memory_eligibility":eligibilityReasons,
+                @"eligibility_by_requested_format":reasonsByFormat,
                 @"observed_classes":classificationCounts,
                 @"scope":@"Own BGRA surfaces, public IOSurface API; no kernel object trace",
                 @"warning":@"Requested input groups do not establish causes of rejection, and API errors do not establish kernel vulnerabilities."
             };
             NSString *docs=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-            NSString *coveragePath=[docs stringByAppendingPathComponent:@"IOSurfaceCoverage-v19_2.json"];
+            NSString *coveragePath=[docs stringByAppendingPathComponent:@"IOSurfaceCoverage-v19_3.json"];
             NSData *coverageBytes=[NSJSONSerialization dataWithJSONObject:coverageReport
                                             options:NSJSONWritingPrettyPrinted error:NULL];
-            if(coverageBytes)
+            if(coverageBytes) {
                 [coverageBytes writeToFile:coveragePath options:NSDataWritingAtomic error:NULL];
+                [coverageBytes writeToFile:[runDirectory stringByAppendingPathComponent:@"coverage.json"]
+                                   options:NSDataWritingAtomic error:NULL];
+            }
             NSMutableString *coverageCSV=[NSMutableString stringWithString:
                 @"input_group,attempted,accepted,rejected,exceptions,integrity_eligible,integrity_tested,integrity_passed,integrity_not_passed\n"];
             NSArray<NSString *> *orderedGroups=[[coverageGroups allKeys]
@@ -1900,11 +1966,62 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                    (unsigned long)[g[@"integrity_passed"] unsignedIntegerValue],
                    (unsigned long)[g[@"integrity_not_passed"] unsignedIntegerValue]];
             }
-            NSString *coverageCsvPath=[docs stringByAppendingPathComponent:@"IOSurfaceCoverage-v19_2.csv"];
-            [coverageCSV writeToFile:coverageCsvPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            NSString *coverageCsvPath=[docs stringByAppendingPathComponent:@"IOSurfaceCoverage-v19_3.csv"];
+            [coverageCSV writeToFile:coverageCsvPath atomically:YES
+                             encoding:NSUTF8StringEncoding error:NULL];
+            [coverageCSV writeToFile:[runDirectory stringByAppendingPathComponent:@"input-groups.csv"]
+                            atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            NSMutableString *formatsCSV=[NSMutableString stringWithString:
+                @"requested_format,attempted,accepted,rejected,exceptions,integrity_eligible,integrity_tested,integrity_passed,integrity_not_passed\n"];
+            NSArray<NSString *> *orderedFormats=[[formatGroups allKeys]
+                sortedArrayUsingSelector:@selector(compare:)];
+            for(NSString *name in orderedFormats) {
+                NSDictionary *g=formatGroups[name];
+                [formatsCSV appendFormat:@"%@,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                    name,(unsigned long)[g[@"attempted"] unsignedIntegerValue],
+                    (unsigned long)[g[@"accepted"] unsignedIntegerValue],
+                    (unsigned long)[g[@"rejected"] unsignedIntegerValue],
+                    (unsigned long)[g[@"exceptions"] unsignedIntegerValue],
+                    (unsigned long)[g[@"integrity_eligible"] unsignedIntegerValue],
+                    (unsigned long)[g[@"integrity_tested"] unsignedIntegerValue],
+                    (unsigned long)[g[@"integrity_passed"] unsignedIntegerValue],
+                    (unsigned long)[g[@"integrity_not_passed"] unsignedIntegerValue]];
+            }
+            NSString *formatsPath=[docs stringByAppendingPathComponent:@"IOSurfaceFormats-v19_3.csv"];
+            [formatsCSV writeToFile:formatsPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            [formatsCSV writeToFile:[runDirectory stringByAppendingPathComponent:@"formats.csv"]
+                         atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            NSMutableString *reasonsCSV=[NSMutableString stringWithString:
+                @"requested_format,eligibility_reason,accepted_surfaces\n"];
+            for(NSString *name in orderedFormats) {
+                NSDictionary *reasons=reasonsByFormat[name];
+                for(NSString *reason in [[reasons allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+                    [reasonsCSV appendFormat:@"%@,%@,%lu\n",name,reason,
+                        (unsigned long)[reasons[reason] unsignedIntegerValue]];
+                }
+            }
+            NSString *reasonsPath=[docs stringByAppendingPathComponent:@"IOSurfaceExclusions-v19_3.csv"];
+            [reasonsCSV writeToFile:reasonsPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            [reasonsCSV writeToFile:[runDirectory stringByAppendingPathComponent:@"eligibility.csv"]
+                         atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            // Keep reports self-contained even after the "latest" compatibility
+            // checkpoint and CSV are replaced by a subsequent run.
+            NSDictionary *runManifest=@{
+                @"schema":@"v19.3-archived-run",
+                @"run":run,@"seed":@(seed),@"total_cases":@(attempts),
+                @"status":final[@"status"],@"timestamp":[NSDate date].description,
+                @"files":@[@"checkpoint.json",@"boundary-trace.csv",@"coverage.json",
+                           @"input-groups.csv",@"formats.csv",@"eligibility.csv"],
+                @"scope":@"Public API + own bounded BGRA surfaces; not a kernel trace"
+            };
+            NSData *manifestBytes=[NSJSONSerialization dataWithJSONObject:runManifest
+                                            options:NSJSONWritingPrettyPrinted error:NULL];
+            if(manifestBytes)
+                [manifestBytes writeToFile:[runDirectory stringByAppendingPathComponent:@"manifest.json"]
+                                  options:NSDataWritingAtomic error:NULL];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self note:[NSString stringWithFormat:
-                    @"COVERAGE v19.2: elegibles=%u comprobadas=%u (%.2f%%) omitidas_por_limite=%u",
+                    @"COVERAGE v19.3: elegibles=%u comprobadas=%u (%.2f%%) omitidas_por_limite=%u",
                     eligibleIntegrity,sampled,
                     eligibleIntegrity ? (100.0*(double)sampled/(double)eligibleIntegrity):0.0,
                     skippedByBudget]];
@@ -3396,6 +3513,27 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                        stringByAppendingPathComponent:name];
         if([[NSFileManager defaultManager] fileExistsAtPath:p])
             [filesToShare addObject:[NSURL fileURLWithPath:p]];
+    }
+    for(NSString *name in @[@"IOSurfaceCoverage-v19_3.json",
+                            @"IOSurfaceCoverage-v19_3.csv",
+                            @"IOSurfaceFormats-v19_3.csv",
+                            @"IOSurfaceExclusions-v19_3.csv"]) {
+        NSString *p=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                       stringByAppendingPathComponent:name];
+        if([[NSFileManager defaultManager] fileExistsAtPath:p])
+            [filesToShare addObject:[NSURL fileURLWithPath:p]];
+    }
+    NSString *latestRun=[NSUserDefaults.standardUserDefaults stringForKey:@"IOSurfaceLatestRun"];
+    if(latestRun.length) {
+        NSString *runDir=[[NSHomeDirectory() stringByAppendingPathComponent:
+                           @"Documents/IOSurfaceRuns"] stringByAppendingPathComponent:latestRun];
+        for(NSString *file in @[@"manifest.json",@"checkpoint.json",@"coverage.json",
+                                @"input-groups.csv",@"formats.csv",@"eligibility.csv",
+                                @"boundary-trace.csv"]) {
+            NSString *path=[runDir stringByAppendingPathComponent:file];
+            if([[NSFileManager defaultManager] fileExistsAtPath:path])
+                [filesToShare addObject:[NSURL fileURLWithPath:path]];
+        }
     }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];
