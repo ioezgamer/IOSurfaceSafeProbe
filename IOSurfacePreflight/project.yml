@@ -19,11 +19,11 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.iosurface.preflight
-        MARKETING_VERSION: "0.19.2"
-        CURRENT_PROJECT_VERSION: "21"
+        MARKETING_VERSION: "0.19.3"
+        CURRENT_PROJECT_VERSION: "22"
         GENERATE_INFOPLIST_FILE: "YES"
-        INFOPLIST_KEY_CFBundleShortVersionString: "0.19.2"
-        INFOPLIST_KEY_CFBundleVersion: "21"
+        INFOPLIST_KEY_CFBundleShortVersionString: "0.19.3"
+        INFOPLIST_KEY_CFBundleVersion: "22"
         INFOPLIST_KEY_CFBundleDisplayName: "IOSurface Preflight"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "NO"
