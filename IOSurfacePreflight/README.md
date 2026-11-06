@@ -93,3 +93,22 @@ Nuevos archivos exportables tras una campaña:
 En el checkpoint final se añaden `integrity_eligible`, `integrity_byte_checks`, `integrity_skipped_by_budget` e `integrity_coverage_pct`. Las categorías identifican atributos de entrada, NO causas demostradas de rechazo de la API. Los rechazos ordinarios NO se contabilizan como vulnerabilidades.
 
 La app no obtiene acceso al kernel, no accede a memoria liberada y no añade llamadas privadas. El artefacto IPA de CI se genera **sin firma**; se requiere firma autorizada antes de instalar en iOS.
+
+## v19.3: cobertura separada por formato, exclusiones y archivos por campaña
+
+La v19.3 conserva las comprobaciones de tres bytes de píxel por superficie BGRA propia, limitadas a 4,096 superficies elegibles. **No intenta verificar memoria de formatos ajenos a BGRA**: sus casos se cuentan como observaciones de aceptación y exclusión, sin acceso a bytes de esos formatos.
+
+- Los formatos son **solicitados** por el diccionario de entrada, no formatos internos inferidos del driver: BGRA, RGBA, cero y AAAA.
+- La clasificación de exclusión de lectura/escritura solo se aplica a superficies **aceptadas** por la API, con un orden de prioridad determinista: funciones de mapeo ausentes, ID cero, dimensiones cero, metadatos fuera de rango, stride demasiado corto, longitud insuficiente del último píxel, formato distinto de BGRA, bytes por elemento distintos de 4 y tamaños superiores a 256x256. El resto son elegibles. No indica el motivo real por el que el sistema rechazó una entrada.
+- El checkpoint actual cambia de \`v18-pixel-span\` a \`v19.3-format-coverage\`. Los campos antiguos de conteo continúan disponibles.
+- Se mantienen los archivos de cobertura \`IOSurfaceCoverage-v19_3.json\` y \`IOSurfaceCoverage-v19_3.csv\`, ahora con \`requested_format_groups\`, \`accepted_memory_eligibility\` y \`eligibility_by_requested_format\`. Se añaden \`IOSurfaceFormats-v19_3.csv\` y \`IOSurfaceExclusions-v19_3.csv\`.
+- Cada nueva ejecución guarda su historial separado en \`Documents/IOSurfaceRuns/<UUID>/\`: \`manifest.json\`, \`checkpoint.json\`, \`boundary-trace.csv\`, \`coverage.json\`, \`input-groups.csv\`, \`formats.csv\` y \`eligibility.csv\`. El botón Exportar incluye los archivos del último UUID además de los tradicionales. **Las ejecuciones anteriores no se borran automáticamente.**
+
+Antes de ejecutar, comprobá que tu dispositivo dispone de almacenamiento suficiente para un CSV de 50,000 casos. Los resultados son registros de espacio de usuario; no demuestran ni descartan una vulnerabilidad del kernel, UAF o KernelRW.
+
+**Pruebas C11:**
+
+\`\`\`sh
+clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFMemoryEligibilityTests.c -o /tmp/pf-memory-tests
+/tmp/pf-memory-tests
+\`\`\`
