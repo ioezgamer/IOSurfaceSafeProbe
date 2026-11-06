@@ -136,3 +136,26 @@ El archivo \`manifest.json\` conserva las semillas, los identificadores de cada 
 clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFBoundedBatchTests.c -o /tmp/pf-batch-tests
 /tmp/pf-batch-tests
 \`\`\`
+
+## v19.5: cobertura efectiva y fuerza bruta de entradas nuevas
+
+La opción **24. Fuerza bruta de entradas nuevas (hasta 50.000)** analiza primero los CSV locales de hasta seis campañas anteriores recientes, con un límite de 250.000 filas de historial. Crea una tabla de claves exactas y, durante la campaña, **deduplica antes de llamar a IOSurfaceCreate**. Por ello un intento nuevo enviado representa una configuración de diccionario de entrada distinta de las ya cargadas y de las enviadas en esta ejecución. No es una medición interna de rutas del kernel.
+
+Para comparar lo que efectivamente se envía, la clave incluye ancho, alto, bytes por elemento, formato solicitado; stride y tamaño de asignación solo cuando están presentes en el diccionario; e indicadores que distinguen una propiedad ausente de una propiedad presente con valor cero.
+
+Las firmas se comparan por sus campos completos, incluso cuando chocan hashes. La tabla tiene 524.288 ranuras (aproximadamente 16 MiB), permite una ocupación máxima del 80 % y distingue duplicados históricos de duplicados producidos dentro de la campaña. El generador determinista usa SplitMix64, diferente al xorshift32 legado, y conserva la semilla para reproducir los candidatos. Las demás opciones mantienen sus generadores anteriores.
+
+**Presupuestos:** máximo 50.000 nuevas llamadas efectivas; máximo 200.000 candidatos incluyendo los duplicados descartados; los seis CSV históricos más recientes como máximo, con 250.000 filas entre todos y 32 MiB por archivo. El botón de cancelación detiene el ensayo y la campaña se corta ante excepciones, alertas de revisión o fallos de integridad.
+
+Si se agota el presupuesto de candidatos sin hallar 50.000 configuraciones diferentes, el estado es `NOVELTY_CANDIDATE_BUDGET_EXHAUSTED`. Esto no significa que se detectó una vulnerabilidad. La novedad se define exclusivamente respecto a la **ventana histórica cargada** y a la ejecución actual. Si el historial es más grande que el límite, `window_truncated` indica que no hay cobertura de todo el pasado.
+
+**Archivos:** `IOSurfaceNovelty-v19_5.json` y `IOSurfaceNovelty-v19_5.csv` en Documents para la última campaña; y `Documents/IOSurfaceRuns/<UUID>/novelty.json`, `novelty-duplicates.csv`, checkpoint y trazas archivados. Los CSV de casos llevan `candidate_index` para reproducir el orden del generador.
+
+**Alcance:** una configuración nueva no implica ejecutar una ruta nueva de kernel. Los rechazos y las excepciones de APIs públicas no prueban por sí solos UAF, corrupción del kernel, escalada de privilegios ni KernelRW. Esta opción opera solamente con APIs públicas y superficies propias.
+
+**Prueba C11:**
+
+```sh
+clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFNoveltyCoverageTests.c -o /tmp/pf-novelty-tests
+/tmp/pf-novelty-tests
+```
