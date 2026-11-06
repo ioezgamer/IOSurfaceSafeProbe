@@ -76,6 +76,7 @@ static inline uint64_t PFEffectiveKeyHash(const PFEffectiveInputKey *key) {
 typedef struct {
     PFEffectiveInputKey key;
     uint8_t occupied;
+    uint8_t origin; // 1: loaded from history; 2: generated this campaign.
 } PFNoveltySlot;
 
 typedef struct {
@@ -106,8 +107,13 @@ static inline void PFNoveltyDestroy(PFNoveltySet *set) {
 
 // 1: inserted a new effective config. 0: previously seen. -1: table full.
 // At most 80% table utilization avoids pathological probe chains.
-static inline int PFNoveltyInsert(PFNoveltySet *set,const PFEffectiveInputKey *key) {
-    if(!set || !key || !set->slots || !set->capacity) return -1;
+static inline int PFNoveltyInsertWithOrigin(
+    PFNoveltySet *set,const PFEffectiveInputKey *key,
+    uint8_t origin,uint8_t *existingOrigin) {
+
+    if(existingOrigin) *existingOrigin=0;
+    if(!set || !key || !set->slots || !set->capacity ||
+       (origin!=1 && origin!=2)) return -1;
     size_t mask=set->capacity-1;
     size_t index=(size_t)PFEffectiveKeyHash(key)&mask;
     for(size_t probes=0;probes<set->capacity;probes++) {
@@ -116,13 +122,20 @@ static inline int PFNoveltyInsert(PFNoveltySet *set,const PFEffectiveInputKey *k
             if(set->used >= (set->capacity*4U)/5U) return -1;
             slot->key=*key;
             slot->occupied=1;
+            slot->origin=origin;
             set->used++;
             return 1;
         }
-        if(PFEffectiveKeyEqual(&slot->key,key)) return 0;
+        if(PFEffectiveKeyEqual(&slot->key,key)) {
+            if(existingOrigin) *existingOrigin=slot->origin;
+            return 0;
+        }
         index=(index+1)&mask;
     }
     return -1;
+}
+static inline int PFNoveltyInsert(PFNoveltySet *set,const PFEffectiveInputKey *key) {
+    return PFNoveltyInsertWithOrigin(set,key,2,NULL);
 }
 
 // SplitMix64 has substantially better low-bit behavior than the legacy
