@@ -74,6 +74,25 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                       (uint64_t)offset*19ULL + (offset>>7))&255ULL);
 }
 
+// v19.2: requested-input groups are not proved reasons for a rejected call.
+static NSString *PFBoundaryRequestedGroup(size_t width, size_t height, size_t elem,
+                                          size_t row, size_t alloc,
+                                          BOOL omitRow, BOOL omitAlloc) {
+    if(omitRow && omitAlloc) return @"OMITTED_BOTH";
+    if(omitRow) return @"OMITTED_STRIDE";
+    if(omitAlloc) return @"OMITTED_ALLOC";
+    if(width==0 || height==0) return @"ZERO_REQUEST_DIMENSION";
+    if(row < width*elem) return @"REQUESTED_ROW_BELOW_PIXEL_WIDTH";
+    size_t span=(height-1)*row+width*elem;
+    if(alloc < span) return @"REQUESTED_ALLOC_BELOW_LAST_PIXEL";
+    if(alloc < height*row) return @"REQUESTED_ALLOC_BELOW_FULL_ROWS";
+    return @"OTHER_REQUEST";
+}
+
+static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString *name) {
+    group[name]=@([group[name] unsignedIntegerValue]+1U);
+}
+
 @interface ProbeController : UIViewController
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, copy) NSString *bootSessionID;
@@ -193,7 +212,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.1";
+    title.text = @"IOSurface Preflight v19.2";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -264,7 +283,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.1"]; 
+    [self note:@"app=IOSurfacePreflight-v19.2"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -1561,6 +1580,9 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
             unsigned review=0,regular=0,missingSize=0,missingStride=0;
             unsigned sampled=0,samplePassed=0,sampleMismatch=0,sampleLockFailed=0;
             unsigned sampleBaseNull=0,sampleUnlockFailed=0;
+            unsigned eligibleIntegrity=0,skippedByBudget=0,byteChecks=0;
+            NSMutableDictionary<NSString *,NSMutableDictionary<NSString *,NSNumber *> *> *coverageGroups=[NSMutableDictionary new];
+            NSMutableDictionary<NSString *,NSNumber *> *classificationCounts=[NSMutableDictionary new];
             CFAbsoluteTime start=CFAbsoluteTimeGetCurrent();
             NSMutableString *csv = [NSMutableString stringWithFormat:
                 @"run,seed,case,width,height,element,row_bytes,alloc_size,format,omit_stride,omit_alloc,id,observed_w,observed_h,observed_row,observed_alloc,min_pixel_span,classification,integrity,result\n"];
@@ -1621,6 +1643,14 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                     } mutableCopy];
                     if (omitRow) [params removeObjectForKey:@"IOSurfaceBytesPerRow"];
                     if (omitAlloc) [params removeObjectForKey:@"IOSurfaceAllocSize"];
+                    NSString *requestedGroup=PFBoundaryRequestedGroup(
+                        width,height,elem,row,alloc,omitRow,omitAlloc);
+                    NSMutableDictionary<NSString *,NSNumber *> *groupStats=coverageGroups[requestedGroup];
+                    if(!groupStats) {
+                        groupStats=[NSMutableDictionary new];
+                        coverageGroups[requestedGroup]=groupStats;
+                    }
+                    PFCount(groupStats,@"attempted");
                     IOSurfaceRef surface=NULL;
                     BOOL threw=NO;
                     @try {
@@ -1638,10 +1668,13 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                     if (threw) {
                         exceptions++;
                         outcome="NS_EXCEPTION";
+                        PFCount(groupStats,@"exceptions");
                     } else if (!surface) {
                         rejected++;
+                        PFCount(groupStats,@"rejected");
                     } else {
                         accepted++;
+                        PFCount(groupStats,@"accepted");
                         id=getID(surface);
                         actualW=getW(surface);
                         actualH=getH(surface);
@@ -1674,12 +1707,20 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
 
                         // Probe fresh owned surfaces, never stale objects or bytes beyond
                         // the last declared pixel. Only uncompressed BGRA, 4 bytes/pixel.
-                        BOOL sample=(n%8==0 && format==0x42475241 && elem==4 &&
+                        BOOL safeCandidate=(format==0x42475241 && elem==4 &&
                                      !zero && inRange && actualW<=256 && actualH<=256 &&
                                      !rowTooSmall && !spanTooSmall && id!=0 &&
                                      minimumSpan>0 && getBase && lock && unlock);
+                        if(safeCandidate) {
+                            eligibleIntegrity++;
+                            PFCount(groupStats,@"integrity_eligible");
+                        }
+                        // Each owned BGRA surface is eligible for bounded verification.
+                        BOOL sample=safeCandidate && sampled<4096;
+                        if(safeCandidate && !sample) skippedByBudget++;
                         if(sample) {
                             sampled++;
+                            PFCount(groupStats,@"integrity_tested");
                             NSDictionary *pre=@{@"run":run,@"seed":@(seed),@"step":@(n),
                                 @"status":@"RUNNING",@"phase":@"BEFORE_SAFE_INTEGRITY",
                                 @"minimum_span":@(minimumSpan),@"observed_alloc":@(actualAlloc),
@@ -1698,16 +1739,31 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                                     sampleBaseNull++;
                                     integrityResult="NO_CPU_MAPPING";
                                 } else {
-                                    // minimumSpan - 1 is a pixel byte within the mapped
-                                    // allocation, never padding and never past allocSize.
-                                    size_t offset=minimumSpan-1;
+                                    // Only touch pixel bytes in the app's own mapped surface.
+                                    // The midpoint accounts for observed row-stride padding.
                                     volatile uint8_t *bytes=(volatile uint8_t *)memory;
-                                    uint8_t original=bytes[offset];
-                                    uint8_t marker=(uint8_t)(original ^ 0xA5);
-                                    bytes[offset]=marker;
-                                    uint8_t observed=bytes[offset];
-                                    bytes[offset]=original;
-                                    if(observed!=marker) {
+                                    size_t offsets[3]={0,
+                                        (actualH/2)*actualRow+(actualW/2)*elem+1,
+                                        minimumSpan-1};
+                                    BOOL mismatch=NO;
+                                    for(unsigned probeIndex=0;probeIndex<3;probeIndex++) {
+                                        size_t offset=offsets[probeIndex];
+                                        if(offset>=minimumSpan || offset>=actualAlloc) {
+                                            mismatch=YES;
+                                            break;
+                                        }
+                                        uint8_t original=bytes[offset];
+                                        uint8_t marker=(uint8_t)(original ^ (0xA5u+probeIndex));
+                                        bytes[offset]=marker;
+                                        uint8_t observed=bytes[offset];
+                                        bytes[offset]=original;
+                                        byteChecks++;
+                                        if(observed!=marker) {
+                                            mismatch=YES;
+                                            break;
+                                        }
+                                    }
+                                    if(mismatch) {
                                         sampleMismatch++;
                                         integrityResult="MISMATCH";
                                         stopOnMismatch=YES;
@@ -1723,8 +1779,16 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                                 }
                             }
                         }
+                        if(sample) {
+                            PFCount(groupStats,strcmp(integrityResult,"PASS")==0 ?
+                                    @"integrity_passed" : @"integrity_not_passed");
+                        }
                         CFRelease(surface);
                     }
+                    NSString *observedClass=[NSString stringWithUTF8String:
+                        strcmp(outcome,"REJECTED")==0 ? "REJECTED_INPUT" :
+                        strcmp(outcome,"NS_EXCEPTION")==0 ? "NS_EXCEPTION" : classification];
+                    PFCount(classificationCounts,observedClass);
                     [csv appendFormat:@"%@,%u,%u,%zu,%zu,%zu,%zu,%zu,0x%08x,%d,%d,%u,%zu,%zu,%zu,%zu,%zu,%s,%s,%s\n",
                         run,seed,n,width,height,elem,row,alloc,(unsigned)format,omitRow,omitAlloc,
                         (unsigned)id,actualW,actualH,actualRow,actualAlloc,
@@ -1781,6 +1845,11 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                 @"short_row_bytes":@(shortRow),@"invalid_id":@(invalidId),
                 @"unexpected_metadata_range":@(unexpectedBounds),
                 @"legacy_full_rows_short":@(legacyFullRowShort),
+                @"integrity_eligible":@(eligibleIntegrity),
+                @"integrity_byte_checks":@(byteChecks),
+                @"integrity_skipped_by_budget":@(skippedByBudget),
+                @"integrity_coverage_pct":@(eligibleIntegrity ?
+                                      (100.0*(double)sampled/(double)eligibleIntegrity):0.0),
                 @"integrity_tested":@(sampled),@"integrity_passed":@(samplePassed),
                 @"integrity_mismatch":@(sampleMismatch),
                 @"integrity_lock_failed":@(sampleLockFailed),
@@ -1795,7 +1864,50 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
             NSString *persistedCSV=[NSHomeDirectory() stringByAppendingPathComponent:
                 @"Documents/IOSurfaceBruteForce-v18-trace.csv"];
             [exportCSV writeToFile:persistedCSV atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            NSDictionary *coverageReport=@{
+                @"schema":@"v19.2-coverage-grouped-owned-memory",
+                @"run":run, @"seed":@(seed), @"total_cases":@(attempts),
+                @"accepted":@(accepted), @"rejected":@(rejected),
+                @"exceptions":@(exceptions), @"review":@(review),
+                @"integrity_eligible":@(eligibleIntegrity),
+                @"integrity_tested":@(sampled), @"integrity_passed":@(samplePassed),
+                @"integrity_byte_checks":@(byteChecks),
+                @"integrity_skipped_by_budget":@(skippedByBudget),
+                @"input_groups":coverageGroups,
+                @"observed_classes":classificationCounts,
+                @"scope":@"Own BGRA surfaces, public IOSurface API; no kernel object trace",
+                @"warning":@"Requested input groups do not establish causes of rejection, and API errors do not establish kernel vulnerabilities."
+            };
+            NSString *docs=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+            NSString *coveragePath=[docs stringByAppendingPathComponent:@"IOSurfaceCoverage-v19_2.json"];
+            NSData *coverageBytes=[NSJSONSerialization dataWithJSONObject:coverageReport
+                                            options:NSJSONWritingPrettyPrinted error:NULL];
+            if(coverageBytes)
+                [coverageBytes writeToFile:coveragePath options:NSDataWritingAtomic error:NULL];
+            NSMutableString *coverageCSV=[NSMutableString stringWithString:
+                @"input_group,attempted,accepted,rejected,exceptions,integrity_eligible,integrity_tested,integrity_passed,integrity_not_passed\n"];
+            NSArray<NSString *> *orderedGroups=[[coverageGroups allKeys]
+                sortedArrayUsingSelector:@selector(compare:)];
+            for(NSString *name in orderedGroups) {
+                NSDictionary *g=coverageGroups[name];
+                [coverageCSV appendFormat:@"%@,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",name,
+                   (unsigned long)[g[@"attempted"] unsignedIntegerValue],
+                   (unsigned long)[g[@"accepted"] unsignedIntegerValue],
+                   (unsigned long)[g[@"rejected"] unsignedIntegerValue],
+                   (unsigned long)[g[@"exceptions"] unsignedIntegerValue],
+                   (unsigned long)[g[@"integrity_eligible"] unsignedIntegerValue],
+                   (unsigned long)[g[@"integrity_tested"] unsignedIntegerValue],
+                   (unsigned long)[g[@"integrity_passed"] unsignedIntegerValue],
+                   (unsigned long)[g[@"integrity_not_passed"] unsignedIntegerValue]];
+            }
+            NSString *coverageCsvPath=[docs stringByAppendingPathComponent:@"IOSurfaceCoverage-v19_2.csv"];
+            [coverageCSV writeToFile:coverageCsvPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
             dispatch_async(dispatch_get_main_queue(), ^{
+                [self note:[NSString stringWithFormat:
+                    @"COVERAGE v19.2: elegibles=%u comprobadas=%u (%.2f%%) omitidas_por_limite=%u",
+                    eligibleIntegrity,sampled,
+                    eligibleIntegrity ? (100.0*(double)sampled/(double)eligibleIntegrity):0.0,
+                    skippedByBudget]];
                 self.stressCSV=exportCSV;
                 self.stressRunning=NO;
                 NSString *endStatus=(sampleMismatch||sampleUnlockFailed)?
@@ -3273,6 +3385,13 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     }
     for(NSString *name in @[@"IOSurfaceBootMonitor-checkpoint.json",
                             @"IOSurfaceBootMonitor-trace.csv"]) {
+        NSString *p=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                       stringByAppendingPathComponent:name];
+        if([[NSFileManager defaultManager] fileExistsAtPath:p])
+            [filesToShare addObject:[NSURL fileURLWithPath:p]];
+    }
+    for(NSString *name in @[@"IOSurfaceCoverage-v19_2.json",
+                            @"IOSurfaceCoverage-v19_2.csv"]) {
         NSString *p=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                        stringByAppendingPathComponent:name];
         if([[NSFileManager defaultManager] fileExistsAtPath:p])

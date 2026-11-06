@@ -1,12 +1,12 @@
 name: Compilar IOSurface Preflight IPA
 on:
   push:
-    branches: [main, preflight-ipa]
+    branches: [main, preflight-ipa, feat/iosurface-preflight-v19-2-coverage]
     paths:
       - 'IOSurfacePreflight/**'
       - '.github/workflows/ios-preflight-ipa.yml'
   pull_request:
-    branches: [main]
+    branches: [main, fix/iosurface-preflight-v19-reboot-diagnostics]
     paths:
       - 'IOSurfacePreflight/**'
       - '.github/workflows/ios-preflight-ipa.yml'
@@ -41,8 +41,8 @@ jobs:
       - name: Verificar versión real del Info.plist
         run: |
           INFO="$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/Info.plist"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.1"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "20"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.2"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "21"
           test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
       - name: Crear IPA
         run: |
