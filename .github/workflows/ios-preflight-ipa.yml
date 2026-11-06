@@ -1,7 +1,7 @@
 name: Compilar IOSurface Preflight IPA
 on:
   push:
-    branches: [main, preflight-ipa, feat/iosurface-preflight-v19-2-coverage, feat/iosurface-preflight-v19-3-format-coverage, feat/iosurface-preflight-v19-4-bounded-bruteforce-batch]
+    branches: [main, preflight-ipa, feat/iosurface-preflight-v19-2-coverage, feat/iosurface-preflight-v19-3-format-coverage, feat/iosurface-preflight-v19-4-bounded-bruteforce-batch, feat/iosurface-preflight-v19-5-effective-coverage]
     paths:
       - 'IOSurfacePreflight/**'
       - '.github/workflows/ios-preflight-ipa.yml'
@@ -40,6 +40,12 @@ jobs:
             IOSurfacePreflight/Tests/PFBoundedBatchTests.c \
             -o "$RUNNER_TEMP/pf-batch-tests"
           "$RUNNER_TEMP/pf-batch-tests"
+      - name: Pruebas de novedad y clave canonica (C11)
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror \
+            IOSurfacePreflight/Tests/PFNoveltyCoverageTests.c \
+            -o "$RUNNER_TEMP/pf-novelty-tests"
+          "$RUNNER_TEMP/pf-novelty-tests"
       - name: Generar proyecto
         working-directory: IOSurfacePreflight
         run: xcodegen generate
@@ -53,8 +59,8 @@ jobs:
       - name: Verificar versión real del Info.plist
         run: |
           INFO="$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/Info.plist"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.4"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "23"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.5"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "24"
           test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
           python3 - "$INFO" <<'PY'
           import plistlib
