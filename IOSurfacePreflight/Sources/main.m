@@ -1735,11 +1735,11 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 NSArray<NSString *> *fields=[line componentsSeparatedByString:@","];
                 if(fields.count<11) {badRows++;return;}
                 rows++;
-                uint32_t width=(uint32_t)[fields[3] unsignedLongLongValue];
-                uint32_t height=(uint32_t)[fields[4] unsignedLongLongValue];
-                uint32_t element=(uint32_t)[fields[5] unsignedLongLongValue];
-                uint32_t row=(uint32_t)[fields[6] unsignedLongLongValue];
-                uint32_t allocation=(uint32_t)[fields[7] unsignedLongLongValue];
+                uint32_t width=(uint32_t)strtoull([fields[3] UTF8String],NULL,10);
+                uint32_t height=(uint32_t)strtoull([fields[4] UTF8String],NULL,10);
+                uint32_t element=(uint32_t)strtoull([fields[5] UTF8String],NULL,10);
+                uint32_t row=(uint32_t)strtoull([fields[6] UTF8String],NULL,10);
+                uint32_t allocation=(uint32_t)strtoull([fields[7] UTF8String],NULL,10);
                 uint32_t format=(uint32_t)strtoul([fields[8] UTF8String],NULL,0);
                 BOOL omitRow=[fields[9] boolValue],omitAlloc=[fields[10] boolValue];
                 PFEffectiveInputKey key=PFEffectiveKey(width,height,element,row,allocation,
