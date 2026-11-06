@@ -1905,7 +1905,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             BOOL noveltyBudgetExhausted=NO,noveltyTableFull=NO;
             const unsigned candidateBudget=noveltyMode ?
                 limit*PF_NOVELTY_CANDIDATE_MULTIPLIER : limit;
-            NSMutableDictionary<NSString *,NSNumber *> *duplicateFormats=[NSMutableDictionary new];
+            NSMutableDictionary<NSString *,NSNumber *> *duplicatesHistoricByFormat=[NSMutableDictionary new];
+            NSMutableDictionary<NSString *,NSNumber *> *duplicatesCurrentByFormat=[NSMutableDictionary new];
             unsigned attempts=0,accepted=0,rejected=0,exceptions=0,unusual=0;
             unsigned normalized=0,zeroDimensionAccepted=0,footprintShort=0,shortRow=0;
             unsigned legacyFullRowShort=0,invalidId=0,unexpectedBounds=0;
@@ -2031,10 +2032,15 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                         uint8_t priorOrigin=0;
                         int admitted=PFNoveltyInsertWithOrigin(noveltySet,&input,2,&priorOrigin);
                         if(admitted==0) {
-                            if(priorOrigin==1) skippedHistoric++;
-                            else skippedWithinRun++;
-                            PFCount(duplicateFormats,[NSString stringWithUTF8String:
-                                PFRequestedPixelFormat(format)]);
+                            NSString *formatName=[NSString stringWithUTF8String:
+                                PFRequestedPixelFormat(format)];
+                            if(priorOrigin==1) {
+                                skippedHistoric++;
+                                PFCount(duplicatesHistoricByFormat,formatName);
+                            } else {
+                                skippedWithinRun++;
+                                PFCount(duplicatesCurrentByFormat,formatName);
+                            }
                             continue;
                         }
                         if(admitted<0) {
@@ -2235,7 +2241,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                     if(n%100==0) {
                         NSDictionary *saved=@{
                             @"run":run,@"seed":@(seed),@"step":@(n),@"status":@"RUNNING",
-                            @"schema":@"v19.3-format-coverage",@"phase":@"IN_PROGRESS",
+                            @"schema":noveltyMode?@"v19.5-effective-coverage":@"v19.3-format-coverage",@"phase":@"IN_PROGRESS",
                             @"accepted":@(accepted),@"rejected":@(rejected),
                             @"exceptions":@(exceptions),@"review":@(review),
                             @"edge_zero_dimension":@(zeroDimensionAccepted),
@@ -2333,7 +2339,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             [exportCSV writeToFile:[runDirectory stringByAppendingPathComponent:@"boundary-trace.csv"]
                           atomically:YES encoding:NSUTF8StringEncoding error:NULL];
             NSDictionary *coverageReport=@{
-                @"schema":@"v19.3-format-coverage-owned-memory",
+                @"schema":noveltyMode?@"v19.5-effective-coverage-owned-memory":@"v19.3-format-coverage-owned-memory",
                 @"run":run, @"seed":@(seed), @"total_cases":@(attempts),
                 @"accepted":@(accepted), @"rejected":@(rejected),
                 @"exceptions":@(exceptions), @"review":@(review),
@@ -2415,18 +2421,68 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
             // Keep reports self-contained even after the "latest" compatibility
             // checkpoint and CSV are replaced by a subsequent run.
             NSDictionary *runManifest=@{
-                @"schema":@"v19.3-archived-run",
+                @"schema":noveltyMode?@"v19.5-archived-run":@"v19.3-archived-run",
                 @"run":run,@"seed":@(seed),@"total_cases":@(attempts),
                 @"status":final[@"status"],@"timestamp":[NSDate date].description,
                 @"files":@[@"checkpoint.json",@"boundary-trace.csv",@"coverage.json",
                            @"input-groups.csv",@"formats.csv",@"eligibility.csv"],
-                @"scope":@"Public API + own bounded BGRA surfaces; not a kernel trace"
+                @"scope":@"Public API + own bounded BGRA surfaces; not a kernel trace",
+                @"mode":noveltyMode?@"EFFECTIVE_NOVELTY":@"LEGACY"
             };
             NSData *manifestBytes=[NSJSONSerialization dataWithJSONObject:runManifest
                                             options:NSJSONWritingPrettyPrinted error:NULL];
             if(manifestBytes)
                 [manifestBytes writeToFile:[runDirectory stringByAppendingPathComponent:@"manifest.json"]
                                   options:NSDataWritingAtomic error:NULL];
+            if(noveltyMode) {
+                NSDictionary *noveltyReport=@{
+                    @"schema":@"v19.5-effective-input-novelty",
+                    @"run":run,@"seed":@(seed),
+                    @"generator":@"splitmix64-v1",
+                    @"signature":@"Effective dictionary: width, height, bytesPerElement, actual passed row and allocation, requested pixel format and omission flags",
+                    @"history":history,
+                    @"history_scope":@"Newest 6 archived runs, capped at 250000 CSV data rows; no claim about older or unavailable history",
+                    @"candidate_budget":@(candidateBudget),
+                    @"generated_candidates":@(generatedCandidates),
+                    @"skipped_historical":@(skippedHistoric),
+                    @"skipped_current_run":@(skippedWithinRun),
+                    @"skipped_duplicates_total":@(skippedHistoric+skippedWithinRun),
+                    @"new_distinct_configs_tested":@(attempts),
+                    @"new_accepted":@(accepted),@"new_rejected":@(rejected),
+                    @"exceptions":@(exceptions),@"review":@(review),
+                    @"integrity_tested":@(sampled),@"integrity_passed":@(samplePassed),
+                    @"limit_reached":@(attempts==limit),
+                    @"candidate_budget_exhausted":@(noveltyBudgetExhausted),
+                    @"table_full":@(noveltyTableFull),
+                    @"format_skipped_historical":duplicatesHistoricByFormat,
+                    @"format_skipped_within_run":duplicatesCurrentByFormat,
+                    @"status":final[@"status"],
+                    @"warning":@"Newness refers to the bounded local archive and this run; a unique user-space input is not evidence of a kernel security issue."
+                };
+                NSData *reportData=[NSJSONSerialization dataWithJSONObject:noveltyReport
+                                           options:NSJSONWritingPrettyPrinted error:NULL];
+                if(reportData) {
+                    [reportData writeToFile:[docs stringByAppendingPathComponent:
+                        @"IOSurfaceNovelty-v19_5.json"] options:NSDataWritingAtomic error:NULL];
+                    [reportData writeToFile:[runDirectory stringByAppendingPathComponent:
+                        @"novelty.json"] options:NSDataWritingAtomic error:NULL];
+                }
+                NSMutableString *noveltyCSV=[NSMutableString stringWithString:
+                    @"requested_format,skipped_historical,skipped_within_run\n"];
+                for(NSString *name in @[@"BGRA_REQUESTED",@"RGBA_REQUESTED",
+                                       @"ZERO_REQUESTED",@"AAAA_REQUESTED"]) {
+                    [noveltyCSV appendFormat:@"%@,%lu,%lu\n",name,
+                        (unsigned long)[duplicatesHistoricByFormat[name] unsignedIntegerValue],
+                        (unsigned long)[duplicatesCurrentByFormat[name] unsignedIntegerValue]];
+                }
+                [noveltyCSV writeToFile:[docs stringByAppendingPathComponent:
+                    @"IOSurfaceNovelty-v19_5.csv"] atomically:YES
+                               encoding:NSUTF8StringEncoding error:NULL];
+                [noveltyCSV writeToFile:[runDirectory stringByAppendingPathComponent:
+                    @"novelty-duplicates.csv"] atomically:YES
+                               encoding:NSUTF8StringEncoding error:NULL];
+            }
+            if(noveltySet) PFNoveltyDestroy(noveltySet);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self note:[NSString stringWithFormat:
                     @"COVERAGE v19.3: elegibles=%u comprobadas=%u (%.2f%%) omitidas_por_limite=%u",
@@ -2451,6 +2507,13 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [self note:[NSString stringWithFormat:@"BOUNDARY: tiempo=%.3fs; CSV persistente y checkpoint guardados.",
                     CFAbsoluteTimeGetCurrent()-start]];
                 [self note:@"BOUNDARY: una anomalía de API no equivale a fallo del kernel, UAF o KernelRW."];
+                if(noveltyMode) {
+                    [self note:[NSString stringWithFormat:
+                        @"NOVELTY v19.5: generadas=%u duplicadas_hist=%u duplicadas_local=%u nuevas_enviadas=%u/%u presupuesto=%u estado=%@",
+                        generatedCandidates,skippedHistoric,skippedWithinRun,
+                        attempts,limit,candidateBudget,final[@"status"]]];
+                    [self note:@"NOVELTY: novedad relativa a los archivos recientes importados; no es cobertura interna del kernel."];
+                }
                 if(batchMode) [self boundedBatchRunCompleted:run seed:seed result:final];
             });
         }
