@@ -2063,14 +2063,6 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                             [data writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
                         }
                     }
-                    if(batchMode && (exceptions>0 || review>0 || sampleLockFailed>0 ||
-                                     sampleBaseNull>0 || sampleUnlockFailed>0 ||
-                                     sampleMismatch>0)) {
-                        stopped=YES;
-                        // Finish this iteration and preserve observed counters.
-                        // No further input combinations are sent for this batch.
-                        break;
-                    }
                     if(stopOnMismatch) {
                         stopped=YES;
                         NSDictionary *incident=@{@"run":run,@"seed":@(seed),@"step":@(n),
@@ -2083,6 +2075,14 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                             [incidentData writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
                             [incidentData writeToFile:archiveCheckpoint options:NSDataWritingAtomic error:NULL];
                         }
+                        break;
+                    }
+                    if(batchMode && (exceptions>0 || review>0 || sampleLockFailed>0 ||
+                                     sampleBaseNull>0 || sampleUnlockFailed>0 ||
+                                     sampleMismatch>0)) {
+                        stopped=YES;
+                        // Finish this iteration and preserve observed counters.
+                        // No further input combinations are sent for this batch.
                         break;
                     }
                     if(n%2500==0) {
@@ -2244,7 +2244,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                     @"BOUNDARY_END_%@_%@",run,endStatus]];
                 [self note:[NSString stringWithFormat:
                     @"BOUNDARY: %@ %u/%u seed=%u aceptadas=%u rechazadas=%u excepciones=%u",
-                    stopped?@"STOPPED":@"DONE",attempts,limit,seed,accepted,rejected,exceptions]];
+                    final[@"status"],attempts,limit,seed,accepted,rejected,exceptions]];
                 [self note:[NSString stringWithFormat:
                     @"BOUNDARY: zero-dimension=%u full-rows-short(INFO)=%u min-pixel-span-short=%u stride-short=%u alertas=%u normales=%u",
                     zeroDimensionAccepted,legacyFullRowShort,footprintShort,shortRow,review,regular]];
