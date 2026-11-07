@@ -70,6 +70,12 @@ jobs:
         if: always()
         run: |
           python3 AppleIOKitLab/tools/iosurface_static_report.py "$RUNNER_TEMP/fwaudit"
+      - name: Verificar la tabla de 60 selectores y la rama de rechazo del selector 4
+        shell: bash
+        run: |
+          set -e
+          python3 AppleIOKitLab/tools/iosurface_dispatch_audit.py "$RUNNER_TEMP/fwaudit"
+          python3 -m json.tool "$RUNNER_TEMP/fwaudit/report/iosurface-selector4-24A437.json" > /dev/null
       - name: Publicar solo informe, logs y binario IOSurface extraído
         if: always()
         uses: actions/upload-artifact@v4
