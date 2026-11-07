@@ -20,6 +20,7 @@ typedef kern_return_t (*DirectMethod)(DirectService, uint32_t, const uint64_t *,
                                      uint32_t, const void *, size_t, uint64_t *,
                                      uint32_t *, void *, size_t *);
 typedef CFDataRef (*DirectSerialize)(CFTypeRef, CFOptionFlags);
+typedef CFTypeRef (*DirectUnserializeWithSize)(const char *, size_t, CFAllocatorRef, CFOptionFlags, CFStringRef *);
 typedef struct __IOSurface *DirectIOSurfaceRef;
 typedef DirectIOSurfaceRef (*DirectSurfaceLookup)(uint32_t);
 typedef CFTypeRef (*DirectSurfaceCopyValue)(DirectIOSurfaceRef, CFStringRef);
@@ -88,7 +89,6 @@ static NSString *DirectMachine(void) {
                 @"kernelRW":@NO
             } mutableCopy];
             NSMutableArray *steps=r[@"steps"];
-            __block NSString *current=@"LOAD";
             void (^savePhase)(NSString *)=^(NSString *stage){
                 r[@"phase"]=@"IN_FLIGHT";r[@"currentStep"]=stage;
                 [self saveJSON:r as:@"AppleIOKitLab-direct-roundtrip.json"];
@@ -109,6 +109,7 @@ static NSString *DirectMachine(void) {
             DirectRelease release=io?(DirectRelease)dlsym(io,"IOObjectRelease"):NULL;
             DirectMethod method=io?(DirectMethod)dlsym(io,"IOConnectCallMethod"):NULL;
             DirectSerialize serialize=io?(DirectSerialize)dlsym(io,"IOCFSerialize"):NULL;
+            DirectUnserializeWithSize unserialize=io?(DirectUnserializeWithSize)dlsym(io,"IOCFUnserializeWithSize"):NULL;
             if(!matching || !get || !open || !close || !release || !method){
                 finish(@"IOKit no ofrece las funciones necesarias.");
                 if(io)dlclose(io);
@@ -236,6 +237,25 @@ static NSString *DirectMachine(void) {
                                            @"valid":@(readBack)}];
                         [self saveJSON:r as:@"AppleIOKitLab-direct-roundtrip.json"];
 
+                        // Decodificar el dato DEVUELTO por el selector 10, en
+                        // lugar de interpretar "kr == 0" como lectura correcta.
+                        BOOL decodedMatches=NO;
+                        if(readBack && unserialize) {
+                            CFStringRef parsingError=NULL;
+                            CFTypeRef decoded=unserialize((const char*)answer+12,
+                                                          answerLen-12,
+                                                          kCFAllocatorDefault,0,&parsingError);
+                            if(decoded && CFGetTypeID(decoded)==CFStringGetTypeID())
+                                decodedMatches=[(__bridge NSString*)decoded isEqualToString:value];
+                            if(decoded) CFRelease(decoded);
+                            if(parsingError) CFRelease(parsingError);
+                        }
+                        r[@"rawDecodedValueMatches"] = @(decodedMatches);
+                        [steps addObject:@{@"operation":@"selector10_decode_and_compare",
+                                           @"valid":@(decodedMatches),
+                                           @"decoderAvailable":@(unserialize!=NULL)}];
+                        [self saveJSON:r as:@"AppleIOKitLab-direct-roundtrip.json"];
+
                         // Comprobación de valor exacto por una segunda API (si el
                         // ownership permite hacer lookup desde IOSurface.framework).
                         void *surf=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
@@ -256,7 +276,7 @@ static NSString *DirectMachine(void) {
                         }
                         if(surf)dlclose(surf);
                         r[@"publicCopyValueMatches"] = @(equal);
-                        r[@"propertyRoundTripConfirmed"] = @(written && readBack && equal);
+                        r[@"propertyRoundTripConfirmed"] = @(written && readBack && (equal || decodedMatches));
                         [steps addObject:@{@"operation":@"IOSurfaceCopyValue_cross_check",
                                            @"valid":@(equal)}];
                         [self saveJSON:r as:@"AppleIOKitLab-direct-roundtrip.json"];
