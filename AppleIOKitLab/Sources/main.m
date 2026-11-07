@@ -195,7 +195,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     self.selectedService = @"";
 
     UILabel *title = [UILabel new];
-    title.text = @"Apple IOKit Lab · v1.6";
+    title.text = @"Apple IOKit Lab · v1.7";
     title.font = [UIFont boldSystemFontOfSize:25];
 
     UILabel *summary = [UILabel new];
@@ -225,7 +225,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
         [self button:@"2. Baseline pública IOSurface (64x64)" selector:@selector(publicBaselineTapped:)],
         [self button:@"3. Contrato IOSurface (selector 13, una consulta)" selector:@selector(contractTapped:)],
         [self button:@"4. Prueba funcional real: crear y leer superficie" selector:@selector(directRoundTripTapped:)],
-        [self button:@"5. Recibir notificación IOSurface (1,5 s)" selector:@selector(notificationLifecycleTapped:)],
+        [self button:@"5. Comprobar notificaciones A-B-A" selector:@selector(notificationLifecycleTapped:)],
         [self button:@"6. Elegir controlador accesible" selector:@selector(chooseTapped:)],
         [self button:@"7. Campaña legacy: 16 llamadas malformadas" selector:@selector(campaignTapped:)],
         [self button:@"8. Reproducir último caso legacy" selector:@selector(replayTapped:)],
@@ -625,7 +625,8 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
                        @"AppleIOKitLab-summary.json", @"AppleIOKitLab-contract.json",
                        @"AppleIOKitLab-direct-roundtrip.json",
                        @"AppleIOKitLab-notification-lifecycle.json",
-                       @"AppleIOKitLab-notification-delivery.json"];
+                       @"AppleIOKitLab-notification-delivery.json",
+                       @"AppleIOKitLab-notification-causality.json"];
     NSMutableArray *urls = [NSMutableArray new];
     for (NSString *name in names) {
         NSURL *u = [self document:name];
