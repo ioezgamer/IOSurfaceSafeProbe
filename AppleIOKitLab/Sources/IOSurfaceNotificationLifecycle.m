@@ -398,6 +398,42 @@ static NSDictionary *NotifyOneUsageCycle(uint32_t sid) {
                                    @"returnCode":NotifyError(rm),@"time":NotifyTime()}];
                 [self saveJSON:report as:filename];
                 [self log:[NSString stringWithFormat:@"NOTIFY: selector18 %@.",NotifyError(rm)]];
+                if(rm==KERN_SUCCESS) {
+                    // Control negativo A posterior: comprobar si hay un
+                    // mensaje de la fase B todavía en cola ANTES del estímulo.
+                    checkpoint(@"post_remove_check_queued_messages");
+                    NSDictionary *queued=NotifyReceiveOnce(wake,0);
+                    report[@"queuedAfterRemoval"]=queued;
+                    [steps addObject:@{@"step":@"post_remove_queue_check",
+                                       @"result":queued,@"time":NotifyTime()}];
+                    BOOL queuedMessage=[queued[@"messageReceived"] boolValue];
+                    BOOL cleanQueue=[queued[@"status"] isEqualToString:@"TIMED_OUT"];
+                    // No ocultar que había mensajes pendientes de la fase B.
+                    // En caso de cola no vacía el control A queda inconcluso.
+                    if(cleanQueue) {
+                        checkpoint(@"control_A_post_removal_cycle");
+                        NSDictionary *postCycle=NotifyOneUsageCycle(sid);
+                        report[@"postUnsubscribeCycle"]=postCycle;
+                        [steps addObject:@{@"step":@"control_A_post_usecount",
+                                           @"result":postCycle,@"time":NotifyTime()}];
+                        checkpoint(@"control_A_post_receive_350ms");
+                        NSDictionary *postReceive=NotifyReceiveOnce(wake,350);
+                        report[@"postUnsubscribeReceive"]=postReceive;
+                        BOOL postPassed=
+                            [postCycle[@"performed"] boolValue] &&
+                            [postCycle[@"restored"] boolValue] &&
+                            ![postReceive[@"messageReceived"] boolValue] &&
+                            [postReceive[@"status"] isEqualToString:@"TIMED_OUT"];
+                        report[@"postUnsubscribeControlPassed"]=@(postPassed);
+                        [steps addObject:@{@"step":@"control_A_post_receive",
+                                           @"result":postReceive,@"time":NotifyTime()}];
+                    } else {
+                        report[@"postUnsubscribeControlSkippedReason"]=
+                            queuedMessage ? @"QUEUED_MESSAGE_FROM_PRIOR_PHASE"
+                                          : @"PORT_RECEIVE_ERROR";
+                    }
+                    [self saveJSON:report as:filename];
+                }
             }
             // No user-originated call overlaps another. Close before destroying port.
             checkpoint(@"IOServiceClose");
@@ -410,17 +446,30 @@ static NSDictionary *NotifyOneUsageCycle(uint32_t sid) {
             report[@"machPortDestroyKR"]=NotifyError(drop);
             [steps addObject:@{@"step":@"mach_port_destroy",
                                @"returnCode":NotifyError(drop),@"time":NotifyTime()}];
+            BOOL pre=[report[@"preSubscriptionControlPassed"] boolValue];
+            BOOL during=[report[@"messageAfterDecrementObserved"] boolValue];
+            BOOL post=[report[@"postUnsubscribeControlPassed"] boolValue];
+            BOOL cleanup=[report[@"removalAccepted"] boolValue];
+            BOOL countRestored=[report[@"usageCountRestored"] boolValue];
+            NSArray *messages=report[@"receivedMessages"];
+            BOOL priorQuiet=(messages.count>=3 &&
+                ![messages[0][@"result"][@"messageReceived"] boolValue] &&
+                ![messages[1][@"result"][@"messageReceived"] boolValue]);
+            BOOL causal=pre && priorQuiet && during && post && cleanup &&
+                        countRestored && done==KERN_SUCCESS && drop==KERN_SUCCESS;
+            report[@"causalControlSupported"]=@(causal);
+            report[@"causalInterpretation"]=causal
+                ? @"Delivery observed in subscribed B after decrement; no delivery before registering and after removal, for the same owned surface. Sender identity not verified."
+                : @"A-B-A controls not all satisfied. The observed message alone does not establish registration dependence.";
             NSString *verdict=@"REGISTER_REJECTED_NO_RACE";
             if([report[@"registrationAccepted"] boolValue]) {
-                BOOL received=[report[@"messageDeliveryObserved"] boolValue];
-                BOOL stimulated=[report[@"usageTransitionPerformed"] boolValue];
-                verdict=received ? @"MESSAGE_ON_REGISTERED_PORT_ORIGIN_UNVERIFIED"
-                    : (stimulated ? @"NO_CALLBACK_OBSERVED_AFTER_USECOUNT_TRANSITION"
-                                  : @"NO_CALLBACK_OBSERVED_WITHOUT_STIMULUS");
-                if(![report[@"removalAccepted"] boolValue])
-                    report[@"cleanupWarning"]=@"NOTIFICATION_REMOVAL_REJECTED";
+                verdict=causal ? @"ABA_CONTROL_SUPPORTS_SUBSCRIPTION_DEPENDENCE"
+                    : (during ? @"MESSAGE_DURING_SUBSCRIPTION_CONTROLS_INCONCLUSIVE"
+                              : @"NO_MATCHING_CALLBACK_IN_B_PHASE");
+                if(!cleanup)report[@"cleanupWarning"]=@"NOTIFICATION_REMOVAL_REJECTED";
             }
-            if(done!=KERN_SUCCESS)verdict=@"SERVICE_CLOSE_ERROR_NO_RACE";
+            if(done!=KERN_SUCCESS || drop!=KERN_SUCCESS)
+                verdict=@"CLEANUP_ERROR_CONTROLS_INCONCLUSIVE";
             finish(verdict);
             dlclose(library);
         });
