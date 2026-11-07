@@ -124,6 +124,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
 @property(atomic, assign) BOOL running;
 @property(atomic, assign) BOOL stopRequested;
 - (void)contractTapped:(id)sender;
+- (void)directRoundTripTapped:(id)sender;
 @end
 
 @implementation AppleIOKitLabController
@@ -193,7 +194,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     self.selectedService = @"";
 
     UILabel *title = [UILabel new];
-    title.text = @"Apple IOKit Lab · v1.2";
+    title.text = @"Apple IOKit Lab · v1.3";
     title.font = [UIFont boldSystemFontOfSize:25];
 
     UILabel *summary = [UILabel new];
@@ -222,9 +223,10 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
         [self button:@"1. Inventariar servicios y permisos reales" selector:@selector(inventoryTapped:)],
         [self button:@"2. Baseline pública IOSurface (64x64)" selector:@selector(publicBaselineTapped:)],
         [self button:@"3. Contrato IOSurface (selector 13, una consulta)" selector:@selector(contractTapped:)],
-        [self button:@"4. Elegir controlador accesible" selector:@selector(chooseTapped:)],
-        [self button:@"4. Ejecutar 16 casos IOKit (requiere confirmación)" selector:@selector(campaignTapped:)],
-        [self button:@"5. Reproducir último caso guardado" selector:@selector(replayTapped:)],
+        [self button:@"4. Prueba funcional real: crear y leer superficie" selector:@selector(directRoundTripTapped:)],
+        [self button:@"5. Elegir controlador accesible" selector:@selector(chooseTapped:)],
+        [self button:@"6. Campaña legacy: 16 llamadas malformadas" selector:@selector(campaignTapped:)],
+        [self button:@"7. Reproducir último caso legacy" selector:@selector(replayTapped:)],
         [self button:@"Detener entre casos" selector:@selector(stopTapped:)],
         [self button:@"Exportar CSV + JSON + registro" selector:@selector(exportTapped:)],
         self.logView
@@ -618,7 +620,8 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     NSArray *names = @[@"AppleIOKitLab-session.txt", @"AppleIOKitLab-inventory.json",
                        @"AppleIOKitLab-checkpoint.json", @"AppleIOKitLab-lastcase.json",
                        @"AppleIOKitLab-trace.csv", @"AppleIOKitLab-public-baseline.json",
-                       @"AppleIOKitLab-summary.json", @"AppleIOKitLab-contract.json"];
+                       @"AppleIOKitLab-summary.json", @"AppleIOKitLab-contract.json",
+                       @"AppleIOKitLab-direct-roundtrip.json"];
     NSMutableArray *urls = [NSMutableArray new];
     for (NSString *name in names) {
         NSURL *u = [self document:name];
