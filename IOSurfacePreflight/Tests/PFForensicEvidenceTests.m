@@ -41,7 +41,37 @@ int main(void) {
         NSCAssert([model[@"same_client"][@"samples"][0][@"call_result"]
                     isEqualToString:@"0x10000003"],@"API outcome");
 
-        // 4. A normal port revocation report must not imply UAF or kernel RW.
+        // 4. The real iPhone CSV uses 11 fields WITHOUT an "index" column.
+        writeText(dir,@"IOSurfaceSameClient-trace.csv",
+            @"run,trial,open_kr,port_kr,call_kr,close_kr,call_start_us,call_end_us,close_start_us,close_end_us,user_space_overlap\n"
+             @"C18DFEDF-F162-475C-A15C-83B608D35330,1,0x00000000,0x00000000,0x10000003,0x00000000,0.000,537.833,21.458,195.625,1\n");
+        NSDictionary *actual=PFBuildForensicSnapshot(dir,@"S1",@"iPhone14,3",@"27.0");
+        NSCAssert([actual[@"same_client"][@"trials"] integerValue]==1,
+                  @"11-column real trace rejected");
+        NSCAssert([actual[@"same_client"][@"invalid_rows"] integerValue]==0,
+                  @"11-column trace incorrectly invalidated");
+        NSCAssert([actual[@"same_client"][@"csv_schema"]
+                  isEqualToString:@"11_columns_original"],@"11-column schema");
+        NSCAssert(fabs([actual[@"same_client"][@"max_overlap_microseconds"]
+                    doubleValue]-174.167)<0.001,@"11-column overlap mismatch");
+        NSCAssert([actual[@"same_client"][@"successful_api_calls"] integerValue]==0,
+                  @"failed external call must not count as successful");
+        // 5. Malformed timing values must never be accepted as valid.
+        writeText(dir,@"IOSurfaceSameClient-trace.csv",
+            @"run,trial,open_kr,port_kr,call_kr,close_kr,call_start_us,call_end_us,close_start_us,close_end_us,user_space_overlap\n"
+             @"R,1,0x0,0x0,0x00000000,0x0,NaN,537.833,21.458,195.625,1\n");
+        NSDictionary *invalid=PFBuildForensicSnapshot(dir,@"S1",@"iPhone14,3",@"27.0");
+        NSCAssert([invalid[@"same_client"][@"trials"] integerValue]==0,
+                  @"malformed timing counted as a trial");
+        NSCAssert([invalid[@"same_client"][@"invalid_rows"] integerValue]==1,
+                  @"malformed timing not identified");
+
+        // 6. A normal port revocation report must not imply UAF or kernel RW.
+        // Restore a valid fixture before taking remaining snapshots.
+        writeText(dir,@"IOSurfaceSameClient-trace.csv",
+            @"run,trial,open_kr,port_kr,call_kr,close_kr,call_start_us,call_end_us,user_space_overlap\n"
+             @"C18DFEDF-F162-475C-A15C-83B608D35330,1,0x00000000,0x00000000,0x10000003,0x00000000,0.000,537.833,21.458,195.625,1\n");
+
         writeText(dir,@"IOSurfacePortRevocation-v19_9.json",
             @"{\"verdict\":\"EXPECTED_REJECTION\","
              @"\"use_after_free_proven\":false,"
@@ -53,7 +83,7 @@ int main(void) {
         NSCAssert([ports[@"kernel_lifetime_correlator"][@"post_free_dispatch_observed"]
                     boolValue]==NO,@"no post-free dispatch observed");
 
-        // 5. Check manifest SHA-256 lengths and user-space boot event count.
+        // 7. Check manifest SHA-256 lengths and user-space boot event count.
         writeText(dir,@"IOSurfaceBootMonitor-trace.csv",
             @"timestamp,session,event,uptime_seconds,boot_epoch_seconds,previous_uptime_seconds,status,checkpoint_saved\n"
              @"t1,S1,DID_BECOME_ACTIVE,100,1,99,NO_UPTIME_ROLLBACK_OBSERVED,1\n"
@@ -64,7 +94,7 @@ int main(void) {
             NSCAssert([source[@"sha256"] length]==64,@"sha256 digest incorrect");
         NSCAssert([NSJSONSerialization isValidJSONObject:full],@"not JSON safe");
         [[NSFileManager defaultManager] removeItemAtPath:dir error:NULL];
-        puts("PFForensicEvidence: 5/5 PASS");
+        puts("PFForensicEvidence: 7/7 PASS");
     }
     return 0;
 }
