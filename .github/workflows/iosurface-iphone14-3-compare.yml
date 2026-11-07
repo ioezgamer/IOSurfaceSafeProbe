@@ -175,6 +175,11 @@ jobs:
           print(json.dumps({'regions':len(changes),'anchors':[
              {'old':h['old']['first_vmaddr'],'new':h['new']['first_vmaddr']} for h in changes]},indent=2))
           PY
+      - name: Dump exact ARM64 instruction operands around modified regions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/iosurface_patch_context.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
