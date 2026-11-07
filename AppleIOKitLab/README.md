@@ -79,3 +79,18 @@ Se agregó el botón **3. Contrato IOSurface (selector 13, una consulta)**. Hace
 Exportar: `AppleIOKitLab-contract.json`.
 
 **Importante:** el contrato en 24A437 puede diferir del publicado para `24A5390f`; un error del selector no equivale a vulnerabilidad. Consultá también [el informe de comparación estática](../informes/AUDITORIA-ESTATICA-IOSURFACE-24A437-2026-11-07.md), que documenta las discrepancias de las 16 llamadas fallidas y las evidencias aún pendientes.
+
+## v1.3: prueba funcional real en iPhone14,3 / iOS 27.0 (24A437)
+
+En lugar de probar números aleatorios, `IOSurfaceDirectRoundTrip.m` ejecuta **una sola secuencia determinista** sobre su propia superficie:
+
+1. Abre `IOSurfaceRoot` como cliente IOKit tipo 0.
+2. **Selector 6:** solicita crear una superficie BGRA 64×64, 16.384 bytes (estructura de entrada de 32 bytes y salida de 3.176 bytes). Solo continúa si la creación devuelve éxito y un ID válido.
+3. **Selector 4:** busca ese mismo ID mediante **la misma conexión** y comprueba la concordancia con la salida de creación.
+4. **Selectores 2 y 3:** intenta bloquear y desbloquear exclusivamente esa superficie, con tamaño exacto de entrada de referencia.
+5. **Selectores 9 y 10:** registra una propiedad propia con un valor de prueba aleatorio y lee esa misma propiedad. No se cuentan éxitos por códigos de retorno únicamente: cuando hay salida se intenta **decodificar el valor**, y se coteja también con `IOSurfaceCopyValue` de la API pública si la superficie es visible desde ella.
+6. Cierra la conexión y guarda `AppleIOKitLab-direct-roundtrip.json`.
+
+**Controles:** no usa punteros caducados, valores de memoria del kernel, escritura fuera de la superficie, brute force, carreras ni modificación de permisos. Solo se habilita en `iPhone14,3` build `24A437`; exige confirmación del usuario porque las llamadas al controlador siguen pudiendo provocar un panic. El informe expone fases y devuelve `PARCIAL` si algún paso no se cumple; un `PASS` indica únicamente la ruta funcional de la superficie propia.
+
+La referencia de layout proviene de [Kurt-228/ios27-research](https://github.com/Kurt-228/ios27-research/blob/main/docs/iosurface_sel_formats.md), validada en macOS 27/iOS 27 beta 4. **No se garantiza** que sea idéntica en `24A437`: el propósito del nuevo botón es medirlo directamente y documentar cualquier discrepancia. **No es jailbreak ni demuestra KernelRW.**
