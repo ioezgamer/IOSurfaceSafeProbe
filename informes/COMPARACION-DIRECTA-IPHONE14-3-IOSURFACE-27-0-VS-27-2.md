@@ -50,6 +50,23 @@ Otras secciones de metadatos se conservaron en tamaño, con diferencias de hash.
 
 El conteo global no revela si se movió o modificó una llamada de bloqueo ni identifica una región específica de código. Incluso sin cambios en estos contadores podría haberse modificado la sincronización de la implementación.
 
+## Alineación de instrucciones ARM64
+
+La segunda ejecución de GitHub Actions alineó las instrucciones del KEXT (comparación por mnemónicos, normalizando direcciones). Se obtuvieron **53,639 instrucciones** en `24A437` y **53,645 instrucciones** en `24B119`, una diferencia de **6 instrucciones**.
+
+Se detectaron **4 regiones de diferencias**:
+
+| Región | Ubicación aproximada dentro de las instrucciones desensambladas | Cambio visible |
+|---|---|---|
+| 1 | 33,365 | Inserción de `ldrb, tbz, add, b` (4 instrucciones = 16 bytes) |
+| 2 | 33,517 | Inserción de `mov, strb` (2 instrucciones = 8 bytes) |
+| 3 | 38,602 | Sustitución/reordenación de acceso a bytes y una llamada (`strb, ldr, mov, bl` observados) |
+| 4 | 38,634 | Supresión/reordenación de `ldr, mov, bl` en el alineamiento |
+
+El detalle completo está en `mnemonic-hunks.txt` del artefacto de la ejecución [#2](https://github.com/ioezgamer/IOSurfaceSafeProbe/actions/runs/42321261453). Estas son diferencias **a nivel de opcode**, no un mapeo validado a métodos con nombres semánticos. La concordancia +16/+8 es interesante pero no prueba que se corresponda exactamente con los dos `sub_*` del otro dispositivo ni que alguno sea el parche de la CVE.
+
+**Precaución:** el algoritmo de diferencias puede alinear equivocadamente bloques con mnemónicos repetidos. La evidencia debe interpretarse como regiones aproximadas hasta contrastarla con el flujo completo de instrucciones y sus operandos.
+
 ## Comparación con diferencial público de otro modelo
 
 La diferencia publicada para `iPhone18,1` entre `24A437` y `24B5084k` muestra dos funciones anónimas cuyos tamaños cambian en **+16** y **+8 bytes** respectivamente. La suma coincide con el **+24 bytes** detectado ahora en iPhone14,3 entre la versión original 27.0 y la 27.2 final, pero los pares comparan diferentes dispositivos y diferentes builds de destino. **No es correcto trasladar direcciones virtuales ni atribuir esas funciones a nuestra versión sin una correspondencia de instrucciones.**
