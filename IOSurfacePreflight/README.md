@@ -313,3 +313,29 @@ Se incluyen **9 pruebas** de correlación, rechazo de alteraciones, errores de o
 4. Si no existe traza instrumentada, el botón 28 continúa permitiendo revisar los diagnósticos públicos ya existentes, sin afirmar un UAF.
 
 El identificador de la app continúa siendo \`org.iosurface.preflight\`, con build 31. La IPA de GitHub Actions es **sin firma** y requiere una firma válida para instalarse.
+
+
+## v19.13 (build 32): investigación de seguridad basada en evidencias
+
+La app incorpora la opción **30. Analizar novedades y anomalías (sin IPC)**. Su objetivo es hacer útil la evidencia acumulada en IOSurfacePreflight sin iniciar otra campaña de fuerza bruta o atribuir falsamente los resultados a un exploit.
+
+La opción 30 lee los archivos del propio sandbox mediante el informe público ya disponible (opción 28), y genera **\`IOSurfaceSecurityResearch-v19_13.json\`**. El botón **Exportar registro, CSV y checkpoint** actualiza ambos informes e incluye el nuevo archivo.
+
+Funciones integradas:
+
+- Agrupación de resultados SameClient por pareja de códigos de retorno IPC (\`call\` / \`close\`) para distinguir respuestas repetidas y nuevas.
+- Interpretación separada de \`overlapping_user_space_intervals\` y \`accepted_rpc_count\`, evitando considerar una llamada \`0x10000003\` como registro exitoso.
+- Clasificación conservadora de anomalías: CSV inválidos, cambios inesperados en revocación Mach, mensajes asíncronos recibidos, posible cambio de uptime y solapamientos de usuario con respuesta positiva.
+- Comparación con el informe anterior usando SHA-256 de archivos y recuentos acumulados: fuentes nuevas, modificadas, eliminadas, nueva actividad BootMonitor, reinicio de contador por posible rotación.
+- Recomendaciones para documentar o revisar hallazgos sin ejecutar IPC adicional.
+
+Esta funcionalidad **no eleva privilegios**, no realiza lectura/escritura arbitraria de memoria del kernel, no ejecuta fuzzing activo y **no identifica automáticamente un UAF**. Los hallazgos únicamente justifican revisión manual; \`kernel_evidence.uaf_proven=false\` y \`kernel_evidence.kernel_privileges_acquired=false\` quedan explícitos.
+
+### Cómo usar
+
+1. Instalar con una firma válida la IPA v19.13 sobre el paquete anterior, conservando el bundle ID \`org.iosurface.preflight\`.
+2. Abrir la app y tocar **30. Analizar novedades y anomalías (sin IPC)** para producir el informe comparativo.
+3. Usar **Exportar registro, CSV y checkpoint** para compartir el JSON y los registros originales.
+4. Comparar contra otra captura solo después de nuevas observaciones reales. No volver a ejecutar la misma campaña únicamente para subir el contador.
+
+La validación en CI incluye **nueve pruebas** sobre cambios de fuentes, solapamientos IPC, retornos positivos y negativos, problemas de calidad, falsos reinicios y resistencia a afirmaciones no verificadas de KernelRW.
