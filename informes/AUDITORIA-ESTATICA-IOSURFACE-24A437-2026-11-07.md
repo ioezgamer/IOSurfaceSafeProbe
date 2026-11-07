@@ -118,3 +118,15 @@ Las cuatro cantidades desde `0x08` ocupan **8 bytes cada una**, con mitades alta
 **Estado epistemológico actualizado:** en `iPhone14,3 / 24A437` quedaron confirmados (a) el nombre y la clase efectivos del servicio y (b) el éxito del selector 13, con tamaño y contenido de salida reproducibles. No quedaron demostrados los contratos de otros selectores, vulnerabilidad de memoria, fuga de dirección, exploit, jailbreak o KernelRW.
 
 **Siguiente paso razonable:** comparar este resultado con `IOSurface.framework` y `com.apple.iokit.IOSurface` extraídos del firmware exacto 24A437; para pruebas dinámicas posteriores, usar únicamente parámetros de contrato verificados y aislar los cambios de estado del controlador. No hay justificación para repetir las 16 llamadas deliberadamente mal formadas.
+
+## 8. Resultado posterior: ciclo funcional directo sobre una IOSurface propia
+
+**Evidencia del teléfono:** `AppleIOKitLab-direct-roundtrip.json`, ejecutado en `iPhone14,3`, `24A437`, `iOS 27.0`, generado con Apple IOKit Lab v1.3.
+
+El selector 6 creó la superficie **ID 156**, con `callKR=0` y un registro de creación de **3176 bytes**. Con esa misma conexión, `selector2 lock`, `selector3 unlock`, `selector9 set_value` y `selector10 get_value` devolvieron `0`. La lectura devolvió **64 bytes**, se decodificó con éxito y el valor recuperado coincidió con el escrito; la API pública `IOSurfaceCopyValue` confirmó por separado ese mismo valor. La conexión se cerró con `0`.
+
+**La única operación rechazada fue `selector4 lookup_surface`**, que devolvió `0xe00002c2` aun con el ID de la superficie creada desde ese cliente. El resultado global `PARCIAL` en v1.3 provenía de exigir que también funcionara esta operación de búsqueda independiente. Una comparación externa en [Kurt-228, run-idprobe7.log](https://github.com/Kurt-228/ios27-research/blob/main/results/run-idprobe7.log) muestra exactamente el patrón `sel6=0` seguido por `sel4=0xe00002c2` sobre una superficie creada desde la misma conexión, en otro build de iOS 27. Esta coincidencia no identifica la condición de rechazo de `24A437`.
+
+**Dictamen actualizado:** es una prueba real de interacción funcional mediante el user client del kernel, con creación de superficie y transferencia verificada de un valor **propio y controlado dentro del espacio autorizado por IOSurface**. No es un exploit; no existe evidencia de lectura o escritura arbitraria de memoria del kernel, UAF, escalada de privilegios o jailbreak.
+
+**Ajuste de instrumentación v1.4:** `coreRoundTripConfirmed` representa creación + lock/unlock + roundtrip de propiedad + cierre. `completeCycleConfirmed` continúa representando *todos* los pasos, incluido `selector4`. Se registra `PASS_CORE_WITH_SELECTOR4_REJECTION` para distinguir ambos resultados sin esconder una verificación funcional positiva. La condición específica de `selector4` se mantiene como cuestión abierta de investigación estática.
