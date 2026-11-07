@@ -17,6 +17,7 @@
 #import "PFTargetedReplay.h"
 #import "PFMachPortHandoff.h"
 #import "PFPortRevocationTest.h"
+#import "PFForensicEvidence.h"
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -189,6 +190,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
         @"BOOTMON: %@ resultado=%@ uptime=%.3f prev=%@ epoch=%@ checkpoint=%@ trace=%@",
         event,status,uptime,oldUptime?:@"NA",stamp,
         persisted?@"OK":@"ERROR",saved?@"OK":@"ERROR"]];
+    PFAppendForensicEvent(dir, self.bootSessionID ?: @"UNKNOWN",
+        @"BOOT_MONITOR", status);
     if(verdict==PFBootUptimeRolledBack)
         [self note:@"BOOTMON: retroceso de uptime indica reinicio entre observaciones, NO su causa."];
     else if(verdict==PFBootBootEpochChangedUnconfirmed)
@@ -227,7 +230,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.9";
+    title.text = @"IOSurface Preflight v19.10";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -280,6 +283,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
       [self button:@"25. Reproducir caso del CSV local (3 veces)" action:@selector(targetedReplayProbe:)],
       [self button:@"26. Transferencia Mach real: imagen editable" action:@selector(machPortHandoffProbe:)],
       [self button:@"27. Verificar revocación de derechos Mach (1 ensayo)" action:@selector(portRevocationProbe:)],
+      [self button:@"28. Correlacionar evidencia local (sin pruebas invasivas)" action:@selector(forensicSnapshotProbe:)],
       self.handoffPreview,
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
@@ -3920,6 +3924,9 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
         [self note:@"PORT-REVOKE: otra prueba activa; detenela primero."];
         return;
     }
+    NSString *forensicDir=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    PFAppendForensicEvent(forensicDir,self.bootSessionID?:@"UNKNOWN",
+        @"PORT_REVOKE_BEGIN",@"PENDING");
     [self note:@"PORT-REVOKE: verificando rechazo de nombre revocado, puerto ajeno y puerto nulo."];
     NSDictionary *report=PFRunPortRevocationTest();
     NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
@@ -3935,6 +3942,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
         report[@"initial_valid_port_lookup"], report[@"remaining_valid_send_right_lookup"],
         report[@"revoked_port_lookup"],report[@"unrelated_port_lookup"],
         report[@"null_port_lookup"]]];
+    PFAppendForensicEvent(directory,self.bootSessionID?:@"UNKNOWN",
+        @"PORT_REVOKE_RESULT",report[@"verdict"]?:@"UNKNOWN");
     [self note:[NSString stringWithFormat:@"PORT-REVOKE: JSON %@",
         saved?@"GUARDADO":(error.localizedDescription?:@"NO GUARDADO")]];
     if([report[@"verdict"] isEqualToString:@"REVIEW_UNEXPECTED_SURFACE"]) {
@@ -4266,7 +4275,42 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     });
 }
 
+// v19.10: correlate only the logs already present in our app sandbox.
+// Do not label IOServiceClose, port revocation or application uptime as kernel free.
+- (void)forensicSnapshotProbe:(id)sender {
+    NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    PFAppendForensicEvent(directory,self.bootSessionID?:@"UNKNOWN",
+        @"FORENSIC_SNAPSHOT",@"GENERATING");
+    struct utsname deviceInfo;
+    uname(&deviceInfo);
+    NSString *model=[NSString stringWithUTF8String:deviceInfo.machine];
+    NSDictionary *report=PFBuildForensicSnapshot(
+        directory,self.bootSessionID?:@"UNKNOWN",model?:@"UNKNOWN",
+        UIDevice.currentDevice.systemVersion);
+    NSString *path=[directory stringByAppendingPathComponent:
+        @"IOSurfaceForensicEvidence-v19_10.json"];
+    NSData *data=[NSJSONSerialization dataWithJSONObject:report
+        options:NSJSONWritingPrettyPrinted error:NULL];
+    NSError *error=nil;
+    BOOL saved=data && [data writeToFile:path
+        options:NSDataWritingAtomic error:&error];
+    NSDictionary *same=report[@"same_client"];
+    NSDictionary *boot=report[@"boot_monitor"];
+    NSDictionary *life=report[@"kernel_lifetime_correlator"];
+    [self note:[NSString stringWithFormat:
+        @"FORENSIC: archivo=%@ fuentes=%lu boot_events=%@ same_client=%@ solapamiento_max_us=%@",
+        saved?@"GUARDADO":(error.localizedDescription?:@"ERROR"),
+        (unsigned long)[report[@"sources"] count],
+        boot[@"event_rows"],same[@"trials"],same[@"max_overlap_microseconds"]]];
+    [self note:[NSString stringWithFormat:
+        @"FORENSIC: %@; esta app no ve el último release() ni punteros del kernel.",
+        life[@"status"]]];
+    [self note:@"FORENSIC: usá Exportar registro, CSV y checkpoint para compartir el JSON."];
+}
+
 - (void)shareLog:(id)sender {
+    // Always refresh the forensic snapshot before exporting current evidence.
+    [self forensicSnapshotProbe:sender];
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
     if (![self.events writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
@@ -4405,7 +4449,9 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
     }
-    for(NSString *file in @[@"IOSurfacePortRevocation-v19_9.json",
+    for(NSString *file in @[@"IOSurfaceForensicEvidence-v19_10.json",
+                            @"IOSurfaceForensicEvents-v19_10.csv",
+                            @"IOSurfacePortRevocation-v19_9.json",
                             @"IOSurfaceMachHandoff-v19_8.json",
                             @"IOSurfaceMachHandoff-v19_8.png",
                             @"IOSurfaceTargetedReplay-checkpoint.json",
