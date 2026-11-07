@@ -83,6 +83,38 @@ typedef NotifySurfaceRef (*NotifyLookupSurface)(uint32_t);
 typedef void (*NotifyAdjustUseCount)(NotifySurfaceRef);
 typedef int32_t (*NotifyGetUseCount)(NotifySurfaceRef);
 
+// Una sola transición documentada de uso sobre una superficie propiedad de la app.
+static NSDictionary *NotifyOneUsageCycle(uint32_t sid) {
+    NSMutableDictionary *out=[@{@"performed":@NO,@"restored":@NO,
+                                @"status":@"UNAVAILABLE"} mutableCopy];
+    void *fw=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_LOCAL);
+    NotifyLookupSurface lookup=fw?(NotifyLookupSurface)dlsym(fw,"IOSurfaceLookup"):NULL;
+    NotifyAdjustUseCount inc=fw?(NotifyAdjustUseCount)dlsym(fw,"IOSurfaceIncrementUseCount"):NULL;
+    NotifyAdjustUseCount dec=fw?(NotifyAdjustUseCount)dlsym(fw,"IOSurfaceDecrementUseCount"):NULL;
+    NotifyGetUseCount count=fw?(NotifyGetUseCount)dlsym(fw,"IOSurfaceGetUseCount"):NULL;
+    if(lookup&&inc&&dec&&count) {
+        NotifySurfaceRef own=lookup(sid);
+        if(own) {
+            int32_t before=count(own);
+            out[@"before"]=@(before);
+            if(before>=0&&before<INT32_MAX) {
+                inc(own);
+                int32_t middle=count(own);
+                dec(own);
+                int32_t after=count(own);
+                out[@"middle"]=@(middle);
+                out[@"after"]=@(after);
+                out[@"performed"]=@YES;
+                out[@"restored"]=@(after==before);
+                out[@"status"]=@"COMPLETED";
+            } else out[@"status"]=@"INVALID_INITIAL_COUNT";
+            CFRelease(own);
+        } else out[@"status"]=@"SURFACE_LOOKUP_FAILED";
+    } else out[@"status"]=@"PUBLIC_SYMBOL_MISSING";
+    if(fw)dlclose(fw);
+    return out;
+}
+
 @interface AppleIOKitLabController : UIViewController
 @property(atomic,assign) BOOL running;
 - (void)log:(NSString *)message;
@@ -106,30 +138,28 @@ typedef int32_t (*NotifyGetUseCount)(NotifySurfaceRef);
         return;
     }
     UIAlertController *alert=[UIAlertController
-       alertControllerWithTitle:@"IOSurface: recibir notificación Mach"
-       message:@"Crea UNA superficie propia, registra UNA notificación asíncrona, "
-               "espera un mensaje Mach con límite temporal y, si la API pública "
-               "puede recuperar la superficie, hace UN incremento y decremento "
-               "de su contador de uso. Luego retira la notificación y cierra "
-               "todo en orden. No ejecuta carreras ni corrupción deliberada. "
-               "La recepción de un mensaje no verifica su origen ni demuestra "
-               "una vulnerabilidad. Las llamadas IOKit pueden provocar reinicios. "
-               "Guarda tus datos antes de ejecutar."
+       alertControllerWithTitle:@"IOSurface: prueba causal A-B-A"
+       message:@"Tres fases, una sola ejecución. A: transición de uso ANTES "
+               "del registro. B: registrar, repetir transición y comprobar "
+               "si llega un mensaje. A: retirar registro, comprobar mensajes "
+               "pendientes y repetir transición. Sin carreras deliberadas ni "
+               "acceso a memoria ajena. El kernel podría reiniciar el teléfono: "
+               "guarda tus datos antes de continuar."
        preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancelar"
                          style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Ejecutar una vez"
                          style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         self.running=YES;
-        [self log:@"NOTIFY v1.6: registro, transición propia y recepción Mach con timeout."];
+        [self log:@"NOTIFY v1.7: A-B-A con controles antes y después de retirar registro."];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{
             NSMutableArray *steps=[NSMutableArray new];
             NSMutableDictionary *report=[@{
-               @"schema":@"AppleIOKitLab.notificationDelivery.v1",
+               @"schema":@"AppleIOKitLab.notificationCausality.v1",
                @"phase":@"STARTED",
                @"device":device,@"build":build,
                @"ios":UIDevice.currentDevice.systemVersion,
-               @"scope":@"single-thread notification registration, bounded Mach receive and one documented use-count transition",
+               @"scope":@"single-thread A-B-A controls; owned surface; no races",
                @"contractReference":@"24A437 60-selector dispatch; sel17 async struct24; sel18 struct24",
                @"attemptedRace":@NO,
                @"kernelMemoryCorruptionProven":@NO,
@@ -143,9 +173,12 @@ typedef int32_t (*NotifyGetUseCount)(NotifySurfaceRef);
                @"usageTransitionPerformed":@NO,
                @"receiveWindowMilliseconds":@1500,
                @"receivedMessages":[NSMutableArray new],
+               @"preSubscriptionControlPassed":@NO,
+               @"postUnsubscribeControlPassed":@NO,
+               @"causalControlSupported":@NO,
                @"steps":steps
             } mutableCopy];
-            NSString *filename=@"AppleIOKitLab-notification-delivery.json";
+            NSString *filename=@"AppleIOKitLab-notification-causality.json";
             void (^checkpoint)(NSString *)=^(NSString *step){
                 report[@"phase"]=@"IN_FLIGHT";
                 report[@"currentStep"]=step;
@@ -235,6 +268,24 @@ typedef int32_t (*NotifyGetUseCount)(NotifySurfaceRef);
             [steps addObject:@{@"step":@"mach_port_setup",
                                @"returnCode":NotifyError(ins),@"time":NotifyTime()}];
 
+            // CONTROL A: transición de uso con el puerto AUN NO REGISTRADO.
+            checkpoint(@"control_A_before_registration");
+            NSDictionary *preCycle=NotifyOneUsageCycle(sid);
+            report[@"preSubscriptionCycle"]=preCycle;
+            [steps addObject:@{@"step":@"control_A_pre_usecount",
+                               @"outcome":preCycle,@"time":NotifyTime()}];
+            checkpoint(@"control_A_receive_250ms");
+            NSDictionary *preReceive=NotifyReceiveOnce(wake,250);
+            report[@"preSubscriptionReceive"]=preReceive;
+            report[@"preSubscriptionControlPassed"]=
+                @([preCycle[@"performed"] boolValue] &&
+                  [preCycle[@"restored"] boolValue] &&
+                  ![preReceive[@"messageReceived"] boolValue] &&
+                  [preReceive[@"status"] isEqualToString:@"TIMED_OUT"]);
+            [steps addObject:@{@"step":@"control_A_pre_receive",
+                               @"outcome":preReceive,@"time":NotifyTime()}];
+            [self saveJSON:report as:filename];
+
             // Struct size has been extracted from the 24A437 dispatch table.
             // Field semantics are NOT established. Provide the owned SID,
             // and zero every other field. Do not reuse a stale ID/port.
@@ -312,7 +363,9 @@ typedef int32_t (*NotifyGetUseCount)(NotifySurfaceRef);
                             NSDictionary *decReply=NotifyReceiveOnce(wake,1200);
                             [receipts addObject:@{@"stage":@"after_decrement",
                                                   @"result":decReply}];
-                            received=received || [decReply[@"messageReceived"] boolValue];
+                             received=received || [decReply[@"messageReceived"] boolValue];
+                            report[@"messageAfterDecrementObserved"]=decReply[@"messageReceived"];
+                            report[@"decrementResponse"]=decReply;
                         } else {
                             report[@"usageTransitionSkipReason"]=@"UNEXPECTED_INITIAL_USECOUNT";
                         }
