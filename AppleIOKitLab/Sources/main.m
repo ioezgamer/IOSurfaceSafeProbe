@@ -1,6 +1,5 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <IOSurface/IOSurface.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <mach/mach.h>
 #import <sys/utsname.h>
@@ -15,6 +14,14 @@
 // Adaptacion controlada de la idea de fuzzing IOKit de dawgyg/AppleResearch.
 // No comparte conexiones entre hilos, no prueba punteros liberados, no intenta KernelRW.
 // IOKit se resuelve dinamicamente porque sus cabeceras son privadas en el SDK iOS.
+// API publica IOSurface: los SDK iOS no siempre publican <IOSurface/IOSurface.h>.
+typedef struct __IOSurface *LabSurfaceRef;
+typedef LabSurfaceRef (*LabCreateSurface)(CFDictionaryRef);
+typedef uint32_t (*LabGetSurfaceID)(LabSurfaceRef);
+typedef LabSurfaceRef (*LabLookupSurface)(uint32_t);
+typedef size_t (*LabSurfaceDimension)(LabSurfaceRef);
+typedef kern_return_t (*LabSurfaceLock)(LabSurfaceRef, uint32_t, uint32_t *);
+
 typedef uint32_t lab_io_object_t;
 typedef lab_io_object_t lab_io_service_t;
 typedef lab_io_object_t lab_io_connect_t;
@@ -314,45 +321,66 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     if (self.running) { [self log:@"Ya hay otra prueba en curso."]; return; }
     self.running = YES;
     [self log:@"Baseline: API pública IOSurface 64x64, sin métodos IOKit privados."];
-    NSDictionary *properties = @{
-        (__bridge NSString *)kIOSurfaceWidth: @64,
-        (__bridge NSString *)kIOSurfaceHeight: @64,
-        (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
-        (__bridge NSString *)kIOSurfaceBytesPerRow: @256,
-        (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241u)
-    };
-    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+
+    void *lib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                       RTLD_LAZY | RTLD_LOCAL);
+    LabCreateSurface createSurface = lib ? (LabCreateSurface)dlsym(lib, "IOSurfaceCreate") : NULL;
+    LabGetSurfaceID getID = lib ? (LabGetSurfaceID)dlsym(lib, "IOSurfaceGetID") : NULL;
+    LabLookupSurface lookup = lib ? (LabLookupSurface)dlsym(lib, "IOSurfaceLookup") : NULL;
+    LabSurfaceDimension getWidth = lib ? (LabSurfaceDimension)dlsym(lib, "IOSurfaceGetWidth") : NULL;
+    LabSurfaceDimension getHeight = lib ? (LabSurfaceDimension)dlsym(lib, "IOSurfaceGetHeight") : NULL;
+    LabSurfaceDimension getAllocSize = lib ? (LabSurfaceDimension)dlsym(lib, "IOSurfaceGetAllocSize") : NULL;
+    LabSurfaceLock lockSurface = lib ? (LabSurfaceLock)dlsym(lib, "IOSurfaceLock") : NULL;
+    LabSurfaceLock unlockSurface = lib ? (LabSurfaceLock)dlsym(lib, "IOSurfaceUnlock") : NULL;
+
     NSMutableDictionary *result = [@{
         @"schema":@"AppleIOKitLab.publicBaseline.v1",
         @"device":labMachine(), @"iOS":UIDevice.currentDevice.systemVersion,
-        @"build":labKernelBuild(), @"created":@(surface != NULL)
+        @"build":labKernelBuild(), @"created":@NO
     } mutableCopy];
-    if (surface) {
-        IOSurfaceID surfaceID = IOSurfaceGetID(surface);
-        result[@"id"] = @(surfaceID);
-        result[@"width"] = @(IOSurfaceGetWidth(surface));
-        result[@"height"] = @(IOSurfaceGetHeight(surface));
-        result[@"allocBytes"] = @(IOSurfaceGetAllocSize(surface));
-        uint32_t seed = 0;
-        kern_return_t lockResult = IOSurfaceLock(surface, 0, &seed);
-        result[@"lockKR"] = labHex(lockResult);
-        if (lockResult == KERN_SUCCESS) {
-            result[@"unlockKR"] = labHex(IOSurfaceUnlock(surface, 0, &seed));
-        }
-        IOSurfaceRef found = IOSurfaceLookup(surfaceID);
-        result[@"lookupOwnID"] = @(found != NULL);
-        if (found) CFRelease(found);
-        CFRelease(surface);
-        [self log:[NSString stringWithFormat:
-             @"Baseline creada: %lux%lu, lock=%@, lookupID=%@",
-             (unsigned long)[result[@"width"] unsignedIntegerValue],
-             (unsigned long)[result[@"height"] unsignedIntegerValue],
-             result[@"lockKR"], [result[@"lookupOwnID"] boolValue] ? @"OK" : @"NO"]];
+    if (!createSurface || !getID || !lookup || !getWidth || !getHeight ||
+        !getAllocSize || !lockSurface || !unlockSurface) {
+        result[@"error"] = @"IOSurface.framework unavailable or missing public exports";
+        [self log:@"Faltan funciones públicas de IOSurface en el dispositivo."];
     } else {
-        [self log:@"IOSurfaceCreate devolvió NULL con parámetros públicos válidos."];
+        NSDictionary *properties = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfaceBytesPerRow": @256,
+            @"IOSurfaceAllocSize": @(64 * 64 * 4),
+            @"IOSurfacePixelFormat": @(0x42475241u)
+        };
+        LabSurfaceRef surface = createSurface((__bridge CFDictionaryRef)properties);
+        if (surface) {
+            result[@"created"] = @YES;
+            uint32_t surfaceID = getID(surface);
+            result[@"id"] = @(surfaceID);
+            result[@"width"] = @(getWidth(surface));
+            result[@"height"] = @(getHeight(surface));
+            result[@"allocBytes"] = @(getAllocSize(surface));
+            uint32_t seed = 0;
+            kern_return_t kr = lockSurface(surface, 0, &seed);
+            result[@"lockKR"] = labHex(kr);
+            if (kr == KERN_SUCCESS)
+                result[@"unlockKR"] = labHex(unlockSurface(surface, 0, &seed));
+            LabSurfaceRef found = lookup(surfaceID);
+            result[@"lookupOwnID"] = @(found != NULL);
+            if (found) CFRelease(found);
+            CFRelease(surface);
+            [self log:[NSString stringWithFormat:
+                 @"Baseline: %lux%lu lock=%@ lookupID=%@",
+                 (unsigned long)[result[@"width"] unsignedIntegerValue],
+                 (unsigned long)[result[@"height"] unsignedIntegerValue],
+                 result[@"lockKR"], [result[@"lookupOwnID"] boolValue] ? @"OK" : @"NO"]];
+        } else {
+            result[@"error"] = @"IOSurfaceCreate returned NULL";
+            [self log:@"IOSurfaceCreate devolvió NULL con parámetros públicos válidos."];
+        }
     }
     [self saveJSON:result as:@"AppleIOKitLab-public-baseline.json"];
-    [self log:@"Baseline exportable. Resultado no demuestra acceso arbitrario al kernel."];
+    if (lib) dlclose(lib);
+    [self log:@"Baseline exportable; no demuestra acceso arbitrario al kernel."];
     self.running = NO;
 }
 
