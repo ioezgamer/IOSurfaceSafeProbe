@@ -8,7 +8,7 @@ kernel void gpu_owned_warm(device uint *victim [[buffer(0)]],
                            constant uint &value [[buffer(1)]],
                            uint tid [[thread_position_in_grid]]) {
     if (tid == 0) {
-        victim[0] = value;
+        victim[1] = value;
     }
 }
 
