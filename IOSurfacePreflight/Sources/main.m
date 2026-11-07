@@ -233,7 +233,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.13";
+    title.text = @"IOSurface Preflight v19.14";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -322,7 +322,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.13"]; 
+    [self note:@"app=IOSurfacePreflight-v19.14"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -4410,10 +4410,11 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
         (unsigned long)[triage[@"findings"] count],
         same[@"classification"]]];
     [self note:[NSString stringWithFormat:
-        @"TRIAGE: fuentes nuevas=%lu modificadas=%lu eliminadas=%lu eventos_boot_nuevos=%@",
+        @"TRIAGE: fuentes del experimento nuevas=%lu modificadas=%lu eliminadas=%lu; telemetría automática modificada=%lu; eventos_boot_nuevos=%@",
         (unsigned long)[changes[@"new_sources"] count],
         (unsigned long)[changes[@"modified_sources"] count],
         (unsigned long)[changes[@"removed_sources"] count],
+        (unsigned long)[changes[@"modified_telemetry_sources"] count],
         changes[@"new_boot_monitor_events"]]];
     [self note:@"TRIAGE: sólo análisis de espacio de usuario. NO demuestra UAF ni KernelRW."];
 }
