@@ -1,0 +1,82 @@
+name: Verificar barrera de ciclo de vida IOSurface 24A437 vs 24B119
+on:
+  push:
+    branches:
+      - research/apple-iokit-lab-20261107
+    paths:
+      - 'AppleIOKitLab/verification/iosurface_lifecycle_gate.py'
+      - '.github/workflows/iosurface-lifecycle-barrier.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-lifecycle:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar ipsw y desensamblador
+        shell: bash
+        run: |
+          set -eu
+          brew install ipsw
+          if xcrun --find llvm-objdump >/dev/null 2>&1; then
+            echo "IOSURFACE_OBJDUMP=$(xcrun --find llvm-objdump)" >> "$GITHUB_ENV"
+          else
+            brew install llvm
+            echo "IOSURFACE_OBJDUMP=$(brew --prefix llvm)/bin/llvm-objdump" >> "$GITHUB_ENV"
+          fi
+      - name: Extraer controladores de ambos firmwares oficiales
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lifecycle/old/firmware" "$RUNNER_TEMP/lifecycle/old/kexts"
+          mkdir -p "$RUNNER_TEMP/lifecycle/fixed/firmware" "$RUNNER_TEMP/lifecycle/fixed/kexts"
+          mkdir -p "$RUNNER_TEMP/lifecycle/report"
+          for build in 24A437 24B119; do
+            if [ "$build" = "24A437" ]; then folder=old; else folder=fixed; fi
+            ipsw download ipsw --device iPhone14,3 --build "$build" \
+              --kernel --confirm --output "$RUNNER_TEMP/lifecycle/$folder/firmware" \
+              > "$RUNNER_TEMP/lifecycle/report/download-$build.log" 2>&1
+            KC="$(find "$RUNNER_TEMP/lifecycle/$folder/firmware" -type f -name 'kernelcache.*' | head -1)"
+            test -n "$KC"
+            ipsw kernel extract "$KC" com.apple.iokit.IOSurface \
+              --output "$RUNNER_TEMP/lifecycle/$folder/kexts" \
+              > "$RUNNER_TEMP/lifecycle/report/extract-$build.log" 2>&1
+            test -f "$RUNNER_TEMP/lifecycle/$folder/kexts/com.apple.iokit.IOSurface"
+            shasum -a 256 "$RUNNER_TEMP/lifecycle/$folder/kexts/com.apple.iokit.IOSurface" \
+              >> "$RUNNER_TEMP/lifecycle/report/iosurface-hashes.txt"
+          done
+      - name: Verificar mapeo de objetos bloqueo y orden de cierre
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 AppleIOKitLab/verification/iosurface_lifecycle_gate.py \
+            "$RUNNER_TEMP/lifecycle/old/kexts/com.apple.iokit.IOSurface" \
+            "$RUNNER_TEMP/lifecycle/fixed/kexts/com.apple.iokit.IOSurface" \
+            "$RUNNER_TEMP/lifecycle/report"
+          python3 -m json.tool "$RUNNER_TEMP/lifecycle/report/lifecycle_gate.json" > /dev/null
+      - name: Prueba negativa debe rechazar firmware equivocado
+        shell: bash
+        run: |
+          set -euo pipefail
+          if python3 AppleIOKitLab/verification/iosurface_lifecycle_gate.py \
+            "$RUNNER_TEMP/lifecycle/old/kexts/com.apple.iokit.IOSurface" \
+            "$RUNNER_TEMP/lifecycle/old/kexts/com.apple.iokit.IOSurface" \
+            "$RUNNER_TEMP/lifecycle/negative" \
+            > "$RUNNER_TEMP/lifecycle/report/negative-test.log" 2>&1; then
+            echo "FAIL: accepted wrong second firmware" >&2
+            exit 1
+          fi
+          grep -q 'Unexpected build SHA-256' "$RUNNER_TEMP/lifecycle/report/negative-test.log"
+          echo "PASS: mismatched-build negative test rejected" \
+            >> "$RUNNER_TEMP/lifecycle/report/VERIFIED.txt"
+      - name: Publicar evidencia sin binarios propietarios
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IOSurface-24A437-24B119-lifecycle-gate
+          path: |
+            ${{ runner.temp }}/lifecycle/report/**
+          if-no-files-found: error
+          retention-days: 14
