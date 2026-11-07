@@ -1,7 +1,7 @@
 name: Compare IOSurface iPhone14,3 official kernelcaches
 on:
   push:
-    branches: [research/iosurface-iphone14-3-binary-compare]
+    branches: [research/iosurface-iphone14-3-binary-compare, research/iosurface-notify-reference-lifetime]
     paths: ['.github/workflows/iosurface-iphone14-3-compare.yml']
   workflow_dispatch:
 permissions:
@@ -191,6 +191,13 @@ jobs:
           PY
           python3 scripts/verify_iosurface_lifecycle.py /tmp/iosurface-analysis.zip > cmp/out/verification.json
           cat cmp/out/verification.json
+      - name: Preserve complete IOSurface disassembly for reference-lifetime audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -9 -c cmp/old.asm > cmp/out/iosurface-24A437.asm.gz
+          gzip -9 -c cmp/new.asm > cmp/out/iosurface-24B119.asm.gz
+          shasum -a 256 cmp/out/iosurface-*.asm.gz | tee cmp/out/disassembly-hashes.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
