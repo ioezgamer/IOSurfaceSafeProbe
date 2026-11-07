@@ -115,7 +115,7 @@ def verify(path,spec):
     exactly_one(sweep,"mov","x19, x0")
     exactly_one(close,"mov","x20, x0")
     assert positions(close,"ldr","x0, [x20, #0xe8]"), "Teardown must load manager from owner"
-    exactly_one(close,"mov","x1, x20")
+    assert positions(close,"mov","x1, x20"), "Teardown must pass owner as sweep argument"
     lock_reg=exactly_one(reg,"bl",hex(spec["lock"]))
     unlock_reg=exactly_one(reg,"bl",hex(spec["unlock"]))
     lock_sweep=exactly_one(sweep,"bl",hex(spec["lock"]))
