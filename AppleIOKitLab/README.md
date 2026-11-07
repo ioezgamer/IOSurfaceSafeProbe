@@ -162,3 +162,21 @@ Se incluyen resultados detallados con retorno de mach_msg, informacion de cabece
 En el caso de un mensaje de la fase B pendiente despues de selector 18, la app no exige un resultado negativo ni lo califica como fallo del controlador: clasifica la causalidad como inconclusa. Si recibe un mensaje fuera de la ventana observada o no se puede recuperar la superficie propia, tambien queda inconclusa.
 
 El ensayo dura aproximadamente 2,1 segundos de tiempo de recepcion maximo ademas de las llamadas sincrónicas y requiere confirmacion. No repetirlo ante un reinicio hasta revisar el registro de datos de analisis de iOS.
+
+## v1.8: GPU entre búferes del mismo proceso, inspiración F1OOB
+
+Esta prueba está inspirada en la demostración F1OOB, pero ejecuta únicamente la parte que la auditoría independiente considera verificable: lectura y escritura a través de direcciones GPU entre **dos búferes Metal independientes propiedad de la misma app**. No utiliza el plano comprimido F1 de IOSurface ni llama a selectores privados de AGX. La investigación pública mostró en un control que el acceso cross-buffer también ocurre sin F1.
+
+**Objetivo de la versión:** iPhone 13 Pro Max, `iPhone14,3`, iOS 27.0 compilación `24A437`. Guarda `AppleIOKitLab-gpu-owned-buffer.json` y solo reporta éxito cuando constatan las lecturas reales desde CPU.
+
+1. Crea dos MTLBuffer de 64 KiB en `MTLResourceStorageModeShared` y un búfer de respuesta.
+2. Escribe en CPU el marcador preexistente `victim[0]=0x11223344` y usa el shader de calentamiento para escribir `victim[1]=0x47474747`, confirmado por CPU.
+3. Obtiene `gpuAddress` de ambos. Solo continúa cuando la VA de la víctima es superior a la base, separada por 64 KiB a 2 MiB y alineada en 4 bytes. No escanea, busca ni modifica recursos ajenos.
+4. Un shader `gpu_owned_cross_read` intenta leer `victim[0]` mediante el índice calculado desde la base GPU del primer búfer, con `victim` declarado residente. Comprueba por CPU la respuesta frente a un dato que nunca se escribió a través del primer búfer.
+5. Otro shader `gpu_owned_cross_write` intenta escribir `0x57524954` en `victim[0]` por esa misma dirección GPU; lee el contenido desde CPU. Guarda errores, códigos MTLCommandBuffer y los valores reales.
+
+El código **no** fuerza que el resultado sea exitoso. Si la dirección no está disponible, el orden de asignación es distinto o Metal impide el acceso, informa un veredicto de fallo. El shader no utiliza ninguna dirección inventada; todos los valores salen de los búferes propios recién creados.
+
+**Limitaciones:** en el material público de F1OOB, la escritura entre búferes fue reproducible sin F1 y no demostró un fallo de kernel. Los resultados de esta prueba están limitados a un contexto GPU propiedad de la app y no son evidencia de acceso a otros procesos, corrupción del kernel, KASAN, KernelRW ni jailbreak. La pantalla de referencia mostraba `iPhone18,1` con A19 Pro y `24A446`; sus direcciones y clases AGX no son las de nuestro A15.
+
+**Precaución:** acceder más allá del tamaño lógico del búfer de referencia puede provocar fallos de ejecución GPU o reinicios. La app solo ejecuta una vez, se limita a direcciones del propio proceso y registra checkpoints antes de cada fase.
