@@ -71,3 +71,11 @@ Cambios en v1.1:
 - Accede a esa API pública mediante `dlopen/dlsym` por compatibilidad con SDK de iOS que no expone la cabecera de IOSurface.
 
 Recomendación: ejecutar primero la baseline pública y compartir su JSON. No repetir automáticamente las mismas 16 llamadas fallidas ni lanzar carreras contra controladores privilegiados basándose solo en errores `kIOReturnBadArgument`.
+
+## v1.2: contrato IOSurfaceRootUserClient y nombre de servicio
+
+Se agregó el botón **3. Contrato IOSurface (selector 13, una consulta)**. Hace dos tipos de búsqueda pasiva en I/O Registry para identificar correctamente la instancia (por nombre `IOCoreSurfaceRoot` o por clase `IOSurfaceRoot`) y registra clase, nombre, ID de registro y resultado de apertura tipo 0. A continuación, bajo confirmación, ejecuta **una sola consulta** del selector 13 sin datos de entrada y con 40 bytes de salida, basada en resultados publicados para iOS 27 beta 4. No ejecuta carreras ni genera una cadena de explotación.
+
+Exportar: `AppleIOKitLab-contract.json`.
+
+**Importante:** el contrato en 24A437 puede diferir del publicado para `24A5390f`; un error del selector no equivale a vulnerabilidad. Consultá también [el informe de comparación estática](../informes/AUDITORIA-ESTATICA-IOSURFACE-24A437-2026-11-07.md), que documenta las discrepancias de las 16 llamadas fallidas y las evidencias aún pendientes.
