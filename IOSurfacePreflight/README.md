@@ -339,3 +339,18 @@ Esta funcionalidad **no eleva privilegios**, no realiza lectura/escritura arbitr
 4. Comparar contra otra captura solo después de nuevas observaciones reales. No volver a ejecutar la misma campaña únicamente para subir el contador.
 
 La validación en CI incluye **nueve pruebas** sobre cambios de fuentes, solapamientos IPC, retornos positivos y negativos, problemas de calidad, falsos reinicios y resistencia a afirmaciones no verificadas de KernelRW.
+
+
+## v19.14 (build 33): separar telemetría automática de evidencias nuevas
+
+En la exportación real de v19.13 del iPhone se reprodujo un falso aviso de novedad: tocar **Exportar registro, CSV y checkpoint** agrega una fila a \`IOSurfaceForensicEvents-v19_10.csv\`. Su SHA-256 cambia aunque ninguna prueba nueva de IOSurface se haya ejecutado. El informe anterior mostraba una fuente modificada.
+
+La opción 30 ahora distingue:
+
+- **Fuentes del experimento:** archivos SameClient, revocación Mach, observación asíncrona, pruebas de cierre y otros resultados experimentales. Un cambio de SHA-256 aquí se conserva como evidencia documental a revisar, sin afirmar por ello explotación.
+- **Telemetría propia de la aplicación:** \`IOSurfaceForensicEvents-v19_10.csv\`, \`IOSurfaceBootMonitor-trace.csv\`, \`IOSurfaceBootMonitor-checkpoint.json\`. Se conservan sus hashes en \`source_hashes\`, pero los cambios se reportan en \`modified_telemetry_sources\`, separados de \`modified_sources\`. Un arranque o una exportación no crea una falsa novedad.
+- **Arranque y estado del dispositivo:** \`new_boot_monitor_events\` y los posibles retrocesos de actividad siguen evaluándose independientemente. Un informe BootMonitor no es un \`panic-full\`.
+
+El JSON \`IOSurfaceSecurityResearch-v19_13.json\` conserva su nombre para facilitar la actualización, pero eleva su esquema interno a \`iosurface-security-research-triage-v19.14\`. Acepta como línea base tanto informes v19.13 como v19.14. \`no_substantive_source_changes\` indica que no cambiaron archivos experimentales, mientras que \`identical_source_set\` mantiene su semántica estricta de que no cambió **ningún** SHA-256 (incluida telemetría).
+
+No es necesario repetir las campañas previas; basta pulsar la opción 30 y exportar. El nuevo lector identifica correctamente la modificación automática y preserva el origen completo para auditoría. CI contiene once pruebas de regresión para garantizar esa separación.

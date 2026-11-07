@@ -31,6 +31,14 @@ static NSDictionary<NSString *,NSString *> *PFRTDigests(NSArray *manifest) {
     }
     return [digests copy];
 }
+// These files are updated by ordinary app launch, lifecycle and export.
+// Keep their hashes for integrity, but do not label such changes as novel
+// IOSurface experiment evidence. Boot status is assessed separately below.
+static BOOL PFRTIsSelfGeneratedTelemetry(NSString *name) {
+    return [name isEqualToString:@"IOSurfaceForensicEvents-v19_10.csv"] ||
+           [name isEqualToString:@"IOSurfaceBootMonitor-trace.csv"] ||
+           [name isEqualToString:@"IOSurfaceBootMonitor-checkpoint.json"];
+}
 static NSDictionary *PFRTFinding(NSString *code,NSString *type,
                                  NSString *description) {
     return @{@"code":code,@"type":type,@"description":description};
@@ -49,27 +57,39 @@ NSDictionary<NSString *, id> *PFBuildSecurityResearchTriage(
     NSDictionary *sourceHashes=PFRTDigests(PFRTArray(snapshot[@"sources"]));
 
     NSDictionary *prior=PFRTDict(priorTriageReport);
-    BOOL havePrior=[PFRTString(prior[@"schema"]) isEqualToString:
-                    @"iosurface-security-research-triage-v19.13"];
+    NSString *priorSchema=PFRTString(prior[@"schema"]);
+    BOOL havePrior=[priorSchema isEqualToString:
+                    @"iosurface-security-research-triage-v19.13"] ||
+                   [priorSchema isEqualToString:
+                    @"iosurface-security-research-triage-v19.14"];
     NSDictionary *oldHashes=havePrior ?
         PFRTDict(prior[@"source_hashes"]):@{};
     NSMutableArray *changed=[NSMutableArray new];
     NSMutableArray *added=[NSMutableArray new];
     NSMutableArray *removed=[NSMutableArray new];
+    NSMutableArray *telemetryChanged=[NSMutableArray new];
+    NSMutableArray *telemetryAdded=[NSMutableArray new];
+    NSMutableArray *telemetryRemoved=[NSMutableArray new];
     if (havePrior) {
         for (NSString *name in sourceHashes) {
             NSString *old=PFRTString(oldHashes[name]);
-            if (!old.length) [added addObject:name];
-            else if (![old isEqualToString:sourceHashes[name]])
-                [changed addObject:name];
+            BOOL telemetry=PFRTIsSelfGeneratedTelemetry(name);
+            if (!old.length) {
+                [(telemetry?telemetryAdded:added) addObject:name];
+            } else if (![old isEqualToString:sourceHashes[name]]) {
+                [(telemetry?telemetryChanged:changed) addObject:name];
+            }
         }
         for (NSString *name in oldHashes) {
-            if (!sourceHashes[name]) [removed addObject:name];
+            if (!sourceHashes[name]) {
+                [(PFRTIsSelfGeneratedTelemetry(name)?
+                   telemetryRemoved:removed) addObject:name];
+            }
         }
     }
-    [changed sortUsingSelector:@selector(compare:)];
-    [added sortUsingSelector:@selector(compare:)];
-    [removed sortUsingSelector:@selector(compare:)];
+    for(NSMutableArray *group in @[changed,added,removed,
+                                   telemetryChanged,telemetryAdded,telemetryRemoved])
+        [group sortUsingSelector:@selector(compare:)];
 
     NSUInteger bootEvents=PFRTCount(boot[@"event_rows"]);
     NSUInteger oldEvents=havePrior ?
@@ -182,7 +202,7 @@ NSDictionary<NSString *, id> *PFBuildSecurityResearchTriage(
         [steps addObject:@"Inspect the documented asynchronous callback contract."];
 
     return @{
-        @"schema":@"iosurface-security-research-triage-v19.13",
+        @"schema":@"iosurface-security-research-triage-v19.14",
         @"report_id":NSUUID.UUID.UUIDString,
         @"created_utc":PFRTDate(),
         @"origin":@"app_sandbox_diagnostic_snapshot",
@@ -202,11 +222,18 @@ NSDictionary<NSString *, id> *PFBuildSecurityResearchTriage(
             @"new_sources":added,
             @"modified_sources":changed,
             @"removed_sources":removed,
+            @"modified_telemetry_sources":telemetryChanged,
+            @"new_telemetry_sources":telemetryAdded,
+            @"removed_telemetry_sources":telemetryRemoved,
             @"new_boot_monitor_events":@(newBootEvents),
             @"boot_trace_counter_reset":@(bootRowsReset),
-            @"identical_source_set":@(havePrior && !added.count &&
+            @"no_substantive_source_changes":@(havePrior && !added.count &&
                                       !changed.count && !removed.count),
-            @"comparison_scope":@"App-owned file hashes and cumulative public observations only."
+            @"identical_source_set":@(havePrior && !added.count &&
+                                      !changed.count && !removed.count &&
+                                      !telemetryAdded.count && !telemetryChanged.count &&
+                                      !telemetryRemoved.count),
+            @"comparison_scope":@"SHA-256 preserved for every file. Routine app telemetry is listed separately from experimental sources; boot status assessed independently."
         },
         @"same_client_triage":@{
             @"classification":sameStatus,

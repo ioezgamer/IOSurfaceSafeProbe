@@ -143,10 +143,74 @@ int main(void) {
         NSMutableDictionary *shortened=[fixture(hashA,123,NO) mutableCopy];
         shortened[@"sources"]=@[];
         NSDictionary *missing=PFBuildSecurityResearchTriage(shortened,initial);
-        check([missing[@"change_analysis"][@"removed_sources"] count]==2,
-              @"missing source detection");
+        check([missing[@"change_analysis"][@"removed_sources"] count]==1,
+              @"missing experiment source detected");
+        check([missing[@"change_analysis"][@"removed_telemetry_sources"] count]==1,
+              @"missing BootMonitor classified as telemetry");
 
-        puts("PFSecurityResearchTriage: 9/9 PASS");
+        // 10. A forensic event written by Exportar is app telemetry, not
+        // a novel IOSurface result. Keep its hash for chain-of-custody.
+        NSMutableDictionary *telemetryOnly=[fixture(hashA,122,NO) mutableCopy];
+        telemetryOnly[@"sources"]=@[
+            @{@"name":@"IOSurfaceSameClient-trace.csv",@"sha256":hashA},
+            @{@"name":@"IOSurfaceBootMonitor-trace.csv",
+              @"sha256":@"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+            @{@"name":@"IOSurfaceForensicEvents-v19_10.csv",@"sha256":hashA},
+            @{@"name":@"IOSurfaceBootMonitor-checkpoint.json",@"sha256":hashA}
+        ];
+        NSDictionary *baseline=PFBuildSecurityResearchTriage(telemetryOnly,nil);
+        NSMutableDictionary *nextTelemetry=[telemetryOnly mutableCopy];
+        nextTelemetry[@"sources"]=@[
+            @{@"name":@"IOSurfaceSameClient-trace.csv",@"sha256":hashA},
+            @{@"name":@"IOSurfaceBootMonitor-trace.csv",
+              @"sha256":@"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+            @{@"name":@"IOSurfaceForensicEvents-v19_10.csv",@"sha256":hashB},
+            @{@"name":@"IOSurfaceBootMonitor-checkpoint.json",@"sha256":hashA}
+        ];
+        NSDictionary *noise=PFBuildSecurityResearchTriage(nextTelemetry,baseline);
+        NSDictionary *diff=noise[@"change_analysis"];
+        check([diff[@"modified_sources"] count]==0,
+              @"automatically generated forensic event must not count as novel evidence");
+        check([diff[@"modified_telemetry_sources"] count]==1,
+              @"self-generated forensic changes remain visible");
+        check([diff[@"modified_telemetry_sources"][0]
+            isEqualToString:@"IOSurfaceForensicEvents-v19_10.csv"],
+              @"telemetry name preserved");
+        check([diff[@"no_substantive_source_changes"] boolValue],
+              @"no substantive source changes");
+        check(![diff[@"identical_source_set"] boolValue],
+              @"raw source hashes did change");
+        check([noise[@"source_hashes"][@"IOSurfaceForensicEvents-v19_10.csv"]
+            isEqualToString:hashB],@"source hash preserved for integrity");
+
+        // 11. Previous v19.13 reports must remain valid baselines on upgrade,
+        // and routine BootMonitor file changes must be separate from evidence.
+        NSMutableDictionary *legacy=[baseline mutableCopy];
+        legacy[@"schema"]=@"iosurface-security-research-triage-v19.13";
+        NSMutableDictionary *bootChanged=[nextTelemetry mutableCopy];
+        bootChanged[@"boot_monitor"]=@{
+            @"event_rows":@130,
+            @"status_counts":@{@"NO_UPTIME_ROLLBACK_OBSERVED":@130}
+        };
+        bootChanged[@"sources"]=@[
+            @{@"name":@"IOSurfaceSameClient-trace.csv",@"sha256":hashA},
+            @{@"name":@"IOSurfaceBootMonitor-trace.csv",@"sha256":hashB},
+            @{@"name":@"IOSurfaceForensicEvents-v19_10.csv",@"sha256":hashB},
+            @{@"name":@"IOSurfaceBootMonitor-checkpoint.json",@"sha256":hashA}
+        ];
+        NSDictionary *upgrade=PFBuildSecurityResearchTriage(bootChanged,legacy);
+        check([upgrade[@"change_analysis"][@"has_previous_report"] boolValue],
+              @"v19.13 baseline accepted");
+        check([upgrade[@"change_analysis"][@"modified_sources"] count]==0,
+              @"BootMonitor is not an experiment source");
+        check([upgrade[@"change_analysis"][@"modified_telemetry_sources"] count]==2,
+              @"boot monitor and forensic events both classified as telemetry");
+        check([upgrade[@"change_analysis"][@"new_boot_monitor_events"] integerValue]==8,
+              @"uptime observations counted separately");
+        check(![upgrade[@"kernel_evidence"][@"uaf_proven"] boolValue],
+              @"no invented kernel evidence during migration");
+
+        puts("PFSecurityResearchTriage: 11/11 PASS");
     }
     return 0;
 }

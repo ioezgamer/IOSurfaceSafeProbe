@@ -1,7 +1,7 @@
 name: Compilar IOSurface Preflight IPA
 on:
   push:
-    branches: [main, preflight-ipa, feat/iosurface-preflight-v19-2-coverage, feat/iosurface-preflight-v19-3-format-coverage, feat/iosurface-preflight-v19-4-bounded-bruteforce-batch, feat/iosurface-preflight-v19-5-effective-coverage, feat/iosurface-preflight-v19-6-stratified-coverage, feat/iosurface-preflight-v19-7-targeted-replay, feat/iosurface-preflight-v19-8-mach-port-ownership, feat/iosurface-preflight-v19-9-port-revocation, feat/iosurface-preflight-v19-10-forensic-export, feat/iosurface-preflight-v19-12-import-kernel-traces, feat/iosurface-preflight-v19-13-research-triage]
+    branches: [main, preflight-ipa, feat/iosurface-preflight-v19-2-coverage, feat/iosurface-preflight-v19-3-format-coverage, feat/iosurface-preflight-v19-4-bounded-bruteforce-batch, feat/iosurface-preflight-v19-5-effective-coverage, feat/iosurface-preflight-v19-6-stratified-coverage, feat/iosurface-preflight-v19-7-targeted-replay, feat/iosurface-preflight-v19-8-mach-port-ownership, feat/iosurface-preflight-v19-9-port-revocation, feat/iosurface-preflight-v19-10-forensic-export, feat/iosurface-preflight-v19-12-import-kernel-traces, feat/iosurface-preflight-v19-13-research-triage, fix/iosurface-preflight-v19-14-telemetry-noise]
     paths:
       - 'IOSurfacePreflight/**'
       - '.github/workflows/ios-preflight-ipa.yml'
@@ -88,7 +88,7 @@ jobs:
             -framework Foundation \
             -o "$RUNNER_TEMP/pf-kernel-trace-import-tests"
           "$RUNNER_TEMP/pf-kernel-trace-import-tests"
-      - name: Pruebas triage de seguridad v19.13 (9 controles)
+      - name: Pruebas triage de seguridad v19.14 (11 controles)
         run: |
           clang -fobjc-arc -Wall -Wextra \
             -I IOSurfacePreflight/Sources \
@@ -110,8 +110,8 @@ jobs:
       - name: Verificar versión real del Info.plist
         run: |
           INFO="$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/Info.plist"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.13"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "32"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.14"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "33"
           test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
           python3 - "$INFO" <<'PY'
           import plistlib
