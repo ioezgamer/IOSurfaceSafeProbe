@@ -143,8 +143,10 @@ int main(void) {
         NSMutableDictionary *shortened=[fixture(hashA,123,NO) mutableCopy];
         shortened[@"sources"]=@[];
         NSDictionary *missing=PFBuildSecurityResearchTriage(shortened,initial);
-        check([missing[@"change_analysis"][@"removed_sources"] count]==2,
-              @"missing source detection");
+        check([missing[@"change_analysis"][@"removed_sources"] count]==1,
+              @"missing experiment source detected");
+        check([missing[@"change_analysis"][@"removed_telemetry_sources"] count]==1,
+              @"missing BootMonitor classified as telemetry");
 
         // 10. A forensic event written by Exportar is app telemetry, not
         // a novel IOSurface result. Keep its hash for chain-of-custody.
