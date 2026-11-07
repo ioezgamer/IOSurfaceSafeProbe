@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <IOSurface/IOSurface.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <mach/mach.h>
 #import <sys/utsname.h>
@@ -84,6 +85,18 @@ static NSString *labMachine(void) {
 
 static NSString *labHex(kern_return_t kr) {
     return [NSString stringWithFormat:@"0x%08x", (unsigned int)kr];
+}
+
+static NSString *labErrorName(kern_return_t kr) {
+    switch ((uint32_t)kr) {
+        case 0: return @"kIOReturnSuccess";
+        case 0xe00002bc: return @"kIOReturnError";
+        case 0xe00002bd: return @"kIOReturnNoMemory";
+        case 0xe00002c1: return @"kIOReturnNotPrivileged";
+        case 0xe00002c2: return @"kIOReturnBadArgument";
+        case 0xe00002c7: return @"kIOReturnUnsupported";
+        default: return @"OTHER";
+    }
 }
 
 static uint64_t labDigest(const uint8_t *data, size_t length) {
@@ -172,7 +185,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     self.selectedService = @"";
 
     UILabel *title = [UILabel new];
-    title.text = @"Apple IOKit Lab · v1";
+    title.text = @"Apple IOKit Lab · v1.1";
     title.font = [UIFont boldSystemFontOfSize:25];
 
     UILabel *summary = [UILabel new];
@@ -199,9 +212,10 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
         title, summary, self.selectedLabel,
         [self button:@"1. Inventariar servicios y permisos reales" selector:@selector(inventoryTapped:)],
-        [self button:@"2. Elegir controlador accesible" selector:@selector(chooseTapped:)],
-        [self button:@"3. Ejecutar 16 casos IOKit (requiere confirmación)" selector:@selector(campaignTapped:)],
-        [self button:@"4. Reproducir último caso guardado" selector:@selector(replayTapped:)],
+        [self button:@"2. Baseline pública IOSurface (64x64)" selector:@selector(publicBaselineTapped:)],
+        [self button:@"3. Elegir controlador accesible" selector:@selector(chooseTapped:)],
+        [self button:@"4. Ejecutar 16 casos IOKit (requiere confirmación)" selector:@selector(campaignTapped:)],
+        [self button:@"5. Reproducir último caso guardado" selector:@selector(replayTapped:)],
         [self button:@"Detener entre casos" selector:@selector(stopTapped:)],
         [self button:@"Exportar CSV + JSON + registro" selector:@selector(exportTapped:)],
         self.logView
@@ -269,7 +283,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
             [rows addObject:@{
                 @"registryService":name,
                 @"matched":@(present),
-                @"openType0":labHex(openKr),
+                @"openType0":present ? labHex(openKr) : @"N/A",
                 @"openable":@((openKr == KERN_SUCCESS) && present)
             }];
             [self log:[NSString stringWithFormat:@"%@ match=%@ open=%@",
@@ -293,6 +307,53 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
                        (unsigned long)openable.count]];
         });
     });
+}
+
+
+- (void)publicBaselineTapped:(id)sender {
+    if (self.running) { [self log:@"Ya hay otra prueba en curso."]; return; }
+    self.running = YES;
+    [self log:@"Baseline: API pública IOSurface 64x64, sin métodos IOKit privados."];
+    NSDictionary *properties = @{
+        (__bridge NSString *)kIOSurfaceWidth: @64,
+        (__bridge NSString *)kIOSurfaceHeight: @64,
+        (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
+        (__bridge NSString *)kIOSurfaceBytesPerRow: @256,
+        (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241u)
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+    NSMutableDictionary *result = [@{
+        @"schema":@"AppleIOKitLab.publicBaseline.v1",
+        @"device":labMachine(), @"iOS":UIDevice.currentDevice.systemVersion,
+        @"build":labKernelBuild(), @"created":@(surface != NULL)
+    } mutableCopy];
+    if (surface) {
+        IOSurfaceID surfaceID = IOSurfaceGetID(surface);
+        result[@"id"] = @(surfaceID);
+        result[@"width"] = @(IOSurfaceGetWidth(surface));
+        result[@"height"] = @(IOSurfaceGetHeight(surface));
+        result[@"allocBytes"] = @(IOSurfaceGetAllocSize(surface));
+        uint32_t seed = 0;
+        kern_return_t lockResult = IOSurfaceLock(surface, 0, &seed);
+        result[@"lockKR"] = labHex(lockResult);
+        if (lockResult == KERN_SUCCESS) {
+            result[@"unlockKR"] = labHex(IOSurfaceUnlock(surface, 0, &seed));
+        }
+        IOSurfaceRef found = IOSurfaceLookup(surfaceID);
+        result[@"lookupOwnID"] = @(found != NULL);
+        if (found) CFRelease(found);
+        CFRelease(surface);
+        [self log:[NSString stringWithFormat:
+             @"Baseline creada: %lux%lu, lock=%@, lookupID=%@",
+             (unsigned long)[result[@"width"] unsignedIntegerValue],
+             (unsigned long)[result[@"height"] unsignedIntegerValue],
+             result[@"lockKR"], [result[@"lookupOwnID"] boolValue] ? @"OK" : @"NO"]];
+    } else {
+        [self log:@"IOSurfaceCreate devolvió NULL con parámetros públicos válidos."];
+    }
+    [self saveJSON:result as:@"AppleIOKitLab-public-baseline.json"];
+    [self log:@"Baseline exportable. Resultado no demuestra acceso arbitrario al kernel."];
+    self.running = NO;
 }
 
 - (void)chooseTapped:(id)sender {
@@ -337,7 +398,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     fclose(fp);
 }
 
-- (void)executeCase:(NSInteger)index on:(NSString *)service run:(NSString *)run
+- (kern_return_t)executeCase:(NSInteger)index on:(NSString *)service run:(NSString *)run
            function:(LabIO)f {
     // 4 selectores x 4 formas de entrada = 16 casos, sin hilos rivales ni punteros caducados.
     static const uint32_t selectors[] = {0, 1, 2, 17};
@@ -389,10 +450,11 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
                 callKr = f.call(cn, sel, scalars, scalarCount,
                                 inputLength ? input : NULL, inputLength,
                                 outputScalars, &n, outputBytes, &bytes);
-                outputCount = n <= 4 ? n : 4;
-                outputSize = bytes <= 256 ? bytes : 256;
-                // Solo huella de los resultados, no exportamos memoria del controlador.
+                // El driver puede dejar n y bytes intactos si rechaza la llamada.
+                // Interpretar las capacidades iniciales como salida seria un falso positivo.
                 if (callKr == KERN_SUCCESS) {
+                    outputCount = n <= 4 ? n : 4;
+                    outputSize = bytes <= 256 ? bytes : 256;
                     digest = labDigest(outputBytes, outputSize);
                     digest ^= labDigest((const uint8_t *)outputScalars,
                                         outputCount * sizeof(uint64_t));
@@ -407,17 +469,25 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     done[@"matched"] = @(matched);
     done[@"openKR"] = labHex(openKr);
     done[@"callKR"] = labHex(callKr);
+    done[@"callStatus"] = labErrorName(callKr);
+    done[@"outputValid"] = @(callKr == KERN_SUCCESS);
     done[@"outputScalars"] = @(outputCount);
     done[@"outputBytes"] = @(outputSize);
     [self appendCSVRun:run service:service index:index selector:sel mode:mode
                 stage:@"POST" match:matched openKR:openKr callKR:callKr
           outputCount:outputCount outputSize:outputSize digest:digest];
     [self saveJSON:done as:@"AppleIOKitLab-checkpoint.json"];
+    [self saveJSON:done as:@"AppleIOKitLab-lastcase.json"];
     [self log:[NSString stringWithFormat:
-        @"Caso %02ld: sel=%u modo=%u open=%@ call=%@ out=%u/%zu hash=%016llx",
+        @"Caso %02ld: sel=%u modo=%u open=%@ call=%@ (%@) %@ hash=%016llx",
         (long)index, sel, mode, matched ? labHex(openKr) : @"SIN_SERVICIO",
         (openKr == KERN_SUCCESS && f.call) ? labHex(callKr) : @"NO_LLAMADO",
-        outputCount, outputSize, (unsigned long long)digest]];
+        labErrorName(callKr),
+        callKr == KERN_SUCCESS
+          ? [NSString stringWithFormat:@"out=%u/%zu",outputCount,outputSize]
+          : @"out=N/A",
+        (unsigned long long)digest]];
+    return callKr;
 }
 
 - (void)runSelected:(NSString *)service replay:(NSNumber *)replay {
@@ -438,18 +508,24 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
         NSInteger start = replay ? replay.integerValue : 0;
         NSInteger end = replay ? start + 1 : 16;
         NSUInteger total = 0;
+        NSMutableDictionary<NSString *, NSNumber *> *returnCounts = [NSMutableDictionary new];
         for (NSInteger i = start; i < end; i++) {
             if (self.stopRequested) break;
-            [self executeCase:i on:service run:run function:f];
+            kern_return_t status = [self executeCase:i on:service run:run function:f];
+            NSString *key = labHex(status);
+            returnCounts[key] = @([returnCounts[key] unsignedIntegerValue] + 1);
             total++;
         }
         NSDictionary *finish = @{
-            @"schema":@"AppleIOKitLab.run.v1",
+            @"schema":@"AppleIOKitLab.run.v1.1",
             @"phase":self.stopRequested ? @"STOPPED" : @"FINISHED",
             @"run":run, @"service":service, @"completed":@(total),
-            @"planned":@(end - start), @"build":labKernelBuild()
+            @"planned":@(end - start), @"build":labKernelBuild(),
+            @"returnCounts":returnCounts,
+            @"interpretation":@"A returned error is not evidence of memory corruption."
         };
         [self saveJSON:finish as:@"AppleIOKitLab-checkpoint.json"];
+        [self saveJSON:finish as:@"AppleIOKitLab-summary.json"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.running = NO;
             [self log:[NSString stringWithFormat:@"Fin: %lu/%ld casos. Exportar CSV/JSON.",
@@ -511,7 +587,8 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
 - (void)exportTapped:(id)sender {
     NSArray *names = @[@"AppleIOKitLab-session.txt", @"AppleIOKitLab-inventory.json",
                        @"AppleIOKitLab-checkpoint.json", @"AppleIOKitLab-lastcase.json",
-                       @"AppleIOKitLab-trace.csv"];
+                       @"AppleIOKitLab-trace.csv", @"AppleIOKitLab-public-baseline.json",
+                       @"AppleIOKitLab-summary.json"];
     NSMutableArray *urls = [NSMutableArray new];
     for (NSString *name in names) {
         NSURL *u = [self document:name];
