@@ -45,3 +45,28 @@ Fuentes de IOKit/XNU (su rama publica no sustituye la configuracion exacta de lo
 Se confirma **un orden parcial**, no una secuencia cronologica unica de una ejecucion real. El control del ultimo `release` depende de referencias y rutas IOKit que aun no pueden deducirse de estas secciones del binario. Los registros existentes de IOSurfacePreflight no incluyen una traza de destruccion del objeto. No es valido presentar este resultado como un UAF del kernel, corrupcion de memoria, KernelRW ni prueba de la CVE.
 
 **Reproduccion:** `audit_iosurface_order.py` (auditado offline), el JSON `IOSurface_orden_y_garantias_IOKit.json` y los dos `.asm.gz` del artefacto de [GitHub Actions 42328640652](https://github.com/ioezgamer/IOSurfaceSafeProbe/actions/runs/42328640652). Se conserva la comparacion binaria en la rama de investigacion sin modificar el IPA.
+
+## Garantia adicional de IOMachPort y cierre con referencias activas
+
+La inspeccion directa de los archivos publicos de Apple XNU añade una garantia que no procede del binario IOSurface aislado:
+
+- `IOMachPort::withObject(OSObject*)` almacena el puntero y ejecuta `taggedRetain` sobre el objeto. `IOMachPort::free()` lo libera mediante `taggedRelease`.
+- `iokit_connect_no_senders` obtiene un `IOMachPort`, adquiere `IORWLockWrite(&client->lock)`, invoca `clientDied()`, libera ese bloqueo y **solo despues** ejecuta `machPort->release()`.
+- `IOUserClient::clientDied()` llama a `clientClose()` cuando el cliente no estaba cerrado, o cuando es compartido.
+
+**Orden obligatorio en esa ruta:** si la perdida de los derechos de envio provoca el cierre, la referencia conservada por `IOMachPort` impide que la destruccion final del objeto cliente tenga lugar antes de completar la llamada a `clientDied`/ `clientClose`/retirada invocada por esta. La liberacion final puede ocurrir mas tarde y depender de otros propietarios.
+
+Por otro lado, `iokit_lookup_connect_ref_current_task` obtiene una referencia adicional al cliente mientras el metodo RPC se ejecuta. `IOUserClient::ipcEnter` incrementa `__ipc`; `ipcExit` la reduce y puede reprogramar la finalizacion al salir la ultima llamada. Por tanto una llamada admitida antes del cierre puede seguir manteniendo el cliente vivo temporalmente aun cuando el cierre ya haya retirado las entradas.
+
+**Punto que depende de la subclase:** `IOUserClient::callExternalMethod` adquiere el bloqueo del cliente en modo lectura o escritura solo si `defaultLocking` esta activo; en caso contrario usa `kIPCLockNone`. El encabezado `IOUserClient.h` explica que este modo de serializacion de `IOServiceClose` con `externalMethod` es una configuracion de `IOUserClient2022` por la que opta cada implementacion. No puede inferirse que este activada en el `IOSurfaceRootUserClient` del firmware examinado solo a partir del fuente generico de XNU.
+
+**Consecuencia logica:** si una llamada de registro conservaba una referencia valida y llegaba al bloqueo de IOSurface **despues** de una retirada de notificaciones y **sin** exclusion de cliente frente al cierre, la ruta 27.0 podia insertar una nueva entrada (la ruta de registro no comprueba el estado de cierre). La llamada activa mantenia vivo al cliente durante la insercion. Si esa entrada sobrevive a la liberacion de la ultima referencia cuando termina la llamada, una notificacion posterior podria encontrar el puntero; pero **no esta demostrado que esa intercalacion sea admisible en IOSurfaceRootUserClient en ese build ni que exista ese evento de liberacion en una ejecucion real**. En 27.2 el control del estado evita una insercion tardia a nivel de la lista, con independencia de esa incertidumbre.
+
+Estos puntos fortalecen la demostracion del *orden parcial*, pero no son una traza cronologica del ultimo `release` de un cliente concreto.
+
+Fuentes:
+- [XNU: implementacion de IOMachPort, ipcEnter/ipcExit, clientDied y iokit_connect_no_senders](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOUserClient.cpp)
+- [XNU: iokit_lookup_connect_ref_current_task](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/device/iokit_rpc.c)
+- [XNU: documentacion de IOUserClient2022 y defaultLocking](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/IOKit/IOUserClient.h)
+
+**Veredicto despues de la revision:** se puede afirmar que el cierre por no-senders retiene al cliente hasta finalizar la retirada y que IOKit retiene el cliente durante llamadas IPC. No se puede afirmar que la ultima liberacion efectiva preceda una entrega con el material disponible.
