@@ -198,3 +198,24 @@ Los resultados se guardan después de cada repetición en
 Un resultado `MATCH_3_OF_3` indica consistencia observada, no ausencia general de
 vulnerabilidades; `DIVERGED` o un fallo de integridad requiere revisión y no
 prueba un exploit. Si no hay CSV local válido, ejecutá antes la opción 24.
+
+## v19.8: transferencia efectiva de IOSurface mediante un puerto Mach
+
+El botón **26. Transferencia Mach real: imagen editable** realiza operaciones públicas reales, no un diagnóstico simulado:
+
+1. Crea una IOSurface propia BGRA de 128×128 (65.536 bytes) y escribe un patrón determinista en su memoria.
+2. Obtiene un puerto mediante `IOSurfaceCreateMachPort`; libera la referencia original y recupera otra mediante `IOSurfaceLookupFromMachPort`.
+3. Libera el puerto Mach y comprueba que la referencia reconstruida conserva los bytes originales, comparando FNV-1a de 64 bits.
+4. Dibuja un cuadrado cian en el búfer recuperado, contrasta cada byte con una imagen reconstruida de forma independiente, la muestra en pantalla y la guarda como PNG.
+5. Archiva `Documents/IOSurfaceMachHandoff-v19_8.json` y `Documents/IOSurfaceMachHandoff-v19_8.png`, accesibles desde Archivos y el botón Exportar.
+
+Si iOS no exporta esos símbolos públicos o niega la transferencia del puerto, la app informa `UNAVAILABLE`/`ERROR` y en qué etapa ocurrió; nunca devuelve `PASS` sin comparar los bytes. El código utiliza solamente memoria de su propia IOSurface, no provoca condiciones de carrera ni prueba una vulnerabilidad del kernel. Es una transferencia **dentro del mismo proceso**, no una prueba de acceso entre apps, escalada de privilegios, KernelRW ni jailbreak.
+
+El archivo `Sources/PFMachPortPattern.h` separa la generación y el sello de píxeles para probarlos en C11 antes de la compilación de iOS:
+
+```sh
+clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFMachPortPatternTests.c -o /tmp/pf-mach-pattern-tests
+/tmp/pf-mach-pattern-tests
+```
+
+**Limitaciones:** requiere autorización de firma para instalar el IPA no firmado que entrega GitHub Actions. La funcionalidad real de transferencia debe validarse en el iPhone, ya que CI compila y ejecuta las pruebas C pero no dispone de un dispositivo iOS físico.

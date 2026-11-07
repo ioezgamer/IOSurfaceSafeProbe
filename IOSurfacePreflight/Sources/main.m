@@ -15,6 +15,7 @@
 #import "PFBoundedBatch.h"
 #import "PFNoveltyCoverage.h"
 #import "PFTargetedReplay.h"
+#import "PFMachPortHandoff.h"
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -99,6 +100,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 
 @interface ProbeController : UIViewController
 @property(nonatomic, strong) UITextView *logView;
+@property(nonatomic, strong) UIImageView *handoffPreview;
 @property(nonatomic, copy) NSString *bootSessionID;
 @property(nonatomic, strong) NSMutableString *events;
 @property(nonatomic, assign) BOOL matrixRunning;
@@ -224,7 +226,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.7";
+    title.text = @"IOSurface Preflight v19.8";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -239,6 +241,15 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.logView.layer.borderWidth = 1;
     self.logView.layer.cornerRadius = 8;
 
+    self.handoffPreview = [UIImageView new];
+    self.handoffPreview.contentMode=UIViewContentModeScaleAspectFit;
+    self.handoffPreview.backgroundColor=UIColor.tertiarySystemBackgroundColor;
+    self.handoffPreview.layer.cornerRadius=10;
+    self.handoffPreview.layer.masksToBounds=YES;
+    self.handoffPreview.hidden=YES;
+    NSLayoutConstraint *imageHeight=[self.handoffPreview.heightAnchor constraintEqualToConstant:180];
+    imageHeight.priority=UILayoutPriorityDefaultHigh;
+    imageHeight.active=YES;
     UIStackView *layout = [[UIStackView alloc] initWithArrangedSubviews:@[
       title, subtitle,
       [self button:@"1. API pública IOSurface" action:@selector(publicProbe:)],
@@ -266,6 +277,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
       [self button:@"23. Fuerza bruta controlada: 3 x 50.000" action:@selector(startBoundedBatch:)],
       [self button:@"24. Fuerza bruta de entradas nuevas (hasta 50.000)" action:@selector(noveltyProbe:)],
       [self button:@"25. Reproducir caso del CSV local (3 veces)" action:@selector(targetedReplayProbe:)],
+      [self button:@"26. Transferencia Mach real: imagen editable" action:@selector(machPortHandoffProbe:)],
+      self.handoffPreview,
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
       self.logView
@@ -298,7 +311,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.7"]; 
+    [self note:@"app=IOSurfacePreflight-v19.8"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -3897,6 +3910,45 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 }
 
 
+// v19.8: genuine, bounded public IOSurface/Mach transfer; no kernel exploitation.
+- (void)machPortHandoffProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.batchRunning ||
+       self.controlledCloseRunning) {
+        [self note:@"MACH-HANDOFF: otra prueba activa; detenela primero."];
+        return;
+    }
+    [self note:@"MACH-HANDOFF: creando IOSurface BGRA y transfiriendo la referencia mediante Mach."];
+    UIImage *preview=nil;
+    NSDictionary *report=PFRunMachPortHandoff(&preview);
+    NSString *dir=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *jsonPath=[dir stringByAppendingPathComponent:@"IOSurfaceMachHandoff-v19_8.json"];
+    NSData *json=[NSJSONSerialization dataWithJSONObject:report
+                       options:NSJSONWritingPrettyPrinted error:NULL];
+    NSError *reportError=nil;
+    BOOL savedReport=json && [json writeToFile:jsonPath
+                             options:NSDataWritingAtomic error:&reportError];
+    BOOL success=[report[@"status"] isEqualToString:@"PASS"] && preview!=nil;
+    if(success) {
+        NSString *pngPath=[dir stringByAppendingPathComponent:@"IOSurfaceMachHandoff-v19_8.png"];
+        NSData *png=UIImagePNGRepresentation(preview);
+        NSError *pngError=nil;
+        BOOL savedPNG=png && [png writeToFile:pngPath
+                           options:NSDataWritingAtomic error:&pngError];
+        self.handoffPreview.image=preview;
+        self.handoffPreview.hidden=NO;
+        [self note:[NSString stringWithFormat:@"MACH-HANDOFF: imagen %@",
+            savedPNG?@"GUARDADA":(pngError.localizedDescription?:@"NO GUARDADA")]];
+    }
+    [self note:[NSString stringWithFormat:@"MACH-HANDOFF: %@ etapa=%@, %@",
+        report[@"status"],report[@"stage"],report[@"detail"]]];
+    [self note:[NSString stringWithFormat:@"MACH-HANDOFF: hashes original=%@ recuperado=%@ editado=%@",
+        report[@"original_pixel_hash_fnv1a64"],report[@"recovered_pixel_hash_fnv1a64"],
+        report[@"modified_pixel_hash_fnv1a64"]]];
+    [self note:[NSString stringWithFormat:@"MACH-HANDOFF: JSON %@",
+        savedReport?@"GUARDADO":(reportError.localizedDescription?:@"NO GUARDADO")]];
+    if(success) [self note:@"MACH-HANDOFF: exportá PNG y JSON para verificar la transferencia real."];
+}
+
 // v19.7: replay a concrete archived CSV row with only the public IOSurface API.
 // Reads an existing local campaign in Documents, without uploading user data.
 - (void)targetedReplayProbe:(id)sender {
@@ -4321,7 +4373,9 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
     }
-    for(NSString *file in @[@"IOSurfaceTargetedReplay-checkpoint.json",
+    for(NSString *file in @[@"IOSurfaceMachHandoff-v19_8.json",
+                            @"IOSurfaceMachHandoff-v19_8.png",
+                            @"IOSurfaceTargetedReplay-checkpoint.json",
                             @"IOSurfaceTargetedReplay-trace.csv",
                             @"IOSurfaceNovelty-v19_6.json",
                             @"IOSurfaceNovelty-v19_6.csv"]) {
