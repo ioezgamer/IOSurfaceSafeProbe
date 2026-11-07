@@ -72,3 +72,49 @@ Botón **“Contrato IOSurface (selector 13, una consulta)”**:
 **Resultado condicionado:** la correspondencia probable de selectores 0, 1, 2, 13 y 17 se deriva de macOS 27 e iOS 27 beta 4 y **no es aún un mapa exacto confirmado de iOS 24A437**.
 
 **Siguiente evidencia concreta:** `AppleIOKitLab-contract.json` de v1.2, seguida de comparación contra un binario exacto del build 24A437. No es útil repetir fuzzing ciego de 16 llamadas cuya forma ya sabemos que no coincide con las ABI de referencia.
+
+## 7. Validación experimental posterior: Apple IOKit Lab v1.2 en 24A437
+
+**Entrada recibida:** archivo `AppleIOKitLab-contract.json`, generado desde el dispositivo `iPhone14,3`, iOS `27.0`, compilación `24A437`.
+
+**La inspección de registro resolvió la duda entre clase y nombre:**
+
+| Mecanismo | Consulta | Encontrado | Clase real | Nombre real | RegistryEntryID | Open type 0 |
+|---|---|---|---|---|---|---|
+| `IOServiceMatching` | `IOSurfaceRoot` | Sí | `IOSurfaceRoot` | `IOCoreSurfaceRoot` | `0000000100000579` | `0x00000000` |
+| `IOServiceMatching` | `IOCoreSurfaceRoot` | No | — | — | — | N/A |
+| `IOServiceNameMatching` | `IOSurfaceRoot` | No | — | — | — | N/A |
+| `IOServiceNameMatching` | `IOCoreSurfaceRoot` | Sí | `IOSurfaceRoot` | `IOCoreSurfaceRoot` | `0000000100000579` | `0x00000000` |
+
+**Conclusión directa:** ambas rutas exitosas resuelven la MISMA entrada de registro. No son dos drivers distintos. La aplicación pudo abrir el cliente tipo 0 por ambas búsquedas.
+
+**Consulta única del selector 13 (s_get_limits, etiqueta histórica):**
+
+- `IOConnectCallMethod`, selector `13`.
+- Escalares y estructura de entrada: **cero**.
+- Capacidad de salida: **cero escalares y 40 bytes** de estructura.
+- `openKR=0x00000000`, `callKR=0x00000000`, `phase=COMPLETED`.
+- Salida: **40 bytes realmente reportados**, a diferencia de los conteos aparentes de los casos fallidos en v1.0.
+- Coincide en tamaño y ausencia de entradas con la documentación externa de iOS 27 beta 4, pero este resultado es **ahora una medida real de 24A437**.
+
+Hexadecimal exacto (40 bytes):
+```text
+ff3f00007f0000000080000000000000004000000000000000400000000000000000010000000000
+```
+
+Decodificación observacional little-endian, sin atribuir campos que no se hayan verificado en el binario `24A437`:
+
+| Offset | U32 little-endian | Nota |
+|---|---|---|
+| 0x00 | `0x00003fff` = 16383 | posible máscara de alineación de dirección |
+| 0x04 | `0x0000007f` = 127 | posible máscara de alineación de fila |
+| 0x08 | `0x00008000` = 32768 | comienzo del primer valor u64 desde offset 0x08 |
+| 0x10 | `0x00004000` = 16384 | segundo valor u64 |
+| 0x18 | `0x00004000` = 16384 | tercer valor u64 |
+| 0x20 | `0x00010000` = 65536 | cuarto valor u64 |
+
+Las cuatro cantidades desde `0x08` ocupan **8 bytes cada una**, con mitades altas cero en esta ejecución. Los nombres propuestos para las máscaras se apoyan en estructuras históricas de IOSurface (véase [iocoresurfaceroot.h](https://github.com/userlandkernel/iokitstuff/blob/master/Zeroday/iocoresurfaceroot.h)), pero la ABI exacta de 40 bytes y las semánticas de los valores restantes requieren desensamblado o símbolos del build objetivo.
+
+**Estado epistemológico actualizado:** en `iPhone14,3 / 24A437` quedaron confirmados (a) el nombre y la clase efectivos del servicio y (b) el éxito del selector 13, con tamaño y contenido de salida reproducibles. No quedaron demostrados los contratos de otros selectores, vulnerabilidad de memoria, fuga de dirección, exploit, jailbreak o KernelRW.
+
+**Siguiente paso razonable:** comparar este resultado con `IOSurface.framework` y `com.apple.iokit.IOSurface` extraídos del firmware exacto 24A437; para pruebas dinámicas posteriores, usar únicamente parámetros de contrato verificados y aislar los cambios de estado del controlador. No hay justificación para repetir las 16 llamadas deliberadamente mal formadas.
