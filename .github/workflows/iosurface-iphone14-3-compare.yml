@@ -1,8 +1,8 @@
 name: Compare IOSurface iPhone14,3 official kernelcaches
 on:
   push:
-    branches: [research/iosurface-iphone14-3-binary-compare]
-    paths: ['.github/workflows/iosurface-iphone14-3-compare.yml']
+    branches: [research/iosurface-iphone14-3-binary-compare, research/iosurface-notify-reference-lifetime]
+    paths: ['.github/workflows/iosurface-iphone14-3-compare.yml', 'scripts/trace_iosurface_locking_flags.py']
   workflow_dispatch:
 permissions:
   contents: read
@@ -191,6 +191,43 @@ jobs:
           PY
           python3 scripts/verify_iosurface_lifecycle.py /tmp/iosurface-analysis.zip > cmp/out/verification.json
           cat cmp/out/verification.json
+      - name: Preserve complete IOSurface disassembly for reference-lifetime audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -9 -c cmp/old.asm > cmp/out/iosurface-24A437.asm.gz
+          gzip -9 -c cmp/new.asm > cmp/out/iosurface-24B119.asm.gz
+          shasum -a 256 cmp/out/iosurface-*.asm.gz | tee cmp/out/disassembly-hashes.txt
+      - name: Inspect IOSurface client default-locking property identifiers
+        shell: bash
+        run: |
+          set -euo pipefail
+          KO="$(find cmp/kext-old -type f -name '*IOSurface*' | head -n 1)"
+          KN="$(find cmp/kext-new -type f -name '*IOSurface*' | head -n 1)"
+          python3 scripts/inspect_iosurface_locking_metadata.py "$KO" "$KN" --output cmp/out/locking-metadata.json
+          for NAME in old new; do
+            FILE="$KO"; test "$NAME" = new && FILE="$KN"
+            xcrun llvm-nm --undefined-only "$FILE" > "cmp/out/${NAME}-undefined-symbols.txt" 2>&1 || true
+            xcrun llvm-nm "$FILE" > "cmp/out/${NAME}-all-symbols.txt" 2>&1 || true
+            xcrun llvm-objdump --macho --bind "$FILE" > "cmp/out/${NAME}-bindings.txt" 2>&1 || true
+          done
+          grep -Ein 'IOUserClientDefaultLocking|IOUserClient2022|setProperty|IOSurfaceRootUserClient' cmp/out/*symbols.txt cmp/out/*bindings.txt || true
+      - name: Preserve extracted IOSurface KEXTs for exact property call tracing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$(find cmp/kext-old -type f -name '*IOSurface*' | head -n 1)" cmp/out/iosurface-24A437.macho
+          cp "$(find cmp/kext-new -type f -name '*IOSurface*' | head -n 1)" cmp/out/iosurface-24B119.macho
+          shasum -a 256 cmp/out/*.macho
+      - name: Verify effective IOUserClient locking property assignments
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/trace_iosurface_locking_flags.py \
+            --old-macho cmp/out/iosurface-24A437.macho \
+            --new-macho cmp/out/iosurface-24B119.macho \
+            --old-asm cmp/old.asm --new-asm cmp/new.asm \
+            --output cmp/out/effective-locking-inference.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

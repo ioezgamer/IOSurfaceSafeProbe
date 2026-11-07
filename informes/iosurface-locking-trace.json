@@ -1,0 +1,58 @@
+{
+  "device": "iPhone14,3",
+  "method": "Static Mach-O cstring xrefs / signed authenticated virtual setProperty calls",
+  "builds": [
+    {
+      "build": "24A437",
+      "macho_sha256": "3f95c45f629a8749775765980434ee927552e1cad4e568743062bf901aa018d8",
+      "references": {
+        "IOUserClientEntitlements": {
+          "xref": "0xfffffff009c1aef4",
+          "value": "shared_false_inferred"
+        },
+        "IOUserClientDefaultLocking": {
+          "xref": "0xfffffff009c1af20",
+          "value": "shared_false_inferred"
+        },
+        "IOUserClientDefaultLockingSetProperties": {
+          "xref": "0xfffffff009c1af58",
+          "value": "opposite_true_inferred"
+        },
+        "IOUserClientDefaultLockingSingleThreadExternalMethod": {
+          "xref": "0xfffffff009c1af84",
+          "value": "shared_false_inferred"
+        }
+      }
+    },
+    {
+      "build": "24B119",
+      "macho_sha256": "a1d255c31648eb54385b32cb51277a262b7d99c246a5195e591ae8d827b3275c",
+      "references": {
+        "IOUserClientEntitlements": {
+          "xref": "0xfffffff009c5ae9c",
+          "value": "shared_false_inferred"
+        },
+        "IOUserClientDefaultLocking": {
+          "xref": "0xfffffff009c5aec8",
+          "value": "shared_false_inferred"
+        },
+        "IOUserClientDefaultLockingSetProperties": {
+          "xref": "0xfffffff009c5af00",
+          "value": "opposite_true_inferred"
+        },
+        "IOUserClientDefaultLockingSingleThreadExternalMethod": {
+          "xref": "0xfffffff009c5af2c",
+          "value": "shared_false_inferred"
+        }
+      }
+    }
+  ],
+  "retention": {
+    "port": "taggedRetain until after clientDied",
+    "IPC": "strong +1 until RPC cleanup",
+    "active_call_counter": "ipcEnter increments; ipcExit decrements",
+    "close_serializes_externalMethod": false
+  },
+  "live_runtime_bits_read": false,
+  "post_final_release_notification_confirmed": false
+}
