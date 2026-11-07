@@ -19,6 +19,7 @@
 #import "PFPortRevocationTest.h"
 #import "PFForensicEvidence.h"
 #import "PFKernelTraceImporter.h"
+#import "PFSecurityResearchTriage.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
@@ -232,7 +233,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.12";
+    title.text = @"IOSurface Preflight v19.13";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -287,6 +288,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
       [self button:@"27. Verificar revocación de derechos Mach (1 ensayo)" action:@selector(portRevocationProbe:)],
       [self button:@"28. Correlacionar evidencia local (sin pruebas invasivas)" action:@selector(forensicSnapshotProbe:)],
       [self button:@"29. Importar traza externa instrumentada (.json)" action:@selector(importKernelTrace:)],
+      [self button:@"30. Analizar novedades y anomalías (sin IPC)" action:@selector(securityResearchTriageProbe:)],
       self.handoffPreview,
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
@@ -320,7 +322,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.12"]; 
+    [self note:@"app=IOSurfacePreflight-v19.13"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -4364,9 +4366,61 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     [self note:@"FORENSIC: usá Exportar registro, CSV y checkpoint para compartir el JSON."];
 }
 
-- (void)shareLog:(id)sender {
-    // Always refresh the forensic snapshot before exporting current evidence.
+// v19.13: classify app-owned historical evidence and compare the previous
+// analysis. No new IPC calls or changes to the device's kernel.
+- (void)securityResearchTriageProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.batchRunning ||
+       self.controlledCloseRunning) {
+        [self note:@"TRIAGE: detené primero la prueba activa."];
+        return;
+    }
+    NSString *dir=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *reportPath=[dir stringByAppendingPathComponent:
+        @"IOSurfaceSecurityResearch-v19_13.json"];
+    NSString *snapshotPath=[dir stringByAppendingPathComponent:
+        @"IOSurfaceForensicEvidence-v19_10.json"];
+
+    // Preserve the previous triage state before updating the forensic snapshot.
+    NSData *previousBytes=[NSData dataWithContentsOfFile:reportPath];
+    id previousRaw=previousBytes?[NSJSONSerialization
+        JSONObjectWithData:previousBytes options:0 error:NULL]:nil;
+    NSDictionary *previous=[previousRaw isKindOfClass:NSDictionary.class]?
+        previousRaw:nil;
+
+    // Reuse the public-only snapshot builder to avoid divergent interpretations.
     [self forensicSnapshotProbe:sender];
+    NSData *snapshotBytes=[NSData dataWithContentsOfFile:snapshotPath];
+    id snapshotRaw=snapshotBytes?[NSJSONSerialization
+        JSONObjectWithData:snapshotBytes options:0 error:NULL]:nil;
+    if (![snapshotRaw isKindOfClass:NSDictionary.class]) {
+        [self note:@"TRIAGE: no se pudo leer el JSON forense local."];
+        return;
+    }
+    NSDictionary *triage=PFBuildSecurityResearchTriage(snapshotRaw,previous);
+    NSData *data=[NSJSONSerialization dataWithJSONObject:triage
+        options:NSJSONWritingPrettyPrinted error:NULL];
+    NSError *error=nil;
+    BOOL saved=data && [data writeToFile:reportPath
+        options:NSDataWritingAtomic error:&error];
+    NSDictionary *changes=triage[@"change_analysis"];
+    NSDictionary *same=triage[@"same_client_triage"];
+    [self note:[NSString stringWithFormat:
+        @"TRIAGE: %@ hallazgos=%lu clasificación=%@",
+        saved?@"GUARDADO":(error.localizedDescription?:@"ERROR"),
+        (unsigned long)[triage[@"findings"] count],
+        same[@"classification"]]];
+    [self note:[NSString stringWithFormat:
+        @"TRIAGE: fuentes nuevas=%lu modificadas=%lu eliminadas=%lu eventos_boot_nuevos=%@",
+        (unsigned long)[changes[@"new_sources"] count],
+        (unsigned long)[changes[@"modified_sources"] count],
+        (unsigned long)[changes[@"removed_sources"] count],
+        changes[@"new_boot_monitor_events"]]];
+    [self note:@"TRIAGE: sólo análisis de espacio de usuario. NO demuestra UAF ni KernelRW."];
+}
+
+- (void)shareLog:(id)sender {
+    // Refresh comparison and the underlying forensic snapshot before sharing.
+    [self securityResearchTriageProbe:sender];
     NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IOSurfacePreflight-log.txt"];
     NSError *error = nil;
     if (![self.events writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
@@ -4505,7 +4559,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
     }
-    for(NSString *file in @[@"IOSurfaceImportedAnalysis-v19_12.json",
+    for(NSString *file in @[@"IOSurfaceSecurityResearch-v19_13.json",
+                            @"IOSurfaceImportedAnalysis-v19_12.json",
                             @"IOSurfaceImportedSource-v19_12.json",
                             @"IOSurfaceForensicEvidence-v19_10.json",
                             @"IOSurfaceForensicEvents-v19_10.csv",
