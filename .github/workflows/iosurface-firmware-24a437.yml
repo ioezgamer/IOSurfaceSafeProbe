@@ -1,0 +1,82 @@
+name: Auditar IOSurface desde IPSW 24A437
+on:
+  push:
+    branches:
+      - research/apple-iokit-lab-20261107
+    paths:
+      - '.github/workflows/iosurface-firmware-24a437.yml'
+      - 'AppleIOKitLab/tools/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  exact-build-static-audit:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      TARGET_DEVICE: iPhone14,3
+      TARGET_BUILD: 24A437
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preparar carpetas
+        run: |
+          mkdir -p "$RUNNER_TEMP/fwaudit/extracted" "$RUNNER_TEMP/fwaudit/kexts" "$RUNNER_TEMP/fwaudit/report"
+      - name: Instalar ipsw
+        run: |
+          brew install ipsw
+          ipsw version 2>&1 | tee "$RUNNER_TEMP/fwaudit/report/ipsw-version.txt" || ipsw --version | tee "$RUNNER_TEMP/fwaudit/report/ipsw-version.txt"
+      - name: Buscar build y extraer remotamente SOLO el kernelcache
+        shell: bash
+        run: |
+          set -o pipefail
+          ipsw download ipsw --device "$TARGET_DEVICE" --build "$TARGET_BUILD" \
+            --kernel --confirm --output "$RUNNER_TEMP/fwaudit/extracted" \
+            > "$RUNNER_TEMP/fwaudit/report/download.log" 2>&1
+          tail -70 "$RUNNER_TEMP/fwaudit/report/download.log"
+      - name: Identificar kernelcache extraído
+        shell: bash
+        run: |
+          set -e
+          find "$RUNNER_TEMP/fwaudit/extracted" -type f > "$RUNNER_TEMP/fwaudit/report/file-list.txt"
+          cat "$RUNNER_TEMP/fwaudit/report/file-list.txt"
+          KC="$(find "$RUNNER_TEMP/fwaudit/extracted" -type f -name 'kernelcache.*' | head -1)"
+          if [ -z "$KC" ]; then
+            echo "No se encontro kernelcache. No se atribuye ninguna instruccion." >&2
+            exit 2
+          fi
+          echo "KC=$KC" >> "$GITHUB_ENV"
+          shasum -a 256 "$KC" | tee "$RUNNER_TEMP/fwaudit/report/kernel-sha256.txt"
+          file "$KC" | tee "$RUNNER_TEMP/fwaudit/report/kernel-file-type.txt"
+      - name: Enumerar KEXTs y extraer IOSurface
+        shell: bash
+        run: |
+          ipsw kernel kexts "$KC" > "$RUNNER_TEMP/fwaudit/report/kexts.txt" 2>&1 || true
+          grep -i -C 2 iosurface "$RUNNER_TEMP/fwaudit/report/kexts.txt" | head -35 || true
+          ipsw kernel extract "$KC" com.apple.iokit.IOSurface \
+            --output "$RUNNER_TEMP/fwaudit/kexts" \
+            > "$RUNNER_TEMP/fwaudit/report/extract-iosurface.log" 2>&1 || true
+          find "$RUNNER_TEMP/fwaudit/kexts" -type f | tee "$RUNNER_TEMP/fwaudit/report/kext-files.txt"
+          ipsw macho info "$KC" --header > "$RUNNER_TEMP/fwaudit/report/kernel-macho-header.txt" 2>&1 || true
+          ipsw kernel cpp "$KC" > "$RUNNER_TEMP/fwaudit/report/iosurface-cpp.txt" 2>&1 || true
+          ipsw kernel symbolsets "$KC" > "$RUNNER_TEMP/fwaudit/report/symbolsets.txt" 2>&1 || true
+          for f in "$RUNNER_TEMP/fwaudit/kexts"/*; do
+            if [ -f "$f" ]; then
+              ipsw macho info "$f" --json > "$RUNNER_TEMP/fwaudit/report/iosurface-macho-info.json" 2>&1 || true
+              ipsw macho info "$f" --symbols > "$RUNNER_TEMP/fwaudit/report/iosurface-symbols.txt" 2>&1 || true
+              break
+            fi
+          done
+      - name: Elaborar informe anclado a archivos reales
+        if: always()
+        run: |
+          python3 AppleIOKitLab/tools/iosurface_static_report.py "$RUNNER_TEMP/fwaudit"
+      - name: Publicar solo informe, logs y binario IOSurface extraído
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IOSurface-24A437-auditoria-estatica
+          path: |
+            ${{ runner.temp }}/fwaudit/report/**
+            ${{ runner.temp }}/fwaudit/kexts/**
+          if-no-files-found: error
+          retention-days: 14
