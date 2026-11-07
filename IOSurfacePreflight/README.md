@@ -271,3 +271,11 @@ El informe reutiliza los archivos propios del contenedor (no necesita computador
 ### Verificación
 
 La ejecución de GitHub Actions compila y ejecuta \`PFForensicEvidenceTests.m\` en macOS, además de producir la IPA para iOS. La IPA exportada no está firmada: para instalarla en el iPhone hace falta una firma válida de la cuenta del usuario. El identificador \`org.iosurface.preflight\` se mantiene para conservar los Documentos existentes cuando la instalación sea una actualización compatible.
+
+### Corrección v19.11: CSV SameClient real
+
+En v19.10, el correlador interpretaba erróneamente el CSV de SameClient del dispositivo como inválido porque esperaba 12 columnas con una columna inicial `index`. El archivo original de iOS tiene **11 columnas**, sin `index`.
+
+La v19.11 lee las columnas por encabezado, admite los dos formatos, valida los intervalos numéricos y diferencia una llamada RPC rechazada de una operación de registro completada. Para la traza original de noviembre, el solapamiento es **174.167 µs**, con `call_kr=0x10000003`, que **no acredita** un registro válido ni un UAF.
+
+La etiqueta del log inicial y el número de compilación se actualizaron a v19.11 (build 30). La auditoría sigue limitada a API pública. La actualización reproduce la lectura correcta del archivo existente; no es necesario repetir el ensayo SameClient.
