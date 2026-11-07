@@ -94,3 +94,28 @@ En lugar de probar números aleatorios, `IOSurfaceDirectRoundTrip.m` ejecuta **u
 **Controles:** no usa punteros caducados, valores de memoria del kernel, escritura fuera de la superficie, brute force, carreras ni modificación de permisos. Solo se habilita en `iPhone14,3` build `24A437`; exige confirmación del usuario porque las llamadas al controlador siguen pudiendo provocar un panic. El informe expone fases y devuelve `PARCIAL` si algún paso no se cumple; un `PASS` indica únicamente la ruta funcional de la superficie propia.
 
 La referencia de layout proviene de [Kurt-228/ios27-research](https://github.com/Kurt-228/ios27-research/blob/main/docs/iosurface_sel_formats.md), validada en macOS 27/iOS 27 beta 4. **No se garantiza** que sea idéntica en `24A437`: el propósito del nuevo botón es medirlo directamente y documentar cualquier discrepancia. **No es jailbreak ni demuestra KernelRW.**
+
+## v1.4: resultado observado en iPhone14,3 build 24A437
+
+Archivo real aportado por el dispositivo: `AppleIOKitLab-direct-roundtrip.json`, generado en v1.3.
+
+| Paso del cliente IOKit | Resultado de la ejecución real |
+|---|---|
+| `IOServiceOpen` tipo 0 | `0x00000000` |
+| Selector 6: crear BGRA 64×64 | `0x00000000`, ID `156`, 3176 bytes de salida |
+| Selector 4: buscar SID 156 | `0xe00002c2` (`kIOReturnBadArgument`) |
+| Selector 2: bloquear | `0x00000000` |
+| Selector 3: desbloquear | `0x00000000` |
+| Selector 9: escribir propiedad propia | `0x00000000` |
+| Selector 10: recuperar propiedad | `0x00000000`, 64 bytes |
+| Deserializar y comparar valor | Coincide exactamente |
+| `IOSurfaceCopyValue`: comparación independiente | Coincide exactamente |
+| `IOServiceClose` | `0x00000000` |
+
+**Interpretación:** hay una prueba real de creación, lock/unlock y roundtrip de propiedades sobre una superficie propia desde un cliente IOKit. La consulta del selector 4 fue rechazada. El `PARCIAL` de v1.3 mezclaba la utilidad funcional de la superficie propia con una operación de búsqueda separada.
+
+**Corrección de v1.4:** ahora se exportan `coreRoundTripConfirmed`, `completeCycleConfirmed`, `selector4Diagnostic`, `publicLookupConfirmed` y `verdict`. Con evidencia equivalente, `verdict` debe ser `PASS_CORE_WITH_SELECTOR4_REJECTION` si el ciclo de propiedad funciona aunque `selector4` devuelva `kIOReturnBadArgument`. `completeCycleConfirmed` permanece falso cuando falla el selector 4.
+
+**Corroboración externa, no prueba de causa:** la investigación [Kurt-228, run-idprobe7.log](https://github.com/Kurt-228/ios27-research/blob/main/results/run-idprobe7.log) también registra que una superficie creada mediante el selector 6, consultada desde la misma conexión mediante el selector 4, devuelve `0xe00002c2`. El motivo exacto de rechazo requiere analizar el binario y controles del build objetivo.
+
+**No extrapolar:** que una aplicación pueda modificar propiedades de su propia IOSurface no implica memoria del kernel arbitraria, fuga de direcciones, UAF, escalada de privilegios o jailbreak. Las verificaciones de versión anteriores se han mantenido; la consulta del selector 4 sigue siendo diagnóstica, no un requisito para demostrar el intercambio de propiedades.
