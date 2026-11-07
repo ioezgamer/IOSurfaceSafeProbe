@@ -212,6 +212,13 @@ jobs:
             xcrun llvm-objdump --macho --bind "$FILE" > "cmp/out/${NAME}-bindings.txt" 2>&1 || true
           done
           grep -Ein 'IOUserClientDefaultLocking|IOUserClient2022|setProperty|IOSurfaceRootUserClient' cmp/out/*symbols.txt cmp/out/*bindings.txt || true
+      - name: Preserve extracted IOSurface KEXTs for exact property call tracing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$(find cmp/kext-old -type f -name '*IOSurface*' | head -n 1)" cmp/out/iosurface-24A437.macho
+          cp "$(find cmp/kext-new -type f -name '*IOSurface*' | head -n 1)" cmp/out/iosurface-24B119.macho
+          shasum -a 256 cmp/out/*.macho
       - uses: actions/upload-artifact@v4
         if: always()
         with:
