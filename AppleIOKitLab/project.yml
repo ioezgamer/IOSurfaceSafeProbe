@@ -18,10 +18,10 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.iosurface.appleiokitlab
         GENERATE_INFOPLIST_FILE: "YES"
-        MARKETING_VERSION: "1.5.0"
-        CURRENT_PROJECT_VERSION: "6"
-        INFOPLIST_KEY_CFBundleShortVersionString: "1.5.0"
-        INFOPLIST_KEY_CFBundleVersion: "6"
+        MARKETING_VERSION: "1.6.0"
+        CURRENT_PROJECT_VERSION: "7"
+        INFOPLIST_KEY_CFBundleShortVersionString: "1.6.0"
+        INFOPLIST_KEY_CFBundleVersion: "7"
         INFOPLIST_KEY_CFBundleDisplayName: "Apple IOKit Lab"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "NO"
