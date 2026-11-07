@@ -2,7 +2,7 @@ name: Compare IOSurface iPhone14,3 official kernelcaches
 on:
   push:
     branches: [research/iosurface-iphone14-3-binary-compare, research/iosurface-notify-reference-lifetime]
-    paths: ['.github/workflows/iosurface-iphone14-3-compare.yml']
+    paths: ['.github/workflows/iosurface-iphone14-3-compare.yml', 'scripts/trace_iosurface_locking_flags.py']
   workflow_dispatch:
 permissions:
   contents: read
