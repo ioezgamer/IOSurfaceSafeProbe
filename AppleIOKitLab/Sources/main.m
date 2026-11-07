@@ -194,7 +194,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     self.selectedService = @"";
 
     UILabel *title = [UILabel new];
-    title.text = @"Apple IOKit Lab · v1.3";
+    title.text = @"Apple IOKit Lab · v1.4";
     title.font = [UIFont boldSystemFontOfSize:25];
 
     UILabel *summary = [UILabel new];
