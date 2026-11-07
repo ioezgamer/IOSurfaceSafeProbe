@@ -1,0 +1,55 @@
+name: IOSurface firmware comparacion 24A437 vs 24B119
+on:
+  push:
+    branches:
+      - research/apple-iokit-lab-20261107
+    paths:
+      - '.github/workflows/iosurface-patchdiff-24b119.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare-patch:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar ipsw
+        run: |
+          brew install ipsw
+          ipsw version || true
+      - name: Descargar SOLO kernelcache iOS 27.2 build 24B119 para iPhone14,3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/iosurfacepatch/patched" "$RUNNER_TEMP/iosurfacepatch/report"
+          ipsw download ipsw --device iPhone14,3 --build 24B119 \
+            --kernel --confirm --output "$RUNNER_TEMP/iosurfacepatch/patched" \
+            > "$RUNNER_TEMP/iosurfacepatch/report/download-24b119.log" 2>&1
+          find "$RUNNER_TEMP/iosurfacepatch/patched" -type f
+      - name: Extraer IOSurface del kernelcache corregido
+        shell: bash
+        run: |
+          set -euxo pipefail
+          KC="$(find "$RUNNER_TEMP/iosurfacepatch/patched" -type f -name 'kernelcache.*' | head -1)"
+          test -n "$KC"
+          shasum -a 256 "$KC" > "$RUNNER_TEMP/iosurfacepatch/report/kernel-sha256.txt"
+          mkdir -p "$RUNNER_TEMP/iosurfacepatch/kexts"
+          ipsw kernel extract "$KC" com.apple.iokit.IOSurface \
+            --output "$RUNNER_TEMP/iosurfacepatch/kexts" \
+            > "$RUNNER_TEMP/iosurfacepatch/report/extract.log" 2>&1
+          KEXT="$(find "$RUNNER_TEMP/iosurfacepatch/kexts" -type f -name 'com.apple.iokit.IOSurface' | head -1)"
+          test -n "$KEXT"
+          shasum -a 256 "$KEXT" > "$RUNNER_TEMP/iosurfacepatch/report/kext-sha256.txt"
+          file "$KEXT" > "$RUNNER_TEMP/iosurfacepatch/report/kext-file.txt"
+          ipsw macho info "$KEXT" --json > "$RUNNER_TEMP/iosurfacepatch/report/macho-info.json" 2>&1
+          printf '%s\n' 'iPhone14,3 iOS 27.2 build 24B119' > "$RUNNER_TEMP/iosurfacepatch/report/firmware.txt"
+      - name: Publicar KEXT y metadatos de la version corregida
+        uses: actions/upload-artifact@v4
+        with:
+          name: IOSurface-24B119-kext-patch-reference
+          path: |
+            ${{ runner.temp }}/iosurfacepatch/kexts/**
+            ${{ runner.temp }}/iosurfacepatch/report/**
+          if-no-files-found: error
+          retention-days: 14
