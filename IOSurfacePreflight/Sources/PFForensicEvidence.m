@@ -122,43 +122,87 @@ static NSDictionary *PFBootSummary(NSString *directory) {
     };
 }
 
+static BOOL PFScanPositiveMicroseconds(NSString *field, double *value) {
+    if (!field || !value) return NO;
+    NSScanner *scanner=[NSScanner scannerWithString:field];
+    double parsed=0.0;
+    if (![scanner scanDouble:&parsed] || !scanner.isAtEnd ||
+        !isfinite(parsed) || parsed < 0.0) return NO;
+    *value=parsed;
+    return YES;
+}
+
+// Support both the actual 11-column CSV and older 12-column indexed exports.
+// Never silently shift field positions when the optional "index" is absent.
 static NSDictionary *PFSameClientSummary(NSString *directory) {
     NSArray<NSArray<NSString *> *> *rows =
         PFReadCSV(directory, @"IOSurfaceSameClient-trace.csv");
-    NSUInteger observed = 0;
-    NSUInteger withOverlap = 0;
-    NSUInteger invalidRows = 0;
-    double longestOverlap = 0.0;
-    NSMutableArray *samples = [NSMutableArray new];
-    for (NSUInteger i = 1; i < rows.count; i++) {
-        NSArray<NSString *> *r = rows[i];
-        if (r.count < 12) { invalidRows++; continue; }
-        double callStart = [r[7] doubleValue], callEnd = [r[8] doubleValue];
-        double closeStart = [r[9] doubleValue], closeEnd = [r[10] doubleValue];
-        if (!isfinite(callStart) || !isfinite(callEnd) ||
-            !isfinite(closeStart) || !isfinite(closeEnd) ||
+    NSArray<NSString *> *header = rows.count ? rows[0] : @[];
+    NSMutableDictionary<NSString *, NSNumber *> *index=[NSMutableDictionary new];
+    for (NSUInteger i=0; i<header.count; i++) {
+        NSString *name=[header[i] stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        index[name]=@(i);
+    }
+    NSArray<NSString *> *required = @[
+        @"trial", @"call_kr", @"close_kr", @"call_start_us",
+        @"call_end_us", @"close_start_us", @"close_end_us"];
+    BOOL headerValid=(header.count==11 || header.count==12);
+    for(NSString *name in required)
+        if (!index[name]) headerValid=NO;
+    if (header.count==12 && !index[@"index"]) headerValid=NO;
+    if (header.count==11 && index[@"index"]) headerValid=NO;
+
+    NSUInteger observed=0, withOverlap=0, invalidRows=0;
+    NSUInteger successfulCalls=0;
+    double longestOverlap=0.0;
+    NSMutableArray *samples=[NSMutableArray new];
+    for (NSUInteger i=1; i<rows.count; i++) {
+        NSArray<NSString *> *r=rows[i];
+        if (!headerValid || r.count!=header.count) {
+            invalidRows++;
+            continue;
+        }
+        NSString *(^field)(NSString *) = ^NSString *(NSString *key) {
+            return r[[index[key] unsignedIntegerValue]];
+        };
+        double callStart=0,callEnd=0,closeStart=0,closeEnd=0;
+        if (!PFScanPositiveMicroseconds(field(@"call_start_us"), &callStart) ||
+            !PFScanPositiveMicroseconds(field(@"call_end_us"), &callEnd) ||
+            !PFScanPositiveMicroseconds(field(@"close_start_us"), &closeStart) ||
+            !PFScanPositiveMicroseconds(field(@"close_end_us"), &closeEnd) ||
             callEnd < callStart || closeEnd < closeStart) {
             invalidRows++;
             continue;
         }
         observed++;
-        double overlap = fmax(0, fmin(callEnd,closeEnd) - fmax(callStart,closeStart));
-        if (overlap > 0) withOverlap++;
-        longestOverlap = fmax(longestOverlap, overlap);
-        if (samples.count < 20) {
-            [samples addObject:@{@"trial":r[2],@"call_result":r[5],
-                                 @"close_result":r[6],
-                                 @"overlap_microseconds":@(overlap)}];
+        if ([field(@"call_kr") isEqualToString:@"0x00000000"])
+            successfulCalls++;
+        double overlap=fmax(0.0,
+            fmin(callEnd,closeEnd)-fmax(callStart,closeStart));
+        if (overlap>0.0) withOverlap++;
+        longestOverlap=fmax(longestOverlap,overlap);
+        if(samples.count<20) {
+            [samples addObject:@{
+                @"trial":field(@"trial"),
+                @"call_result":field(@"call_kr"),
+                @"close_result":field(@"close_kr"),
+                @"overlap_microseconds":@(overlap)
+            }];
         }
     }
     return @{
         @"trials":@(observed),
         @"overlapping_trails_user_space":@(withOverlap),
         @"max_overlap_microseconds":@(longestOverlap),
+        @"successful_api_calls":@(successfulCalls),
         @"invalid_rows":@(invalidRows),
+        @"csv_schema":headerValid ?
+            (index[@"index"]?@"12_columns_indexed":@"11_columns_original") :
+            @"UNSUPPORTED_OR_MISSING",
         @"samples":samples,
         @"kernel_client_identity_observed":@NO,
-        @"interpretation":@"Overlapping user-space intervals do not prove an overlapping kernel callback."
+        @"interpretation":@"User-space overlap is not a kernel callback. Nonzero call_kr does not establish a successful registration."
     };
 }
 
