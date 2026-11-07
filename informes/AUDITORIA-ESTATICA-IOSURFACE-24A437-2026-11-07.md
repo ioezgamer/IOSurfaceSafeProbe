@@ -130,3 +130,24 @@ El selector 6 creó la superficie **ID 156**, con `callKR=0` y un registro de cr
 **Dictamen actualizado:** es una prueba real de interacción funcional mediante el user client del kernel, con creación de superficie y transferencia verificada de un valor **propio y controlado dentro del espacio autorizado por IOSurface**. No es un exploit; no existe evidencia de lectura o escritura arbitraria de memoria del kernel, UAF, escalada de privilegios o jailbreak.
 
 **Ajuste de instrumentación v1.4:** `coreRoundTripConfirmed` representa creación + lock/unlock + roundtrip de propiedad + cierre. `completeCycleConfirmed` continúa representando *todos* los pasos, incluido `selector4`. Se registra `PASS_CORE_WITH_SELECTOR4_REJECTION` para distinguir ambos resultados sin esconder una verificación funcional positiva. La condición específica de `selector4` se mantiene como cuestión abierta de investigación estática.
+
+
+## 9. Hallazgo confirmado por análisis del binario exacto
+
+**Se cerró la incógnita del selector 4.** Se extrajo el kernelcache exacto del iPhone14,3 / 24A437 desde el IPSW de Apple, se identificó el KEXT de IOSurface por SHA-256 y se verificó la ruta del selector 4 en código máquina ARM64e.
+
+- Kernel SHA-256: 742714192f267bf7fbfe3de8c5437b534d7f305bf87c8b77c4d1ad9dd7446385.
+- KEXT SHA-256: 3f95c45f629a8749775765980434ee927552e1cad4e568743062bf901aa018d8.
+- Dos tablas de 60 selectores, 40 bytes por entrada: 0x46638 (normal), 0x46f98 (restringida).
+- El selector 4 acepta 1 escalar y salida estructurada de 3176 bytes, exactamente como los proporcionó nuestra app.
+- Puntero autenticado del selector 4: 0x8050bcad02c1503c, que resuelve al thunk 0xfffffff009c1903c sobre la base __TEXT del kernelcache 0xfffffff007004000.
+- La implementación de búsqueda comienza en 0xfffffff009c1bbc0. En 0xfffffff009c1bc18 llama al ayudante 0xfffffff009c1f5dc, que comprueba si el ID ya está indexado en el cliente. En 0xfffffff009c1bc1c, la instrucción tbnz toma el camino de rechazo si el ayudante devuelve verdadero.
+- La rama de rechazo añade 5 al retorno inicial 0xe00002bd, obteniendo exactamente **0xe00002c2**. Ese es el resultado que observamos con nuestra superficie ID 156.
+
+**Dictamen:** el selector 4 rechaza explícitamente la búsqueda por ID de una superficie ya registrada en el mismo user-client. No se trataba de un tamaño de argumento mal especificado, y este caso no aporta indicios de corrupción de memoria.
+
+La verificación independiente automatizada pasó 12 huellas de instrucciones del binario original en [GitHub Actions 42384252470](https://github.com/ioezgamer/IOSurfaceSafeProbe/actions/runs/42384252470). Código de comprobación: AppleIOKitLab/tools/iosurface_dispatch_audit.py.
+
+**Informe técnico completo:** [CAUSA-SELECTOR4-IOSURFACE-24A437.md](CAUSA-SELECTOR4-IOSURFACE-24A437.md).
+
+En el mismo controlador se encontraron diferencias de forma de argumentos en los selectores 43-59 frente al mapa histórico de macOS 27; se confirma que la comparación exacta de versiones es necesaria. No se ha hallado ni demostrado una primitiva KernelRW, UAF o jailbreak.
