@@ -119,3 +119,19 @@ Archivo real aportado por el dispositivo: `AppleIOKitLab-direct-roundtrip.json`,
 **Corroboración externa, no prueba de causa:** la investigación [Kurt-228, run-idprobe7.log](https://github.com/Kurt-228/ios27-research/blob/main/results/run-idprobe7.log) también registra que una superficie creada mediante el selector 6, consultada desde la misma conexión mediante el selector 4, devuelve `0xe00002c2`. El motivo exacto de rechazo requiere analizar el binario y controles del build objetivo.
 
 **No extrapolar:** que una aplicación pueda modificar propiedades de su propia IOSurface no implica memoria del kernel arbitraria, fuga de direcciones, UAF, escalada de privilegios o jailbreak. Las verificaciones de versión anteriores se han mantenido; la consulta del selector 4 sigue siendo diagnóstica, no un requisito para demostrar el intercambio de propiedades.
+
+## v1.5: prueba secuencial del ciclo de notificaciones IOSurface
+
+El boton **5. Notificaciones IOSurface (secuencial)** agrega una prueba puntual de los selectores 17 y 18 para iPhone14,3 / 24A437. No ejecuta carreras ni intenta alterar memoria arbitraria del kernel.
+
+1. Abre IOSurfaceRoot (cliente tipo 0) y crea UNA superficie propia BGRA 64 x 64 (selector 6).
+2. Crea UN puerto Mach propio con derechos de envio/recepcion.
+3. Invoca UNA vez el selector 17 mediante IOConnectCallAsyncMethod, con estructura de 24 bytes e ID de la superficie propia. No se han confirmado todos los campos internos del argumento y el driver puede rechazarlo.
+4. Solo si el registro fue aceptado, intenta retirarlo UNA vez con selector 18.
+5. Cierra secuencialmente la conexion, destruye el puerto y registra los codigos devueltos.
+
+Exporta **AppleIOKitLab-notification-lifecycle.json** con etapas, timestamps, return codes, intentos y veredicto. Un codigo de exito no implica callback recibido ni una corrupcion de memoria. Un JSON IN_FLIGHT tras un reinicio requiere examinar un panic del sistema; no es prueba por si solo.
+
+La nueva funcion requiere confirmacion. Ninguna llamada es deliberadamente concurrente, no duplica registros ni utiliza IDs o puertos liberados. Una llamada a IOKit puede ocasionar un panic, incluso con los controles anteriores. Este experimento verifica aceptacion de contratos, NO reproduce la carrera ni demuestra KernelRW.
+
+Contexto: [informe de notificaciones 24A437](../informes/RUTA-CANDIDATA-IOSURFACE-NOTIFICACIONES-24A437.md).
