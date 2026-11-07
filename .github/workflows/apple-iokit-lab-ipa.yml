@@ -1,0 +1,65 @@
+name: Compilar Apple IOKit Lab IPA
+on:
+  push:
+    branches:
+      - research/apple-iokit-lab-20261107
+    paths:
+      - 'AppleIOKitLab/**'
+      - '.github/workflows/apple-iokit-lab-ipa.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verificar el entorno
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          git rev-parse HEAD
+      - name: Instalar XcodeGen
+        run: brew install xcodegen
+      - name: Generar proyecto independiente
+        working-directory: AppleIOKitLab
+        run: xcodegen generate
+      - name: Compilar para iPhone sin firma
+        run: |
+          set -o pipefail
+          xcodebuild -project AppleIOKitLab/AppleIOKitLab.xcodeproj \
+            -scheme AppleIOKitLab -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/apple-iokit-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/apple-iokit-build.log"
+      - name: Empaquetar y verificar IPA
+        run: |
+          set -eu
+          APP="$RUNNER_TEMP/apple-iokit-build/Build/Products/Release-iphoneos/AppleIOKitLab.app"
+          test -f "$APP/AppleIOKitLab"
+          plutil -lint "$APP/Info.plist"
+          mkdir -p "$RUNNER_TEMP/apple-iokit-pkg/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/apple-iokit-pkg/Payload/"
+          (cd "$RUNNER_TEMP/apple-iokit-pkg" && zip -qr "$GITHUB_WORKSPACE/AppleIOKitLab-unsigned.ipa" Payload)
+          unzip -t AppleIOKitLab-unsigned.ipa | tail -1
+          shasum -a 256 AppleIOKitLab-unsigned.ipa > AppleIOKitLab-unsigned.ipa.sha256
+          cat AppleIOKitLab-unsigned.ipa.sha256
+      - name: Guardar registro de build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppleIOKitLab-build-log
+          path: ${{ runner.temp }}/apple-iokit-build.log
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Publicar IPA sin firma
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppleIOKitLab-unsigned-ipa
+          path: |
+            AppleIOKitLab-unsigned.ipa
+            AppleIOKitLab-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 14
