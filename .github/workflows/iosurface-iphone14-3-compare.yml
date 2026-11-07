@@ -198,6 +198,20 @@ jobs:
           gzip -9 -c cmp/old.asm > cmp/out/iosurface-24A437.asm.gz
           gzip -9 -c cmp/new.asm > cmp/out/iosurface-24B119.asm.gz
           shasum -a 256 cmp/out/iosurface-*.asm.gz | tee cmp/out/disassembly-hashes.txt
+      - name: Inspect IOSurface client default-locking property identifiers
+        shell: bash
+        run: |
+          set -euo pipefail
+          KO="$(find cmp/kext-old -type f -name '*IOSurface*' | head -n 1)"
+          KN="$(find cmp/kext-new -type f -name '*IOSurface*' | head -n 1)"
+          python3 scripts/inspect_iosurface_locking_metadata.py "$KO" "$KN" --output cmp/out/locking-metadata.json
+          for NAME in old new; do
+            FILE="$KO"; test "$NAME" = new && FILE="$KN"
+            xcrun llvm-nm --undefined-only "$FILE" > "cmp/out/${NAME}-undefined-symbols.txt" 2>&1 || true
+            xcrun llvm-nm "$FILE" > "cmp/out/${NAME}-all-symbols.txt" 2>&1 || true
+            xcrun llvm-objdump --macho --bind "$FILE" > "cmp/out/${NAME}-bindings.txt" 2>&1 || true
+          done
+          grep -Ein 'IOUserClientDefaultLocking|IOUserClient2022|setProperty|IOSurfaceRootUserClient' cmp/out/*symbols.txt cmp/out/*bindings.txt || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
