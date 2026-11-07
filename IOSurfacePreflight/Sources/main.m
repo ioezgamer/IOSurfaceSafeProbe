@@ -247,7 +247,9 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.handoffPreview.layer.cornerRadius=10;
     self.handoffPreview.layer.masksToBounds=YES;
     self.handoffPreview.hidden=YES;
-    [self.handoffPreview.heightAnchor constraintEqualToConstant:180].active=YES;
+    NSLayoutConstraint *imageHeight=[self.handoffPreview.heightAnchor constraintEqualToConstant:180];
+    imageHeight.priority=UILayoutPriorityDefaultHigh;
+    imageHeight.active=YES;
     UIStackView *layout = [[UIStackView alloc] initWithArrangedSubviews:@[
       title, subtitle,
       [self button:@"1. API pública IOSurface" action:@selector(publicProbe:)],
