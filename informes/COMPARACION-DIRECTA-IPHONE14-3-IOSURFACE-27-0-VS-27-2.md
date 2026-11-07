@@ -67,6 +67,23 @@ El detalle completo está en `mnemonic-hunks.txt` del artefacto de la ejecución
 
 **Precaución:** el algoritmo de diferencias puede alinear equivocadamente bloques con mnemónicos repetidos. La evidencia debe interpretarse como regiones aproximadas hasta contrastarla con el flujo completo de instrucciones y sus operandos.
 
+## Ubicaciones exactas de las regiones alineadas
+
+La tercera ejecución de CI obtuvo la posición de los opcode directamente del desensamblado del KEXT, conservando una tabla de correspondencia entre número de instrucción y dirección virtual **estática**. Estas direcciones no deben interpretarse como direcciones de memoria del dispositivo en ejecución ni como nombres de función.
+
+| Región | Ubicación en 27.0 `24A437` | Ubicación en 27.2 `24B119` | Cambio según alineamiento |
+|---|---|---|---|
+| 1 | `0xfffffff009c15e20` | `0xfffffff009c55db0` | +4 instrucciones (`ldrb, tbz, add, b`) |
+| 2 | `0xfffffff009c16080` | `0xfffffff009c56020` | +2 instrucciones (`mov, strb`) |
+| 3 | `0xfffffff009c1aff4` | `0xfffffff009c5af9c` | Alteración local de instrucciones de acceso a memoria y llamada |
+| 4 | `0xfffffff009c1b074` | `0xfffffff009c5b028` | Eliminación/reordenación de `ldr, mov, bl` según el alineamiento |
+
+Estas ubicaciones corresponden al primer opcode del contexto de cada hunk (no necesariamente al primer opcode modificado ni al comienzo de una función). Para la región 3/4, la ubicación y el contexto no deben leerse como método o ruta de error específicos.
+
+**Fuente:** [Ejecución #3 de GitHub Actions](https://github.com/ioezgamer/IOSurfaceSafeProbe/actions/runs/42321360686), archivo `hunk-addresses.json`. Se generó a partir de los dos KEXT extraídos de kernelcache oficiales correspondientes a `iPhone14,3`.
+
+La exactitud de esta comparación se limita a **instrucciones y sus posiciones**; aún no conocemos nombres de las funciones propietarias, operandos completos con semántica verificada ni el parche atribuido a CVE-2026-112477.
+
 ## Comparación con diferencial público de otro modelo
 
 La diferencia publicada para `iPhone18,1` entre `24A437` y `24B5084k` muestra dos funciones anónimas cuyos tamaños cambian en **+16** y **+8 bytes** respectivamente. La suma coincide con el **+24 bytes** detectado ahora en iPhone14,3 entre la versión original 27.0 y la 27.2 final, pero los pares comparan diferentes dispositivos y diferentes builds de destino. **No es correcto trasladar direcciones virtuales ni atribuir esas funciones a nuestra versión sin una correspondencia de instrucciones.**
