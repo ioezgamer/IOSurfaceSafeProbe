@@ -135,3 +135,15 @@ Exporta **AppleIOKitLab-notification-lifecycle.json** con etapas, timestamps, re
 La nueva funcion requiere confirmacion. Ninguna llamada es deliberadamente concurrente, no duplica registros ni utiliza IDs o puertos liberados. Una llamada a IOKit puede ocasionar un panic, incluso con los controles anteriores. Este experimento verifica aceptacion de contratos, NO reproduce la carrera ni demuestra KernelRW.
 
 Contexto: [informe de notificaciones 24A437](../informes/RUTA-CANDIDATA-IOSURFACE-NOTIFICACIONES-24A437.md).
+
+## v1.6: recepcion real de mensajes en el puerto Mach
+
+La prueba usa el boton **5. Recibir notificacion IOSurface (1,5 s)**. Solo esta habilitada para `iPhone14,3 / 24A437` y requiere confirmacion. Crea una superficie BGRA propia, abre un puerto Mach de recepcion, registra la notificacion con selector 17 una sola vez y espera hasta 100 ms por un mensaje inmediato.
+
+Si la API publica esta disponible y permite recuperar la superficie propia, ejecuta `IOSurfaceIncrementUseCount` y `IOSurfaceDecrementUseCount` UNA vez cada una, leyendo el contador antes, entre ambas y despues. Entre las transiciones intenta recibir mensajes con ventanas de 200 ms y 1200 ms. Usa `mach_msg(... MACH_RCV_TIMEOUT ...)` y limita la recepcion a un buffer de 2048 bytes. Retira el registro con selector 18, cierra el cliente y destruye el puerto en ese orden.
+
+El archivo **AppleIOKitLab-notification-delivery.json** registra: `messageDeliveryObserved`, `notificationOriginVerified` (siempre false por falta de autenticacion independiente), `usageTransitionPerformed`, `usageCountRestored`, y `receivedMessages` con status, tiempo, ID y tamano de cualquier mensaje. El programa no interpreta el contenido ni presenta mensajes recibidos como prueba de origen kernel.
+
+Veredictos posibles: `MESSAGE_ON_REGISTERED_PORT_ORIGIN_UNVERIFIED`, `NO_CALLBACK_OBSERVED_AFTER_USECOUNT_TRANSITION`, `NO_CALLBACK_OBSERVED_WITHOUT_STIMULUS`, `REGISTER_REJECTED_NO_RACE` o avisos de cierre/retirada. La ausencia de un mensaje NO niega que existan notificaciones en otros estados; la recepcion tampoco prueba UAF, KernelRW o CVE.
+
+Este experimento no ejecuta operaciones concurrentes, carreras de cierre, repeticion intensiva, ni usa superficies o puertos liberados. Aunque es acotado, una llamada al kernel puede provocar reinicio; no ejecutar de nuevo si la app deja un checkpoint `IN_FLIGHT` hasta revisar datos de analisis del sistema.
