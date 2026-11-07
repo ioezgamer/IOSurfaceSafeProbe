@@ -180,6 +180,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/iosurface_patch_context.py
+      - name: Validate lifecycle patch linkage independently (12 invariants)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('/tmp/iosurface-analysis.zip','w') as archive:
+              archive.write('cmp/out/instruction-contexts.json', 'instruction-contexts.json')
+          PY
+          python3 scripts/verify_iosurface_lifecycle.py /tmp/iosurface-analysis.zip > cmp/out/verification.json
+          cat cmp/out/verification.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
