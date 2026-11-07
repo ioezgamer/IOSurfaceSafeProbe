@@ -28,3 +28,28 @@ Apple solo confirma una carrera de IOSurface corregida mediante **mejoras de blo
 La herramienta local `iosurface_notification_path_audit.py` valida los dos hashes, las entradas 17/18, los destinos de los saltos, la lectura/establecimiento de estado y la llamada de limpieza. Rechaza cualquier cambio inesperado. Sus resultados se incluyen en el paquete de evidencias compartido en esta conversacion.
 
 La siguiente confirmacion valida requeriria evidencia dinamica del registro asincrono y de un conflicto de ciclo de vida en un entorno de kernel instrumentado. **Un panic aislado en un iPhone sin instrumentacion no probaria la causa.**
+
+## Verificación dinámica real en Apple IOKit Lab v1.5
+
+**Fuente:** archivo `AppleIOKitLab-notification-lifecycle.json` exportado del `iPhone14,3`, iOS `27.0`, build `24A437`.
+
+| Operación secuencial | Resultado del controlador |
+|---|---|
+| `IOServiceOpen` tipo 0 | `0x00000000` |
+| Selector 6, crear superficie propia ID `321` | `0x00000000`, salida de 3176 bytes |
+| Crear puerto Mach | `0x00000000` |
+| Selector 17, registrar notificación asíncrona | `0x00000000` |
+| Selector 18, retirar registro | `0x00000000` |
+| `IOServiceClose` | `0x00000000` |
+| Destruir puerto Mach | `0x00000000` |
+
+- Veredicto del programa: `SEQUENTIAL_NOTIFY_LIFECYCLE_ACCEPTED_NO_RACE`.
+- Duración desde la apertura hasta destruir el puerto: aproximadamente `19,49 ms`.
+- `registrationAccepted=true`, `removalAccepted=true`, `attemptedRace=false`, `kernelMemoryCorruptionProven=false`, `kernelRW=false`.
+- El formato del argumento del selector 17 (`[SID, 0, 0]`, 24 bytes) era una hipótesis. El controlador lo aceptó en esta ejecución, pero ello no demuestra recepción de una notificación ni permite inferir el significado exacto de cada campo.
+
+**Conclusión que sí queda respaldada:** los selectores de registro asíncrono y retirada son invocables desde la app en el build objetivo, y el ciclo secuencial fue completado satisfactoriamente.
+
+**Conclusiones que NO quedan respaldadas:** entrega de un callback al puerto Mach, existencia de una carrera reproducible, UAF/OOB del kernel, vinculación inequívoca con CVE-2026-112477, una primitiva KernelRW o un jailbreak.
+
+**Siguiente prueba discriminante, sin carreras:** recibir con límite temporal un mensaje de notificación válido en un puerto Mach propio después de estimular únicamente transiciones documentadas de la superficie. Un registro aceptado y una entrega observada serían evidencias distintas; en ausencia de mensaje, registrar `NO_CALLBACK_OBSERVED` en vez de afirmar que la ruta no funciona.
