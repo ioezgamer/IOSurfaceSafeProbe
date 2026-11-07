@@ -104,3 +104,36 @@ Los kernelcache y KEXT extraídos no se publicaron en GitHub: solo se publicó e
 ## Conclusión
 
 **Comparación real completada** sobre el mismo modelo de dispositivo y firmwares públicos correctos: se comprobó un crecimiento neto de 24 bytes de código ejecutable de IOSurface y diferencias de contenido en varias secciones. **Todavía no es una identificación del parche exacto, de la función vulnerable o de una primitiva de explotación de CVE-2026-112477.** Para eso se necesita correlación a nivel de función e instrucciones con una atribución independiente a la CVE.
+
+
+## Relación funcional entre rutinas y CVE-2026-112477
+
+**Nueva evidencia:** se realizó una cuarta comparación sobre los KEXT reales, conservando **operandos completos, destinatarios de llamadas y contexto de instrucciones**, en lugar de limitarse a contar mnemónicos. El análisis se ejecutó en [GitHub Actions #42322125697](https://github.com/ioezgamer/IOSurfaceSafeProbe/actions/runs/42322125697) y generó `instruction-contexts.md` e `instruction-contexts.json` dentro del artefacto de esa ejecución.
+
+### Interpretación de las tres rutinas relacionadas
+
+- **Rutina A (primera región):** la versión corregida introduce una lectura condicional de un indicador de estado y una salida alternativa antes de continuar con la operación. El flujo inmediatamente anterior accede a una estructura común y llama a una función auxiliar, pero su símbolo no está disponible.
+- **Rutina B (segunda región):** la versión corregida escribe un indicador de estado antes de avanzar por una estructura enlazada de referencias. El cuerpo de la función hace comprobaciones y modifica enlaces de elementos, comportamiento compatible con un desregistro o retirada controlada. Invoca **la misma función auxiliar** que la rutina A.
+- **Rutina C (regiones tercera y cuarta):** el desensamblado revela que no se trata de dos funciones nuevas: es una rutina de limpieza cuyo orden de operaciones cambió. La llamada a B que anteriormente aparecía después de otras operaciones se mueve a una fase anterior. También cambia el momento en que se actualiza otro indicador de estado.
+
+La combinación **comprobar estado → marcar estado durante retirada → adelantar retirada antes de otras limpiezas** es una estrategia coherente para limitar operaciones concurrentes sobre el ciclo de vida de un objeto. La reutilización de la misma función auxiliar antes del acceso a dicho estado es un indicio adicional de una sección sincronizada.
+
+### Relación con el boletín de Apple
+
+Apple clasifica **CVE-2026-112477** como una condición de carrera corregida mediante bloqueo mejorado. El patrón observado en los binarios es **compatible con esa clase de solución**, y la comparación se hizo entre una versión afectada y otra corregida del mismo modelo de dispositivo.
+
+**Confianza de las conclusiones:**
+
+| Afirmación | Evaluación |
+|---|---|
+| Las regiones A/B/C forman un conjunto funcional relacionado | **Alta**: la rutina C llama directamente a B y A/B comparten una subrutina auxiliar |
+| El cambio agrega coordinación de estado durante retirada y limpieza | **Alta**: se ven la comprobación, el marcado y la reordenación |
+| El conjunto sería compatible con una mitigación de carrera | **Moderada-alta**: coherencia estructural con el patrón descrito por Apple |
+| La subrutina auxiliar compartida es un bloqueo concreto con nombre identificado | **No confirmado**: faltan símbolos |
+| Las tres rutinas son, inequívocamente, el parche de CVE-2026-112477 | **No demostrado**: falta atribución independiente a la CVE |
+| Existe una primitiva UAF, KernelRW o jailbreak | **No demostrado** |
+
+**Limitación técnica crítica:** la coincidencia de un patrón con la clase de vulnerabilidad no establece por sí sola causalidad. Para confirmación inequívoca harían falta símbolos atribuibles, comparación cruzada en otra rama corregida o una publicación técnica que identifique el parche específico. No se infiere un procedimiento de activación a partir de esta comparación.
+
+Fuente oficial: https://support.apple.com/en-us/149230
+
