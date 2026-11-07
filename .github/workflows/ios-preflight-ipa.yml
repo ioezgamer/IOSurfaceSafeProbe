@@ -1,7 +1,7 @@
 name: Compilar IOSurface Preflight IPA
 on:
   push:
-    branches: [main, preflight-ipa, feat/iosurface-preflight-v19-2-coverage, feat/iosurface-preflight-v19-3-format-coverage, feat/iosurface-preflight-v19-4-bounded-bruteforce-batch, feat/iosurface-preflight-v19-5-effective-coverage, feat/iosurface-preflight-v19-6-stratified-coverage, feat/iosurface-preflight-v19-7-targeted-replay, feat/iosurface-preflight-v19-8-mach-port-ownership, feat/iosurface-preflight-v19-9-port-revocation]
+    branches: [main, preflight-ipa, feat/iosurface-preflight-v19-2-coverage, feat/iosurface-preflight-v19-3-format-coverage, feat/iosurface-preflight-v19-4-bounded-bruteforce-batch, feat/iosurface-preflight-v19-5-effective-coverage, feat/iosurface-preflight-v19-6-stratified-coverage, feat/iosurface-preflight-v19-7-targeted-replay, feat/iosurface-preflight-v19-8-mach-port-ownership, feat/iosurface-preflight-v19-9-port-revocation, feat/iosurface-preflight-v19-10-forensic-export]
     paths:
       - 'IOSurfacePreflight/**'
       - '.github/workflows/ios-preflight-ipa.yml'
@@ -70,6 +70,15 @@ jobs:
             IOSurfacePreflight/Tests/PFPortRevocationClassifierTests.c \
             -o "$RUNNER_TEMP/pf-port-revocation-tests"
           "$RUNNER_TEMP/pf-port-revocation-tests"
+      - name: Pruebas forenses locales v19.10 (cinco comprobaciones)
+        run: |
+          clang -fobjc-arc -Wall -Wextra \
+            -I IOSurfacePreflight/Sources \
+            IOSurfacePreflight/Sources/PFForensicEvidence.m \
+            IOSurfacePreflight/Tests/PFForensicEvidenceTests.m \
+            -framework Foundation \
+            -o "$RUNNER_TEMP/pf-forensic-tests"
+          "$RUNNER_TEMP/pf-forensic-tests"
       - name: Generar proyecto
         working-directory: IOSurfacePreflight
         run: xcodegen generate
@@ -83,8 +92,8 @@ jobs:
       - name: Verificar versión real del Info.plist
         run: |
           INFO="$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/Info.plist"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.9"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "28"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.10"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "29"
           test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
           python3 - "$INFO" <<'PY'
           import plistlib
