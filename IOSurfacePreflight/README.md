@@ -219,3 +219,33 @@ clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFMachPortPatternT
 ```
 
 **Limitaciones:** requiere autorización de firma para instalar el IPA no firmado que entrega GitHub Actions. La funcionalidad real de transferencia debe validarse en el iPhone, ya que CI compila y ejecuta las pruebas C pero no dispone de un dispositivo iOS físico.
+
+
+## v19.9: control de revocación de derechos Mach
+
+El botón **27. Verificar revocación de derechos Mach (1 ensayo)** somete a prueba una propiedad concreta del control de acceso de \`IOSurfaceLookupFromMachPort\`, siempre utilizando una IOSurface propia y APIs públicas:
+
+- Control positivo A: crear una IOSurface BGRA 64×64 y recuperar su mismo ID mediante un puerto Mach válido.
+- Control positivo B: agregar una referencia al derecho de envío, liberar una referencia y comprobar que el derecho restante continúa siendo válido.
+- Revocación: liberar el último derecho de envío, verificar que ese nombre ya no conserva un derecho SEND y comprobar una sola vez que \`IOSurfaceLookupFromMachPort\` no entrega una superficie a partir del nombre revocado.
+- Dos controles negativos: un puerto Mach válido de un tipo ajeno (creado por nuestra aplicación) y \`MACH_PORT_NULL\`, que también deberían ser rechazados.
+
+Los derechos y referencias propios se liberan al terminar. La IOSurface original se mantiene viva durante los controles para no confundir revocación del derecho de acceso con destrucción del objeto, reutilización de ID o cambios en el ciclo de vida del kernel. No se emplean servicios privados ni referencias sin dueño, y no se repiten casos en bucle.
+
+El archivo \`Documents/IOSurfacePortRevocation-v19_9.json\` recoge los resultados por separado, los códigos de retorno, las condiciones comprobadas y el veredicto:
+
+- \`EXPECTED_REJECTION\`: los controles positivos funcionaron, el nombre quedó inválido y los negativos fueron rechazados.
+- \`REVIEW_UNEXPECTED_SURFACE\`: algún control negativo devolvió una IOSurface. Requiere revisión manual; no demuestra vulnerabilidad, UAF ni escalada.
+- \`INCONCLUSIVE\`: falta un control necesario para evaluar la hipótesis.
+- \`UNAVAILABLE\`: faltan funciones requeridas.
+- \`BASELINE_FAILED\`: falló la prueba positiva inicial.
+
+Prueba nativa del clasificador (sin iPhone):
+\`\`\`sh
+clang -std=c11 -Wall -Wextra -Werror \
+    IOSurfacePreflight/Tests/PFPortRevocationClassifierTests.c \
+    -o /tmp/pf-port-revocation-tests
+/tmp/pf-port-revocation-tests
+\`\`\`
+
+**Limitación:** esta prueba solo comprueba autorización al consultar IOSurface desde el mismo proceso. No permite inferir acceso entre procesos, corrupción del kernel, KernelRW ni jailbreak. Un fallo inesperado de API se registrará para revisar si se produjo por permisos, transporte o semántica pública antes de atribuirlo al kernel.
