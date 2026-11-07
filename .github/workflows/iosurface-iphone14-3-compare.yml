@@ -138,6 +138,43 @@ jobs:
           print(json.dumps(stats,indent=2))
           print('FIRST HUNKS',summary[:18000])
           PY
+      - name: Locate changed ARM64 instruction regions within the extracted KEXTs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re,pathlib
+          root=pathlib.Path('cmp')
+          op=re.compile(r'^\s*(?:0x)?([0-9a-fA-F]+):\s*(?:[0-9a-fA-F]{8}\s+)?([a-zA-Z][\w.]*)\b')
+          def addresses(which):
+              parsed=[]
+              for line in (root/f'{which}.asm').read_text(errors='replace').splitlines():
+                  m=op.match(line)
+                  if m:parsed.append({'vmaddr':'0x'+m.group(1).lower(),'opcode':m.group(2).lower()})
+              return parsed
+          old,new=addresses('old'),addresses('new')
+          hunks=re.finditer(r'^@@ -(\d+),(\d+) \+(\d+),(\d+) @@', (root/'out'/'mnemonic-hunks.txt').read_text(),re.M)
+          changes=[]
+          for n,m in enumerate(hunks,1):
+              oldstart,oldlength,newstart,newlength=map(int,m.groups())
+              def place(data,start,size):
+                  i=max(0,start-1)
+                  j=min(len(data),i+size)
+                  return {'first_vmaddr':data[i]['vmaddr'] if i<len(data) else None,
+                          'last_vmaddr':data[j-1]['vmaddr'] if j>i else None,
+                          'opcodes':[v['opcode'] for v in data[i:j]]}
+              changes.append({'region':n,'old_start_instruction':oldstart,'old_lines':oldlength,
+                              'new_start_instruction':newstart,'new_lines':newlength,
+                              'old':place(old,oldstart,oldlength),
+                              'new':place(new,newstart,newlength),
+                              'interpretation':'approximate opcode-alignment region, not a CVE attribution'})
+          (root/'out'/'hunk-addresses.json').write_text(json.dumps({
+             'device':'iPhone14,3','old':'24A437','new':'24B119','regions':changes,
+             'note':'Module virtual addresses from static binaries, not runtime addresses and not vulnerability proof'
+          },indent=2))
+          print(json.dumps({'regions':len(changes),'anchors':[
+             {'old':h['old']['first_vmaddr'],'new':h['new']['first_vmaddr']} for h in changes]},indent=2))
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
