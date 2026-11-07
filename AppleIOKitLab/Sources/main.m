@@ -123,6 +123,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
 @property(nonatomic, copy) NSString *selectedService;
 @property(atomic, assign) BOOL running;
 @property(atomic, assign) BOOL stopRequested;
+- (void)contractTapped:(id)sender;
 @end
 
 @implementation AppleIOKitLabController
@@ -554,7 +555,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
             @"interpretation":@"A returned error is not evidence of memory corruption."
         };
         [self saveJSON:finish as:@"AppleIOKitLab-checkpoint.json"];
-        [self saveJSON:finish as:@"AppleIOKitLab-summary.json", @"AppleIOKitLab-contract.json"];
+        [self saveJSON:finish as:@"AppleIOKitLab-summary.json"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.running = NO;
             [self log:[NSString stringWithFormat:@"Fin: %lu/%ld casos. Exportar CSV/JSON.",
@@ -617,7 +618,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     NSArray *names = @[@"AppleIOKitLab-session.txt", @"AppleIOKitLab-inventory.json",
                        @"AppleIOKitLab-checkpoint.json", @"AppleIOKitLab-lastcase.json",
                        @"AppleIOKitLab-trace.csv", @"AppleIOKitLab-public-baseline.json",
-                       @"AppleIOKitLab-summary.json"];
+                       @"AppleIOKitLab-summary.json", @"AppleIOKitLab-contract.json"];
     NSMutableArray *urls = [NSMutableArray new];
     for (NSString *name in names) {
         NSURL *u = [self document:name];
