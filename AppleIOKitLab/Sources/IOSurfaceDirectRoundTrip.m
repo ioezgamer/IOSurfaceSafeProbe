@@ -299,10 +299,15 @@ static NSString *DirectMachine(void) {
                 created?@"OK":@"NO",looked?@"OK":@"NO",
                 [r[@"propertyRoundTripConfirmed"] boolValue]?@"OK":@"NO",
                 DirectHex(closeKr)]];
-            if([r[@"propertyRoundTripConfirmed"] boolValue]){
-                finish(@"PASS: creada superficie y valor propio leído de vuelta por ruta independiente.");
+            BOOL lockCycle=[r[@"lockUnlockConfirmed"] boolValue];
+            BOOL ownValue=[r[@"propertyRoundTripConfirmed"] boolValue];
+            BOOL closed=(closeKr==KERN_SUCCESS);
+            r[@"completeCycleConfirmed"]=@(created && looked && lockCycle && ownValue && closed);
+            [self saveJSON:r as:@"AppleIOKitLab-direct-roundtrip.json"];
+            if([r[@"completeCycleConfirmed"] boolValue]){
+                finish(@"PASS: crear/buscar/bloquear/desbloquear/escribir/leer/cerrar funcionó en superficie propia.");
             }else if(created && looked){
-                finish(@"PARCIAL: creación y lookup reales; escritura/lectura requiere revisión.");
+                finish(@"PARCIAL: creación y lookup reales; revisar lock, propiedad o cierre en JSON.");
             }else{
                 finish(@"PARCIAL: creación real; lookup o contrato de salida no confirmado.");
             }
