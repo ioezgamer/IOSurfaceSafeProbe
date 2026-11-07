@@ -18,6 +18,8 @@
 #import "PFMachPortHandoff.h"
 #import "PFPortRevocationTest.h"
 #import "PFForensicEvidence.h"
+#import "PFKernelTraceImporter.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -100,7 +102,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     group[name]=@([group[name] unsignedIntegerValue]+1U);
 }
 
-@interface ProbeController : UIViewController
+@interface ProbeController : UIViewController <UIDocumentPickerDelegate>
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) UIImageView *handoffPreview;
 @property(nonatomic, copy) NSString *bootSessionID;
@@ -230,7 +232,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.11";
+    title.text = @"IOSurface Preflight v19.12";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -284,6 +286,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
       [self button:@"26. Transferencia Mach real: imagen editable" action:@selector(machPortHandoffProbe:)],
       [self button:@"27. Verificar revocación de derechos Mach (1 ensayo)" action:@selector(portRevocationProbe:)],
       [self button:@"28. Correlacionar evidencia local (sin pruebas invasivas)" action:@selector(forensicSnapshotProbe:)],
+      [self button:@"29. Importar traza externa instrumentada (.json)" action:@selector(importKernelTrace:)],
       self.handoffPreview,
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
@@ -317,7 +320,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.11"]; 
+    [self note:@"app=IOSurfacePreflight-v19.12"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -4277,6 +4280,59 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 
 // v19.10: correlate only the logs already present in our app sandbox.
 // Do not label IOServiceClose, port revocation or application uptime as kernel free.
+// v19.12: passive import only. Requires a trace collected elsewhere with
+// legitimate kernel-debug instrumentation; this app cannot capture those events.
+- (void)importKernelTrace:(id)sender {
+    if (self.stressRunning || self.matrixRunning || self.batchRunning ||
+        self.controlledCloseRunning) {
+        [self note:@"IMPORT: detené primero la prueba activa."];
+        return;
+    }
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:
+            @[UTTypeJSON]];
+    picker.delegate=self;
+    picker.allowsMultipleSelection=NO;
+    [self presentViewController:picker animated:YES completion:nil];
+    [self note:@"IMPORT: elegir JSON de un kernel de depuración autorizado. No se obtienen datos internos del iPhone."];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+    didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *url=urls.firstObject;
+    if (!url) return;
+    BOOL scoped=[url startAccessingSecurityScopedResource];
+    NSDictionary *report=PFAnalyzeInstrumentedKernelTrace(url);
+    NSString *dir=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *reportPath=[dir stringByAppendingPathComponent:
+        @"IOSurfaceImportedAnalysis-v19_12.json"];
+    NSData *json=[NSJSONSerialization dataWithJSONObject:report
+        options:NSJSONWritingPrettyPrinted error:NULL];
+    BOOL saved=json && [json writeToFile:reportPath
+        options:NSDataWritingAtomic error:NULL];
+    BOOL valid=![[report[@"status"] description]
+        isEqualToString:@"INVALID_EXTERNAL_TRACE"];
+    BOOL savedSource=NO;
+    if (valid) {
+        NSData *raw=[NSData dataWithContentsOfURL:url];
+        if (raw.length>0 && raw.length<=1024*1024) {
+            NSString *dest=[dir stringByAppendingPathComponent:
+                @"IOSurfaceImportedSource-v19_12.json"];
+            savedSource=[raw writeToFile:dest
+                options:NSDataWritingAtomic error:NULL];
+        }
+    }
+    if (scoped) [url stopAccessingSecurityScopedResource];
+    PFAppendForensicEvent(dir,self.bootSessionID?:@"UNKNOWN",
+        @"OFFLINE_EXTERNAL_TRACE_IMPORT",report[@"status"]?:@"UNKNOWN");
+    [self note:[NSString stringWithFormat:
+        @"IMPORT: %@ eventos=%@ candidatos=%@ informe=%@ fuente=%@",
+        report[@"status"], report[@"event_count"], report[@"candidate_count"],
+        saved?@"GUARDADO":@"ERROR",savedSource?@"GUARDADA":@"NO GUARDADA"]];
+    [self note:@"IMPORT: trazas externas no autenticadas. La app NO prueba por sí sola un use-after-free del kernel."];
+    [self note:@"IMPORT: tocá Exportar para compartir el análisis y la fuente importada."];
+}
+
 - (void)forensicSnapshotProbe:(id)sender {
     NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
     PFAppendForensicEvent(directory,self.bootSessionID?:@"UNKNOWN",
@@ -4449,7 +4505,9 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
     }
-    for(NSString *file in @[@"IOSurfaceForensicEvidence-v19_10.json",
+    for(NSString *file in @[@"IOSurfaceImportedAnalysis-v19_12.json",
+                            @"IOSurfaceImportedSource-v19_12.json",
+                            @"IOSurfaceForensicEvidence-v19_10.json",
                             @"IOSurfaceForensicEvents-v19_10.csv",
                             @"IOSurfacePortRevocation-v19_9.json",
                             @"IOSurfaceMachHandoff-v19_8.json",

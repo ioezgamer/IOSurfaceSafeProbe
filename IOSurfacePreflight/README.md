@@ -279,3 +279,37 @@ En v19.10, el correlador interpretaba erróneamente el CSV de SameClient del dis
 La v19.11 lee las columnas por encabezado, admite los dos formatos, valida los intervalos numéricos y diferencia una llamada RPC rechazada de una operación de registro completada. Para la traza original de noviembre, el solapamiento es **174.167 µs**, con `call_kr=0x10000003`, que **no acredita** un registro válido ni un UAF.
 
 La etiqueta del log inicial y el número de compilación se actualizaron a v19.11 (build 30). La auditoría sigue limitada a API pública. La actualización reproduce la lectura correcta del archivo existente; no es necesario repetir el ensayo SameClient.
+
+
+## v19.12 (build 31): importador pasivo de trazas instrumentadas
+
+Se incorpora el botón **29. Importar traza externa instrumentada (.json)**. La aplicación permite elegir un archivo con la app Archivos mediante el selector de documentos iOS, sin computadora conectada. Lee un archivo local de hasta 1 MiB, valida su estructura y orden, separa el identificador de instancia y su generación y registra un resumen SHA-256 y los posibles encadenamientos declarados por el propio documento. El análisis se exporta en:
+
+- \`IOSurfaceImportedAnalysis-v19_12.json\` (resultado y hash del archivo).
+- \`IOSurfaceImportedSource-v19_12.json\` (última traza externa válida importada; hasta 1 MiB).
+
+**IMPORTANTE:** este botón **no registra eventos internos** del kernel en el iPhone. Una aplicación de terceros firmada normalmente no dispone de APIs para extraer el último \`OSObject::release()\`, el estado interno de la lista de notificaciones o un acceso posterior a memoria liberada. El archivo tiene que proceder de un **entorno de depuración del kernel autorizado y con instrumentación independiente**. El importador no ejecuta explotación ni instrumentación del kernel.
+
+### Esquema aceptado
+
+Un único objeto JSON con:
+
+- \`schema: "iosurface-instrumented-lifetime-v1"\`
+- \`provenance.environment\` y \`provenance.capture_id\` (declaraciones del archivo, **no autenticadas**).
+- \`events\`: entre 1 y 4096 eventos, con secuencia \`seq\` y reloj \`monotonic_ns\` no decrecientes, \`boot_id\`, \`object_id\`, \`generation\` y \`event\`.
+- En eventos de notificación también \`notification_id\`.
+
+Los eventos admitidos son \`object_created\`, \`notification_registered\`, \`last_release\`, \`object_deallocated\`, \`notification_still_linked\`, \`notification_removed\` y \`notification_dispatch_dereference\`. Sólo se marca como **candidato estructural** una cadena consistente para el mismo arranque, objeto, generación y notificación, sin retirada intermedia del nodo.
+
+**Ningún archivo JSON por sí mismo acredita los acontecimientos que afirma.** Incluso si el análisis produce \`CONSISTENT_EXTERNAL_CANDIDATE_UNAUTHENTICATED\`, los campos \`kernel_uaf_proven\` y \`provenance_authenticated\` permanecen en \`false\`. No se acepta un CSV de usuario como si fueran eventos del kernel.
+
+Se incluyen **9 pruebas** de correlación, rechazo de alteraciones, errores de orden y negativa a presentar un archivo sintético como UAF real. La verificación se realiza por GitHub Actions además de la compilación del IPA iOS.
+
+### Uso
+
+1. Abrir IOSurfacePreflight v19.12.
+2. Pulsar **29. Importar traza externa instrumentada (.json)** si se dispone de una traza auténtica procedente de un sistema de investigación con kernel instrumentado.
+3. Pulsar **Exportar registro, CSV y checkpoint** para compartir los resultados.
+4. Si no existe traza instrumentada, el botón 28 continúa permitiendo revisar los diagnósticos públicos ya existentes, sin afirmar un UAF.
+
+El identificador de la app continúa siendo \`org.iosurface.preflight\`, con build 31. La IPA de GitHub Actions es **sin firma** y requiere una firma válida para instalarse.
