@@ -147,3 +147,18 @@ El archivo **AppleIOKitLab-notification-delivery.json** registra: `messageDelive
 Veredictos posibles: `MESSAGE_ON_REGISTERED_PORT_ORIGIN_UNVERIFIED`, `NO_CALLBACK_OBSERVED_AFTER_USECOUNT_TRANSITION`, `NO_CALLBACK_OBSERVED_WITHOUT_STIMULUS`, `REGISTER_REJECTED_NO_RACE` o avisos de cierre/retirada. La ausencia de un mensaje NO niega que existan notificaciones en otros estados; la recepcion tampoco prueba UAF, KernelRW o CVE.
 
 Este experimento no ejecuta operaciones concurrentes, carreras de cierre, repeticion intensiva, ni usa superficies o puertos liberados. Aunque es acotado, una llamada al kernel puede provocar reinicio; no ejecutar de nuevo si la app deja un checkpoint `IN_FLIGHT` hasta revisar datos de analisis del sistema.
+
+## v1.7: prueba A-B-A de dependencia de la suscripcion
+
+Se agrega el botón **5. Comprobar notificaciones A-B-A**. La IPA genera `AppleIOKitLab-notification-causality.json` con las fases A/B/A de un unico ensayo, siempre sobre una sola IOSurface propia y sin carreras deliberadas.
+
+- **A1, sin registro:** una transicion 0->1->0 del contador de uso y una escucha de 250 ms al puerto Mach antes de invocar el selector 17.
+- **B, registro activo:** selector 17 una sola vez, escucha inmediata 100 ms; una sola transicion del contador de uso, con escucha tras incremento (200 ms) y decremento (1200 ms), igual al protocolo que produjo un mensaje 53 de 120 bytes en v1.6.
+- **A2, despues de retirar:** selector 18, una comprobacion no bloqueante de si quedaron mensajes pendientes en cola, una transicion 0->1->0 y escucha de 350 ms solo si la cola estaba vacia. Si habia mensajes pendientes, el control posterior queda inconcluso y se preserva su resultado.
+- **Cierre:** liberar los recursos en orden, guardar todo y calcular `causalControlSupported` solo si se cumplen todos los controles. La entrega se considera asociada al registro cuando no se observa antes de suscribirse, aparece tras el decremento durante el registro y no aparece tras retirar la notificacion, con el contador restaurado y la limpieza exitosa.
+
+Se incluyen resultados detallados con retorno de mach_msg, informacion de cabeceras, tiempos y conteos de uso. El veredicto `ABA_CONTROL_SUPPORTS_SUBSCRIPTION_DEPENDENCE` es EVIDENCIA DE DEPENDENCIA DE SUSCRIPCION, no prueba que el contenido sea una notificacion autentificada del kernel. No se analizan contenidos ni punteros, no hay UAF, no hay KernelRW y no hay jailbreak.
+
+En el caso de un mensaje de la fase B pendiente despues de selector 18, la app no exige un resultado negativo ni lo califica como fallo del controlador: clasifica la causalidad como inconclusa. Si recibe un mensaje fuera de la ventana observada o no se puede recuperar la superficie propia, tambien queda inconclusa.
+
+El ensayo dura aproximadamente 2,1 segundos de tiempo de recepcion maximo ademas de las llamadas sincrónicas y requiere confirmacion. No repetirlo ante un reinicio hasta revisar el registro de datos de analisis de iOS.
