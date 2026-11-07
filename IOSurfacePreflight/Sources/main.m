@@ -16,6 +16,7 @@
 #import "PFNoveltyCoverage.h"
 #import "PFTargetedReplay.h"
 #import "PFMachPortHandoff.h"
+#import "PFPortRevocationTest.h"
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -226,7 +227,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v19.8";
+    title.text = @"IOSurface Preflight v19.9";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -278,6 +279,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
       [self button:@"24. Fuerza bruta de entradas nuevas (hasta 50.000)" action:@selector(noveltyProbe:)],
       [self button:@"25. Reproducir caso del CSV local (3 veces)" action:@selector(targetedReplayProbe:)],
       [self button:@"26. Transferencia Mach real: imagen editable" action:@selector(machPortHandoffProbe:)],
+      [self button:@"27. Verificar revocación de derechos Mach (1 ensayo)" action:@selector(portRevocationProbe:)],
       self.handoffPreview,
       [self button:@"Detener prueba activa" action:@selector(stopStressProbe:)],
       [self button:@"Exportar registro, CSV y checkpoint" action:@selector(shareLog:)],
@@ -311,7 +313,7 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v19.8"]; 
+    [self note:@"app=IOSurfacePreflight-v19.9"]; 
     [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
     self.bootSessionID=NSUUID.UUID.UUIDString;
     [self recordBootEvent:@"APP_LAUNCHED"];
@@ -3910,6 +3912,36 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
 }
 
 
+// v19.9: validate Mach send-right revocation using our own IOSurface.
+// Tests positive and negative controls exactly once, no fuzzing.
+- (void)portRevocationProbe:(id)sender {
+    if(self.stressRunning || self.matrixRunning || self.batchRunning ||
+       self.controlledCloseRunning) {
+        [self note:@"PORT-REVOKE: otra prueba activa; detenela primero."];
+        return;
+    }
+    [self note:@"PORT-REVOKE: verificando rechazo de nombre revocado, puerto ajeno y puerto nulo."];
+    NSDictionary *report=PFRunPortRevocationTest();
+    NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *jsonPath=[directory stringByAppendingPathComponent:@"IOSurfacePortRevocation-v19_9.json"];
+    NSData *json=[NSJSONSerialization dataWithJSONObject:report
+                        options:NSJSONWritingPrettyPrinted error:NULL];
+    NSError *error=nil;
+    BOOL saved=json && [json writeToFile:jsonPath
+                              options:NSDataWritingAtomic error:&error];
+    [self note:[NSString stringWithFormat:@"PORT-REVOKE: %@ etapa=%@ detalle=%@",
+        report[@"verdict"],report[@"stage"],report[@"detail"]]];
+    [self note:[NSString stringWithFormat:@"PORT-REVOKE: puerto vivo=%@ derecho restante=%@ revocado=%@ ajeno=%@ nulo=%@",
+        report[@"initial_valid_port_lookup"], report[@"remaining_valid_send_right_lookup"],
+        report[@"revoked_port_lookup"],report[@"unrelated_port_lookup"],
+        report[@"null_port_lookup"]]];
+    [self note:[NSString stringWithFormat:@"PORT-REVOKE: JSON %@",
+        saved?@"GUARDADO":(error.localizedDescription?:@"NO GUARDADO")]];
+    if([report[@"verdict"] isEqualToString:@"REVIEW_UNEXPECTED_SURFACE"]) {
+        [self note:@"PORT-REVOKE: revisión necesaria; una respuesta inesperada no demuestra por sí sola vulnerabilidad."];
+    }
+}
+
 // v19.8: genuine, bounded public IOSurface/Mach transfer; no kernel exploitation.
 - (void)machPortHandoffProbe:(id)sender {
     if(self.stressRunning || self.matrixRunning || self.batchRunning ||
@@ -4373,7 +4405,8 @@ static void PFCount(NSMutableDictionary<NSString *,NSNumber *> *group, NSString 
                 [filesToShare addObject:[NSURL fileURLWithPath:file]];
         }
     }
-    for(NSString *file in @[@"IOSurfaceMachHandoff-v19_8.json",
+    for(NSString *file in @[@"IOSurfacePortRevocation-v19_9.json",
+                            @"IOSurfaceMachHandoff-v19_8.json",
                             @"IOSurfaceMachHandoff-v19_8.png",
                             @"IOSurfaceTargetedReplay-checkpoint.json",
                             @"IOSurfaceTargetedReplay-trace.csv",
