@@ -1,0 +1,28 @@
+name: AppleIOKitLab
+options:
+  bundleIdPrefix: org.iosurface
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CLANG_ENABLE_OBJC_ARC: "YES"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  AppleIOKitLab:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.iosurface.appleiokitlab
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleShortVersionString: "1.0.0"
+        INFOPLIST_KEY_CFBundleVersion: "1"
+        INFOPLIST_KEY_CFBundleDisplayName: "Apple IOKit Lab"
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "NO"
+        INFOPLIST_KEY_UIFileSharingEnabled: "YES"
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: "YES"
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
