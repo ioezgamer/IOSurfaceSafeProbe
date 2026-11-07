@@ -53,3 +53,27 @@ La siguiente confirmacion valida requeriria evidencia dinamica del registro asin
 **Conclusiones que NO quedan respaldadas:** entrega de un callback al puerto Mach, existencia de una carrera reproducible, UAF/OOB del kernel, vinculación inequívoca con CVE-2026-112477, una primitiva KernelRW o un jailbreak.
 
 **Siguiente prueba discriminante, sin carreras:** recibir con límite temporal un mensaje de notificación válido en un puerto Mach propio después de estimular únicamente transiciones documentadas de la superficie. Un registro aceptado y una entrega observada serían evidencias distintas; en ausencia de mensaje, registrar `NO_CALLBACK_OBSERVED` en vez de afirmar que la ruta no funciona.
+
+## Nueva prueba dinámica de entrega de mensaje: Apple IOKit Lab 1.6
+
+**Fuente primaria:** `AppleIOKitLab-notification-delivery.json` exportado del dispositivo `iPhone14,3`, iOS 27.0, build `24A437`. Es una secuencia ejecutada en un único hilo, no un intento de carrera.
+
+| Etapa | Resultado |
+|---|---|
+| Crear superficie propia (selector 6) | SID **11**, código `0x00000000`, salida de 3176 bytes |
+| Registrar notificación (selector 17) | `0x00000000` |
+| Recepción 100 ms inmediatamente tras registrar | `MACH_RCV_TIMED_OUT`, sin mensaje |
+| Incrementar use count propio | `0 → 1` |
+| Recepción 200 ms tras incremento | `MACH_RCV_TIMED_OUT`, sin mensaje |
+| Decrementar use count propio | `1 → 0`, contador restaurado |
+| Recepción posterior, ventana máxima 1200 ms | **Mensaje Mach recibido:** `msgh_id=53`, `msgh_size=120`, cabecera válida, `mach_msg=0x00000000` |
+| Retirar notificación (selector 18) | `0x00000000` |
+| Cerrar el user-client y destruir el puerto | Ambos `0x00000000` |
+
+La marca temporal entre el decremento registrado (`1794068872.0129399`) y la recepción (`1794068872.018491`) es ~**5,55 ms**. La entrega se observó en el puerto propio que se había registrado con selector 17; el programa **no verificó de forma independiente el remitente** y no analizó el contenido del mensaje. El archivo explicita `notificationOriginVerified=false`, `attemptedRace=false`, `kernelMemoryCorruptionProven=false` y `kernelRW=false`.
+
+**Demostración respaldada:** existe una señal recibida después del decremento del contador de uso de una IOSurface propia, con registro asíncrono previamente aceptado. Esto es consistente con una notificación de transición de uso.
+
+**No respaldado:** identidad exacta del mensaje 53, garantía de origen kernel, causalidad demostrada por controles negativos, concurrencia defectuosa, la CVE específica, UAF, KernelRW o jailbreak.
+
+**Control recomendado:** después de retirar exitosamente el registro con selector 18, repetir una sola transición `0 → 1 → 0` y escuchar el mismo puerto de forma acotada. Si no hay un segundo mensaje, aumentará la evidencia de que la notificación observada dependía del registro, sin constituir prueba de corrupción de memoria.
