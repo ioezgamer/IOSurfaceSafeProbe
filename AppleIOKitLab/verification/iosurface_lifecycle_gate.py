@@ -114,7 +114,7 @@ def verify(path,spec):
     exactly_one(sweep,"mov","x20, x1")
     exactly_one(sweep,"mov","x19, x0")
     exactly_one(close,"mov","x20, x0")
-    exactly_one(close,"ldr","x0, [x20, #0xe8]")
+    assert positions(close,"ldr","x0, [x20, #0xe8]"), "Teardown must load manager from owner"
     exactly_one(close,"mov","x1, x20")
     lock_reg=exactly_one(reg,"bl",hex(spec["lock"]))
     unlock_reg=exactly_one(reg,"bl",hex(spec["unlock"]))
