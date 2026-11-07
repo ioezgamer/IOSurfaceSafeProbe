@@ -15,3 +15,9 @@ La auditoria de las 26 regiones modificadas verifico que la funcion de validacio
 Hashes: `24A437 = dc1ccfb04fc2ff8b600228dde2c5d83f3695ebe119774e285d511e8da4425ea3`; `24B119 = b5b187861ad9287fd3b976d872a89029991acdfcd8bd445a6ebfb2f560cf499c`.
 
 Fuente: extracciones exactas AppleAVE2 [GitHub Actions](https://github.com/ioezgamer/IOSurfaceSafeProbe/actions/runs/42408583861). Evidencia ampliada y scripts: paquete descargable en la conversacion.
+
+## Seguimiento del límite del bucle (16 comprobaciones de opcodes)
+
+El campo de límite no aparece sin procedencia: en `24A437` se carga `w9` desde `[x19+0xdf8]` (`0xfffffff008542af0`), se calcula `w9-1` (`0xfffffff008542b04`) y se conserva en `[x19+0x3760]` (`0xfffffff008542b0c`). En `24B119` la misma lógica obtiene `[x19+0xe00]`, resta uno y guarda `[x19+0x3768]` (`0xfffffff00857304c`, `...3060`, `...3068`). Estas seis instrucciones adicionales se verificaron byte por byte junto a las diez anteriores, con una prueba negativa que rechazó un build sustituido.
+
+El bucle del `str` usa condición inclusiva (`b.lo` tras incrementar el contador que empieza en -1). Si el campo original representa la cantidad de entradas `N`, el almacén del límite `N-1` es compatible con efectuar **exactamente N iteraciones**, no con un desbordamiento de una posición. No se ha probado una discrepancia entre la capacidad reservada y el número de escrituras. Este candidato sigue siendo un `store` real, **pero no un fallo OOB demostrado**.
