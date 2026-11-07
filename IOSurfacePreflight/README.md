@@ -249,3 +249,33 @@ clang -std=c11 -Wall -Wextra -Werror \
 \`\`\`
 
 **Limitación:** esta prueba solo comprueba autorización al consultar IOSurface desde el mismo proceso. No permite inferir acceso entre procesos, corrupción del kernel, KernelRW ni jailbreak. Un fallo inesperado de API se registrará para revisar si se produjo por permisos, transporte o semántica pública antes de atribuirlo al kernel.
+
+
+## v19.10: informe forense generado directamente en la IPA
+
+La opción **28. Correlacionar evidencia local (sin pruebas invasivas)** genera y guarda en Documentos el informe \`IOSurfaceForensicEvidence-v19_10.json\`. Al tocar **Exportar registro, CSV y checkpoint**, la aplicación actualiza automáticamente el informe y comparte ambos archivos nuevos:
+
+- \`IOSurfaceForensicEvidence-v19_10.json\`: resumen con identificadores de sesión, sello de captura, información pública de dispositivo y versión, manifiesto SHA-256 de los archivos procesados, estado del BootMonitor, solapamiento medido de SameClient, controles de revocación y criterios de evidencia pendientes.
+- \`IOSurfaceForensicEvents-v19_10.csv\`: eventos observables desde la app, con timestamp ISO 8601, sesión, uptime y origen \`user_space\`. El archivo se mantiene acotado.
+
+El informe reutiliza los archivos propios del contenedor (no necesita computadora, acceso a Analytics ni conexión a un servidor) y **no ejecuta nuevas campañas ni fuerza condiciones de carrera**.
+
+**Interpretación estricta:** la app normal no puede ver el último \`OSObject::release()\` real de \`IOSurfaceRootUserClient\` ni leer nodos de notificación del kernel. Por tanto, \`kernel_last_release_observed\`, \`notification_survived_final_release_observed\` y \`post_free_dispatch_observed\` permanecen en \`false\`. La existencia de solapamiento de llamadas y de una revocación Mach normal nunca se presenta como un UAF demostrado.
+
+### Uso desde el iPhone
+
+1. Abrir IOSurfacePreflight 0.19.10.
+2. Tocar **28. Correlacionar evidencia local**. La app registra un resumen del diagnóstico ya guardado.
+3. Tocar **Exportar registro, CSV y checkpoint** y compartir \`IOSurfaceForensicEvidence-v19_10.json\` y el CSV de eventos. No hace falta repetir los ensayos previos.
+
+### Verificación
+
+La ejecución de GitHub Actions compila y ejecuta \`PFForensicEvidenceTests.m\` en macOS, además de producir la IPA para iOS. La IPA exportada no está firmada: para instalarla en el iPhone hace falta una firma válida de la cuenta del usuario. El identificador \`org.iosurface.preflight\` se mantiene para conservar los Documentos existentes cuando la instalación sea una actualización compatible.
+
+### Corrección v19.11: CSV SameClient real
+
+En v19.10, el correlador interpretaba erróneamente el CSV de SameClient del dispositivo como inválido porque esperaba 12 columnas con una columna inicial `index`. El archivo original de iOS tiene **11 columnas**, sin `index`.
+
+La v19.11 lee las columnas por encabezado, admite los dos formatos, valida los intervalos numéricos y diferencia una llamada RPC rechazada de una operación de registro completada. Para la traza original de noviembre, el solapamiento es **174.167 µs**, con `call_kr=0x10000003`, que **no acredita** un registro válido ni un UAF.
+
+La etiqueta del log inicial y el número de compilación se actualizaron a v19.11 (build 30). La auditoría sigue limitada a API pública. La actualización reproduce la lectura correcta del archivo existente; no es necesario repetir el ensayo SameClient.
