@@ -192,7 +192,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     self.selectedService = @"";
 
     UILabel *title = [UILabel new];
-    title.text = @"Apple IOKit Lab · v1.1";
+    title.text = @"Apple IOKit Lab · v1.2";
     title.font = [UIFont boldSystemFontOfSize:25];
 
     UILabel *summary = [UILabel new];
@@ -220,7 +220,8 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
         title, summary, self.selectedLabel,
         [self button:@"1. Inventariar servicios y permisos reales" selector:@selector(inventoryTapped:)],
         [self button:@"2. Baseline pública IOSurface (64x64)" selector:@selector(publicBaselineTapped:)],
-        [self button:@"3. Elegir controlador accesible" selector:@selector(chooseTapped:)],
+        [self button:@"3. Contrato IOSurface (selector 13, una consulta)" selector:@selector(contractTapped:)],
+        [self button:@"4. Elegir controlador accesible" selector:@selector(chooseTapped:)],
         [self button:@"4. Ejecutar 16 casos IOKit (requiere confirmación)" selector:@selector(campaignTapped:)],
         [self button:@"5. Reproducir último caso guardado" selector:@selector(replayTapped:)],
         [self button:@"Detener entre casos" selector:@selector(stopTapped:)],
@@ -553,7 +554,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
             @"interpretation":@"A returned error is not evidence of memory corruption."
         };
         [self saveJSON:finish as:@"AppleIOKitLab-checkpoint.json"];
-        [self saveJSON:finish as:@"AppleIOKitLab-summary.json"];
+        [self saveJSON:finish as:@"AppleIOKitLab-summary.json", @"AppleIOKitLab-contract.json"];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.running = NO;
             [self log:[NSString stringWithFormat:@"Fin: %lu/%ld casos. Exportar CSV/JSON.",
