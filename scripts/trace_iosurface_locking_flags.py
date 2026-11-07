@@ -90,7 +90,7 @@ def main():
         "builds":[audit("24A437",args.old_macho,args.old_asm),
                   audit("24B119",args.new_macho,args.new_asm)],
         "8_property_callsite_assertions_passed":True,
-        "note":"Static inference; no live flags, after-free access, or CVE exploit proven"}
+        "note":"Static inference; no live flags, after-free access, or CVE exploit proven"
     }
     dst=pathlib.Path(args.output)
     dst.parent.mkdir(parents=True,exist_ok=True)
