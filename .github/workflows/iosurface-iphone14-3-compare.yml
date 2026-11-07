@@ -1,0 +1,109 @@
+name: Compare IOSurface iPhone14,3 official kernelcaches
+on:
+  push:
+    branches: [research/iosurface-iphone14-3-binary-compare]
+    paths: ['.github/workflows/iosurface-iphone14-3-compare.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ipsw
+        run: brew install ipsw
+      - name: Download only the matching kernelcache from each official firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cmp/old cmp/new cmp/out
+          ipsw extract --kernel --remote --device iPhone14,3 -o cmp/old 'https://updates.cdn-apple.com/2026FallFCS/73d1826d-b08b-404a-92b6-94249593de65/iPhone14%2C3_27.0_24A437_Restore.ipsw'
+          ipsw extract --kernel --remote --device iPhone14,3 -o cmp/new 'https://updates.cdn-apple.com/2026FallFCS/59db57ab-bf39-4722-ae2c-930079835914/iPhone14%2C3_27.2_24B119_Restore.ipsw'
+          find cmp/old cmp/new -type f
+      - name: Extract and compare IOSurface Mach-O binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLD="$(find cmp/old -type f -name 'kernelcache*' | head -n 1)"
+          NEW="$(find cmp/new -type f -name 'kernelcache*' | head -n 1)"
+          test -s "$OLD" && test -s "$NEW"
+          ipsw kernel version "$OLD" > cmp/out/old-kernel-version.txt
+          ipsw kernel version "$NEW" > cmp/out/new-kernel-version.txt
+          ipsw kernel kexts --json "$OLD" > cmp/out/old-kexts.json
+          ipsw kernel kexts --json "$NEW" > cmp/out/new-kexts.json
+          ipsw kernel kexts --diff "$OLD" "$NEW" > cmp/out/kext-diff.txt || true
+          mkdir -p cmp/kext-old cmp/kext-new
+          ipsw kernel extract "$OLD" com.apple.iokit.IOSurface -o cmp/kext-old
+          ipsw kernel extract "$NEW" com.apple.iokit.IOSurface -o cmp/kext-new
+          KO="$(find cmp/kext-old -type f -name '*IOSurface*' | head -n 1)"
+          KN="$(find cmp/kext-new -type f -name '*IOSurface*' | head -n 1)"
+          test -s "$KO" && test -s "$KN"
+          xcrun llvm-objdump --macho --disassemble --no-show-raw-insn "$KO" > cmp/old.asm || true
+          xcrun llvm-objdump --macho --disassemble --no-show-raw-insn "$KN" > cmp/new.asm || true
+          python3 - "$OLD" "$NEW" "$KO" "$KN" <<'PY'
+          import hashlib, json, pathlib, struct, sys, collections, re
+          oldkc,newkc,oldfile,newfile=map(pathlib.Path,sys.argv[1:])
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          def macho(path):
+              data=path.read_bytes()
+              if struct.unpack_from('<I',data)[0]!=0xfeedfacf:raise ValueError("Not MH_MAGIC_64")
+              _,cpu,sub,kind,ncmds,commandsize,flags,res=struct.unpack_from('<IiiIIIII',data)
+              pos=32;sections={}
+              for n in range(ncmds):
+                  cmd,sz=struct.unpack_from('<II',data,pos)
+                  if sz<8 or pos+sz>len(data):raise ValueError("invalid Mach-O load command")
+                  if cmd==0x19:
+                      seg=data[pos+8:pos+24].split(b'\0')[0].decode(errors='replace')
+                      count=struct.unpack_from('<I',data,pos+64)[0]
+                      for j in range(count):
+                          p=pos+72+j*80
+                          if p+80>pos+sz:raise ValueError("invalid section")
+                          sect=data[p:p+16].split(b'\0')[0].decode(errors='replace')
+                          length=struct.unpack_from('<Q',data,p+40)[0]
+                          offset=struct.unpack_from('<I',data,p+48)[0]
+                          if offset+length<=len(data):
+                              sections[seg+'.'+sect]={'size':length,'sha256':sha(data[offset:offset+length])}
+                  pos+=sz
+              return {'bytes':len(data),'sha256':sha(data),'sections':sections}
+          old,new=macho(oldfile),macho(newfile)
+          changes=[]
+          for s in sorted(set(old['sections'])|set(new['sections'])):
+              a=old['sections'].get(s);b=new['sections'].get(s)
+              if a!=b:changes.append({'section':s,'old':a,'new':b,'delta':(b or {}).get('size',0)-(a or {}).get('size',0)})
+          def opcodes(path):
+              c=collections.Counter()
+              rx=re.compile(r'^\s*(?:0x)?[0-9a-fA-F]+:\s*(?:[0-9a-fA-F]{8}\s+)?([a-zA-Z][\w.]*)\b')
+              for line in pathlib.Path(path).read_text(errors='replace').splitlines():
+                  m=rx.match(line)
+                  if m:c[m.group(1).lower()]+=1
+              return c
+          oc,nc=opcodes('cmp/old.asm'),opcodes('cmp/new.asm')
+          ops=['ldxr','ldaxr','stxr','stlxr','cas','casal','ldadd','dmb','dsb','isb','bl','blr','ret']
+          result={'device':'iPhone14,3','old_build':'24A437','new_build':'24B119',
+                  'old_kernel_sha256':sha(oldkc.read_bytes()),
+                  'new_kernel_sha256':sha(newkc.read_bytes()),
+                  'old_kext':old,'new_kext':new,'changed_sections':changes,
+                  'instruction_counts':{k:{'old':oc[k],'new':nc[k]} for k in ops},
+                  'cve_2026_112477_fix_location_confirmed':False}
+          dest=pathlib.Path('cmp/out')
+          (dest/'comparison.json').write_text(json.dumps(result,indent=2))
+          lines=['# IOSurface binary comparison on iPhone14,3','',
+                 'iOS 27.0 24A437 vs iOS 27.2 24B119, same target model.','',
+                 '| Mach-O section | Old bytes | New bytes | Delta |','|---|---:|---:|---:|']
+          for r in changes:
+              a,b=r['old'],r['new']
+              lines.append(f"| {r['section']} | {a['size'] if a else 'missing'} | {b['size'] if b else 'missing'} | {r['delta']:+d} |")
+          lines+=['','Opcode count observations are included in comparison.json.',
+                 'No CVE-specific fix or exploit is identified by these metrics.']
+          (dest/'comparison.md').write_text('\n'.join(lines))
+          print('\n'.join(lines))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: IOSurface-iPhone14-3-comparison
+          path: cmp/out/
+          retention-days: 14
+          if-no-files-found: warn
