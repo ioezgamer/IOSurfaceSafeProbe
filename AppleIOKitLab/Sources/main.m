@@ -126,6 +126,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
 - (void)contractTapped:(id)sender;
 - (void)directRoundTripTapped:(id)sender;
 - (void)notificationLifecycleTapped:(id)sender;
+- (void)gpuOwnedBufferTapped:(id)sender;
 @end
 
 @implementation AppleIOKitLabController
@@ -195,7 +196,7 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
     self.selectedService = @"";
 
     UILabel *title = [UILabel new];
-    title.text = @"Apple IOKit Lab · v1.7";
+    title.text = @"Apple IOKit Lab · v1.8";
     title.font = [UIFont boldSystemFontOfSize:25];
 
     UILabel *summary = [UILabel new];
@@ -226,9 +227,10 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
         [self button:@"3. Contrato IOSurface (selector 13, una consulta)" selector:@selector(contractTapped:)],
         [self button:@"4. Prueba funcional real: crear y leer superficie" selector:@selector(directRoundTripTapped:)],
         [self button:@"5. Comprobar notificaciones A-B-A" selector:@selector(notificationLifecycleTapped:)],
-        [self button:@"6. Elegir controlador accesible" selector:@selector(chooseTapped:)],
-        [self button:@"7. Campaña legacy: 16 llamadas malformadas" selector:@selector(campaignTapped:)],
-        [self button:@"8. Reproducir último caso legacy" selector:@selector(replayTapped:)],
+        [self button:@"6. GPU: prueba entre búferes propios" selector:@selector(gpuOwnedBufferTapped:)],
+        [self button:@"7. Elegir controlador accesible" selector:@selector(chooseTapped:)],
+        [self button:@"8. Campaña legacy: 16 llamadas malformadas" selector:@selector(campaignTapped:)],
+        [self button:@"9. Reproducir último caso legacy" selector:@selector(replayTapped:)],
         [self button:@"Detener entre casos" selector:@selector(stopTapped:)],
         [self button:@"Exportar CSV + JSON + registro" selector:@selector(exportTapped:)],
         self.logView
@@ -626,7 +628,8 @@ static uint64_t labDigest(const uint8_t *data, size_t length) {
                        @"AppleIOKitLab-direct-roundtrip.json",
                        @"AppleIOKitLab-notification-lifecycle.json",
                        @"AppleIOKitLab-notification-delivery.json",
-                       @"AppleIOKitLab-notification-causality.json"];
+                       @"AppleIOKitLab-notification-causality.json",
+                       @"AppleIOKitLab-gpu-owned-buffer.json"];
     NSMutableArray *urls = [NSMutableArray new];
     for (NSString *name in names) {
         NSURL *u = [self document:name];
