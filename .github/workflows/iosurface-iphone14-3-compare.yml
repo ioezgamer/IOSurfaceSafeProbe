@@ -219,6 +219,15 @@ jobs:
           cp "$(find cmp/kext-old -type f -name '*IOSurface*' | head -n 1)" cmp/out/iosurface-24A437.macho
           cp "$(find cmp/kext-new -type f -name '*IOSurface*' | head -n 1)" cmp/out/iosurface-24B119.macho
           shasum -a 256 cmp/out/*.macho
+      - name: Verify effective IOUserClient locking property assignments
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/trace_iosurface_locking_flags.py \
+            --old-macho cmp/out/iosurface-24A437.macho \
+            --new-macho cmp/out/iosurface-24B119.macho \
+            --old-asm cmp/old.asm --new-asm cmp/new.asm \
+            --output cmp/out/effective-locking-inference.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
