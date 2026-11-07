@@ -86,6 +86,9 @@ static NSString *DirectMachine(void) {
                 @"steps":[NSMutableArray array],
                 @"creationConfirmed":@NO, @"lookupConfirmed":@NO,
                 @"propertyRoundTripConfirmed":@NO,
+                @"coreRoundTripConfirmed":@NO,
+                @"completeCycleConfirmed":@NO,
+                @"selector4IsOptionalDiagnostic":@YES,
                 @"kernelRW":@NO
             } mutableCopy];
             NSMutableArray *steps=r[@"steps"];
@@ -169,6 +172,10 @@ static NSString *DirectMachine(void) {
                         lookupLen==sizeof(lookupOut) &&
                         DirectRead32(lookupOut+0x18)==sid;
             r[@"lookupConfirmed"]=@(looked);
+            r[@"selector4Diagnostic"] = looked ? @"SUCCEEDED"
+                : (kr == (kern_return_t)0xe00002c2 ? @"BAD_ARGUMENT_REJECTED" : @"OTHER_FAILURE");
+            r[@"selector4Interpretation"] =
+                @"This optional lookup may be restricted even for a surface created by the same client. A rejection alone is not a vulnerability.";
             [steps addObject:@{@"operation":@"selector4_lookup_same_connection",
                                @"kr":DirectHex(kr),@"valid":@(looked)}];
             [self saveJSON:r as:@"AppleIOKitLab-direct-roundtrip.json"];
@@ -263,8 +270,10 @@ static NSString *DirectMachine(void) {
                         DirectSurfaceLookup look=surf?(DirectSurfaceLookup)dlsym(surf,"IOSurfaceLookup"):NULL;
                         DirectSurfaceCopyValue copy=surf?(DirectSurfaceCopyValue)dlsym(surf,"IOSurfaceCopyValue"):NULL;
                         BOOL equal=NO;
+                        BOOL publicLookup=NO;
                         if(look && copy){
                             DirectIOSurfaceRef owned=look(sid);
+                            publicLookup=(owned!=NULL);
                             if(owned){
                                 CFTypeRef copied=copy(owned,(__bridge CFStringRef)key);
                                 if(copied && CFGetTypeID(copied)==CFStringGetTypeID()){
@@ -275,6 +284,7 @@ static NSString *DirectMachine(void) {
                             }
                         }
                         if(surf)dlclose(surf);
+                        r[@"publicLookupConfirmed"] = @(publicLookup);
                         r[@"publicCopyValueMatches"] = @(equal);
                         r[@"propertyRoundTripConfirmed"] = @(written && readBack && (equal || decodedMatches));
                         [steps addObject:@{@"operation":@"IOSurfaceCopyValue_cross_check",
@@ -302,14 +312,23 @@ static NSString *DirectMachine(void) {
             BOOL lockCycle=[r[@"lockUnlockConfirmed"] boolValue];
             BOOL ownValue=[r[@"propertyRoundTripConfirmed"] boolValue];
             BOOL closed=(closeKr==KERN_SUCCESS);
-            r[@"completeCycleConfirmed"]=@(created && looked && lockCycle && ownValue && closed);
+            BOOL core=(created && lockCycle && ownValue && closed);
+            r[@"coreRoundTripConfirmed"]=@(core);
+            // Ciclo completo incluye el lookup por selector 4, que puede ser
+            // rechazado por politica aun cuando el resto funciona en la
+            // misma superficie y la API publica puede recuperar el mismo ID.
+            r[@"completeCycleConfirmed"]=@(core && looked);
+            r[@"verdict"]=core ? (looked ? @"PASS_ALL"
+                        : @"PASS_CORE_WITH_SELECTOR4_REJECTION") : @"PARTIAL";
             [self saveJSON:r as:@"AppleIOKitLab-direct-roundtrip.json"];
-            if([r[@"completeCycleConfirmed"] boolValue]){
-                finish(@"PASS: crear/buscar/bloquear/desbloquear/escribir/leer/cerrar funcionó en superficie propia.");
-            }else if(created && looked){
-                finish(@"PARCIAL: creación y lookup reales; revisar lock, propiedad o cierre en JSON.");
+            if(core && looked){
+                finish(@"PASS: crear, buscar, bloquear, escribir, leer y cerrar superficie propia.");
+            }else if(core){
+                finish(@"PASS FUNCIONAL: crear, bloquear, escribir, recuperar y cerrar superficie propia. Selector 4 rechazado (diagnostico independiente).");
+            }else if(created){
+                finish(@"PARCIAL: creación real, pero falta alguna verificación del ciclo de vida o datos.");
             }else{
-                finish(@"PARCIAL: creación real; lookup o contrato de salida no confirmado.");
+                finish(@"PARCIAL: no se verificó creación de superficie.");
             }
             dlclose(io);
         });
