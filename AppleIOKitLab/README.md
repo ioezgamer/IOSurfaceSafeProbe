@@ -58,3 +58,16 @@ Alternativa con Mac y Xcode: `cd AppleIOKitLab && brew install xcodegen && xcode
 Para las comparaciones de esta investigación, el dispositivo previamente documentado es `iPhone14,3` (iPhone 13 Pro Max), `iOS 27.0`, build `24A437`. La app muestra el build real de la instalación y avisa si difiere.
 
 Este módulo es compatible en principio con iOS 16+ pero **todavía debe compilarse y verificarse** antes de afirmar funcionamiento en un dispositivo concreto.
+
+## v1.1: corrección tras primera ejecución en iPhone14,3
+
+El inventario real registró 5/12 servicios con apertura tipo 0 exitosa. La campaña para `IOSurfaceRoot` terminó los 16/16 casos (selectores 0,1,2,17 y cuatro modalidades) y **las 16 llamadas devolvieron `0xe00002c2` (`kIOReturnBadArgument`)**. Ningún caso devolvió éxito. No se observó una vulnerabilidad explotable en estos resultados. Las llamadas fallidas de v1.0 tenían buffers inicializados a 4 escalares y 256 bytes; esos valores **no eran respuestas del controlador**.
+
+Cambios en v1.1:
+- Muestra `out=N/A` y conteos cero cuando la llamada devuelve error; solo se calculan digest y longitudes si hubo éxito.
+- Registra nombre de error y el campo `outputValid` en `lastcase.json`, que ahora se actualiza a `COMPLETED` para no confundir el último caso con un cuelgue.
+- Guarda `AppleIOKitLab-summary.json` con conteos de retorno.
+- Añade `Baseline pública IOSurface (64x64)` con create/ID/lookup/lock/unlock y su `AppleIOKitLab-public-baseline.json`.
+- Accede a esa API pública mediante `dlopen/dlsym` por compatibilidad con SDK de iOS que no expone la cabecera de IOSurface.
+
+Recomendación: ejecutar primero la baseline pública y compartir su JSON. No repetir automáticamente las mismas 16 llamadas fallidas ni lanzar carreras contra controladores privilegiados basándose solo en errores `kIOReturnBadArgument`.
