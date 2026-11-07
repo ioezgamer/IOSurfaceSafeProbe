@@ -1,0 +1,51 @@
+name: AppleAVE2 A15 exact firmware audit 24A437 vs 24B119
+on:
+  push:
+    branches: [research/apple-iokit-lab-20261107]
+    paths: ['.github/workflows/appleave2-a15-kext-compare.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  extract-exact-a15:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install firmware extractor
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ipsw
+          ipsw version || true
+      - name: Download original Apple kernelcache and extract AppleAVE2 for each exact iPhone14,3 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/ave-a15"
+          mkdir -p "$ROOT/report"
+          for BUILD in 24A437 24B119; do
+            mkdir -p "$ROOT/$BUILD/kc" "$ROOT/$BUILD/kext"
+            ipsw download ipsw --device iPhone14,3 --build "$BUILD" --kernel --confirm --output "$ROOT/$BUILD/kc" > "$ROOT/report/download-$BUILD.log" 2>&1
+            KC="$(find "$ROOT/$BUILD/kc" -type f -name 'kernelcache.*' | head -1)"
+            if [ -z "$KC" ]; then echo "No kernelcache for $BUILD" >&2; exit 2; fi
+            shasum -a 256 "$KC" >> "$ROOT/report/kernelcache-sha256.txt"
+            ipsw kernel extract "$KC" com.apple.driver.AppleAVE2 --output "$ROOT/$BUILD/kext" > "$ROOT/report/extract-$BUILD.log" 2>&1
+            OUT="$ROOT/$BUILD/kext/com.apple.driver.AppleAVE2"
+            test -s "$OUT"
+            file "$OUT" >> "$ROOT/report/kext-file-types.txt"
+            shasum -a 256 "$OUT" >> "$ROOT/report/appleave2-sha256.txt"
+            wc -c "$OUT" >> "$ROOT/report/appleave2-sizes.txt"
+            xcrun llvm-objdump --macho --section=__TEXT,__cstring --full-contents "$OUT" > "$ROOT/report/strings-$BUILD.txt" 2>&1 || true
+            ipsw macho info "$OUT" --json > "$ROOT/report/macho-$BUILD.json" 2>&1 || true
+          done
+          cat "$ROOT/report/appleave2-sha256.txt"
+          cat "$ROOT/report/appleave2-sizes.txt"
+      - name: Publish source-aligned binary evidence for offline diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppleAVE2-iPhone14-3-24A437-vs-24B119-extracted
+          path: ${{ runner.temp }}/ave-a15/**
+          if-no-files-found: error
+          retention-days: 14
