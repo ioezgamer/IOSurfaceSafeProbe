@@ -152,13 +152,22 @@ struct ContentView: View {
                         LabeledContent("Capacidad", value: "8 bytes")
                         LabeledContent("Índice 8", value: "Fuera del bloque")
                     }
-                    Section("Prueba real instrumentada") {
-                        Text("Solo en esta compilación con AddressSanitizer. Si se pulsa ejecutar, una escritura intencional en el byte 9 debería producir heap-buffer-overflow y cerrar la app. Puede requerir capturar el registro del dispositivo para obtener la evidencia ASan.")
+                    #if ASAN_LAB
+                    Section("Prueba instrumentada de usuario") {
+                        Text("Solo esta compilación ASan puede registrar el desbordamiento. En iOS 27.0 se ha observado un cierre antes de abrir debido a la inicialización del runtime ASan.")
                             .font(.footnote)
                         Button("Activar prueba con cierre deliberado", role: .destructive) {
                             overflowArmed = true
                         }
                     }
+                    #else
+                    Section("Estado del instrumento") {
+                        Text("AddressSanitizer no está incluido en esta versión estable. La prueba de 9 bytes no se ejecuta: escribir fuera de los límites sin instrumentación no daría una evidencia válida y podría causar un cierre.")
+                            .font(.footnote)
+                        LabeledContent("Prueba fuera de límites", value: "Deshabilitada")
+                        LabeledContent("Inicio de aplicación", value: "Sin runtime ASan")
+                    }
+                    #endif
                 }
                 .navigationTitle("Memoria ASan")
                 .alert("Prueba de desbordamiento", isPresented: $overflowArmed) {
