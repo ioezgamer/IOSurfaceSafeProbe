@@ -9,6 +9,7 @@ private struct SharedFile: Identifiable {
 struct ContentView: View {
     @State private var overflowArmed = false
     @State private var stressReport: StressReport?
+    @State private var matrixReport: MatrixReport?
     @State private var report: ProbeReport?
     @State private var campaign: CampaignReport?
     @State private var ownership: OwnershipReport?
@@ -29,6 +30,16 @@ struct ContentView: View {
                             report = ProbeRunner.run()
                         }
                         .buttonStyle(.borderedProminent)
+                        Button(campaignRunning ? "Ejecutando..." : "Matriz profunda de invariantes v6") {
+                            campaignRunning = true
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let result = SurfaceMatrixLab.run()
+                                DispatchQueue.main.async {
+                                    matrixReport = result
+                                    campaignRunning = false
+                                }
+                            }
+                        }.disabled(campaignRunning)
                         Button(campaignRunning ? "Ejecutando..." : "Prueba real de estrés IOSurface v5") {
                             campaignRunning = true
                             DispatchQueue.global(qos: .userInitiated).async {
@@ -61,6 +72,24 @@ struct ContentView: View {
                         }.disabled(campaignRunning)
                     } header: { Text("Prueba local") }
 
+                    if let matrixReport {
+                        Section("Matriz profunda v6") {
+                            LabeledContent("Casos", value: String(matrixReport.cases.count))
+                            LabeledContent("Correctos", value: String(matrixReport.passed))
+                            LabeledContent("Fallidos", value: String(matrixReport.failed))
+                            LabeledContent("No disponibles", value: String(matrixReport.unavailable))
+                            LabeledContent("Duración (ms)", value: String(format: "%.2f", Double(matrixReport.elapsedNanoseconds) / 1_000_000))
+                            ForEach(matrixReport.cases.filter { $0.status != "PASS" }, id: \.caseID) { test in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(test.caseID).font(.subheadline.monospaced()).bold()
+                                    Text(test.status + ": " + test.detail).font(.caption)
+                                }
+                            }
+                            Text("Cada caso registra dimensiones, asignación real, tiempo, ID y verificación de integridad. Los fallos requieren reproducción; no constituyen automáticamente un UAF.")
+                                .font(.footnote)
+                            Button("Exportar matriz v6 JSON") { export(matrixReport) }
+                        }
+                    }
                     if let stressReport {
                         Section("Estrés real v5") {
                             LabeledContent("Operaciones", value: String(stressReport.operations))
