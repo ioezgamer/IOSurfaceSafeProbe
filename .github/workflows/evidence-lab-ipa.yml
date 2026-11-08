@@ -1,0 +1,46 @@
+name: IOSurface Evidence Lab IPA
+on:
+  push:
+    branches: [evidence-lab-ipa]
+    paths:
+      - 'EvidenceLab/**'
+      - '.github/workflows/evidence-lab-ipa.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verificar Xcode
+        run: xcodebuild -version
+      - name: Instalar XcodeGen
+        run: brew install xcodegen
+      - name: Generar proyecto Xcode
+        working-directory: EvidenceLab
+        run: xcodegen generate
+      - name: Compilar aplicacion iPhone sin firma
+        run: |
+          xcodebuild -project EvidenceLab/IOSurfaceEvidenceLab.xcodeproj \
+            -scheme IOSurfaceEvidenceLab \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/evidence-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Crear IPA sin firma
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence-pkg/Payload"
+          cp -R "$RUNNER_TEMP/evidence-build/Build/Products/Release-iphoneos/IOSurfaceEvidenceLab.app" \
+            "$RUNNER_TEMP/evidence-pkg/Payload/"
+          (cd "$RUNNER_TEMP/evidence-pkg" && zip -qr "$GITHUB_WORKSPACE/IOSurfaceEvidenceLab-unsigned.ipa" Payload)
+          unzip -t IOSurfaceEvidenceLab-unsigned.ipa
+          shasum -a 256 IOSurfaceEvidenceLab-unsigned.ipa
+      - name: Subir IPA como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: IOSurfaceEvidenceLab-unsigned-ipa
+          path: IOSurfaceEvidenceLab-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14

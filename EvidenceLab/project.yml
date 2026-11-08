@@ -1,0 +1,21 @@
+name: IOSurfaceEvidenceLab
+options:
+  bundleIdPrefix: org.research
+targets:
+  IOSurfaceEvidenceLab:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: IOSurfaceEvidenceLab
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        PRODUCT_BUNDLE_IDENTIFIER: org.research.iosurface.evidencelab
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: "IOSurface Evidence"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        TARGETED_DEVICE_FAMILY: "1"
+    dependencies:
+      - framework: IOSurface.framework
