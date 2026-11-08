@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 private struct SharedFile: Identifiable {
     let id = UUID()
@@ -8,6 +9,8 @@ private struct SharedFile: Identifiable {
 
 struct ContentView: View {
     @State private var overflowArmed = false
+    @State private var kernelEvidence: KernelEvidenceReport?
+    @State private var importPanic = false
     @State private var protectionReport: ProtectionReport?
     @State private var showCrashConfirmation = false
     @State private var priorCrashMarker = ProcessProtectionLab.pendingCrashMarker()
@@ -26,6 +29,25 @@ struct ContentView: View {
         TabView {
             NavigationStack {
                 Form {
+                    Section("Kernel Evidence v8") {
+                        Text("Reinicios reales y análisis de informes panic-full. No confunde fallos de la aplicación con fallos del kernel.")
+                            .font(.subheadline)
+                        Button("Registrar estado del dispositivo") {
+                            kernelEvidence = KernelEvidenceLab.record()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("Importar informe panic-full (.ips)") { importPanic = true }
+                        if let kernelEvidence {
+                            LabeledContent("Tiempo encendido (s)", value: String(Int(kernelEvidence.systemUptimeSeconds)))
+                            LabeledContent("Cambio de arranque", value: kernelEvidence.bootChanged ? "Posible reinicio" : "No observado")
+                            LabeledContent("Clasificación", value: kernelEvidence.classification)
+                            Text(kernelEvidence.notes).font(.caption)
+                            if let source = kernelEvidence.reportName {
+                                Text("Informe: " + source).font(.caption)
+                            }
+                            Button("Exportar evidencia del kernel JSON") { export(kernelEvidence) }
+                        }
+                    }
                     Section("Protección de memoria v7 (proceso propio)") {
                         Text("Demostración real de páginas y permisos de memoria. No es un exploit del kernel.")
                             .font(.subheadline)
@@ -275,6 +297,27 @@ struct ContentView: View {
             Button("Cancelar", role: .cancel) {}
         } message: {
             Text("Se intentará escribir en una página PROT_NONE del proceso de la app. No modifica memoria del kernel. Guardá tus datos antes.")
+        }
+        .fileImporter(isPresented: $importPanic, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                let granted = url.startAccessingSecurityScopedResource()
+                defer { if granted { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+                    let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
+                    guard size <= 8_000_000 else { error = "Informe demasiado grande"; return }
+                    let data = try Data(contentsOf: url)
+                    guard let body = String(data: data, encoding: .utf8) else {
+                        error = "Este informe no está en UTF-8"
+                        return
+                    }
+                    kernelEvidence = KernelEvidenceLab.analyze(body, fileName: url.lastPathComponent)
+                } catch { self.error = error.localizedDescription }
+            case .failure(let failure):
+                error = failure.localizedDescription
+            }
         }
         .sheet(item: $sharedFile) { file in ShareSheet(file: file.url) }
         .alert("No se pudo exportar", isPresented: Binding(
