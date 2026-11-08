@@ -1,0 +1,46 @@
+name: IOSurface Evidence Lab v4 AddressSanitizer IPA
+on:
+  push:
+    branches: [evidence-lab-ipa]
+    paths:
+      - 'EvidenceLab/**'
+      - '.github/workflows/evidence-lab-asan.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: EvidenceLab
+        run: xcodegen generate
+      - name: Build iOS with AddressSanitizer
+        run: |
+          xcodebuild \
+            -project EvidenceLab/IOSurfaceEvidenceLab.xcodeproj \
+            -scheme IOSurfaceEvidenceLab \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/asan-build" \
+            -enableAddressSanitizer YES \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS='DEBUG ASAN_LAB' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build
+      - name: Package unsigned ASan IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/asan-pkg/Payload"
+          cp -R "$RUNNER_TEMP/asan-build/Build/Products/Debug-iphoneos/IOSurfaceEvidenceLab.app" "$RUNNER_TEMP/asan-pkg/Payload/"
+          (cd "$RUNNER_TEMP/asan-pkg" && zip -qr "$GITHUB_WORKSPACE/IOSurfaceEvidenceLab-v4-ASan-unsigned.ipa" Payload)
+          unzip -t IOSurfaceEvidenceLab-v4-ASan-unsigned.ipa
+          shasum -a 256 IOSurfaceEvidenceLab-v4-ASan-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IOSurfaceEvidenceLab-v4-ASan-unsigned
+          path: IOSurfaceEvidenceLab-v4-ASan-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14

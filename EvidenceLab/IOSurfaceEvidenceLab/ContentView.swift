@@ -7,6 +7,7 @@ private struct SharedFile: Identifiable {
 }
 
 struct ContentView: View {
+    @State private var overflowArmed = false
     @State private var report: ProbeReport?
     @State private var campaign: CampaignReport?
     @State private var ownership: OwnershipReport?
@@ -140,6 +141,40 @@ struct ContentView: View {
                 .navigationTitle("Auditar registro")
             }
             .tabItem { Label("Registro", systemImage: "doc.text.magnifyingglass") }
+
+            NavigationStack {
+                Form {
+                    Section("Demo de memoria de usuario") {
+                        Text("Se asignan exactamente 8 bytes. La prueba segura comprueba que el noveno no pertenece a la asignación. No se toca IOSurface ni el kernel.")
+                        Button("Comprobar límite sin escribir fuera") {
+                            overflowArmed = false
+                        }
+                        LabeledContent("Capacidad", value: "8 bytes")
+                        LabeledContent("Índice 8", value: "Fuera del bloque")
+                    }
+                    Section("Prueba real instrumentada") {
+                        Text("Solo en esta compilación con AddressSanitizer. Si se pulsa ejecutar, una escritura intencional en el byte 9 debería producir heap-buffer-overflow y cerrar la app. Puede requerir capturar el registro del dispositivo para obtener la evidencia ASan.")
+                            .font(.footnote)
+                        Button("Activar prueba con cierre deliberado", role: .destructive) {
+                            overflowArmed = true
+                        }
+                    }
+                }
+                .navigationTitle("Memoria ASan")
+                .alert("Prueba de desbordamiento", isPresented: $overflowArmed) {
+                    Button("Cancelar", role: .cancel) { overflowArmed = false }
+                    Button("Ejecutar prueba", role: .destructive) {
+                        overflowArmed = false
+                        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "asanTriggeredAt")
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            MemoryASanDemo.trigger()
+                        }
+                    }
+                } message: {
+                    Text("La aplicación puede cerrarse abruptamente. Es una prueba de memoria de esta app, no una vulnerabilidad de iOS ni un bypass SPTM.")
+                }
+            }
+            .tabItem { Label("Memoria", systemImage: "memorychip") }
         }
         .sheet(item: $sharedFile) { file in ShareSheet(file: file.url) }
         .alert("No se pudo exportar", isPresented: Binding(
