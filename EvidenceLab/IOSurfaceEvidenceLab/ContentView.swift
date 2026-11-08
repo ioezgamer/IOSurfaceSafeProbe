@@ -9,6 +9,7 @@ private struct SharedFile: Identifiable {
 struct ContentView: View {
     @State private var report: ProbeReport?
     @State private var campaign: CampaignReport?
+    @State private var ownership: OwnershipReport?
     @State private var campaignRunning = false
     @State private var logInput = ""
     @State private var findings: [AuditFinding] = []
@@ -36,7 +37,30 @@ struct ContentView: View {
                                 }
                             }
                         }.disabled(campaignRunning)
+                        Button(campaignRunning ? "Ejecutando..." : "Experimento de IDs simultaneos v3") {
+                            campaignRunning = true
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let result = OwnershipExperiment.execute()
+                                DispatchQueue.main.async {
+                                    ownership = result
+                                    campaignRunning = false
+                                }
+                            }
+                        }.disabled(campaignRunning)
                     } header: { Text("Prueba local") }
+
+                    if let ownership {
+                        Section("Experimento controlado v3") {
+                            LabeledContent("Creadas", value: String(ownership.totalCreated))
+                            LabeledContent("Colisiones con IDs activos", value: String(ownership.activeIDCollisions))
+                            LabeledContent("IDs recuperados", value: String(ownership.reusedReleasedIDs))
+                            LabeledContent("Lecturas correctas", value: String(ownership.verifiedReads))
+                            LabeledContent("Errores", value: String(ownership.errors.count))
+                            Text("Un ID recuperado tras liberar el objeto es compatible con reciclaje normal. Solo una colision entre objetos simultaneamente vivos seria una inconsistencia de identidad que merece verificacion.")
+                                .font(.footnote)
+                            Button("Exportar evidencia v3 JSON") { export(ownership) }
+                        }
+                    }
 
                     if let campaign {
                         Section("Campaña de ciclo de vida") {
