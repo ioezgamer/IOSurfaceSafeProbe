@@ -8,6 +8,7 @@ private struct SharedFile: Identifiable {
 
 struct ContentView: View {
     @State private var overflowArmed = false
+    @State private var stressReport: StressReport?
     @State private var report: ProbeReport?
     @State private var campaign: CampaignReport?
     @State private var ownership: OwnershipReport?
@@ -28,6 +29,16 @@ struct ContentView: View {
                             report = ProbeRunner.run()
                         }
                         .buttonStyle(.borderedProminent)
+                        Button(campaignRunning ? "Ejecutando..." : "Prueba real de estrés IOSurface v5") {
+                            campaignRunning = true
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let result = SurfaceStressTest.run()
+                                DispatchQueue.main.async {
+                                    stressReport = result
+                                    campaignRunning = false
+                                }
+                            }
+                        }.disabled(campaignRunning)
                         Button(campaignRunning ? "Ejecutando..." : "Campaña de 20 ciclos") {
                             campaignRunning = true
                             DispatchQueue.global(qos: .userInitiated).async {
@@ -50,6 +61,19 @@ struct ContentView: View {
                         }.disabled(campaignRunning)
                     } header: { Text("Prueba local") }
 
+                    if let stressReport {
+                        Section("Estrés real v5") {
+                            LabeledContent("Operaciones", value: String(stressReport.operations))
+                            LabeledContent("Creaciones", value: String(stressReport.created))
+                            LabeledContent("Lecturas correctas", value: String(stressReport.verified))
+                            LabeledContent("Errores", value: String(stressReport.errors.count))
+                            LabeledContent("Duración (ms)", value: String(format: "%.2f", Double(stressReport.elapsedNanoseconds) / 1_000_000))
+                            LabeledContent("Hilos", value: String(stressReport.workers))
+                            Text("Prueba concurrente sobre IOSurface propios. No accede a memoria arbitraria del kernel ni ejecuta un exploit.")
+                                .font(.footnote)
+                            Button("Exportar estrés v5 JSON") { export(stressReport) }
+                        }
+                    }
                     if let ownership {
                         Section("Experimento controlado v3") {
                             LabeledContent("Creadas", value: String(ownership.totalCreated))
