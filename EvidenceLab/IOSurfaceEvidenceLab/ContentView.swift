@@ -8,6 +8,9 @@ private struct SharedFile: Identifiable {
 
 struct ContentView: View {
     @State private var overflowArmed = false
+    @State private var protectionReport: ProtectionReport?
+    @State private var showCrashConfirmation = false
+    @State private var priorCrashMarker = ProcessProtectionLab.pendingCrashMarker()
     @State private var stressReport: StressReport?
     @State private var matrixReport: MatrixReport?
     @State private var report: ProbeReport?
@@ -23,6 +26,33 @@ struct ContentView: View {
         TabView {
             NavigationStack {
                 Form {
+                    Section("Protección de memoria v7 (proceso propio)") {
+                        Text("Demostración real de páginas y permisos de memoria. No es un exploit del kernel.")
+                            .font(.subheadline)
+                        Button("Ejecutar demostración sin cierre") {
+                            protectionReport = ProcessProtectionLab.run()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        if let protectionReport {
+                            LabeledContent("Tamaño de página", value: String(protectionReport.pageSize))
+                            LabeledContent("Protección aplicada", value: protectionReport.protectionApplied ? "Sí" : "No")
+                            LabeledContent("Acceso restaurado", value: protectionReport.accessRestored ? "Sí" : "No")
+                            LabeledContent("Integridad verificada", value: protectionReport.integrityVerified ? "Sí" : "No")
+                            Text(protectionReport.detail).font(.caption)
+                            Button("Exportar JSON v7") { export(protectionReport) }
+                        }
+                        if priorCrashMarker {
+                            Text("Se inició una prueba de cierre en una ejecución anterior. Consultá el informe .ips del proceso en Ajustes > Privacidad y seguridad > Análisis y mejoras > Datos del análisis.")
+                                .font(.footnote)
+                            Button("Borrar marcador") {
+                                ProcessProtectionLab.clearCrashMarker()
+                                priorCrashMarker = false
+                            }
+                        }
+                        Button("Provocar cierre de la app en una página protegida") {
+                            showCrashConfirmation = true
+                        }.tint(.red)
+                    }
                     Section {
                         Text("Verificacion de APIs publicas sobre un buffer IOSurface propio. No intenta vulnerar iOS.")
                             .font(.subheadline)
@@ -237,6 +267,14 @@ struct ContentView: View {
                 }
             }
             .tabItem { Label("Memoria", systemImage: "memorychip") }
+        }
+        .confirmationDialog("Este experimento cerrará la aplicación", isPresented: $showCrashConfirmation, titleVisibility: .visible) {
+            Button("Provocar cierre de la aplicación", role: .destructive) {
+                ProcessProtectionLab.triggerProtectedPageFault()
+            }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("Se intentará escribir en una página PROT_NONE del proceso de la app. No modifica memoria del kernel. Guardá tus datos antes.")
         }
         .sheet(item: $sharedFile) { file in ShareSheet(file: file.url) }
         .alert("No se pudo exportar", isPresented: Binding(
