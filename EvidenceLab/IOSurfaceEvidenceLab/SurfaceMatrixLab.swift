@@ -93,7 +93,7 @@ enum SurfaceMatrixLab {
                     let minimum = Int(w) * Int(h) * 4
                     guard actualWidth == Int(w), actualHeight == Int(h),
                           bytesPerRow >= Int(w) * 4,
-                          actualSize >= minimum else {
+                          actualSize >= minimum, actualSize >= 4 else {
                         finish("FAIL", "Dimension/stride/allocation invariant failed; stride \(bytesPerRow)", actualSize, id)
                         return
                     }
@@ -101,11 +101,18 @@ enum SurfaceMatrixLab {
                         finish("FAIL", "Could not lock owned pixels", actualSize, id)
                         return
                     }
-                    let marker = UInt64(sequence + 1) ^ 0x9473D812C56FA209
+                    let marker = UInt32(truncatingIfNeeded: sequence + 1) ^ 0x9473D812
                     let buffer = IOSurfaceGetBaseAddress(owner)
-                    buffer.storeBytes(of: marker, as: UInt64.self)
-                    let endOffset = actualSize - MemoryLayout<UInt64>.size
-                    buffer.advanced(by: endOffset).storeBytes(of: marker ^ 0xA55A55A5, as: UInt64.self)
+                    let endOffset = (Int(h) - 1) * bytesPerRow + (Int(w) - 1) * 4
+                    guard endOffset >= 0, endOffset + 4 <= actualSize else {
+                        IOSurfaceUnlock(owner, [], nil)
+                        finish("FAIL", "Last logical pixel exceeds allocation", actualSize, id)
+                        return
+                    }
+                    buffer.storeBytes(of: marker, as: UInt32.self)
+                    if endOffset != 0 {
+                        buffer.advanced(by: endOffset).storeBytes(of: marker ^ 0xA55A55A5, as: UInt32.self)
+                    }
                     if IOSurfaceUnlock(owner, [], nil) != 0 {
                         finish("FAIL", "Unlock of owner failed", actualSize, id)
                         return
@@ -119,10 +126,11 @@ enum SurfaceMatrixLab {
                         return
                     }
                     let base = IOSurfaceGetBaseAddress(second)
-                    let first = base.load(as: UInt64.self)
-                    let last = base.advanced(by: endOffset).load(as: UInt64.self)
+                    let first = base.load(as: UInt32.self)
+                    let last = base.advanced(by: endOffset).load(as: UInt32.self)
                     let secondUnlock = IOSurfaceUnlock(second, [], nil)
-                    if first == marker && last == marker ^ 0xA55A55A5 && secondUnlock == 0 {
+                    let expectedLast = endOffset == 0 ? marker : marker ^ 0xA55A55A5
+                    if first == marker && last == expectedLast && secondUnlock == 0 {
                         finish("PASS", "Dimensions, stride, first/last token and valid lookup verified; stride \(bytesPerRow)", actualSize, id)
                     } else {
                         finish("FAIL", "Owned buffer tokens or unlock diverged", actualSize, id)
@@ -139,7 +147,7 @@ enum SurfaceMatrixLab {
             elapsedNanoseconds: DispatchTime.now().uptimeNanoseconds &- start,
             limitations: [
                 "Expected min allocation is logical pixel count; stride may require additional padding.",
-                "The test writes first and last 8 bytes of a valid IOSurface pixel buffer.",
+                "The test writes 4-byte markers into the first and last logical pixels.",
                 "No kernel memory instrumentation, UAF, kernel write or SPTM bypass is attempted.",
                 "Unexpected results need repeat tests and independent system logs."
             ])
