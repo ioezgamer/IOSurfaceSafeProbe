@@ -8,6 +8,8 @@ private struct SharedFile: Identifiable {
 
 struct ContentView: View {
     @State private var report: ProbeReport?
+    @State private var campaign: CampaignReport?
+    @State private var campaignRunning = false
     @State private var logInput = ""
     @State private var findings: [AuditFinding] = []
     @State private var sharedFile: SharedFile?
@@ -24,7 +26,30 @@ struct ContentView: View {
                             report = ProbeRunner.run()
                         }
                         .buttonStyle(.borderedProminent)
+                        Button(campaignRunning ? "Ejecutando..." : "Campaña de 20 ciclos") {
+                            campaignRunning = true
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let result = CampaignReport.execute()
+                                DispatchQueue.main.async {
+                                    campaign = result
+                                    campaignRunning = false
+                                }
+                            }
+                        }.disabled(campaignRunning)
                     } header: { Text("Prueba local") }
+
+                    if let campaign {
+                        Section("Campaña de ciclo de vida") {
+                            LabeledContent("Ciclos", value: String(campaign.runs.count))
+                            LabeledContent("Creaciones", value: String(campaign.created))
+                            LabeledContent("Lecturas correctas", value: String(campaign.verified))
+                            LabeledContent("IDs no resueltos tras cierre", value: String(campaign.unresolvedAfterScope))
+                            LabeledContent("Fallos o ausencias", value: String(campaign.failedOrUnavailable))
+                            Text("Solo son comprobaciones de buffers propios. Esto no demuestra un UAF de kernel ni un bypass SPTM.")
+                                .font(.footnote)
+                            Button("Exportar campaña JSON") { export(campaign) }
+                        }
+                    }
 
                     if let report {
                         Section("Resultados") {
@@ -100,7 +125,7 @@ struct ContentView: View {
         }
     }
 
-    private func export(_ report: ProbeReport) {
+    private func export<T: Encodable>(_ report: T) {
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -122,4 +147,36 @@ private struct ShareSheet: UIViewControllerRepresentable {
         UIActivityViewController(activityItems: [file], applicationActivities: nil)
     }
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private struct CampaignReport: Encodable {
+    let schema = "iosurface-evidence-lab/campaign-v2"
+    let timestamp: Date
+    let runs: [ProbeReport]
+    let created: Int
+    let verified: Int
+    let unresolvedAfterScope: Int
+    let failedOrUnavailable: Int
+
+    static func execute() -> CampaignReport {
+        var runs: [ProbeReport] = []
+        for _ in 0..<20 {
+            runs.append(ProbeRunner.run())
+        }
+        func count(_ key: String, _ state: String) -> Int {
+            runs.filter { run in
+                run.steps.contains { $0.id == key && $0.result == state }
+            }.count
+        }
+        let failed = runs.reduce(0) { total, run in
+            total + run.steps.filter { $0.result == "FAIL" || $0.result == "UNAVAILABLE" }.count
+        }
+        return CampaignReport(timestamp: Date(), runs: runs,
+            created: count("iosurface_create", "PASS"),
+            verified: count("read_owned_buffer", "PASS"),
+            unresolvedAfterScope: runs.filter {
+                $0.steps.contains { $0.id == "lookup_after_scope" && $0.detail.hasPrefix("El ID ya no") }
+            }.count,
+            failedOrUnavailable: failed)
+    }
 }
