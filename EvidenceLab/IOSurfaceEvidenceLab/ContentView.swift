@@ -9,6 +9,8 @@ private struct SharedFile: Identifiable {
 
 struct ContentView: View {
     @State private var overflowArmed = false
+    @State private var invariantRunning = false
+    @State private var invariantReport: InvariantCampaignReport?
     @State private var kernelEvidence: KernelEvidenceReport?
     @State private var importPanic = false
     @State private var protectionReport: ProtectionReport?
@@ -29,6 +31,32 @@ struct ContentView: View {
         TabView {
             NavigationStack {
                 Form {
+                    Section("Experimento de invariantes v9") {
+                        Text("Superficies testigo permanecen activas mientras cuatro trabajadores crean y liberan superficies independientes. La primera discrepancia detiene nuevas operaciones.")
+                            .font(.subheadline)
+                        Button(invariantRunning ? "Ejecutando..." : "Ejecutar campaña de integridad v9") {
+                            invariantRunning = true
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let result = PersistentInvariantLab.run()
+                                DispatchQueue.main.async {
+                                    invariantReport = result
+                                    invariantRunning = false
+                                }
+                            }
+                        }.disabled(invariantRunning)
+                        .buttonStyle(.borderedProminent)
+                        if let invariantReport {
+                            LabeledContent("Testigos mantenidos", value: String(invariantReport.sentinels))
+                            LabeledContent("Operaciones de cambio", value: String(invariantReport.churnCompleted))
+                            LabeledContent("Revisiones de testigos", value: String(invariantReport.sentinelChecks))
+                            LabeledContent("Resultado", value: invariantReport.verdict)
+                            LabeledContent("Duración (ms)", value: String(format: "%.2f", Double(invariantReport.elapsedNanoseconds) / 1_000_000))
+                            if let first = invariantReport.firstAnomaly {
+                                Text(first).font(.caption).foregroundStyle(.red)
+                            }
+                            Button("Exportar campaña v9 JSON") { export(invariantReport) }
+                        }
+                    }
                     Section("Kernel Evidence v8") {
                         Text("Reinicios reales y análisis de informes panic-full. No confunde fallos de la aplicación con fallos del kernel.")
                             .font(.subheadline)
