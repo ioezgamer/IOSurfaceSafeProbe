@@ -4,6 +4,8 @@
 //
 //  Reads App Groups from the app's signed entitlements at runtime
 //  using Security.framework (SecTaskCopyValueForEntitlement).
+//  Falls back to hardcoded group for TrollStore installs where
+//  the sideloader's runtime entitlements differ from embedded ones.
 //
 
 #import <Foundation/Foundation.h>
@@ -11,77 +13,77 @@
 #include <dlfcn.h>
 #include "WorseQueryGroup.h"
 
-// SecTask functions may not be declared in public iOS SDK headers.
 typedef void *SecTaskRef;
 extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef allocator);
 extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
 
+static NSString *const kHardcodedGroup = @"group.com.ioezgamer.cachewipe";
+
 static NSString *_cachedGroup = nil;
 static NSArray<NSString *> *_cachedSignatureGroups = nil;
 static BOOL _cacheValid = NO;
+static BOOL _usingSideloaderGroups = NO;
+
+static BOOL _isSideloaderGroup(NSString *group) {
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^group\\.[0-9a-f]{16}\\." options:0 error:nil];
+    NSRange range = NSMakeRange(0, group.length);
+    return [regex numberOfMatchesInString:group options:0 range:range] > 0;
+}
 
 static void _loadSignatureGroups(void) {
     if (_cacheValid) return;
 
     _cachedGroup = nil;
     _cachedSignatureGroups = nil;
-
-    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
-    if (!task) {
-        NSLog(@"[WorseQueryGroup] SecTaskCreateFromSelf failed");
-        _cacheValid = YES;
-        return;
-    }
-
-    CFErrorRef error = NULL;
-    CFTypeRef value = SecTaskCopyValueForEntitlement(
-        task,
-        CFSTR("com.apple.security.application-groups"),
-        &error
-    );
-    CFRelease(task);
-
-    if (error) {
-        NSLog(@"[WorseQueryGroup] SecTaskCopyValueForEntitlement error: %@", (__bridge NSError *)error);
-        CFRelease(error);
-        _cacheValid = YES;
-        return;
-    }
-
-    if (!value) {
-        NSLog(@"[WorseQueryGroup] No application-groups entitlement in signature");
-        _cacheValid = YES;
-        return;
-    }
-
-    if (CFGetTypeID(value) != CFArrayGetTypeID()) {
-        NSLog(@"[WorseQueryGroup] Unexpected entitlement type");
-        CFRelease(value);
-        _cacheValid = YES;
-        return;
-    }
-
-    NSArray *groups = (__bridge_transfer NSArray *)value;
-    _cachedSignatureGroups = groups;
-
-    NSLog(@"[WorseQueryGroup] Signature groups: %@", groups);
+    _usingSideloaderGroups = NO;
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *group in groups) {
-        NSURL *container = [fm containerURLForSecurityApplicationGroupIdentifier:group];
-        if (container) {
-            _cachedGroup = group;
-            NSLog(@"[WorseQueryGroup] Using group: %@ (container: %@)", group, container.path);
-            break;
-        } else {
-            NSLog(@"[WorseQueryGroup] Group %@ has no container, skipping", group);
+    NSMutableArray<NSString *> *allGroups = [NSMutableArray array];
+
+    // 1) Try hardcoded group first (works when installed via TrollStore)
+    NSURL *hardcodedContainer = [fm containerURLForSecurityApplicationGroupIdentifier:kHardcodedGroup];
+    if (hardcodedContainer) {
+        NSLog(@"[WorseQueryGroup] Hardcoded group OK: %@ -> %@", kHardcodedGroup, hardcodedContainer.path);
+        _cachedGroup = kHardcodedGroup;
+        [allGroups addObject:kHardcodedGroup];
+    } else {
+        NSLog(@"[WorseQueryGroup] Hardcoded group %@ has no container (not installed via TrollStore?)", kHardcodedGroup);
+    }
+
+    // 2) Read groups from code signature
+    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (task) {
+        CFErrorRef error = NULL;
+        CFTypeRef value = SecTaskCopyValueForEntitlement(task, CFSTR("com.apple.security.application-groups"), &error);
+        CFRelease(task);
+        if (error) { CFRelease(error); error = NULL; }
+
+        if (value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+            NSArray *signedGroups = (__bridge_transfer NSArray *)value;
+            NSLog(@"[WorseQueryGroup] Signed groups: %@", signedGroups);
+
+            for (NSString *group in signedGroups) {
+                if ([group isEqualToString:kHardcodedGroup]) continue;
+                if (_isSideloaderGroup(group)) {
+                    _usingSideloaderGroups = YES;
+                    NSLog(@"[WorseQueryGroup] WARNING: Sideloader group detected: %@", group);
+                }
+                NSURL *container = [fm containerURLForSecurityApplicationGroupIdentifier:group];
+                if (container) {
+                    [allGroups addObject:group];
+                    if (!_cachedGroup) _cachedGroup = group;
+                }
+            }
+        } else if (value) {
+            CFRelease(value);
         }
     }
 
-    if (!_cachedGroup) {
-        NSLog(@"[WorseQueryGroup] No usable App Group found in %lu signed groups", (unsigned long)groups.count);
+    if (_usingSideloaderGroups && !hardcodedContainer) {
+        NSLog(@"[WorseQueryGroup] ERROR: Only sideloader groups found. Install via TrollStore for the exploit to work.");
     }
 
+    _cachedSignatureGroups = [allGroups copy];
     _cacheValid = YES;
 }
 
@@ -99,4 +101,10 @@ void KMWorseQueryResetGroupCache(void) {
     _cachedGroup = nil;
     _cachedSignatureGroups = nil;
     _cacheValid = NO;
+    _usingSideloaderGroups = NO;
+}
+
+BOOL KMWorseQueryUsingSideloaderGroups(void) {
+    _loadSignatureGroups();
+    return _usingSideloaderGroups;
 }

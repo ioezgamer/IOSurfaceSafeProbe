@@ -21,4 +21,7 @@ NSArray<NSString *> * _Nullable KMWorseQuerySignatureGroups(void);
 /// Clears the cached group so the next call re-reads from the signature.
 void KMWorseQueryResetGroupCache(void);
 
+/// Returns YES if only sideloader-generated groups were found (TrollStore needed).
+BOOL KMWorseQueryUsingSideloaderGroups(void);
+
 #endif

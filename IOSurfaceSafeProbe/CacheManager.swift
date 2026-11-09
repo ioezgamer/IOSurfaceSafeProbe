@@ -21,6 +21,7 @@ class CacheManager: ObservableObject {
     @Published var detectedGroup: String = "detecting..."
     @Published var signatureGroups: [String] = []
     @Published var workingGroup: String = "none yet"
+    @Published var needsTrollStore = false
 
     private let cachePaths = ["/var/mobile/Containers/Data/Application"]
 
@@ -28,11 +29,16 @@ class CacheManager: ObservableObject {
         KMWorseQueryResetGroupCache()
         let group = KMWorseQueryAppGroup()
         let allGroups = KMWorseQuerySignatureGroups() as? [String] ?? []
+        let sideloaderDetected = KMWorseQueryUsingSideloaderGroups()
         detectedGroup = group ?? "none"
         signatureGroups = allGroups
+        needsTrollStore = sideloaderDetected
+        if sideloaderDetected {
+            print("[AppGroup] WARNING: Sideloader groups detected - install via TrollStore!")
+        }
         if let g = group {
             print("[AppGroup] Primary: \(g)")
-            print("[AppGroup] All signed: \(allGroups.joined(separator: ", "))")
+            print("[AppGroup] All: \(allGroups.joined(separator: ", "))")
         } else {
             print("[AppGroup] ERROR: No usable App Group found")
         }
