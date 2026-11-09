@@ -13,6 +13,7 @@
 #include <stdbool.h>
 
 int64_t worse_query(NSString *path, NSString *group, bool alt_flags, bool create_dir);
+int64_t worse_query_issue_self(NSString *path);
 void worse_query_release(int64_t handle);
 
 #endif
