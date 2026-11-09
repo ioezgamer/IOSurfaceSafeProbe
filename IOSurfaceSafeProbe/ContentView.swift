@@ -36,22 +36,6 @@ struct ContentView: View {
                 }
                 .listRowBackground(Color.clear)
 
-                if cache.needsTrollStore {
-                    Section {
-                        HStack(spacing: 10) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.yellow)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("TrollStore Required")
-                                    .font(.headline)
-                                Text("Sideloader groups detected. The exploit only works when installed via TrollStore, which preserves the app's entitlements.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
                 
                 // Actions
                 Section {
