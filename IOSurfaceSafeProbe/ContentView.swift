@@ -2,8 +2,6 @@
 //  ContentView.swift
 //  IOSurfaceSafeProbe
 //
-//  Cache cleaner UI
-//
 
 import SwiftUI
 
@@ -11,7 +9,6 @@ struct ContentView: View {
     @StateObject private var cache = CacheManager()
     @StateObject private var console = Console()
     @State private var showLog = false
-    @AppStorage("cachewipe.appGroupOverride") private var appGroupOverride = ""
     
     var body: some View {
         NavigationStack {
@@ -37,6 +34,19 @@ struct ContentView: View {
                 }
                 .listRowBackground(Color.clear)
                 
+                // App Group info
+                Section("App Group") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Active: \(cache.detectedGroup)")
+                            .font(.system(.caption, design: .monospaced))
+                        if !cache.signatureGroups.isEmpty {
+                            Text("Signed groups: \(cache.signatureGroups.joined(separator: ", "))")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                
                 // Actions
                 Section {
                     Button {
@@ -44,7 +54,7 @@ struct ContentView: View {
                     } label: {
                         Label("Scan Caches", systemImage: "magnifyingglass")
                     }
-                    .disabled(cache.isScanning || cache.isCleaning)
+                    .disabled(cache.isScanning || cache.isCleaning || cache.detectedGroup == "none")
                     
                     Button(role: .destructive) {
                         cache.cleanSelected()
@@ -54,42 +64,29 @@ struct ContentView: View {
                     .disabled(cache.apps.isEmpty || cache.isCleaning || cache.isScanning)
                 }
                 
-                // Optional override when the signed IPA does not expose a readable profile.
-                Section("App Group (SideStore)") {
-                    TextField("Optional signed group identifier", text: $appGroupOverride)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.system(.footnote, design: .monospaced))
-                    Text("Leave blank for automatic detection. Enter an App Group actually granted to CacheWipe, not SideStore's own group.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
                 // App list
                 if !cache.apps.isEmpty {
                     Section("Apps (\(cache.apps.count))") {
                         ForEach(Array(cache.apps.enumerated()), id: \.element.id) { index, app in
-                            HStack {
-                                Toggle(isOn: Binding(
-                                    get: { cache.apps[index].selected },
-                                    set: { cache.apps[index].selected = $0 }
-                                )) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(app.bundleID)
-                                            .font(.system(.body, design: .monospaced))
-                                            .lineLimit(1)
-                                        Text(app.formattedSize)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
+                            Toggle(isOn: Binding(
+                                get: { cache.apps[index].selected },
+                                set: { cache.apps[index].selected = $0 }
+                            )) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(app.bundleID)
+                                        .font(.system(.body, design: .monospaced))
+                                        .lineLimit(1)
+                                    Text(app.formattedSize)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
-                                .toggleStyle(.switch)
                             }
+                            .toggleStyle(.switch)
                         }
                     }
                 }
                 
-                // Freed space result
+                // Freed space
                 if cache.freedSpace > 0 {
                     Section {
                         HStack {
@@ -101,7 +98,7 @@ struct ContentView: View {
                     }
                 }
                 
-                // Log toggle
+                // Console
                 Section {
                     DisclosureGroup("Console Log", isExpanded: $showLog) {
                         ScrollView {
@@ -125,6 +122,7 @@ struct ContentView: View {
             }
             .onAppear {
                 console.start()
+                cache.detectGroup()
             }
             .overlay {
                 if cache.isScanning {
@@ -144,8 +142,4 @@ struct ContentView: View {
             }
         }
     }
-}
-
-#Preview {
-    ContentView()
 }

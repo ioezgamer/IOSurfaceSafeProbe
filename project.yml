@@ -4,7 +4,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     CODE_SIGNING_ALLOWED: "NO"
     TARGETED_DEVICE_FAMILY: "1"
 targets:
@@ -15,11 +15,14 @@ targets:
       - IOSurfaceSafeProbe
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.iosurface.research.safeprobe
+        PRODUCT_BUNDLE_IDENTIFIER: com.ioezgamer.IOSurfaceSafeProbe
         GENERATE_INFOPLIST_FILE: "YES"
-        INFOPLIST_KEY_CFBundleDisplayName: "IOSurface Probe"
+        SWIFT_OBJC_BRIDGING_HEADER: IOSurfaceSafeProbe/IOSurfaceSafeProbe-Bridging-Header.h
+        CODE_SIGN_ENTITLEMENTS: IOSurfaceSafeProbe/IOSurfaceSafeProbe.entitlements
+        INFOPLIST_KEY_CFBundleDisplayName: "CacheWipe"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
     dependencies:
       - sdk: IOSurface.framework
+      - sdk: Security.framework

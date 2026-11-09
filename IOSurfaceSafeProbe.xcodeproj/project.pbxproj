@@ -14,6 +14,8 @@
 		A10005 /* worse_query.m in Sources */ = {isa = PBXBuildFile; fileRef = B10005; };
 		A10006 /* pathleak.m in Sources */ = {isa = PBXBuildFile; fileRef = B10006; };
 		A10007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10007; };
+		A10008 /* WorseQueryGroup.m in Sources */ = {isa = PBXBuildFile; fileRef = B10013; };
+		A10009 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B10014; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +30,9 @@
 		B10009 /* pathleak.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = pathleak.h; sourceTree = "<group>"; };
 		B10010 /* IOSurfaceSafeProbe-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IOSurfaceSafeProbe-Bridging-Header.h"; sourceTree = "<group>"; };
 		B10011 /* IOSurfaceSafeProbe.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = IOSurfaceSafeProbe.entitlements; sourceTree = "<group>"; };
+		B10012 /* WorseQueryGroup.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WorseQueryGroup.h; sourceTree = "<group>"; };
+		B10013 /* WorseQueryGroup.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WorseQueryGroup.m; sourceTree = "<group>"; };
+		B10014 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		B10099 /* IOSurfaceSafeProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IOSurfaceSafeProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -36,6 +41,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10009 /* Security.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -46,6 +52,7 @@
 			isa = PBXGroup;
 			children = (
 				G10002 /* IOSurfaceSafeProbe */,
+				G10004 /* Frameworks */,
 				G10003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -62,6 +69,8 @@
 				B10009 /* pathleak.h */,
 				B10006 /* pathleak.m */,
 				B10010 /* IOSurfaceSafeProbe-Bridging-Header.h */,
+				B10012 /* WorseQueryGroup.h */,
+				B10013 /* WorseQueryGroup.m */,
 				B10011 /* IOSurfaceSafeProbe.entitlements */,
 				B10007 /* Assets.xcassets */,
 			);
@@ -74,6 +83,14 @@
 				B10099 /* IOSurfaceSafeProbe.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		G10004 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				B10014 /* Security.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -146,6 +163,7 @@
 				A10004 /* CacheManager.swift in Sources */,
 				A10005 /* worse_query.m in Sources */,
 				A10006 /* pathleak.m in Sources */,
+				A10008 /* WorseQueryGroup.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

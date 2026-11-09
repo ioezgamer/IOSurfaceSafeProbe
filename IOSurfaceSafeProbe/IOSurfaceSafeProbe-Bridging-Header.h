@@ -4,3 +4,4 @@
 
 #include "worse_query.h"
 #include "pathleak.h"
+#include "WorseQueryGroup.h"

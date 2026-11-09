@@ -2,7 +2,8 @@
 //  CacheManager.swift
 //  IOSurfaceSafeProbe
 //
-//  Handles scanning and cleaning of app caches via worse_query
+//  Handles scanning and cleaning of app caches via worse_query.
+//  App Group is detected automatically from the signed entitlements.
 //
 
 import Foundation
@@ -26,19 +27,43 @@ class CacheManager: ObservableObject {
     @Published var totalCacheSize: UInt64 = 0
     @Published var freedSpace: UInt64 = 0
     @Published var statusMessage = ""
+    @Published var detectedGroup: String = "detecting..."
+    @Published var signatureGroups: [String] = []
     
-    // Default requested by IOSurfaceSafeProbe.entitlements at build time.
-    // SideStore may replace the identifier when it re-signs the app.
-    private static let bundledAppGroup = "group.com.ioezgamer.iosurfacesafeprobe"
-    private static let appGroupOverrideKey = "cachewipe.appGroupOverride"
+    private var appGroup: String? {
+        return KMWorseQueryAppGroup()
+    }
     
     private let cachePaths = [
         "/var/mobile/Containers/Data/Application"
     ]
     
+    func detectGroup() {
+        KMWorseQueryResetGroupCache()
+        let group = KMWorseQueryAppGroup()
+        let allGroups = KMWorseQuerySignatureGroups() as? [String] ?? []
+        
+        detectedGroup = group ?? "none"
+        signatureGroups = allGroups
+        
+        if let g = group {
+            print("[AppGroup] Active: \(g)")
+        } else if allGroups.isEmpty {
+            print("[AppGroup] ERROR: No App Groups in signature. Re-sign with App Groups enabled.")
+        } else {
+            print("[AppGroup] ERROR: \(allGroups.count) groups in signature but none have a container.")
+        }
+    }
+    
     // MARK: - Scan
     
     func scanCaches() {
+        guard let group = appGroup else {
+            statusMessage = "No usable App Group"
+            print("[Scan] Cannot scan: no App Group available")
+            return
+        }
+        
         isScanning = true
         apps = []
         totalCacheSize = 0
@@ -46,17 +71,10 @@ class CacheManager: ObservableObject {
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            guard let group = self.resolveAccessibleAppGroup() else {
-                DispatchQueue.main.async {
-                    self.isScanning = false
-                    self.statusMessage = "No accessible App Group. Check SideStore signing or enter the signed App Group."
-                }
-                return
-            }
             var found: [AppCacheInfo] = []
-
+            
             for basePath in self.cachePaths {
-                let handle = self.consumeExtension(basePath, appGroup: group)
+                let handle = self.consumeExtension(basePath, group: group)
                 if handle < 0 {
                     print("[Scan] Failed to access: \(basePath) (error \(handle))")
                     continue
@@ -77,11 +95,8 @@ class CacheManager: ObservableObject {
                         guard resources?.isDirectory == true else { continue }
                         
                         let containerPath = containerURL.path
+                        let bundleID = self.getBundleID(at: containerPath)
                         
-                        // Get bundle ID from xattr
-                        let bundleID = self.getBundleID(at: containerPath, parentHandle: handle)
-                        
-                        // Calculate cache size
                         let cacheDirs = [
                             containerURL.appending(path: "Library/Caches"),
                             containerURL.appending(path: "tmp")
@@ -124,6 +139,7 @@ class CacheManager: ObservableObject {
     // MARK: - Clean
     
     func cleanSelected() {
+        guard let group = appGroup else { return }
         let toClean = apps.filter { $0.selected }
         guard !toClean.isEmpty else { return }
         
@@ -134,17 +150,10 @@ class CacheManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let fm = FileManager.default
-            guard let group = self.resolveAccessibleAppGroup() else {
-                DispatchQueue.main.async {
-                    self.isCleaning = false
-                    self.statusMessage = "No accessible App Group. Check SideStore signing or enter the signed App Group."
-                }
-                return
-            }
             var freed: UInt64 = 0
-
+            
             for app in toClean {
-                let handle = self.consumeExtension(app.path, appGroup: group)
+                let handle = self.consumeExtension(app.path, group: group)
                 if handle < 0 {
                     print("[Clean] Failed to access: \(app.bundleID)")
                     continue
@@ -158,13 +167,11 @@ class CacheManager: ObservableObject {
                 
                 for cacheDir in cacheDirs {
                     let sizeBefore = self.directorySize(at: cacheDir)
-                    
                     if let items = try? fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
                         for item in items {
                             try? fm.removeItem(at: item)
                         }
                     }
-                    
                     let sizeAfter = self.directorySize(at: cacheDir)
                     if sizeBefore > sizeAfter {
                         freed += (sizeBefore - sizeAfter)
@@ -179,9 +186,6 @@ class CacheManager: ObservableObject {
                 self.freedSpace = freed
                 self.isCleaning = false
                 self.statusMessage = "Freed \(ByteCountFormatter.string(fromByteCount: Int64(freed), countStyle: .file))"
-                print("[Clean] Total freed: \(ByteCountFormatter.string(fromByteCount: Int64(freed), countStyle: .file))")
-                
-                // Rescan
                 self.scanCaches()
             }
         }
@@ -189,61 +193,15 @@ class CacheManager: ObservableObject {
     
     // MARK: - Helpers
     
-    // Only select groups for which iOS actually grants this app a container URL.
-    // A provisioning profile is a candidate source, not proof of final signed permissions.
-    private func resolveAccessibleAppGroup() -> String? {
-        var candidates: [String] = []
-
-        if let manual = UserDefaults.standard.string(forKey: Self.appGroupOverrideKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !manual.isEmpty {
-            candidates.append(manual)
-        }
-
-        candidates.append(contentsOf: Self.groupsFromEmbeddedProvisioningProfile())
-        candidates.append(Self.bundledAppGroup)
-
-        var tried = Set<String>()
-        for candidate in candidates where tried.insert(candidate).inserted {
-            if FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: candidate
-            ) != nil {
-                print("[AppGroup] Accessible group: \(candidate)")
-                return candidate
-            }
-        }
-
-        print("[AppGroup] No accessible group. Candidates checked: \(tried.sorted().joined(separator: ", "))")
-        print("[AppGroup] Check the app's *signed* entitlements after SideStore re-signing.")
-        return nil
-    }
-
-    // embedded.mobileprovision is usually CMS with a plaintext plist payload.
-    // If SideStore does not embed a readable profile, use the manual override.
-    private static func groupsFromEmbeddedProvisioningProfile() -> [String] {
-        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
-              let data = try? Data(contentsOf: url),
-              let start = data.range(of: Data("<plist".utf8)),
-              let end = data.range(of: Data("</plist>".utf8),
-                                   in: start.upperBound..<data.endIndex),
-              let plist = try? PropertyListSerialization.propertyList(
-                from: data.subdata(in: start.lowerBound..<end.upperBound), format: nil
-              ),
-              let profile = plist as? [String: Any],
-              let entitlements = profile["Entitlements"] as? [String: Any],
-              let groups = entitlements["com.apple.security.application-groups"] as? [String]
-        else { return [] }
-        return groups.filter { !$0.isEmpty }
-    }
-
-    private func consumeExtension(_ path: String, appGroup: String) -> Int64 {
+    private func consumeExtension(_ path: String, group: String) -> Int64 {
         let isAppGroup = path.contains("/var/mobile/Containers/Shared/AppGroup")
         let isIOS26 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
         let altFlags = isAppGroup && isIOS26
         
-        return worse_query(path, appGroup, altFlags, false)
+        return worse_query(path, group, altFlags, false)
     }
     
-    private func getBundleID(at path: String, parentHandle: Int64) -> String? {
+    private func getBundleID(at path: String) -> String? {
         var buf = [CChar](repeating: 0, count: 512)
         let len = getxattr(path, "com.apple.containermanager.identifier", &buf, 511, 0, 0)
         if len > 0 {
