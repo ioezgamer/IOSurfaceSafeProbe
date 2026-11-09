@@ -38,96 +38,108 @@ class CacheManager: ObservableObject {
         }
     }
 
-    private func canAccessDirectly(_ path: String) -> Bool {
-        do {
-            let contents = try FileManager.default.contentsOfDirectory(atPath: path)
-            if !contents.isEmpty {
-                print("[Access] Direct access to \(path) OK (\(contents.count) items)")
-                return true
-            }
-        } catch {
-            print("[Access] No direct access to \(path): \(error.localizedDescription)")
-        }
-        return false
-    }
-
-    private func obtainAccess(_ path: String) -> (Int64, String) {
-        // Method 1: Direct access (TrollStore / unsandboxed / jailbroken)
-        if canAccessDirectly(path) {
-            return (0, "direct")
-        }
-
-        // Method 2: Container manager exploit with all group/flag/part combos
+    private func consumeExtensionTryingAllGroups(_ path: String) -> (Int64, String?) {
         let allGroups = KMWorseQuerySignatureGroups() as? [String] ?? []
+        let isAppGroup = path.contains("/var/mobile/Containers/Shared/AppGroup")
+        let isIOS26 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
+
+        // Try both flag combos for every group
         for altFlags in [false, true] {
+            let flagLabel = altFlags ? "alt" : "primary"
+            let effectiveAlt = (isAppGroup && isIOS26) ? !altFlags : altFlags
             for group in allGroups {
-                let handle = worse_query(path, group, altFlags, false)
+                let handle = worse_query(path, group, effectiveAlt, false)
                 if handle > 0 {
-                    print("[Exploit] SUCCESS group=\(group) altFlags=\(altFlags) handle=\(handle)")
-                    return (handle, "exploit:\(group)")
+                    print("[Exploit] SUCCESS group=\(group) flags=\(flagLabel) handle=\(handle)")
+                    return (handle, group)
                 }
-                print("[Exploit] group=\(group) altFlags=\(altFlags) err=\(handle)")
+                print("[Exploit] group=\(group) flags=\(flagLabel) err=\(handle)")
             }
         }
-
-        // Method 3: sandbox_extension_issue_file_to_self
-        let selfHandle = worse_query_issue_self(path)
-        if selfHandle > 0 {
-            print("[Fallback] issue_file_to_self succeeded handle=\(selfHandle)")
-            return (selfHandle, "issue_self")
-        }
-
-        return (-1, "none")
+        return (-6, nil)
     }
 
     func scanCaches() {
+        let allGroups = KMWorseQuerySignatureGroups() as? [String] ?? []
+        guard !allGroups.isEmpty else {
+            // No groups from entitlements - try issue_file_to_self directly
+            statusMessage = "No App Groups, trying fallback..."
+            isScanning = true; apps = []; totalCacheSize = 0
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                var found: [AppCacheInfo] = []
+                for basePath in self.cachePaths {
+                    let handle = worse_query_issue_self(basePath)
+                    if handle <= 0 {
+                        print("[Scan] issue_self failed for \(basePath): \(handle)")
+                        continue
+                    }
+                    print("[Scan] issue_self succeeded for \(basePath)")
+                    found += self.scanContainers(basePath: basePath)
+                    worse_query_release(handle)
+                }
+                self.finishScan(found)
+            }
+            return
+        }
+
         isScanning = true; apps = []; totalCacheSize = 0
-        statusMessage = "Scanning..."
+        statusMessage = "Scanning (\(allGroups.count) groups)..."
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             var found: [AppCacheInfo] = []
             for basePath in self.cachePaths {
-                let (handle, method) = self.obtainAccess(basePath)
-                if handle < 0 {
-                    print("[Scan] All methods failed for: \(basePath)")
-                    DispatchQueue.main.async { self.statusMessage = "Access denied: \(basePath)" }
-                    continue
-                }
-
-                DispatchQueue.main.async {
-                    self.workingGroup = method
-                    self.statusMessage = "Scanning via \(method)..."
-                }
-
-                let fm = FileManager.default
-                let baseURL = URL(filePath: basePath)
-                do {
-                    let containers = try fm.contentsOfDirectory(at: baseURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
-                    for containerURL in containers {
-                        let resources = try? containerURL.resourceValues(forKeys: [.isDirectoryKey])
-                        guard resources?.isDirectory == true else { continue }
-                        let containerPath = containerURL.path
-                        let bundleID = self.getBundleID(at: containerPath)
-                        var size: UInt64 = 0
-                        for sub in ["Library/Caches", "tmp"] {
-                            size += self.directorySize(at: containerURL.appending(path: sub))
-                        }
-                        if size > 0 {
-                            found.append(AppCacheInfo(bundleID: bundleID ?? containerURL.lastPathComponent, path: containerPath, cacheSize: size))
-                        }
+                let (handle, usedGroup) = self.consumeExtensionTryingAllGroups(basePath)
+                if handle > 0 {
+                    DispatchQueue.main.async { self.workingGroup = usedGroup ?? "unknown" }
+                    found += self.scanContainers(basePath: basePath)
+                    worse_query_release(handle)
+                } else {
+                    // Fallback: try issue_file_to_self
+                    let selfHandle = worse_query_issue_self(basePath)
+                    if selfHandle > 0 {
+                        print("[Scan] Fallback issue_self succeeded for \(basePath)")
+                        DispatchQueue.main.async { self.workingGroup = "issue_self" }
+                        found += self.scanContainers(basePath: basePath)
+                        worse_query_release(selfHandle)
+                    } else {
+                        print("[Scan] All methods failed for: \(basePath)")
                     }
-                } catch {
-                    print("[Scan] Error listing \(basePath): \(error)")
                 }
+            }
+            self.finishScan(found)
+        }
+    }
 
-                if handle > 0 { worse_query_release(handle) }
+    private func scanContainers(basePath: String) -> [AppCacheInfo] {
+        var found: [AppCacheInfo] = []
+        let fm = FileManager.default
+        let baseURL = URL(filePath: basePath)
+        do {
+            let containers = try fm.contentsOfDirectory(at: baseURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+            for containerURL in containers {
+                let resources = try? containerURL.resourceValues(forKeys: [.isDirectoryKey])
+                guard resources?.isDirectory == true else { continue }
+                let containerPath = containerURL.path
+                let bundleID = getBundleID(at: containerPath)
+                var size: UInt64 = 0
+                for sub in ["Library/Caches", "tmp"] {
+                    size += directorySize(at: containerURL.appending(path: sub))
+                }
+                if size > 0 {
+                    found.append(AppCacheInfo(bundleID: bundleID ?? containerURL.lastPathComponent, path: containerPath, cacheSize: size))
+                }
             }
-            found.sort { $0.cacheSize > $1.cacheSize }
-            let total = found.reduce(0) { $0 + $1.cacheSize }
-            DispatchQueue.main.async {
-                self.apps = found; self.totalCacheSize = total; self.isScanning = false
-                self.statusMessage = "Found \(found.count) apps with caches"
-            }
+        } catch { print("[Scan] Error: \(error)") }
+        return found
+    }
+
+    private func finishScan(_ found: [AppCacheInfo]) {
+        let sorted = found.sorted { $0.cacheSize > $1.cacheSize }
+        let total = sorted.reduce(0) { $0 + $1.cacheSize }
+        DispatchQueue.main.async {
+            self.apps = sorted; self.totalCacheSize = total; self.isScanning = false
+            self.statusMessage = "Found \(sorted.count) apps with caches"
         }
     }
 
@@ -139,8 +151,12 @@ class CacheManager: ObservableObject {
             guard let self = self else { return }
             let fm = FileManager.default; var freed: UInt64 = 0
             for app in toClean {
-                let (handle, _) = self.obtainAccess(app.path)
-                if handle < 0 { continue }
+                let (handle, _) = self.consumeExtensionTryingAllGroups(app.path)
+                var activeHandle = handle
+                if activeHandle <= 0 {
+                    activeHandle = worse_query_issue_self(app.path)
+                }
+                if activeHandle <= 0 { continue }
                 let containerURL = URL(filePath: app.path)
                 for sub in ["Library/Caches", "tmp"] {
                     let cacheDir = containerURL.appending(path: sub)
@@ -151,7 +167,7 @@ class CacheManager: ObservableObject {
                     let after = self.directorySize(at: cacheDir)
                     if before > after { freed += (before - after) }
                 }
-                if handle > 0 { worse_query_release(handle) }
+                worse_query_release(activeHandle)
             }
             DispatchQueue.main.async {
                 self.freedSpace = freed; self.isCleaning = false
