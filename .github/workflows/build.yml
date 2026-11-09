@@ -32,8 +32,8 @@ jobs:
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
           DEVELOPMENT_TEAM="" \
-          | tail -20
-    
+          IPHONEOS_DEPLOYMENT_TARGET=16.0
+
     - name: Archive (unsigned IPA)
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: |
@@ -47,7 +47,7 @@ jobs:
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
           DEVELOPMENT_TEAM="" \
-          | tail -20
+          IPHONEOS_DEPLOYMENT_TARGET=16.0
     
     - name: Create IPA
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
