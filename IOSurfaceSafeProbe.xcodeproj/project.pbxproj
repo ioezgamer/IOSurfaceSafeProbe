@@ -1,0 +1,282 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10001 /* IOSurfaceSafeProbeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10001; };
+		A10002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10002; };
+		A10003 /* Console.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10003; };
+		A10004 /* CacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10004; };
+		A10005 /* worse_query.m in Sources */ = {isa = PBXBuildFile; fileRef = B10005; };
+		A10006 /* pathleak.m in Sources */ = {isa = PBXBuildFile; fileRef = B10006; };
+		A10007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10007; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B10001 /* IOSurfaceSafeProbeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSurfaceSafeProbeApp.swift; sourceTree = "<group>"; };
+		B10002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		B10003 /* Console.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Console.swift; sourceTree = "<group>"; };
+		B10004 /* CacheManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheManager.swift; sourceTree = "<group>"; };
+		B10005 /* worse_query.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = worse_query.m; sourceTree = "<group>"; };
+		B10006 /* pathleak.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = pathleak.m; sourceTree = "<group>"; };
+		B10007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B10008 /* worse_query.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = worse_query.h; sourceTree = "<group>"; };
+		B10009 /* pathleak.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = pathleak.h; sourceTree = "<group>"; };
+		B10010 /* IOSurfaceSafeProbe-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IOSurfaceSafeProbe-Bridging-Header.h"; sourceTree = "<group>"; };
+		B10011 /* IOSurfaceSafeProbe.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = IOSurfaceSafeProbe.entitlements; sourceTree = "<group>"; };
+		B10099 /* IOSurfaceSafeProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IOSurfaceSafeProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F10001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		G10001 = {
+			isa = PBXGroup;
+			children = (
+				G10002 /* IOSurfaceSafeProbe */,
+				G10003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		G10002 /* IOSurfaceSafeProbe */ = {
+			isa = PBXGroup;
+			children = (
+				B10001 /* IOSurfaceSafeProbeApp.swift */,
+				B10002 /* ContentView.swift */,
+				B10003 /* Console.swift */,
+				B10004 /* CacheManager.swift */,
+				B10008 /* worse_query.h */,
+				B10005 /* worse_query.m */,
+				B10009 /* pathleak.h */,
+				B10006 /* pathleak.m */,
+				B10010 /* IOSurfaceSafeProbe-Bridging-Header.h */,
+				B10011 /* IOSurfaceSafeProbe.entitlements */,
+				B10007 /* Assets.xcassets */,
+			);
+			path = IOSurfaceSafeProbe;
+			sourceTree = "<group>";
+		};
+		G10003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B10099 /* IOSurfaceSafeProbe.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		T10001 /* IOSurfaceSafeProbe */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C10003;
+			buildPhases = (
+				S10001 /* Sources */,
+				F10001 /* Frameworks */,
+				R10001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = IOSurfaceSafeProbe;
+			productName = IOSurfaceSafeProbe;
+			productReference = B10099;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		P10001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1620;
+				LastUpgradeCheck = 1620;
+			};
+			buildConfigurationList = C10001;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = G10001;
+			productRefGroup = G10003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				T10001 /* IOSurfaceSafeProbe */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		R10001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10007 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		S10001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10001 /* IOSurfaceSafeProbeApp.swift in Sources */,
+				A10002 /* ContentView.swift in Sources */,
+				A10003 /* Console.swift in Sources */,
+				A10004 /* CacheManager.swift in Sources */,
+				A10005 /* worse_query.m in Sources */,
+				A10006 /* pathleak.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		C10D01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		C10R01 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		C10D02 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = IOSurfaceSafeProbe/IOSurfaceSafeProbe.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = CacheWipe;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ioezgamer.IOSurfaceSafeProbe;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "IOSurfaceSafeProbe/IOSurfaceSafeProbe-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		C10R02 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = IOSurfaceSafeProbe/IOSurfaceSafeProbe.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = CacheWipe;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ioezgamer.IOSurfaceSafeProbe;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "IOSurfaceSafeProbe/IOSurfaceSafeProbe-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		C10001 /* Build configuration list for PBXProject */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C10D01 /* Debug */,
+				C10R01 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C10003 /* Build configuration list for PBXNativeTarget */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C10D02 /* Debug */,
+				C10R02 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = P10001 /* Project object */;
+}
