@@ -2,6 +2,8 @@
 //  ContentView.swift
 //  IOSurfaceSafeProbe
 //
+//  Cache cleaner UI
+//
 
 import SwiftUI
 
@@ -34,19 +36,6 @@ struct ContentView: View {
                 }
                 .listRowBackground(Color.clear)
                 
-                // App Group info
-                Section("App Group") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Active: \(cache.detectedGroup)")
-                            .font(.system(.caption, design: .monospaced))
-                        if !cache.signatureGroups.isEmpty {
-                            Text("Signed groups: \(cache.signatureGroups.joined(separator: ", "))")
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                
                 // Actions
                 Section {
                     Button {
@@ -54,7 +43,7 @@ struct ContentView: View {
                     } label: {
                         Label("Scan Caches", systemImage: "magnifyingglass")
                     }
-                    .disabled(cache.isScanning || cache.isCleaning || cache.detectedGroup == "none")
+                    .disabled(cache.isScanning || cache.isCleaning)
                     
                     Button(role: .destructive) {
                         cache.cleanSelected()
@@ -68,25 +57,27 @@ struct ContentView: View {
                 if !cache.apps.isEmpty {
                     Section("Apps (\(cache.apps.count))") {
                         ForEach(Array(cache.apps.enumerated()), id: \.element.id) { index, app in
-                            Toggle(isOn: Binding(
-                                get: { cache.apps[index].selected },
-                                set: { cache.apps[index].selected = $0 }
-                            )) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(app.bundleID)
-                                        .font(.system(.body, design: .monospaced))
-                                        .lineLimit(1)
-                                    Text(app.formattedSize)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                            HStack {
+                                Toggle(isOn: Binding(
+                                    get: { cache.apps[index].selected },
+                                    set: { cache.apps[index].selected = $0 }
+                                )) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(app.bundleID)
+                                            .font(.system(.body, design: .monospaced))
+                                            .lineLimit(1)
+                                        Text(app.formattedSize)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
+                                .toggleStyle(.switch)
                             }
-                            .toggleStyle(.switch)
                         }
                     }
                 }
                 
-                // Freed space
+                // Freed space result
                 if cache.freedSpace > 0 {
                     Section {
                         HStack {
@@ -98,7 +89,7 @@ struct ContentView: View {
                     }
                 }
                 
-                // Console
+                // Log toggle
                 Section {
                     DisclosureGroup("Console Log", isExpanded: $showLog) {
                         ScrollView {
@@ -122,7 +113,6 @@ struct ContentView: View {
             }
             .onAppear {
                 console.start()
-                cache.detectGroup()
             }
             .overlay {
                 if cache.isScanning {
@@ -142,4 +132,8 @@ struct ContentView: View {
             }
         }
     }
+}
+
+#Preview {
+    ContentView()
 }
