@@ -11,6 +11,7 @@ struct ContentView: View {
     @StateObject private var cache = CacheManager()
     @StateObject private var console = Console()
     @State private var showLog = false
+    @AppStorage("cachewipe.appGroupOverride") private var appGroupOverride = ""
     
     var body: some View {
         NavigationStack {
@@ -53,6 +54,17 @@ struct ContentView: View {
                     .disabled(cache.apps.isEmpty || cache.isCleaning || cache.isScanning)
                 }
                 
+                // Optional override when the signed IPA does not expose a readable profile.
+                Section("App Group (SideStore)") {
+                    TextField("Optional signed group identifier", text: $appGroupOverride)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.system(.footnote, design: .monospaced))
+                    Text("Leave blank for automatic detection. Enter an App Group actually granted to CacheWipe, not SideStore's own group.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 // App list
                 if !cache.apps.isEmpty {
                     Section("Apps (\(cache.apps.count))") {

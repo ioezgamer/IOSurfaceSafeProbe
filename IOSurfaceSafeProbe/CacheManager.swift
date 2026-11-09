@@ -27,7 +27,10 @@ class CacheManager: ObservableObject {
     @Published var freedSpace: UInt64 = 0
     @Published var statusMessage = ""
     
-    private let appGroup = "group.com.ioezgamer.iosurfacesafeprobe" // Register this identifier in Apple Developer before signing
+    // Default requested by IOSurfaceSafeProbe.entitlements at build time.
+    // SideStore may replace the identifier when it re-signs the app.
+    private static let bundledAppGroup = "group.com.ioezgamer.iosurfacesafeprobe"
+    private static let appGroupOverrideKey = "cachewipe.appGroupOverride"
     
     private let cachePaths = [
         "/var/mobile/Containers/Data/Application"
@@ -43,10 +46,17 @@ class CacheManager: ObservableObject {
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
+            guard let group = self.resolveAccessibleAppGroup() else {
+                DispatchQueue.main.async {
+                    self.isScanning = false
+                    self.statusMessage = "No accessible App Group. Check SideStore signing or enter the signed App Group."
+                }
+                return
+            }
             var found: [AppCacheInfo] = []
-            
+
             for basePath in self.cachePaths {
-                let handle = self.consumeExtension(basePath)
+                let handle = self.consumeExtension(basePath, appGroup: group)
                 if handle < 0 {
                     print("[Scan] Failed to access: \(basePath) (error \(handle))")
                     continue
@@ -124,10 +134,17 @@ class CacheManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let fm = FileManager.default
+            guard let group = self.resolveAccessibleAppGroup() else {
+                DispatchQueue.main.async {
+                    self.isCleaning = false
+                    self.statusMessage = "No accessible App Group. Check SideStore signing or enter the signed App Group."
+                }
+                return
+            }
             var freed: UInt64 = 0
-            
+
             for app in toClean {
-                let handle = self.consumeExtension(app.path)
+                let handle = self.consumeExtension(app.path, appGroup: group)
                 if handle < 0 {
                     print("[Clean] Failed to access: \(app.bundleID)")
                     continue
@@ -172,7 +189,53 @@ class CacheManager: ObservableObject {
     
     // MARK: - Helpers
     
-    private func consumeExtension(_ path: String) -> Int64 {
+    // Only select groups for which iOS actually grants this app a container URL.
+    // A provisioning profile is a candidate source, not proof of final signed permissions.
+    private func resolveAccessibleAppGroup() -> String? {
+        var candidates: [String] = []
+
+        if let manual = UserDefaults.standard.string(forKey: Self.appGroupOverrideKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !manual.isEmpty {
+            candidates.append(manual)
+        }
+
+        candidates.append(contentsOf: Self.groupsFromEmbeddedProvisioningProfile())
+        candidates.append(Self.bundledAppGroup)
+
+        var tried = Set<String>()
+        for candidate in candidates where tried.insert(candidate).inserted {
+            if FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: candidate
+            ) != nil {
+                print("[AppGroup] Accessible group: \(candidate)")
+                return candidate
+            }
+        }
+
+        print("[AppGroup] No accessible group. Candidates checked: \(tried.sorted().joined(separator: ", "))")
+        print("[AppGroup] Check the app's *signed* entitlements after SideStore re-signing.")
+        return nil
+    }
+
+    // embedded.mobileprovision is usually CMS with a plaintext plist payload.
+    // If SideStore does not embed a readable profile, use the manual override.
+    private static func groupsFromEmbeddedProvisioningProfile() -> [String] {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url),
+              let start = data.range(of: Data("<plist".utf8)),
+              let end = data.range(of: Data("</plist>".utf8),
+                                   in: start.upperBound..<data.endIndex),
+              let plist = try? PropertyListSerialization.propertyList(
+                from: data.subdata(in: start.lowerBound..<end.upperBound), format: nil
+              ),
+              let profile = plist as? [String: Any],
+              let entitlements = profile["Entitlements"] as? [String: Any],
+              let groups = entitlements["com.apple.security.application-groups"] as? [String]
+        else { return [] }
+        return groups.filter { !$0.isEmpty }
+    }
+
+    private func consumeExtension(_ path: String, appGroup: String) -> Int64 {
         let isAppGroup = path.contains("/var/mobile/Containers/Shared/AppGroup")
         let isIOS26 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
         let altFlags = isAppGroup && isIOS26
