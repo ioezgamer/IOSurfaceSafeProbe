@@ -2,13 +2,24 @@
 //  WorseQueryGroup.m
 //  IOSurfaceSafeProbe
 //
-//  Reads App Groups available to the process via containerURL checks.
-//  No Security.framework — matches GestaltEdit's approach.
+//  Reads App Groups from the kernel's entitlements via csops syscall.
+//  No Security.framework needed — reads the same data SecTask would.
 //
 
 #import <Foundation/Foundation.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
 #include "WorseQueryGroup.h"
+
+#define CS_OPS_ENTITLEMENTS_BLOB 7
+
+struct cs_blob {
+    uint32_t magic;
+    uint32_t length;
+};
+
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 
 static NSString *const kSystemGroup = @"group.com.apple.mobilegestaltcache";
 static NSString *const kHardcodedGroup = @"group.com.ioezgamer.cachewipe";
@@ -22,6 +33,52 @@ static BOOL _isSideloaderGroup(NSString *group) {
     NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^group\\.[0-9a-f]{16}\\." options:0 error:nil];
     NSRange range = NSMakeRange(0, group.length);
     return [regex numberOfMatchesInString:group options:0 range:range] > 0;
+}
+
+static NSArray *_readEntitlementGroups(void) {
+    // Read entitlements blob from kernel via csops
+    size_t bufsize = 65536;
+    void *buf = malloc(bufsize);
+    if (!buf) return nil;
+
+    int ret = csops(getpid(), CS_OPS_ENTITLEMENTS_BLOB, buf, bufsize);
+    if (ret != 0) {
+        printf("[Group] csops failed: %d\n", ret);
+        fflush(stdout);
+        free(buf);
+        return nil;
+    }
+
+    struct cs_blob *blob = (struct cs_blob *)buf;
+    uint32_t magic = ntohl(blob->magic);
+    uint32_t length = ntohl(blob->length);
+
+    if (magic != 0xFADE7171 || length <= sizeof(struct cs_blob) || length > bufsize) {
+        printf("[Group] csops blob invalid magic=0x%x len=%u\n", magic, length);
+        fflush(stdout);
+        free(buf);
+        return nil;
+    }
+
+    // XML plist starts after the 8-byte header
+    NSData *plistData = [NSData dataWithBytes:(uint8_t *)buf + sizeof(struct cs_blob)
+                                       length:length - sizeof(struct cs_blob)];
+    free(buf);
+
+    NSDictionary *entitlements = [NSPropertyListSerialization propertyListWithData:plistData
+                                                                          options:NSPropertyListImmutable
+                                                                           format:nil
+                                                                            error:nil];
+    if (!entitlements) {
+        printf("[Group] csops plist parse failed\n");
+        fflush(stdout);
+        return nil;
+    }
+
+    NSArray *groups = entitlements[@"com.apple.security.application-groups"];
+    printf("[Group] csops found %lu groups\n", (unsigned long)(groups ? groups.count : 0));
+    fflush(stdout);
+    return groups;
 }
 
 static void _loadSignatureGroups(void) {
@@ -55,26 +112,10 @@ static void _loadSignatureGroups(void) {
         [allGroups addObject:kHardcodedGroup];
     }
 
-    // 3) Read groups from embedded entitlements plist
-    NSString *entPath = [[NSBundle mainBundle] pathForResource:@"embedded" ofType:@"mobileprovision"];
-    NSDictionary *entitlements = nil;
-
-    // Try reading entitlements from the code directory
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-    NSString *entPlistPath = [bundlePath stringByAppendingPathComponent:@"archived-expanded-entitlements.xcent"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:entPlistPath]) {
-        entPlistPath = [bundlePath stringByAppendingPathComponent:@"Entitlements.plist"];
-    }
-    NSData *entData = [NSData dataWithContentsOfFile:entPlistPath];
-    if (entData) {
-        entitlements = [NSPropertyListSerialization propertyListWithData:entData options:NSPropertyListImmutable format:nil error:nil];
-    }
-
-    NSArray *embeddedGroups = entitlements[@"com.apple.security.application-groups"];
-    if (embeddedGroups) {
-        printf("[Group] Embedded groups: %lu\n", (unsigned long)embeddedGroups.count);
-        fflush(stdout);
-        for (NSString *group in embeddedGroups) {
+    // 3) Read groups from kernel entitlements via csops (includes FlareStore hex groups)
+    NSArray *csopsGroups = _readEntitlementGroups();
+    if (csopsGroups) {
+        for (NSString *group in csopsGroups) {
             if ([group isEqualToString:kSystemGroup]) continue;
             if ([group isEqualToString:kHardcodedGroup]) continue;
             if (_isSideloaderGroup(group)) {
@@ -82,26 +123,14 @@ static void _loadSignatureGroups(void) {
             }
             NSURL *container = [fm containerURLForSecurityApplicationGroupIdentifier:group];
             if (container) {
-                printf("[Group] Embedded group OK: %s\n", group.UTF8String);
+                printf("[Group] csops group OK: %s\n", group.UTF8String);
                 fflush(stdout);
                 [allGroups addObject:group];
                 if (!_cachedGroup) _cachedGroup = group;
+            } else {
+                printf("[Group] csops group no container: %s\n", group.UTF8String);
+                fflush(stdout);
             }
-        }
-    }
-
-    // 4) Fallback: scan for FlareStore-style hex groups by checking known patterns
-    if (allGroups.count == 0) {
-        printf("[Group] No groups found via entitlements, trying bundle ID patterns\n");
-        fflush(stdout);
-        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.unknown";
-        NSString *guessGroup = [NSString stringWithFormat:@"group.%@", bundleID];
-        NSURL *guessContainer = [fm containerURLForSecurityApplicationGroupIdentifier:guessGroup];
-        if (guessContainer) {
-            printf("[Group] Bundle group OK: %s\n", guessGroup.UTF8String);
-            fflush(stdout);
-            [allGroups addObject:guessGroup];
-            if (!_cachedGroup) _cachedGroup = guessGroup;
         }
     }
 
