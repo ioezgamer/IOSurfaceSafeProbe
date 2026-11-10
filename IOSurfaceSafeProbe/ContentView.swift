@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var showCleanConfirm = false
     @State private var selectedApp: AppCacheInfo? = nil
     @State private var showSortMenu = false
+    @State private var didInit = false
 
     private var filteredApps: [AppCacheInfo] {
         cache.sortedApps(by: sortOption, search: searchText)
@@ -66,6 +67,8 @@ struct ContentView: View {
                 }
             }
             .onAppear {
+                guard !didInit else { return }
+                didInit = true
                 console.start()
                 cache.detectGroup()
             }

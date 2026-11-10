@@ -467,25 +467,45 @@ class GestaltManager: ObservableObject {
     // MARK: - Apply (binary plist)
 
     func applyChanges() {
+        writeGestalt(forceAll: false)
+    }
+
+    func forceRewrite() {
+        writeGestalt(forceAll: true)
+    }
+
+    private func writeGestalt(forceAll: Bool) {
         guard let path = plistPath else {
             statusMessage = "No plist loaded"
             return
         }
 
-        let changed = tweakStates.filter(\.isModified)
-        guard !changed.isEmpty else {
+        let toWrite: [TweakState]
+        if forceAll {
+            toWrite = tweakStates.filter { state in
+                switch state.tweak.type {
+                case .bool: return (state.currentValue as? Bool) == true
+                case .pick: return (state.currentValue as? Int ?? 0) != 0
+                case .int: return state.currentValue != nil
+                }
+            }
+        } else {
+            toWrite = tweakStates.filter(\.isModified)
+        }
+
+        if toWrite.isEmpty && !forceAll {
             statusMessage = "No changes to apply"
             return
         }
 
         isLoading = true
-        statusMessage = "Applying \(changed.count) changes..."
+        let label = forceAll ? "Force rewriting" : "Applying"
+        statusMessage = "\(label) \(toWrite.count) tweaks..."
         lastError = ""
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            // Re-grant
             let dir = (path as NSString).deletingLastPathComponent
             guard wq_grant(dir) else {
                 print("[Gestalt] Apply: grant failed for \(dir)")
@@ -497,7 +517,6 @@ class GestaltManager: ObservableObject {
                 return
             }
 
-            // Create backup if needed
             let backupPath = path + self.backupSuffix
             if !FileManager.default.fileExists(atPath: backupPath) {
                 do {
@@ -508,7 +527,6 @@ class GestaltManager: ObservableObject {
                 }
             }
 
-            // Read current plist
             guard let plistData = FileManager.default.contents(atPath: path) else {
                 print("[Gestalt] Apply: cannot read plist")
                 DispatchQueue.main.async {
@@ -530,8 +548,6 @@ class GestaltManager: ObservableObject {
                 return
             }
 
-            print("[Gestalt] Original format: \(format == .binary ? "binary" : format == .xml ? "XML" : "openStep")")
-
             guard let extra = plist["CacheExtra"] as? NSMutableDictionary else {
                 print("[Gestalt] Apply: no CacheExtra")
                 DispatchQueue.main.async {
@@ -541,24 +557,39 @@ class GestaltManager: ObservableObject {
                 return
             }
 
-            // Apply changes
-            for state in changed {
+            // Write all enabled tweaks to CacheExtra
+            var writeCount = 0
+            for state in toWrite {
                 if let val = state.currentValue {
                     extra[state.tweak.key] = val
                     print("[Gestalt] Set \(state.tweak.key) = \(val)")
+                    writeCount += 1
+                }
+            }
+
+            // Also write bool tweaks that are explicitly OFF (ensure the key exists)
+            if forceAll {
+                for state in self.tweakStates {
+                    if case .bool = state.tweak.type,
+                       (state.currentValue as? Bool) == false {
+                        extra[state.tweak.key] = false
+                        print("[Gestalt] Set \(state.tweak.key) = false (explicit)")
+                    }
                 }
             }
 
             plist["CacheExtra"] = extra
 
-            // Remove CacheData — iOS uses this serialized blob over CacheExtra.
-            // Without removing it, CacheExtra modifications are ignored.
-            if plist["CacheData"] != nil {
+            // Remove CacheData — iOS uses this serialized blob with higher priority
+            // than CacheExtra. If we leave it, our CacheExtra changes are ignored.
+            let hadCacheData = plist["CacheData"] != nil
+            if hadCacheData {
                 plist.removeObject(forKey: "CacheData")
                 print("[Gestalt] Removed CacheData (forces iOS to use CacheExtra)")
+            } else {
+                print("[Gestalt] No CacheData found (already removed or not present)")
             }
 
-            // Write back as BINARY plist (critical!)
             do {
                 let outputData = try PropertyListSerialization.data(
                     fromPropertyList: plist,
@@ -567,39 +598,37 @@ class GestaltManager: ObservableObject {
                 )
                 print("[Gestalt] Serialized \(outputData.count) bytes as binary plist")
 
-                let success = FileManager.default.createFile(atPath: path, contents: outputData, attributes: nil)
-                if !success {
-                    // Try writing via NSData
-                    try (outputData as NSData).write(toFile: path, options: .atomic)
-                }
+                try (outputData as NSData).write(toFile: path, options: .atomic)
                 print("[Gestalt] Write completed")
 
-                // Verify: re-read and check
+                // Verify
+                var verified = 0
+                var cacheDataBack = false
                 if let verifyData = FileManager.default.contents(atPath: path),
                    let verifyDict = try? PropertyListSerialization.propertyList(
                     from: verifyData, options: [], format: nil
-                   ) as? [String: Any],
-                   let verifyExtra = verifyDict["CacheExtra"] as? [String: Any] {
-                    var verified = 0
-                    for state in changed {
-                        if let written = verifyExtra[state.tweak.key] {
-                            print("[Gestalt] Verify \(state.tweak.name): \(written)")
-                            verified += 1
+                   ) as? [String: Any] {
+                    cacheDataBack = verifyDict["CacheData"] != nil
+                    if let verifyExtra = verifyDict["CacheExtra"] as? [String: Any] {
+                        for state in toWrite {
+                            if verifyExtra[state.tweak.key] != nil {
+                                verified += 1
+                            }
                         }
                     }
-                    print("[Gestalt] Verified \(verified)/\(changed.count) changes")
+                }
 
-                    DispatchQueue.main.async {
-                        self.modifiedCount = changed.count
-                        self.hasBackup = true
-                        self.statusMessage = "Applied \(changed.count) tweaks (\(verified) verified) — REBOOT to take effect"
-                        self.isLoading = false
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        self.statusMessage = "Written but verify failed — reboot to check"
-                        self.isLoading = false
-                    }
+                let cacheDataMsg = hadCacheData ? " CacheData removed." : ""
+                let verifyMsg = cacheDataBack ? " WARNING: CacheData regenerated!" : ""
+
+                print("[Gestalt] Verified \(verified)/\(writeCount) changes.\(cacheDataMsg)\(verifyMsg)")
+
+                DispatchQueue.main.async {
+                    self.modifiedCount = writeCount
+                    self.hasBackup = true
+                    self.hasCacheData = cacheDataBack
+                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified).\(cacheDataMsg)\(verifyMsg) REBOOT required."
+                    self.isLoading = false
                 }
             } catch {
                 print("[Gestalt] Write error: \(error)")
@@ -609,6 +638,23 @@ class GestaltManager: ObservableObject {
                     self.isLoading = false
                 }
             }
+        }
+    }
+
+    func respring() {
+        let path = "/usr/bin/killall"
+        var pid: pid_t = 0
+        var argv: [UnsafeMutablePointer<CChar>?] = [
+            strdup(path), strdup("SpringBoard"), nil
+        ]
+        let ret = posix_spawn(&pid, path, nil, nil, &argv, nil)
+        argv.compactMap { $0 }.forEach { free($0) }
+        if ret == 0 {
+            print("[Gestalt] Respring triggered (pid \(pid))")
+            statusMessage = "Respring sent — device should restart SpringBoard"
+        } else {
+            print("[Gestalt] Respring failed: posix_spawn returned \(ret)")
+            statusMessage = "Respring failed (code \(ret)) — reboot manually"
         }
     }
 

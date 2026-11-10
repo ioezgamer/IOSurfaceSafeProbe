@@ -5,6 +5,8 @@ struct TweaksView: View {
     @State private var searchText = ""
     @State private var showApplyConfirm = false
     @State private var showRestoreConfirm = false
+    @State private var showForceConfirm = false
+    @State private var showRespringConfirm = false
     @State private var expandedCategory: TweakCategory? = .display
 
     private var pendingCount: Int {
@@ -34,6 +36,18 @@ struct TweaksView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
+                        if gestalt.gestaltAccessible {
+                            Button {
+                                showForceConfirm = true
+                            } label: {
+                                Label("Force Rewrite All", systemImage: "arrow.triangle.2.circlepath")
+                            }
+                            Button {
+                                showRespringConfirm = true
+                            } label: {
+                                Label("Respring", systemImage: "arrow.clockwise.circle")
+                            }
+                        }
                         if gestalt.hasBackup {
                             Button(role: .destructive) {
                                 showRestoreConfirm = true
@@ -69,6 +83,22 @@ struct TweaksView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("This will undo all MobileGestalt modifications and restore the original plist. Reboot required.")
+            }
+            .confirmationDialog("Force Rewrite?", isPresented: $showForceConfirm, titleVisibility: .visible) {
+                Button("Force Rewrite", role: .destructive) {
+                    gestalt.forceRewrite()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Rewrites ALL enabled tweaks to the plist and removes CacheData. Use this if Apply shows 0 changes but tweaks aren't working.")
+            }
+            .confirmationDialog("Respring?", isPresented: $showRespringConfirm, titleVisibility: .visible) {
+                Button("Respring Now", role: .destructive) {
+                    gestalt.respring()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Restarts SpringBoard to apply changes without a full reboot. The app will close.")
             }
         }
     }
