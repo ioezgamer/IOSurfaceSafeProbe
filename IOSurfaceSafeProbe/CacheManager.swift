@@ -20,8 +20,9 @@ class CacheManager: ObservableObject {
     @Published var statusMessage = ""
     @Published var detectedGroup: String = "detecting..."
     @Published var logText: String = ""
+    @Published var scanProgress: String = ""
 
-    private let cachePaths = ["/var/mobile/Containers/Data/Application"]
+    private let containerParent = "/var/mobile/Containers/Data/Application"
 
     func detectGroup() {
         let group = wq_app_group()
@@ -40,45 +41,49 @@ class CacheManager: ObservableObject {
             return
         }
         isScanning = true; apps = []; totalCacheSize = 0
-        statusMessage = "Scanning..."
+        statusMessage = "Discovering containers..."
+        scanProgress = ""
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
+
+            let containers = wq_enumerate(self.containerParent) { done, total, found in
+                let pct = total > 0 ? Int(done * 100 / total) : 0
+                DispatchQueue.main.async {
+                    self.scanProgress = "\(pct)% scanned, \(found) found"
+                    self.statusMessage = "Scanning: \(pct)% (\(found) apps)"
+                }
+            }
+
+            guard let paths = containers as? [String], !paths.isEmpty else {
+                DispatchQueue.main.async {
+                    self.statusMessage = "No containers found"
+                    self.isScanning = false
+                    self.logText = wq_log_text()
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.statusMessage = "Measuring caches for \(paths.count) apps..."
+            }
+
             var found: [AppCacheInfo] = []
-            for basePath in self.cachePaths {
-                if wq_grant(basePath) {
-                    found += self.scanContainers(basePath: basePath)
-                } else {
-                    print("[Scan] Grant failed for: \(basePath)")
+            for containerPath in paths {
+                let bundleID = self.getBundleID(at: containerPath)
+                var size: UInt64 = 0
+                for sub in ["Library/Caches", "tmp"] {
+                    let subPath = (containerPath as NSString).appendingPathComponent(sub)
+                    if wq_grant(subPath) {
+                        size += self.directorySize(at: URL(filePath: subPath))
+                    }
+                }
+                if size > 0 {
+                    let name = bundleID ?? (containerPath as NSString).lastPathComponent
+                    found.append(AppCacheInfo(bundleID: name, path: containerPath, cacheSize: size))
                 }
             }
             self.finishScan(found)
         }
-    }
-
-    private func scanContainers(basePath: String) -> [AppCacheInfo] {
-        var found: [AppCacheInfo] = []
-        let fm = FileManager.default
-        let baseURL = URL(filePath: basePath)
-        do {
-            let containers = try fm.contentsOfDirectory(at: baseURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
-            for containerURL in containers {
-                let resources = try? containerURL.resourceValues(forKeys: [.isDirectoryKey])
-                guard resources?.isDirectory == true else { continue }
-                let containerPath = containerURL.path
-                let bundleID = getBundleID(at: containerPath)
-                var size: UInt64 = 0
-                for sub in ["Library/Caches", "tmp"] {
-                    let subPath = containerURL.appending(path: sub).path
-                    if wq_grant(subPath) {
-                        size += directorySize(at: containerURL.appending(path: sub))
-                    }
-                }
-                if size > 0 {
-                    found.append(AppCacheInfo(bundleID: bundleID ?? containerURL.lastPathComponent, path: containerPath, cacheSize: size))
-                }
-            }
-        } catch { print("[Scan] Error: \(error)") }
-        return found
     }
 
     private func finishScan(_ found: [AppCacheInfo]) {
@@ -99,15 +104,15 @@ class CacheManager: ObservableObject {
             guard let self = self else { return }
             let fm = FileManager.default; var freed: UInt64 = 0
             for app in toClean {
-                let containerURL = URL(filePath: app.path)
                 for sub in ["Library/Caches", "tmp"] {
-                    let cacheDir = containerURL.appending(path: sub)
-                    guard wq_grant(cacheDir.path) else { continue }
-                    let before = self.directorySize(at: cacheDir)
-                    if let items = try? fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
+                    let cachePath = (app.path as NSString).appendingPathComponent(sub)
+                    let cacheURL = URL(filePath: cachePath)
+                    guard wq_grant(cachePath) else { continue }
+                    let before = self.directorySize(at: cacheURL)
+                    if let items = try? fm.contentsOfDirectory(at: cacheURL, includingPropertiesForKeys: nil) {
                         for item in items { try? fm.removeItem(at: item) }
                     }
-                    let after = self.directorySize(at: cacheDir)
+                    let after = self.directorySize(at: cacheURL)
                     if before > after { freed += (before - after) }
                 }
             }

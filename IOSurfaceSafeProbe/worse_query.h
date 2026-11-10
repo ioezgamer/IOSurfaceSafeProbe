@@ -23,6 +23,13 @@ BOOL wq_grant(NSString * _Nonnull path);
 /// Releases all held sandbox extensions and clears the grant cache.
 void wq_release_all(void);
 
+/// Discovers direct children of `dir` by brute-forcing inode numbers with
+/// fsgetpath (not sandbox-gated). No token needed on `dir` itself.
+/// Progress block called periodically with (done, total, found_count).
+/// Returns sorted array of absolute paths, or nil on failure.
+NSArray<NSString *> * _Nullable wq_enumerate(NSString * _Nonnull dir,
+    void (^ _Nullable progress)(int64_t done, int64_t total, NSUInteger found));
+
 /// Returns diagnostic log text.
 NSString * _Nonnull wq_log_text(void);
 

@@ -449,3 +449,97 @@ void wq_release_all(void) {
     [gGrantLock unlock];
     wq_log(@"released all grants");
 }
+
+#pragma mark - Container enumeration via fsgetpath (from KAMUI)
+
+extern ssize_t fsgetpath(char *buf, size_t buflen, fsid_t *fsid, uint64_t objid);
+
+static const int64_t kInodeMargin = 100000;
+
+static int64_t wq_volume_max_inode(fsid_t fsid) {
+    NSArray *dirs = @[
+        NSTemporaryDirectory() ?: @"",
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"],
+    ];
+    for (NSString *dir in dirs) {
+        if (!dir.length) continue;
+        NSString *probe = [dir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"wq-inode-%u", arc4random()]];
+        int fd = open(probe.fileSystemRepresentation, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd < 0) continue;
+        struct stat st = {0};
+        struct statfs sfs = {0};
+        BOOL ok = fstat(fd, &st) == 0 && fstatfs(fd, &sfs) == 0;
+        close(fd);
+        unlink(probe.fileSystemRepresentation);
+        if (!ok) continue;
+        if (memcmp(&sfs.f_fsid, &fsid, sizeof(fsid)) != 0) continue;
+        if ((uint64_t)st.st_ino > (uint64_t)INT64_MAX - (uint64_t)kInodeMargin) return 0;
+        return (int64_t)st.st_ino + kInodeMargin;
+    }
+    return 0;
+}
+
+NSArray<NSString *> *wq_enumerate(NSString *dir,
+    void (^progress)(int64_t done, int64_t total, NSUInteger found))
+{
+    NSString *base = wq_norm(dir);
+    struct statfs sfs;
+    if (statfs(base.fileSystemRepresentation, &sfs) != 0) {
+        if (statfs("/private/var/mobile", &sfs) != 0) {
+            wq_log(@"enumerate: statfs failed (%s)", strerror(errno));
+            return nil;
+        }
+    }
+    fsid_t fsid = sfs.f_fsid;
+    int64_t maxInode = wq_volume_max_inode(fsid);
+    if (maxInode <= 0) {
+        wq_log(@"enumerate: cannot determine inode bound");
+        return nil;
+    }
+    wq_log(@"enumerate: scanning inodes 1..%lld for children of %@", (long long)maxInode, base);
+
+    const char *prefix = base.fileSystemRepresentation;
+    size_t prefixLen = strlen(prefix);
+    NSMutableDictionary<NSString *, NSNumber *> *found = [NSMutableDictionary new];
+    NSLock *lock = [NSLock new];
+    int64_t total = maxInode;
+    __block int64_t nextChunk = 0, done = 0;
+    const int64_t chunk = 32768;
+    int64_t chunks = (total + chunk - 1) / chunk;
+    NSUInteger cores = NSProcessInfo.processInfo.activeProcessorCount;
+    size_t workers = (size_t)MAX((NSUInteger)1, MIN((NSUInteger)4, cores / 2));
+
+    dispatch_apply(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t __unused w) {
+        fsid_t id = fsid;
+        char buf[1200];
+        for (;;) {
+            [lock lock];
+            int64_t c = nextChunk++;
+            [lock unlock];
+            if (c >= chunks) return;
+            int64_t first = 1 + c * chunk, last = MIN(first + chunk - 1, maxInode);
+            NSMutableDictionary *local = nil;
+            for (int64_t ino = first; ino <= last; ino++) {
+                ssize_t n = fsgetpath(buf, sizeof(buf), &id, (uint64_t)ino);
+                if (n <= 0) continue;
+                if (strncmp(buf, prefix, prefixLen) == 0 && buf[prefixLen] == '/' &&
+                    strchr(buf + prefixLen + 1, '/') == NULL) {
+                    if (!local) local = [NSMutableDictionary new];
+                    local[[NSString stringWithUTF8String:buf]] = @(ino);
+                }
+            }
+            [lock lock];
+            if (local) [found addEntriesFromDictionary:local];
+            done += last - first + 1;
+            int64_t nowDone = done;
+            NSUInteger nowFound = found.count;
+            [lock unlock];
+            if (progress) progress(nowDone, total, nowFound);
+        }
+    });
+
+    NSArray *sorted = [found.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    wq_log(@"enumerate: found %lu containers", (unsigned long)sorted.count);
+    return sorted;
+}

@@ -126,6 +126,11 @@ struct ContentView: View {
                                     .scaleEffect(1.5)
                                 Text("Scanning...")
                                     .font(.headline)
+                                if !cache.scanProgress.isEmpty {
+                                    Text(cache.scanProgress)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             .padding(30)
                             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
