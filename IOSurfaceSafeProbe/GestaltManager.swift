@@ -597,25 +597,60 @@ class GestaltManager: ObservableObject {
     // MARK: - Analyze CacheData structure
 
     private func analyzeCacheData(_ data: Data) -> String {
-        guard let patcher = BPlistPatcher(data: data) else {
-            return "Not binary plist (\(data.prefix(8).map { String(format: "%02x", $0) }.joined()))"
-        }
+        let size = data.count
+        let header64 = data.prefix(64).map { String(format: "%02x", $0) }.joined(separator: " ")
+        print("[Gestalt] CacheData: \(size) bytes, header: \(header64)")
 
-        var keyCount = 0
-        var tweakKeysFound = 0
-        let tweakKeys = Set(Self.allTweaks.map(\.key))
-
-        let dicts = patcher.findDicts()
-        for d in dicts {
-            for ki in d.keys {
-                if let s = patcher.stringAt(ki) {
-                    keyCount += 1
-                    if tweakKeys.contains(s) { tweakKeysFound += 1 }
+        // Try to find known strings inside CacheData
+        let tweakKeys = Self.allTweaks.map(\.key)
+        var foundKeys = [String]()
+        for key in tweakKeys {
+            if let keyData = key.data(using: .utf8) {
+                if data.range(of: keyData) != nil {
+                    foundKeys.append(key)
                 }
             }
         }
+        print("[Gestalt] CacheData contains \(foundKeys.count) tweak key strings")
 
-        return "\(data.count)B, \(dicts.count) dicts, \(keyCount) string keys, \(tweakKeysFound) tweak keys found"
+        // Try NSKeyedUnarchiver decode
+        var nskaDecode = "no"
+        if let dict = try? NSKeyedUnarchiver.unarchivedObject(
+            ofClasses: [NSDictionary.self, NSMutableDictionary.self, NSString.self,
+                        NSNumber.self, NSData.self, NSArray.self, NSMutableArray.self],
+            from: data
+        ) as? NSDictionary {
+            nskaDecode = "yes(\(dict.count) keys)"
+        }
+
+        // Try PropertyListSerialization
+        var plDecode = "no"
+        if let obj = try? PropertyListSerialization.propertyList(
+            from: data, options: [], format: nil
+        ) {
+            let t = type(of: obj)
+            plDecode = "yes(\(t))"
+        }
+
+        // Check if it's a binary plist
+        if let patcher = BPlistPatcher(data: data) {
+            let dicts = patcher.findDicts()
+            var keyCount = 0
+            var tweakKeysFound = 0
+            let tweakKeySet = Set(tweakKeys)
+            for d in dicts {
+                for ki in d.keys {
+                    if let s = patcher.stringAt(ki) {
+                        keyCount += 1
+                        if tweakKeySet.contains(s) { tweakKeysFound += 1 }
+                    }
+                }
+            }
+            return "\(size)B bplist, \(dicts.count)d, \(tweakKeysFound)/\(keyCount) keys"
+        }
+
+        let h16 = data.prefix(16).map { String(format: "%02x", $0) }.joined()
+        return "\(size)B h:\(h16) nska:\(nskaDecode) pl:\(plDecode) keys:\(foundKeys.count)"
     }
 
     // MARK: - Discover path
