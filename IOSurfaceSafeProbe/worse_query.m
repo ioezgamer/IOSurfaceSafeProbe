@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <sys/file.h>
 #include <xpc/xpc.h>
 #include "worse_query.h"
