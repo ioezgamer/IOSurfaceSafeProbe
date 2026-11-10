@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 // MARK: - Tweak Definitions
 
@@ -598,8 +599,15 @@ class GestaltManager: ObservableObject {
                 )
                 print("[Gestalt] Serialized \(outputData.count) bytes as binary plist")
 
+                // Clear immutable flag if set (so we can write)
+                chflags(path, 0)
+
                 try (outputData as NSData).write(toFile: path, options: .atomic)
                 print("[Gestalt] Write completed")
+
+                // Set immutable to prevent iOS from overwriting on reboot
+                let immRet = chflags(path, UInt32(UF_IMMUTABLE))
+                print("[Gestalt] Set UF_IMMUTABLE: ret=\(immRet), errno=\(errno)")
 
                 // Verify
                 var verified = 0
@@ -691,6 +699,7 @@ class GestaltManager: ObservableObject {
             }
 
             do {
+                chflags(path, 0) // Clear immutable before restore
                 try FileManager.default.removeItem(atPath: path)
                 try FileManager.default.copyItem(atPath: backupPath, toPath: path)
                 print("[Gestalt] Backup restored")
@@ -732,6 +741,152 @@ class GestaltManager: ObservableObject {
                 tweakStates[i].isModified = true
             default: break
             }
+        }
+    }
+
+    // MARK: - Eligibility Override
+
+    @Published var eligibilityStatus = ""
+
+    private let eligibilityPaths = [
+        "/var/db/eligibilityd/eligibility.plist",
+        "/private/var/db/eligibilityd/eligibility.plist"
+    ]
+
+    func writeEligibility() {
+        isLoading = true
+        statusMessage = "Writing eligibility override..."
+        eligibilityStatus = ""
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            let eligibility: [String: Any] = [
+                "OS_ELIGIBILITY_DOMAIN_GREYMATTER": [
+                    "os_eligibility_answer_source_t": 3,
+                    "os_eligibility_answer_t": 4,
+                    "context": [
+                        "OS_ELIGIBILITY_CONTEXT_ELIGIBLE_DEVICE_LANGUAGES": ["en"]
+                    ],
+                    "status": [
+                        "OS_ELIGIBILITY_INPUT_DEVICE_LANGUAGE": 3,
+                        "OS_ELIGIBILITY_INPUT_DEVICE_REGION_CODE": 3,
+                        "OS_ELIGIBILITY_INPUT_EXTERNAL_BOOT_DRIVE": 3,
+                        "OS_ELIGIBILITY_INPUT_GENERATIVE_MODEL_SYSTEM": 3,
+                        "OS_ELIGIBILITY_INPUT_SHARED_IPAD": 3,
+                        "OS_ELIGIBILITY_INPUT_SIRI_LANGUAGE": 3
+                    ]
+                ],
+                "OS_ELIGIBILITY_DOMAIN_CALCIUM": [
+                    "os_eligibility_answer_source_t": 3,
+                    "os_eligibility_answer_t": 2,
+                    "status": [
+                        "OS_ELIGIBILITY_INPUT_CHINA_CELLULAR": 2
+                    ]
+                ]
+            ]
+
+            var wrote = false
+            for ePath in self.eligibilityPaths {
+                let dir = (ePath as NSString).deletingLastPathComponent
+                print("[Eligibility] Trying grant: \(dir)")
+                guard wq_grant(dir) else {
+                    print("[Eligibility] Grant failed for \(dir)")
+                    continue
+                }
+
+                do {
+                    // Create directory if needed
+                    if !FileManager.default.fileExists(atPath: dir) {
+                        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                        print("[Eligibility] Created dir: \(dir)")
+                    }
+
+                    let data = try PropertyListSerialization.data(
+                        fromPropertyList: eligibility,
+                        format: .binary,
+                        options: 0
+                    )
+                    try (data as NSData).write(toFile: ePath, options: .atomic)
+                    print("[Eligibility] Wrote \(data.count) bytes to \(ePath)")
+
+                    // Verify
+                    if FileManager.default.fileExists(atPath: ePath) {
+                        print("[Eligibility] Verified file exists")
+                        wrote = true
+
+                        DispatchQueue.main.async {
+                            self.eligibilityStatus = "OK — wrote to \(ePath)"
+                        }
+                        break
+                    }
+                } catch {
+                    print("[Eligibility] Write error: \(error)")
+                }
+            }
+
+            DispatchQueue.main.async {
+                if wrote {
+                    self.statusMessage = "Eligibility override written — REBOOT required"
+                } else {
+                    self.statusMessage = "Eligibility write failed — could not access /var/db/eligibilityd/"
+                    self.eligibilityStatus = "FAILED"
+                    self.lastError = "Cannot grant access to eligibilityd directory"
+                }
+                self.isLoading = false
+            }
+        }
+    }
+
+    // MARK: - Immutable Flag
+
+    func setImmutable() {
+        guard let path = plistPath else {
+            statusMessage = "No plist loaded"
+            return
+        }
+
+        isLoading = true
+        statusMessage = "Setting immutable flag..."
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            let dir = (path as NSString).deletingLastPathComponent
+            guard wq_grant(dir) else {
+                DispatchQueue.main.async {
+                    self.statusMessage = "Grant failed"
+                    self.isLoading = false
+                }
+                return
+            }
+
+            let ret = chflags(path, UInt32(UF_IMMUTABLE))
+            print("[Gestalt] chflags UF_IMMUTABLE on \(path): ret=\(ret), errno=\(errno)")
+
+            DispatchQueue.main.async {
+                if ret == 0 {
+                    self.statusMessage = "Immutable flag set — iOS cannot overwrite the plist on reboot"
+                } else {
+                    let err = String(cString: strerror(errno))
+                    self.statusMessage = "chflags failed: \(err)"
+                    self.lastError = "chflags errno \(errno): \(err)"
+                }
+                self.isLoading = false
+            }
+        }
+    }
+
+    func clearImmutable() {
+        guard let path = plistPath else { return }
+
+        let dir = (path as NSString).deletingLastPathComponent
+        guard wq_grant(dir) else { return }
+
+        let ret = chflags(path, 0)
+        print("[Gestalt] Cleared flags on \(path): ret=\(ret)")
+        if ret == 0 {
+            statusMessage = "Immutable flag cleared"
         }
     }
 }

@@ -7,6 +7,8 @@ struct TweaksView: View {
     @State private var showRestoreConfirm = false
     @State private var showForceConfirm = false
     @State private var showRespringConfirm = false
+    @State private var showEligibilityConfirm = false
+    @State private var showImmutableConfirm = false
     @State private var expandedCategory: TweakCategory? = .display
 
     private var pendingCount: Int {
@@ -43,12 +45,24 @@ struct TweaksView: View {
                                 Label("Force Rewrite All", systemImage: "arrow.triangle.2.circlepath")
                             }
                             Button {
+                                showImmutableConfirm = true
+                            } label: {
+                                Label("Lock Plist (Immutable)", systemImage: "lock.shield")
+                            }
+                            Button {
+                                showEligibilityConfirm = true
+                            } label: {
+                                Label("Write AI Eligibility", systemImage: "brain")
+                            }
+                            Divider()
+                            Button {
                                 showRespringConfirm = true
                             } label: {
                                 Label("Respring", systemImage: "arrow.clockwise.circle")
                             }
                         }
                         if gestalt.hasBackup {
+                            Divider()
                             Button(role: .destructive) {
                                 showRestoreConfirm = true
                             } label: {
@@ -99,6 +113,25 @@ struct TweaksView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Restarts SpringBoard to apply changes without a full reboot. The app will close.")
+            }
+            .confirmationDialog("Write AI Eligibility?", isPresented: $showEligibilityConfirm, titleVisibility: .visible) {
+                Button("Write Eligibility", role: .destructive) {
+                    gestalt.writeEligibility()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Writes eligibility override to /var/db/eligibilityd/ to enable Apple Intelligence. This is separate from MobileGestalt — some iOS versions check this file for AI eligibility.")
+            }
+            .confirmationDialog("Lock Plist?", isPresented: $showImmutableConfirm, titleVisibility: .visible) {
+                Button("Set Immutable Flag") {
+                    gestalt.setImmutable()
+                }
+                Button("Clear Immutable Flag") {
+                    gestalt.clearImmutable()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Sets the user-immutable flag (UF_IMMUTABLE) on the MobileGestalt plist so iOS cannot overwrite it on reboot. Apply tweaks FIRST, then lock. Clear to allow modifications again.")
             }
         }
     }
@@ -423,6 +456,15 @@ struct TweaksView: View {
                     Text(gestalt.hasCacheData ? "Present (will be removed on Apply)" : "Not present")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(gestalt.hasCacheData ? .orange : .green)
+                }
+                if !gestalt.eligibilityStatus.isEmpty {
+                    HStack {
+                        Text("Eligibility:")
+                            .font(.caption.weight(.medium))
+                        Text(gestalt.eligibilityStatus)
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(gestalt.eligibilityStatus.hasPrefix("OK") ? .green : .red)
+                    }
                 }
                 if !gestalt.deviceModel.isEmpty {
                     HStack {
