@@ -51,6 +51,7 @@ enum TweakCategory: String, CaseIterable {
 struct TweakState: Identifiable {
     let id: String
     var currentValue: Any?
+    var originalValue: Any?
     var isModified: Bool
     var tweak: GestaltTweak
 }
@@ -66,14 +67,17 @@ class GestaltManager: ObservableObject {
     @Published var modifiedCount = 0
     @Published var deviceModel = ""
     @Published var deviceSubtype = 0
+    @Published var grantStatus = ""
+    @Published var plistKeyCount = 0
+    @Published var lastError = ""
 
-    private let gestaltPaths = [
+    private let knownPaths = [
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
         "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist"
     ]
     private let backupSuffix = ".cachewipe-backup"
-    private var plistPath: String?
-    private var cacheExtra: NSMutableDictionary?
+    private(set) var plistPath: String?
+    private var originalPlistData: Data?
 
     static let shared = GestaltManager()
 
@@ -244,16 +248,11 @@ class GestaltManager: ObservableObject {
             category: .advanced, type: .bool,
             defaultValue: false, enabledValue: true
         ))
-        t.append(GestaltTweak(
-            id: "dev_mode", key: "EqrsVvjcYDdxHBiQmGhAWw",
-            name: "Developer Mode Extras",
-            description: "Shows additional developer options.",
-            category: .advanced, type: .bool,
-            defaultValue: false, enabledValue: true
-        ))
 
         return t
     }()
+
+    // MARK: - Load
 
     func loadGestalt() {
         guard wq_app_group() != nil else {
@@ -262,22 +261,46 @@ class GestaltManager: ObservableObject {
         }
         isLoading = true
         statusMessage = "Granting access to MobileGestalt..."
+        lastError = ""
+        grantStatus = ""
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
+            print("[Gestalt] Starting gestalt load...")
+
+            // Try known paths
             var foundPath: String?
-            for path in self.gestaltPaths {
+            for path in self.knownPaths {
                 let dir = (path as NSString).deletingLastPathComponent
+                print("[Gestalt] Trying grant for: \(dir)")
                 if wq_grant(dir) {
-                    foundPath = path
-                    break
+                    print("[Gestalt] Grant OK for: \(dir)")
+                    if FileManager.default.fileExists(atPath: path) {
+                        foundPath = path
+                        print("[Gestalt] Plist found at: \(path)")
+                        break
+                    } else {
+                        print("[Gestalt] Grant OK but plist not found at: \(path)")
+                    }
+                } else {
+                    print("[Gestalt] Grant FAILED for: \(dir)")
                 }
             }
 
+            // Try discovering via Shared SystemGroup containers
+            if foundPath == nil {
+                print("[Gestalt] Known paths failed, trying discovery...")
+                foundPath = self.discoverGestaltPath()
+            }
+
             guard let path = foundPath else {
+                let msg = "Cannot access MobileGestalt — grant failed for all paths"
+                print("[Gestalt] \(msg)")
                 DispatchQueue.main.async {
-                    self.statusMessage = "Cannot access MobileGestalt cache"
+                    self.statusMessage = msg
+                    self.grantStatus = "FAILED"
+                    self.lastError = "wq_grant returned false for all MobileGestalt paths. The exploit may not reach SystemGroup containers on this iOS version."
                     self.isLoading = false
                     self.gestaltAccessible = false
                 }
@@ -285,24 +308,58 @@ class GestaltManager: ObservableObject {
             }
 
             self.plistPath = path
+            print("[Gestalt] Using plist: \(path)")
 
+            DispatchQueue.main.async {
+                self.grantStatus = "OK"
+            }
+
+            // Check backup
             let backupPath = path + self.backupSuffix
             let hasBackup = FileManager.default.fileExists(atPath: backupPath)
 
-            guard let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
-                  let extra = dict["CacheExtra"] as? [String: Any] else {
+            // Read plist as data first (to preserve binary format)
+            guard let plistData = FileManager.default.contents(atPath: path) else {
+                print("[Gestalt] Cannot read plist data")
                 DispatchQueue.main.async {
                     self.statusMessage = "Cannot read MobileGestalt plist"
+                    self.lastError = "FileManager.contents returned nil"
+                    self.isLoading = false
+                }
+                return
+            }
+            self.originalPlistData = plistData
+            print("[Gestalt] Plist data: \(plistData.count) bytes")
+
+            // Parse plist
+            guard let plist = try? PropertyListSerialization.propertyList(
+                from: plistData, options: .mutableContainersAndLeaves, format: nil
+            ) as? NSMutableDictionary else {
+                print("[Gestalt] Cannot parse plist")
+                DispatchQueue.main.async {
+                    self.statusMessage = "Cannot parse MobileGestalt plist"
+                    self.lastError = "PropertyListSerialization failed"
                     self.isLoading = false
                 }
                 return
             }
 
-            let mutableExtra = NSMutableDictionary(dictionary: extra)
-            self.cacheExtra = mutableExtra
+            guard let extra = plist["CacheExtra"] as? NSDictionary else {
+                print("[Gestalt] No CacheExtra key")
+                DispatchQueue.main.async {
+                    self.statusMessage = "MobileGestalt plist has no CacheExtra"
+                    self.lastError = "CacheExtra key missing"
+                    self.isLoading = false
+                }
+                return
+            }
+
+            let keyCount = extra.count
+            print("[Gestalt] CacheExtra has \(keyCount) keys")
 
             let subtype = extra["ArtworkDeviceSubType"] as? Int ?? 0
             let model = extra["h63QSdBCiT/z0WU6rdQr6Q"] as? String ?? "Unknown"
+            print("[Gestalt] Device model: \(model), subtype: \(subtype)")
 
             var states = [TweakState]()
             for tweak in Self.allTweaks {
@@ -318,11 +375,12 @@ class GestaltManager: ObservableObject {
                     let def = tweak.defaultValue as? Int ?? 0
                     isModified = cur != def
                 case .pick:
-                    isModified = current != nil && (current as? Int ?? 0) != 0
+                    isModified = false
                 }
                 states.append(TweakState(
                     id: tweak.id,
                     currentValue: current,
+                    originalValue: current,
                     isModified: isModified,
                     tweak: tweak
                 ))
@@ -334,17 +392,63 @@ class GestaltManager: ObservableObject {
                 self.hasBackup = hasBackup
                 self.deviceSubtype = subtype
                 self.deviceModel = model
+                self.plistKeyCount = keyCount
                 self.modifiedCount = states.filter(\.isModified).count
-                self.statusMessage = "Loaded \(extra.count) keys"
+                self.statusMessage = "Loaded \(keyCount) keys from MobileGestalt"
                 self.isLoading = false
             }
         }
     }
 
+    // MARK: - Discover path via scanning /var/containers/Shared/SystemGroup
+
+    private func discoverGestaltPath() -> String? {
+        let bases = [
+            "/var/containers/Shared/SystemGroup",
+            "/private/var/containers/Shared/SystemGroup"
+        ]
+        for base in bases {
+            print("[Gestalt] Trying to grant base: \(base)")
+            if wq_grant(base) {
+                print("[Gestalt] Base grant OK, listing...")
+                if let items = try? FileManager.default.contentsOfDirectory(atPath: base) {
+                    for item in items {
+                        if item.contains("mobilegestalt") {
+                            let candidate = "\(base)/\(item)/Library/Caches/com.apple.MobileGestalt.plist"
+                            let dir = (candidate as NSString).deletingLastPathComponent
+                            print("[Gestalt] Found gestalt dir: \(item), granting \(dir)")
+                            if wq_grant(dir) && FileManager.default.fileExists(atPath: candidate) {
+                                print("[Gestalt] Discovery found plist: \(candidate)")
+                                return candidate
+                            }
+                        }
+                    }
+                }
+            } else {
+                print("[Gestalt] Base grant FAILED for: \(base)")
+            }
+
+            // Try granting the specific systemgroup path directly
+            let directPath = "\(base)/systemgroup.com.apple.mobilegestaltcache"
+            print("[Gestalt] Trying direct: \(directPath)")
+            if wq_grant(directPath) {
+                let cachesDir = "\(directPath)/Library/Caches"
+                if wq_grant(cachesDir) {
+                    let plist = "\(cachesDir)/com.apple.MobileGestalt.plist"
+                    if FileManager.default.fileExists(atPath: plist) {
+                        return plist
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Modify
+
     func toggleBool(id: String) {
         guard let idx = tweakStates.firstIndex(where: { $0.id == id }) else { return }
-        let state = tweakStates[idx]
-        let current = state.currentValue as? Bool ?? false
+        let current = tweakStates[idx].currentValue as? Bool ?? false
         tweakStates[idx].currentValue = !current
         tweakStates[idx].isModified = true
     }
@@ -355,64 +459,148 @@ class GestaltManager: ObservableObject {
         tweakStates[idx].isModified = true
     }
 
+    // MARK: - Apply (binary plist)
+
     func applyChanges() {
-        guard let path = plistPath, let extra = cacheExtra else {
+        guard let path = plistPath else {
             statusMessage = "No plist loaded"
             return
         }
 
+        let changed = tweakStates.filter(\.isModified)
+        guard !changed.isEmpty else {
+            statusMessage = "No changes to apply"
+            return
+        }
+
         isLoading = true
-        statusMessage = "Applying changes..."
+        statusMessage = "Applying \(changed.count) changes..."
+        lastError = ""
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
+            // Re-grant
             let dir = (path as NSString).deletingLastPathComponent
             guard wq_grant(dir) else {
+                print("[Gestalt] Apply: grant failed for \(dir)")
                 DispatchQueue.main.async {
                     self.statusMessage = "Grant failed — cannot write"
+                    self.lastError = "wq_grant failed during apply"
                     self.isLoading = false
                 }
                 return
             }
 
+            // Create backup if needed
             let backupPath = path + self.backupSuffix
             if !FileManager.default.fileExists(atPath: backupPath) {
-                try? FileManager.default.copyItem(atPath: path, toPath: backupPath)
-            }
-
-            for state in self.tweakStates where state.isModified {
-                if let val = state.currentValue {
-                    extra[state.tweak.key] = val
+                do {
+                    try FileManager.default.copyItem(atPath: path, toPath: backupPath)
+                    print("[Gestalt] Backup created: \(backupPath)")
+                } catch {
+                    print("[Gestalt] Backup failed: \(error)")
                 }
             }
 
-            guard let fullDict = NSDictionary(contentsOfFile: path) as? [String: Any] else {
+            // Read current plist
+            guard let plistData = FileManager.default.contents(atPath: path) else {
+                print("[Gestalt] Apply: cannot read plist")
                 DispatchQueue.main.async {
-                    self.statusMessage = "Re-read failed"
+                    self.statusMessage = "Cannot read plist for modification"
                     self.isLoading = false
                 }
                 return
             }
 
-            let mutable = NSMutableDictionary(dictionary: fullDict)
-            mutable["CacheExtra"] = extra
-
-            let success = mutable.write(toFile: path, atomically: true)
-
-            DispatchQueue.main.async {
-                if success {
-                    let count = self.tweakStates.filter(\.isModified).count
-                    self.modifiedCount = count
-                    self.hasBackup = true
-                    self.statusMessage = "Applied \(count) tweaks — reboot to take effect"
-                } else {
-                    self.statusMessage = "Write failed — check permissions"
+            var format = PropertyListSerialization.PropertyListFormat.binary
+            guard let plist = try? PropertyListSerialization.propertyList(
+                from: plistData, options: .mutableContainersAndLeaves, format: &format
+            ) as? NSMutableDictionary else {
+                print("[Gestalt] Apply: cannot parse plist")
+                DispatchQueue.main.async {
+                    self.statusMessage = "Cannot parse plist"
+                    self.isLoading = false
                 }
-                self.isLoading = false
+                return
+            }
+
+            print("[Gestalt] Original format: \(format == .binary ? "binary" : format == .xml ? "XML" : "openStep")")
+
+            guard let extra = plist["CacheExtra"] as? NSMutableDictionary else {
+                print("[Gestalt] Apply: no CacheExtra")
+                DispatchQueue.main.async {
+                    self.statusMessage = "No CacheExtra in plist"
+                    self.isLoading = false
+                }
+                return
+            }
+
+            // Apply changes
+            for state in changed {
+                if let val = state.currentValue {
+                    extra[state.tweak.key] = val
+                    print("[Gestalt] Set \(state.tweak.key) = \(val)")
+                }
+            }
+
+            plist["CacheExtra"] = extra
+
+            // Write back as BINARY plist (critical!)
+            do {
+                let outputData = try PropertyListSerialization.data(
+                    fromPropertyList: plist,
+                    format: .binary,
+                    options: 0
+                )
+                print("[Gestalt] Serialized \(outputData.count) bytes as binary plist")
+
+                let success = FileManager.default.createFile(atPath: path, contents: outputData, attributes: nil)
+                if !success {
+                    // Try writing via NSData
+                    try (outputData as NSData).write(toFile: path, options: .atomic)
+                }
+                print("[Gestalt] Write completed")
+
+                // Verify: re-read and check
+                if let verifyData = FileManager.default.contents(atPath: path),
+                   let verifyDict = try? PropertyListSerialization.propertyList(
+                    from: verifyData, options: [], format: nil
+                   ) as? [String: Any],
+                   let verifyExtra = verifyDict["CacheExtra"] as? [String: Any] {
+                    var verified = 0
+                    for state in changed {
+                        if let written = verifyExtra[state.tweak.key] {
+                            print("[Gestalt] Verify \(state.tweak.name): \(written)")
+                            verified += 1
+                        }
+                    }
+                    print("[Gestalt] Verified \(verified)/\(changed.count) changes")
+
+                    DispatchQueue.main.async {
+                        self.modifiedCount = changed.count
+                        self.hasBackup = true
+                        self.statusMessage = "Applied \(changed.count) tweaks (\(verified) verified) — REBOOT to take effect"
+                        self.isLoading = false
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        self.statusMessage = "Written but verify failed — reboot to check"
+                        self.isLoading = false
+                    }
+                }
+            } catch {
+                print("[Gestalt] Write error: \(error)")
+                DispatchQueue.main.async {
+                    self.statusMessage = "Write failed: \(error.localizedDescription)"
+                    self.lastError = error.localizedDescription
+                    self.isLoading = false
+                }
             }
         }
     }
+
+    // MARK: - Restore
 
     func restoreBackup() {
         guard let path = plistPath else {
@@ -447,12 +635,14 @@ class GestaltManager: ObservableObject {
             do {
                 try FileManager.default.removeItem(atPath: path)
                 try FileManager.default.copyItem(atPath: backupPath, toPath: path)
+                print("[Gestalt] Backup restored")
                 DispatchQueue.main.async {
-                    self.statusMessage = "Backup restored — reboot to take effect"
+                    self.statusMessage = "Backup restored — REBOOT to take effect"
                     self.isLoading = false
                     self.loadGestalt()
                 }
             } catch {
+                print("[Gestalt] Restore error: \(error)")
                 DispatchQueue.main.async {
                     self.statusMessage = "Restore failed: \(error.localizedDescription)"
                     self.isLoading = false
@@ -460,6 +650,8 @@ class GestaltManager: ObservableObject {
             }
         }
     }
+
+    // MARK: - Bulk
 
     func enableAll(in category: TweakCategory) {
         for i in tweakStates.indices {

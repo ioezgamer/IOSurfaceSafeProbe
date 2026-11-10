@@ -16,6 +16,7 @@ struct TweaksView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     headerCard
+                    diagnosticCard
                     if gestalt.gestaltAccessible {
                         applyBar
                         searchBar
@@ -346,6 +347,69 @@ struct TweaksView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
+        }
+    }
+
+    // MARK: - Diagnostic Card
+
+    @ViewBuilder
+    private var diagnosticCard: some View {
+        if !gestalt.grantStatus.isEmpty || !gestalt.lastError.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("Diagnostics", systemImage: "stethoscope")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                }
+                Divider()
+                HStack {
+                    Text("Grant Status:")
+                        .font(.caption.weight(.medium))
+                    Text(gestalt.grantStatus)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(gestalt.grantStatus == "OK" ? .green : .red)
+                }
+                if let path = gestalt.plistPath {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Plist Path:")
+                            .font(.caption.weight(.medium))
+                        Text(path)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+                if gestalt.plistKeyCount > 0 {
+                    HStack {
+                        Text("Keys in CacheExtra:")
+                            .font(.caption.weight(.medium))
+                        Text("\(gestalt.plistKeyCount)")
+                            .font(.caption.weight(.bold))
+                    }
+                }
+                if !gestalt.deviceModel.isEmpty {
+                    HStack {
+                        Text("Device:")
+                            .font(.caption.weight(.medium))
+                        Text("\(gestalt.deviceModel) (subtype \(gestalt.deviceSubtype))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if !gestalt.lastError.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Error:")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.red)
+                        Text(gestalt.lastError)
+                            .font(.caption2)
+                            .foregroundStyle(.red.opacity(0.8))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding()
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
         }
     }
 
