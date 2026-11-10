@@ -453,9 +453,9 @@ struct TweaksView: View {
                 HStack {
                     Text("CacheData:")
                         .font(.caption.weight(.medium))
-                    Text(gestalt.hasCacheData ? "Present (will be removed on Apply)" : "Not present")
+                    Text(gestalt.hasCacheData ? "Present (will be patched on Apply)" : "Not present — restore backup first")
                         .font(.caption.weight(.bold))
-                        .foregroundStyle(gestalt.hasCacheData ? .orange : .green)
+                        .foregroundStyle(gestalt.hasCacheData ? .green : .orange)
                 }
                 HStack {
                     Text("Immutable:")

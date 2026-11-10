@@ -586,14 +586,40 @@ class GestaltManager: ObservableObject {
 
             plist["CacheExtra"] = extra
 
-            // Remove CacheData — iOS uses this serialized blob with higher priority
-            // than CacheExtra. If we leave it, our CacheExtra changes are ignored.
-            let hadCacheData = plist["CacheData"] != nil
-            if hadCacheData {
-                plist.removeObject(forKey: "CacheData")
-                print("[Gestalt] Removed CacheData (forces iOS to use CacheExtra)")
+            // Modify CacheData — iOS reads this serialized blob with HIGHER PRIORITY
+            // than CacheExtra. We must patch our values into it, not just remove it.
+            var cacheDataPatched = false
+            if let cacheDataBlob = plist["CacheData"] as? Data {
+                print("[Gestalt] CacheData found (\(cacheDataBlob.count) bytes), attempting to patch...")
+                if let cacheDict = self.deserializeCacheData(cacheDataBlob) {
+                    for state in toWrite {
+                        if let val = state.currentValue {
+                            cacheDict[state.tweak.key] = val
+                            print("[Gestalt] Patched CacheData: \(state.tweak.key) = \(val)")
+                        }
+                    }
+                    if forceAll {
+                        for state in self.tweakStates {
+                            if case .bool = state.tweak.type,
+                               (state.currentValue as? Bool) == false {
+                                cacheDict[state.tweak.key] = false
+                            }
+                        }
+                    }
+                    if let newBlob = self.serializeCacheData(cacheDict) {
+                        plist["CacheData"] = newBlob
+                        cacheDataPatched = true
+                        print("[Gestalt] CacheData patched (\(newBlob.count) bytes)")
+                    } else {
+                        print("[Gestalt] CacheData re-serialization failed, removing it")
+                        plist.removeObject(forKey: "CacheData")
+                    }
+                } else {
+                    print("[Gestalt] CacheData deserialization failed, removing it")
+                    plist.removeObject(forKey: "CacheData")
+                }
             } else {
-                print("[Gestalt] No CacheData found (already removed or not present)")
+                print("[Gestalt] No CacheData present")
             }
 
             do {
@@ -633,16 +659,15 @@ class GestaltManager: ObservableObject {
                     }
                 }
 
-                let cacheDataMsg = hadCacheData ? " CacheData removed." : ""
-                let verifyMsg = cacheDataBack ? " WARNING: CacheData regenerated!" : ""
+                let patchMsg = cacheDataPatched ? " CacheData patched." : " CacheData not present."
 
-                print("[Gestalt] Verified \(verified)/\(writeCount) changes.\(cacheDataMsg)\(verifyMsg)")
+                print("[Gestalt] Verified \(verified)/\(writeCount) changes.\(patchMsg)")
 
                 DispatchQueue.main.async {
                     self.modifiedCount = writeCount
                     self.hasBackup = true
                     self.hasCacheData = cacheDataBack
-                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified).\(cacheDataMsg)\(verifyMsg) REBOOT required."
+                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified).\(patchMsg) REBOOT required."
                     self.isLoading = false
                 }
             } catch {
@@ -880,6 +905,50 @@ class GestaltManager: ObservableObject {
                 self.isLoading = false
             }
         }
+    }
+
+    // MARK: - CacheData Serialization
+
+    private func deserializeCacheData(_ data: Data) -> NSMutableDictionary? {
+        // Try NSKeyedUnarchiver first (most common format)
+        if let dict = try? NSKeyedUnarchiver.unarchivedObject(
+            ofClasses: [NSDictionary.self, NSMutableDictionary.self, NSString.self,
+                        NSNumber.self, NSData.self, NSArray.self, NSMutableArray.self,
+                        NSDate.self, NSSet.self, NSMutableSet.self],
+            from: data
+        ) as? NSMutableDictionary {
+            print("[Gestalt] CacheData decoded via NSKeyedUnarchiver (\(dict.count) keys)")
+            return dict
+        }
+
+        // Try as a nested binary plist
+        if let dict = try? PropertyListSerialization.propertyList(
+            from: data, options: .mutableContainersAndLeaves, format: nil
+        ) as? NSMutableDictionary {
+            print("[Gestalt] CacheData decoded as binary plist (\(dict.count) keys)")
+            return dict
+        }
+
+        print("[Gestalt] CacheData: unknown format (first 4 bytes: \(data.prefix(4).map { String(format: "%02x", $0) }.joined()))")
+        return nil
+    }
+
+    private func serializeCacheData(_ dict: NSMutableDictionary) -> Data? {
+        // Re-encode with NSKeyedArchiver
+        if let data = try? NSKeyedArchiver.archivedData(
+            withRootObject: dict, requiringSecureCoding: false
+        ) {
+            return data
+        }
+
+        // Fallback to binary plist
+        if let data = try? PropertyListSerialization.data(
+            fromPropertyList: dict, format: .binary, options: 0
+        ) {
+            return data
+        }
+
+        return nil
     }
 
     func checkImmutable() {
