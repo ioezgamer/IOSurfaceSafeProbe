@@ -1,17 +1,23 @@
 import Foundation
 import Darwin
 
+// MARK: - GreenTea / NotGreenTea master flags (CacheData gate keys)
+
+private let kGreenTeaKey  = "iyfxmLogGVIaH7aEgqwcIA"   // must be FALSE (0) to enable overrides
+private let kNotGreenTeaKey = "4snMZS8LJkSctKypt2m+xA"  // must be TRUE  (1) to enable overrides
+
 // MARK: - Tweak Definitions
 
 struct GestaltTweak: Identifiable, Hashable {
     let id: String
-    let key: String
+    let key: String          // MobileGestalt key hash (used for both CacheExtra and CacheData)
     let name: String
     let description: String
     let category: TweakCategory
     let type: TweakType
     let defaultValue: Any?
     let enabledValue: Any?
+    var extraKey: String?    // Alternate CacheExtra key (e.g. "ArtworkDeviceSubType")
 
     enum TweakType {
         case bool
@@ -295,7 +301,7 @@ class GestaltManager: ObservableObject {
 
         // Display & UI
         t.append(GestaltTweak(
-            id: "dynamic_island", key: "ArtworkDeviceSubType",
+            id: "dynamic_island", key: "oPeik/9e8lQWMszEjbPzng",
             name: "Device Subtype (Dynamic Island)",
             description: "Changes device appearance. Pick a model to get its UI features like Dynamic Island.",
             category: .display, type: .pick([
@@ -307,10 +313,11 @@ class GestaltManager: ObservableObject {
                 .init(label: "iPhone 16 Pro", value: 2766, detail: "All latest features"),
                 .init(label: "iPhone 16 Pro Max", value: 2976, detail: "All latest features"),
             ]),
-            defaultValue: nil, enabledValue: nil
+            defaultValue: nil, enabledValue: nil,
+            extraKey: "ArtworkDeviceSubType"
         ))
         t.append(GestaltTweak(
-            id: "aod", key: "oPeik/9e8lQWMszEjbPJng",
+            id: "aod", key: "2OOJf1VhaM7NxfRok3HbWQ",
             name: "Always On Display",
             description: "Enables the Always On Display feature.",
             category: .display, type: .bool,
@@ -326,28 +333,28 @@ class GestaltManager: ObservableObject {
 
         // Buttons & Hardware
         t.append(GestaltTweak(
-            id: "action_button", key: "j8/Omm6s1lsmTDFsXjsBfA",
+            id: "action_button", key: "cT44WE1EohiwRzhsZ8xEsw",
             name: "Action Button",
             description: "Enables the customizable Action Button in Settings.",
             category: .hardware, type: .bool,
             defaultValue: false, enabledValue: true
         ))
         t.append(GestaltTweak(
-            id: "camera_control", key: "8olRm6C1xqr7APlGPLQaBQ",
+            id: "camera_control", key: "CwvKxM2cEogD3p+HYgaW0Q",
             name: "Camera Control",
             description: "Enables the Camera Control button feature.",
             category: .hardware, type: .bool,
             defaultValue: false, enabledValue: true
         ))
         t.append(GestaltTweak(
-            id: "boot_chime", key: "qeaj75wk3HF4DwQ8qbIi7g",
+            id: "boot_chime", key: "QHxt+hGLaBPbQJbXiUJX3w",
             name: "Boot Chime",
             description: "Plays a sound when the device starts up.",
             category: .hardware, type: .bool,
             defaultValue: false, enabledValue: true
         ))
         t.append(GestaltTweak(
-            id: "tap_to_wake", key: "IMLaTlxS7ITtwfbRfPYWuA",
+            id: "tap_to_wake", key: "yZf3GTRMGTuwSV/lD7Cagw",
             name: "Tap to Wake",
             description: "Wake device by tapping the screen.",
             category: .hardware, type: .bool,
@@ -363,21 +370,21 @@ class GestaltManager: ObservableObject {
 
         // Features
         t.append(GestaltTweak(
-            id: "apple_intelligence", key: "h9jDsbgj7xIVeIQ8S3/X3Q",
+            id: "apple_intelligence", key: "A62OafQ85EJAiiqKn4agtg",
             name: "Apple Intelligence",
             description: "Enables Apple Intelligence AI features.",
             category: .features, type: .bool,
             defaultValue: false, enabledValue: true
         ))
         t.append(GestaltTweak(
-            id: "stage_manager", key: "A62OafQ85EJAiiqKn4agtg",
+            id: "stage_manager", key: "qeaj75wk3HF4DwQ8qbIi7g",
             name: "Stage Manager",
             description: "Enables Stage Manager multitasking.",
             category: .features, type: .bool,
             defaultValue: false, enabledValue: true
         ))
         t.append(GestaltTweak(
-            id: "charge_limit", key: "HCzWusHQwZDea6nNhaKndw",
+            id: "charge_limit", key: "37NVydb//GP/GrhuTN+exg",
             name: "Charge Limit (80%)",
             description: "Shows the battery charging limit option in Settings.",
             category: .features, type: .bool,
@@ -391,7 +398,7 @@ class GestaltManager: ObservableObject {
             defaultValue: false, enabledValue: true
         ))
         t.append(GestaltTweak(
-            id: "internal_storage", key: "cT44WE1EohiwRzhsZ8xEsw",
+            id: "internal_storage", key: "LBJfwOEzExRxzlAnSuI7eg",
             name: "Show Internal Storage",
             description: "Shows detailed internal storage info in Settings.",
             category: .features, type: .bool,
@@ -551,7 +558,7 @@ class GestaltManager: ObservableObject {
             }
 
             let keyCount = extra.count
-            let subtype = extra["ArtworkDeviceSubType"] as? Int ?? 0
+            let subtype = (extra["ArtworkDeviceSubType"] ?? extra["oPeik/9e8lQWMszEjbPzng"]) as? Int ?? 0
             let model = extra["h63QSdBCiT/z0WU6rdQr6Q"] as? String ?? "Unknown"
 
             var states = [TweakState]()
@@ -817,11 +824,14 @@ class GestaltManager: ObservableObject {
                 return
             }
 
-            // Step 1: Write all enabled tweaks to CacheExtra
+            // Step 1: Write all enabled tweaks to CacheExtra (backward compat)
             var writeCount = 0
             for state in toWrite {
                 if let val = state.currentValue {
                     extra[state.tweak.key] = val
+                    if let alt = state.tweak.extraKey {
+                        extra[alt] = val
+                    }
                     writeCount += 1
                 }
             }
@@ -834,11 +844,16 @@ class GestaltManager: ObservableObject {
             }
             plist["CacheExtra"] = extra
 
-            // Step 2: Keep CacheData intact (iOS 27 only reads CacheData, not CacheExtra)
-            var cacheDataStatus = "Not present"
-            if plist["CacheData"] != nil {
-                cacheDataStatus = "Kept intact (preserved original)"
-                print("[Gestalt] CacheData kept intact")
+            // Step 2: Patch CacheData binary directly (iOS 27 reads ONLY CacheData)
+            var cdStatus = "Not present"
+            var cdPatched = 0
+            if var cacheData = plist["CacheData"] as? Data {
+                let result = self.patchCacheDataBinary(&cacheData, tweaks: toWrite, forceAll: forceAll)
+                cdPatched = result.patched
+                cdStatus = result.status
+                if result.patched > 0 {
+                    plist["CacheData"] = cacheData
+                }
             }
 
             // Step 3: Write the plist
@@ -847,7 +862,7 @@ class GestaltManager: ObservableObject {
                     fromPropertyList: plist, format: .binary, options: 0
                 )
 
-                chflags(path, 0) // Clear immutable
+                chflags(path, 0)
                 try (outputData as NSData).write(toFile: path, options: .atomic)
 
                 let immRet = chflags(path, UInt32(UF_IMMUTABLE))
@@ -870,8 +885,8 @@ class GestaltManager: ObservableObject {
                     self.modifiedCount = writeCount
                     self.hasBackup = true
                     self.hasCacheData = plist["CacheData"] != nil
-                    self.cacheDataPatchInfo = cacheDataStatus
-                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified). CacheData: \(cacheDataStatus). REBOOT required."
+                    self.cacheDataPatchInfo = cdStatus
+                    self.statusMessage = "CacheExtra: \(writeCount) (\(verified) ok). CacheData: \(cdPatched) patched. \(cdStatus). REBOOT required."
                     self.isLoading = false
                 }
             } catch {
@@ -884,82 +899,116 @@ class GestaltManager: ObservableObject {
         }
     }
 
-    // MARK: - CacheData In-Place Patching
+    // MARK: - CacheData Binary Patching (v14)
+    //
+    // CacheData layout: N slots × 9 bytes total
+    //   Bytes [0 ..< N*8]:        value slots (8 bytes LE each)
+    //   Bytes [N*8 ..< N*8 + N]:  validity bytes (1 = trust cached, 0 = query daemon)
+    //
+    // We resolve each tweak's slot index at runtime by calling mg_cache_index(),
+    // which scans libMobileGestalt's query descriptors in memory.
 
     private struct PatchResult {
-        let data: Data?
         let patched: Int
         let status: String
     }
 
-    private func patchCacheDataInPlace(
-        _ blob: Data, tweaks: [TweakState], forceAll: Bool
+    private func patchCacheDataBinary(
+        _ data: inout Data, tweaks: [TweakState], forceAll: Bool
     ) -> PatchResult {
-        guard var patcher = BPlistPatcher(data: blob) else {
-            return PatchResult(data: nil, patched: 0, status: "Not bplist00")
+        let size = data.count
+        guard size >= 9 else {
+            return PatchResult(patched: 0, status: "CacheData too small (\(size)B)")
         }
 
-        let dicts = patcher.findDicts()
-        if dicts.isEmpty {
-            return PatchResult(data: nil, patched: 0, status: "No dicts found")
+        // Derive slot count: size = slotCount * 9
+        guard size % 9 == 0 else {
+            return PatchResult(patched: 0, status: "CacheData size \(size) not divisible by 9")
         }
+        let slotCount = size / 9
+        print("[v14] CacheData: \(size) bytes, \(slotCount) slots")
 
-        // Build a map of key-string → (dictIndex, valueObjectIndex) for ALL dicts
-        var keyToValue = [String: (dictIdx: Int, valObjIdx: Int)]()
-        for d in dicts {
-            for (i, ki) in d.keys.enumerated() {
-                if let s = patcher.stringAt(ki), i < d.values.count {
-                    keyToValue[s] = (d.index, d.values[i])
-                }
-            }
+        // Also try runtime slot count for cross-check
+        let runtimeSlots = Int(mg_slot_count())
+        if runtimeSlots > 0 && runtimeSlots != slotCount {
+            print("[v14] WARNING: runtime reports \(runtimeSlots) slots vs file \(slotCount)")
         }
 
         var patched = 0
-        var notFound = [String]()
+        var failed = [String]()
 
-        // Patch boolean tweaks
-        let allStates = forceAll ? tweakStates : []
-        let tweaksToPatch = tweaks + allStates.filter { s in
-            if case .bool = s.tweak.type, (s.currentValue as? Bool) == false {
-                return !tweaks.contains(where: { $0.id == s.id })
+        // Collect all keys to patch (including disabled bools in forceAll mode)
+        var allToPatch = tweaks
+        if forceAll {
+            let extraDisabled = tweakStates.filter { s in
+                if case .bool = s.tweak.type, (s.currentValue as? Bool) == false {
+                    return !tweaks.contains(where: { $0.id == s.id })
+                }
+                return false
             }
-            return false
+            allToPatch.append(contentsOf: extraDisabled)
         }
 
-        for state in tweaksToPatch {
-            guard let entry = keyToValue[state.tweak.key] else {
-                notFound.append(state.tweak.key)
+        for state in allToPatch {
+            let idx = Int(mg_cache_index(state.tweak.key))
+            guard idx >= 0 && idx < slotCount else {
+                failed.append(state.id)
+                print("[v14] \(state.id): index resolution failed (got \(idx))")
                 continue
             }
 
+            let valueOffset = idx * 8
+            let validityOffset = slotCount * 8 + idx
+
+            // Determine the 8-byte LE value to write
+            var value: UInt64
             switch state.tweak.type {
             case .bool:
-                let val = state.currentValue as? Bool ?? false
-                if patcher.patchBool(objectIndex: entry.valObjIdx, value: val) {
-                    print("[Gestalt] CacheData patched \(state.tweak.key) = \(val)")
-                    patched += 1
-                } else {
-                    print("[Gestalt] CacheData: \(state.tweak.key) not a bool object")
-                }
+                value = (state.currentValue as? Bool ?? false) ? 1 : 0
             case .int:
-                if let val = state.currentValue as? Int {
-                    if patcher.patchInt(objectIndex: entry.valObjIdx, value: Int64(val)) {
-                        print("[Gestalt] CacheData patched \(state.tweak.key) = \(val)")
-                        patched += 1
-                    }
-                }
+                value = UInt64(bitPattern: Int64(state.currentValue as? Int ?? 0))
             case .pick:
-                if let val = state.currentValue as? Int, val != 0 {
-                    if patcher.patchInt(objectIndex: entry.valObjIdx, value: Int64(val)) {
-                        print("[Gestalt] CacheData patched \(state.tweak.key) = \(val)")
-                        patched += 1
-                    }
-                }
+                value = UInt64(state.currentValue as? Int ?? 0)
             }
+
+            // Write value at slot
+            data.replaceSubrange(valueOffset ..< valueOffset + 8, with: withUnsafeBytes(of: value.littleEndian) { Data($0) })
+            // Mark validity byte = 1 (trust this cached value)
+            data[validityOffset] = 1
+
+            print("[v14] \(state.id) [\(state.tweak.key)] -> slot \(idx), value \(value)")
+            patched += 1
         }
 
-        let status = "\(patched) patched, \(notFound.count) not in CacheData"
-        return PatchResult(data: patcher.toData(), patched: patched, status: status)
+        // Patch greenTea/notGreenTea master flags
+        let greenTeaIdx = Int(mg_cache_index(kGreenTeaKey))
+        let notGreenTeaIdx = Int(mg_cache_index(kNotGreenTeaKey))
+
+        if greenTeaIdx >= 0 && greenTeaIdx < slotCount {
+            // greenTea = false (0) to ENABLE overrides
+            let off = greenTeaIdx * 8
+            let zero = UInt64(0)
+            data.replaceSubrange(off ..< off + 8, with: withUnsafeBytes(of: zero.littleEndian) { Data($0) })
+            data[slotCount * 8 + greenTeaIdx] = 1
+            print("[v14] greenTea -> slot \(greenTeaIdx) = 0 (disabled)")
+        } else {
+            print("[v14] WARNING: greenTea index not resolved (\(greenTeaIdx))")
+        }
+
+        if notGreenTeaIdx >= 0 && notGreenTeaIdx < slotCount {
+            // notGreenTea = true (1) to ENABLE overrides
+            let off = notGreenTeaIdx * 8
+            let one = UInt64(1)
+            data.replaceSubrange(off ..< off + 8, with: withUnsafeBytes(of: one.littleEndian) { Data($0) })
+            data[slotCount * 8 + notGreenTeaIdx] = 1
+            print("[v14] notGreenTea -> slot \(notGreenTeaIdx) = 1 (enabled)")
+        } else {
+            print("[v14] WARNING: notGreenTea index not resolved (\(notGreenTeaIdx))")
+        }
+
+        let gtStatus = greenTeaIdx >= 0 && notGreenTeaIdx >= 0 ? "gates OK" : "gates PARTIAL"
+        let status = "\(patched)/\(allToPatch.count) slots, \(gtStatus), \(failed.count) unresolved"
+        return PatchResult(patched: patched, status: status)
     }
 
     // MARK: - Respring

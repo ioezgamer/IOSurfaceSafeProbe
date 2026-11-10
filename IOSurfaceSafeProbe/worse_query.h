@@ -33,4 +33,13 @@ NSArray<NSString *> * _Nullable wq_enumerate(NSString * _Nonnull dir,
 /// Returns diagnostic log text.
 NSString * _Nonnull wq_log_text(void);
 
+/// Resolves the CacheData slot index for a MobileGestalt key hash string
+/// by scanning libMobileGestalt's memory at runtime.
+/// Returns the slot index (>= 0) on success, or -1 if not found.
+int mg_cache_index(const char * _Nonnull keyHash);
+
+/// Returns the total number of CacheData slots detected from the binary,
+/// or -1 if libMobileGestalt could not be loaded.
+int mg_slot_count(void);
+
 #endif

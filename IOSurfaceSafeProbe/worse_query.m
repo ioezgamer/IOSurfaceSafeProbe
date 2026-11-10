@@ -545,3 +545,131 @@ NSArray<NSString *> *wq_enumerate(NSString *dir,
     wq_log(@"enumerate: found %lu containers", (unsigned long)sorted.count);
     return sorted;
 }
+
+// MARK: - MobileGestalt Cache Index Resolution
+
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <string.h>
+
+// Query descriptor layout in libMobileGestalt (64 bytes each):
+//   +0x00: pointer to key hash C-string (with PAC bits, mask with 0x0000FFFFFFFFFFFF)
+//   +0x3A: Int16 cache index
+//   +0x3C: UInt32 query type (11 = boolean)
+// Descriptors live in __AUTH_CONST,__const or __DATA_CONST,__const
+
+static void *s_mg_handle = NULL;
+static const struct mach_header_64 *s_mg_header = NULL;
+static int s_slot_count = -1;
+
+static void mg_ensure_loaded(void) {
+    if (s_mg_handle) return;
+    s_mg_handle = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY | RTLD_NOLOAD);
+    if (!s_mg_handle)
+        s_mg_handle = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+    if (!s_mg_handle) return;
+
+    // Find the mach_header for libMobileGestalt
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "libMobileGestalt")) {
+            s_mg_header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            break;
+        }
+    }
+}
+
+// Walk __TEXT,__cstring to find the address of a key hash string
+static const char *mg_find_cstring(const char *needle) {
+    if (!s_mg_header) return NULL;
+    unsigned long size = 0;
+    intptr_t slide = 0;
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        if ((const struct mach_header_64 *)_dyld_get_image_header(i) == s_mg_header) {
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+
+    const uint8_t *sect = getsectiondata(s_mg_header, "__TEXT", "__cstring", &size);
+    if (!sect || size == 0) return NULL;
+
+    size_t needleLen = strlen(needle);
+    const uint8_t *end = sect + size - needleLen;
+    for (const uint8_t *p = sect; p <= end; p++) {
+        if (memcmp(p, needle, needleLen) == 0 && p[needleLen] == '\0') {
+            return (const char *)p;
+        }
+    }
+    return NULL;
+}
+
+// Scan query descriptors (64-byte structs) for one whose key-hash pointer
+// matches `targetStr`. Returns the Int16 at +0x3A (the cache index).
+static int mg_scan_descriptors(const char *sectName, const char *targetStr) {
+    if (!s_mg_header) return -1;
+    unsigned long size = 0;
+    const uint8_t *sect = getsectiondata(s_mg_header, "__AUTH_CONST", sectName, &size);
+    if (!sect) sect = getsectiondata(s_mg_header, "__DATA_CONST", sectName, &size);
+    if (!sect || size < 64) return -1;
+
+    uintptr_t target = (uintptr_t)targetStr;
+    size_t numEntries = size / 64;
+
+    for (size_t i = 0; i < numEntries; i++) {
+        const uint8_t *entry = sect + i * 64;
+        uintptr_t rawPtr;
+        memcpy(&rawPtr, entry, 8);
+        // Strip PAC bits (keep lower 48 bits)
+        uintptr_t stripped = rawPtr & 0x0000FFFFFFFFFFFF;
+        if (stripped == target) {
+            int16_t idx;
+            memcpy(&idx, entry + 0x3A, 2);
+            return (int)idx;
+        }
+    }
+    return -1;
+}
+
+// Compute slot count from the descriptors: find the maximum index
+static int mg_compute_slot_count(const char *sectName) {
+    if (!s_mg_header) return -1;
+    unsigned long size = 0;
+    const uint8_t *sect = getsectiondata(s_mg_header, "__AUTH_CONST", sectName, &size);
+    if (!sect) sect = getsectiondata(s_mg_header, "__DATA_CONST", sectName, &size);
+    if (!sect || size < 64) return -1;
+
+    int maxIdx = -1;
+    size_t numEntries = size / 64;
+    for (size_t i = 0; i < numEntries; i++) {
+        const uint8_t *entry = sect + i * 64;
+        int16_t idx;
+        memcpy(&idx, entry + 0x3A, 2);
+        if (idx > maxIdx) maxIdx = idx;
+    }
+    return maxIdx >= 0 ? maxIdx + 1 : -1;
+}
+
+int mg_cache_index(const char *keyHash) {
+    mg_ensure_loaded();
+    if (!s_mg_header) return -1;
+
+    const char *strAddr = mg_find_cstring(keyHash);
+    if (!strAddr) return -1;
+
+    int idx = mg_scan_descriptors("__const", strAddr);
+    if (idx >= 0) return idx;
+    return -1;
+}
+
+int mg_slot_count(void) {
+    mg_ensure_loaded();
+    if (!s_mg_header) return -1;
+    if (s_slot_count >= 0) return s_slot_count;
+    s_slot_count = mg_compute_slot_count("__const");
+    return s_slot_count;
+}
