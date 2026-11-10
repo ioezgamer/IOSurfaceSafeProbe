@@ -14,6 +14,8 @@
 		A10005 /* worse_query.m in Sources */ = {isa = PBXBuildFile; fileRef = B10005; };
 		A10006 /* pathleak.m in Sources */ = {isa = PBXBuildFile; fileRef = B10006; };
 		A10007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10007; };
+		A10008 /* GestaltManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10012; };
+		A10009 /* TweaksView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10013; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +30,8 @@
 		B10009 /* pathleak.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = pathleak.h; sourceTree = "<group>"; };
 		B10010 /* IOSurfaceSafeProbe-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IOSurfaceSafeProbe-Bridging-Header.h"; sourceTree = "<group>"; };
 		B10011 /* IOSurfaceSafeProbe.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = IOSurfaceSafeProbe.entitlements; sourceTree = "<group>"; };
+		B10012 /* GestaltManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestaltManager.swift; sourceTree = "<group>"; };
+		B10013 /* TweaksView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TweaksView.swift; sourceTree = "<group>"; };
 		B10099 /* IOSurfaceSafeProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IOSurfaceSafeProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -57,6 +61,8 @@
 				B10002 /* ContentView.swift */,
 				B10003 /* Console.swift */,
 				B10004 /* CacheManager.swift */,
+				B10012 /* GestaltManager.swift */,
+				B10013 /* TweaksView.swift */,
 				B10008 /* worse_query.h */,
 				B10005 /* worse_query.m */,
 				B10009 /* pathleak.h */,
@@ -146,6 +152,8 @@
 				A10004 /* CacheManager.swift in Sources */,
 				A10005 /* worse_query.m in Sources */,
 				A10006 /* pathleak.m in Sources */,
+				A10008 /* GestaltManager.swift in Sources */,
+				A10009 /* TweaksView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

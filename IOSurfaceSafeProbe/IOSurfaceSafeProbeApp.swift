@@ -11,7 +11,28 @@ import SwiftUI
 struct IOSurfaceSafeProbeApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            MainTabView()
         }
+    }
+}
+
+struct MainTabView: View {
+    @State private var selectedTab = 0
+
+    var body: some View {
+        TabView(selection: $selectedTab) {
+            ContentView()
+                .tabItem {
+                    Label("Cache", systemImage: "trash.circle.fill")
+                }
+                .tag(0)
+
+            TweaksView()
+                .tabItem {
+                    Label("Tweaks", systemImage: "wrench.and.screwdriver.fill")
+                }
+                .tag(1)
+        }
+        .tint(.purple)
     }
 }
