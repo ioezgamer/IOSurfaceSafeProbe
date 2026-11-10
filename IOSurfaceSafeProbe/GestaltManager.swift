@@ -391,11 +391,16 @@ class GestaltManager: ObservableObject {
                 ))
             }
 
+            // Check immutable flag
+            var fileStat = stat()
+            let immutable = stat(path, &fileStat) == 0 && (fileStat.st_flags & UInt32(UF_IMMUTABLE)) != 0
+
             DispatchQueue.main.async {
                 self.tweakStates = states
                 self.gestaltAccessible = true
                 self.hasBackup = hasBackup
                 self.hasCacheData = cacheDataPresent
+                self.isImmutable = immutable
                 self.deviceSubtype = subtype
                 self.deviceModel = model
                 self.plistKeyCount = keyCount
@@ -607,7 +612,9 @@ class GestaltManager: ObservableObject {
 
                 // Set immutable to prevent iOS from overwriting on reboot
                 let immRet = chflags(path, UInt32(UF_IMMUTABLE))
+                let immOk = immRet == 0
                 print("[Gestalt] Set UF_IMMUTABLE: ret=\(immRet), errno=\(errno)")
+                DispatchQueue.main.async { self.isImmutable = immOk }
 
                 // Verify
                 var verified = 0
@@ -744,18 +751,14 @@ class GestaltManager: ObservableObject {
         }
     }
 
-    // MARK: - Eligibility Override
+    // MARK: - Eligibility Override (via SystemGroup discovery)
 
     @Published var eligibilityStatus = ""
-
-    private let eligibilityPaths = [
-        "/var/db/eligibilityd/eligibility.plist",
-        "/private/var/db/eligibilityd/eligibility.plist"
-    ]
+    @Published var isImmutable = false
 
     func writeEligibility() {
         isLoading = true
-        statusMessage = "Writing eligibility override..."
+        statusMessage = "Searching for eligibility container..."
         eligibilityStatus = ""
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -786,42 +789,83 @@ class GestaltManager: ObservableObject {
                 ]
             ]
 
+            // Strategy 1: Search SystemGroup containers for eligibility
             var wrote = false
-            for ePath in self.eligibilityPaths {
-                let dir = (ePath as NSString).deletingLastPathComponent
-                print("[Eligibility] Trying grant: \(dir)")
-                guard wq_grant(dir) else {
-                    print("[Eligibility] Grant failed for \(dir)")
-                    continue
-                }
+            let bases = [
+                "/var/containers/Shared/SystemGroup",
+                "/private/var/containers/Shared/SystemGroup"
+            ]
 
-                do {
-                    // Create directory if needed
-                    if !FileManager.default.fileExists(atPath: dir) {
-                        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                        print("[Eligibility] Created dir: \(dir)")
+            for base in bases {
+                if !wq_grant(base) { continue }
+                guard let items = try? FileManager.default.contentsOfDirectory(atPath: base) else { continue }
+
+                for item in items where item.lowercased().contains("eligib") {
+                    let containerPath = "\(base)/\(item)"
+                    print("[Eligibility] Found container: \(containerPath)")
+
+                    // Try common plist locations within the container
+                    let candidates = [
+                        "\(containerPath)/Library/Caches/eligibility.plist",
+                        "\(containerPath)/Library/eligibility.plist",
+                        "\(containerPath)/eligibility.plist"
+                    ]
+
+                    for candidate in candidates {
+                        let dir = (candidate as NSString).deletingLastPathComponent
+                        guard wq_grant(dir) else { continue }
+
+                        do {
+                            if !FileManager.default.fileExists(atPath: dir) {
+                                try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                            }
+                            let data = try PropertyListSerialization.data(
+                                fromPropertyList: eligibility, format: .binary, options: 0
+                            )
+                            try (data as NSData).write(toFile: candidate, options: .atomic)
+                            print("[Eligibility] Wrote to: \(candidate)")
+                            wrote = true
+                            DispatchQueue.main.async {
+                                self.eligibilityStatus = "OK — \(candidate)"
+                            }
+                            break
+                        } catch {
+                            print("[Eligibility] Write failed at \(candidate): \(error)")
+                        }
                     }
+                    if wrote { break }
+                }
+                if wrote { break }
+            }
 
-                    let data = try PropertyListSerialization.data(
-                        fromPropertyList: eligibility,
-                        format: .binary,
-                        options: 0
-                    )
-                    try (data as NSData).write(toFile: ePath, options: .atomic)
-                    print("[Eligibility] Wrote \(data.count) bytes to \(ePath)")
-
-                    // Verify
-                    if FileManager.default.fileExists(atPath: ePath) {
-                        print("[Eligibility] Verified file exists")
+            // Strategy 2: Try /var/db paths (unlikely to work — not a container)
+            if !wrote {
+                let dbPaths = [
+                    "/var/db/eligibilityd/eligibility.plist",
+                    "/private/var/db/eligibilityd/eligibility.plist"
+                ]
+                for ePath in dbPaths {
+                    let dir = (ePath as NSString).deletingLastPathComponent
+                    guard wq_grant(dir) else {
+                        print("[Eligibility] Grant failed for \(dir) (expected — not a container)")
+                        continue
+                    }
+                    do {
+                        if !FileManager.default.fileExists(atPath: dir) {
+                            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                        }
+                        let data = try PropertyListSerialization.data(
+                            fromPropertyList: eligibility, format: .binary, options: 0
+                        )
+                        try (data as NSData).write(toFile: ePath, options: .atomic)
                         wrote = true
-
                         DispatchQueue.main.async {
-                            self.eligibilityStatus = "OK — wrote to \(ePath)"
+                            self.eligibilityStatus = "OK — \(ePath)"
                         }
                         break
+                    } catch {
+                        print("[Eligibility] Write error: \(error)")
                     }
-                } catch {
-                    print("[Eligibility] Write error: \(error)")
                 }
             }
 
@@ -829,12 +873,20 @@ class GestaltManager: ObservableObject {
                 if wrote {
                     self.statusMessage = "Eligibility override written — REBOOT required"
                 } else {
-                    self.statusMessage = "Eligibility write failed — could not access /var/db/eligibilityd/"
-                    self.eligibilityStatus = "FAILED"
-                    self.lastError = "Cannot grant access to eligibilityd directory"
+                    self.statusMessage = "Eligibility: no accessible path found (exploit only reaches containers)"
+                    self.eligibilityStatus = "N/A"
+                    self.lastError = "eligibilityd is not in a SystemGroup container — cannot access with worse_query"
                 }
                 self.isLoading = false
             }
+        }
+    }
+
+    func checkImmutable() {
+        guard let path = plistPath else { return }
+        var st = stat()
+        if stat(path, &st) == 0 {
+            isImmutable = (st.st_flags & UInt32(UF_IMMUTABLE)) != 0
         }
     }
 

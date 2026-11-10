@@ -120,7 +120,7 @@ struct TweaksView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Writes eligibility override to /var/db/eligibilityd/ to enable Apple Intelligence. This is separate from MobileGestalt — some iOS versions check this file for AI eligibility.")
+                Text("Searches for the eligibility container in SystemGroup and writes an AI eligibility override. This may not work if the eligibility daemon doesn't use a container path.")
             }
             .confirmationDialog("Lock Plist?", isPresented: $showImmutableConfirm, titleVisibility: .visible) {
                 Button("Set Immutable Flag") {
@@ -457,13 +457,25 @@ struct TweaksView: View {
                         .font(.caption.weight(.bold))
                         .foregroundStyle(gestalt.hasCacheData ? .orange : .green)
                 }
+                HStack {
+                    Text("Immutable:")
+                        .font(.caption.weight(.medium))
+                    Text(gestalt.isImmutable ? "Locked" : "Not locked")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(gestalt.isImmutable ? .blue : .secondary)
+                    if gestalt.isImmutable {
+                        Image(systemName: "lock.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                    }
+                }
                 if !gestalt.eligibilityStatus.isEmpty {
                     HStack {
                         Text("Eligibility:")
                             .font(.caption.weight(.medium))
                         Text(gestalt.eligibilityStatus)
                             .font(.caption.weight(.bold))
-                            .foregroundStyle(gestalt.eligibilityStatus.hasPrefix("OK") ? .green : .red)
+                            .foregroundStyle(gestalt.eligibilityStatus.hasPrefix("OK") ? .green : (gestalt.eligibilityStatus == "N/A" ? .secondary : .red))
                     }
                 }
                 if !gestalt.deviceModel.isEmpty {
