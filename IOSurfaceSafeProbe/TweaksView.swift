@@ -104,7 +104,7 @@ struct TweaksView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Rewrites ALL enabled tweaks to CacheExtra and REMOVES CacheData (forces MobileGestalt to use CacheExtra). Use this if tweaks show active but don't take effect.")
+                Text("Rewrites ALL enabled tweaks to CacheExtra and keeps CacheData intact. Use this if tweaks show active but don't take effect.")
             }
             .confirmationDialog("Respring?", isPresented: $showRespringConfirm, titleVisibility: .visible) {
                 Button("Respring Now", role: .destructive) {
@@ -453,17 +453,44 @@ struct TweaksView: View {
                 HStack {
                     Text("CacheData:")
                         .font(.caption.weight(.medium))
-                    Text(gestalt.hasCacheData ? "Present (will be REMOVED on Apply)" : "Removed (CacheExtra active)")
+                    Text(gestalt.hasCacheData ? "Present" : "Not present")
                         .font(.caption.weight(.bold))
-                        .foregroundStyle(gestalt.hasCacheData ? .yellow : .green)
+                        .foregroundStyle(gestalt.hasCacheData ? .green : .orange)
                 }
                 if !gestalt.cacheDataPatchInfo.isEmpty {
-                    HStack {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text("CacheData Analysis:")
                             .font(.caption.weight(.medium))
                         Text(gestalt.cacheDataPatchInfo)
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+                if !gestalt.cacheDataHexDump.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Hex Dump (first 256B):")
+                                .font(.caption.weight(.medium))
+                            Spacer()
+                            if !gestalt.cacheDataBase64.isEmpty {
+                                Button {
+                                    UIPasteboard.general.string = gestalt.cacheDataBase64
+                                } label: {
+                                    Label("Copy Base64", systemImage: "doc.on.doc")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.blue)
+                            }
+                        }
+                        ScrollView(.horizontal) {
+                            Text(gestalt.cacheDataHexDump)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        .frame(maxHeight: 200)
                     }
                 }
                 HStack {

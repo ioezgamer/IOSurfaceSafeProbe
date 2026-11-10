@@ -277,6 +277,8 @@ class GestaltManager: ObservableObject {
     @Published var eligibilityStatus = ""
     @Published var isImmutable = false
     @Published var cacheDataPatchInfo = ""
+    @Published var cacheDataBase64 = ""
+    @Published var cacheDataHexDump = ""
 
     private let knownPaths = [
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
@@ -598,59 +600,93 @@ class GestaltManager: ObservableObject {
 
     private func analyzeCacheData(_ data: Data) -> String {
         let size = data.count
-        let header64 = data.prefix(64).map { String(format: "%02x", $0) }.joined(separator: " ")
-        print("[Gestalt] CacheData: \(size) bytes, header: \(header64)")
+        let arr = Array(data)
 
-        // Try to find known strings inside CacheData
+        // Store base64 for export
+        DispatchQueue.main.async {
+            self.cacheDataBase64 = data.base64EncodedString()
+        }
+
+        // Build hex dump of first 256 bytes
+        var hexLines = [String]()
+        let dumpLen = min(256, arr.count)
+        for i in stride(from: 0, to: dumpLen, by: 16) {
+            let end = min(i + 16, dumpLen)
+            let hex = arr[i..<end].map { String(format: "%02x", $0) }.joined(separator: " ")
+            let ascii = arr[i..<end].map { (32...126).contains(Int($0)) ? String(UnicodeScalar($0)) : "." }.joined()
+            hexLines.append(String(format: "%04x: %-48s %@", i, hex, ascii))
+        }
+        DispatchQueue.main.async {
+            self.cacheDataHexDump = hexLines.joined(separator: "\n")
+        }
+
+        // Search for base64-decoded key hashes (16 raw bytes each)
+        let gestaltxHashes: [(String, String)] = [
+            ("YlEtTtHlNesRBMal1CqRaA==", "DynamicIsland"),
+            ("2OOJf1VhaM7NxfRok3HbWQ==", "AOD"),
+            ("A62OafQ85EJAiiqKn4agtg==", "Intelligence"),
+            ("SAGvsp6O6kAQ4fEfDJpC4Q==", "BootChime"),
+            ("QHxt+hGLaBPbQJbXiUJX3w==", "ChgLimit"),
+            ("CwvKxM2cEogD3p+HYgaW0Q==", "CamControl"),
+            ("cT44WE1EohiwRzhsZ8xEsw==", "ActionBtn"),
+            ("yhHcB0iH0d1XzPO/CFd3ow==", "Pencil"),
+            ("qeaj75wk3HF4DwQ8qbIi7g==", "StageMgr"),
+        ]
+        var hashHits = [String]()
+        for (b64, label) in gestaltxHashes {
+            if let decoded = Data(base64Encoded: b64) {
+                if let range = data.range(of: decoded) {
+                    let off = range.lowerBound
+                    hashHits.append("\(label)@\(off)")
+                }
+            }
+        }
+
+        // Also search for our plist key strings
         let tweakKeys = Self.allTweaks.map(\.key)
-        var foundKeys = [String]()
+        var stringHits = 0
         for key in tweakKeys {
-            if let keyData = key.data(using: .utf8) {
-                if data.range(of: keyData) != nil {
-                    foundKeys.append(key)
+            if let kd = key.data(using: .utf8), data.range(of: kd) != nil {
+                stringHits += 1
+            }
+        }
+
+        // Analyze byte patterns - look for repeating structures
+        var entrySize = 0
+        if size > 32 {
+            // Check common entry sizes
+            for candidate in [48, 64, 72, 80, 81, 96, 128] {
+                let headerSize = 16
+                let remaining = size - headerSize
+                if remaining > 0 && remaining % candidate == 0 {
+                    entrySize = candidate
+                    break
                 }
             }
         }
-        print("[Gestalt] CacheData contains \(foundKeys.count) tweak key strings")
 
-        // Try NSKeyedUnarchiver decode
-        var nskaDecode = "no"
-        if let dict = try? NSKeyedUnarchiver.unarchivedObject(
-            ofClasses: [NSDictionary.self, NSMutableDictionary.self, NSString.self,
-                        NSNumber.self, NSData.self, NSArray.self, NSMutableArray.self],
-            from: data
-        ) as? NSDictionary {
-            nskaDecode = "yes(\(dict.count) keys)"
-        }
-
-        // Try PropertyListSerialization
-        var plDecode = "no"
-        if let obj = try? PropertyListSerialization.propertyList(
-            from: data, options: [], format: nil
-        ) {
-            let t = type(of: obj)
-            plDecode = "yes(\(t))"
-        }
-
-        // Check if it's a binary plist
-        if let patcher = BPlistPatcher(data: data) {
-            let dicts = patcher.findDicts()
-            var keyCount = 0
-            var tweakKeysFound = 0
-            let tweakKeySet = Set(tweakKeys)
-            for d in dicts {
-                for ki in d.keys {
-                    if let s = patcher.stringAt(ki) {
-                        keyCount += 1
-                        if tweakKeySet.contains(s) { tweakKeysFound += 1 }
-                    }
-                }
+        // Count unique non-zero 16-byte blocks
+        var uniqueBlocks = Set<Data>()
+        for i in stride(from: 16, to: size - 15, by: 16) {
+            let block = data[i..<i+16]
+            if block != Data(repeating: 0, count: 16) {
+                uniqueBlocks.insert(Data(block))
             }
-            return "\(size)B bplist, \(dicts.count)d, \(tweakKeysFound)/\(keyCount) keys"
         }
 
-        let h16 = data.prefix(16).map { String(format: "%02x", $0) }.joined()
-        return "\(size)B h:\(h16) nska:\(nskaDecode) pl:\(plDecode) keys:\(foundKeys.count)"
+        let h32 = arr.prefix(32).map { String(format: "%02x", $0) }.joined()
+        let summary = "\(size)B h:\(h32) hashes:\(hashHits.count) strs:\(stringHits) blk:\(uniqueBlocks.count)"
+        let hashDetail = hashHits.isEmpty ? "none" : hashHits.joined(separator: ",")
+        let entryInfo = entrySize > 0 ? " entry:\(entrySize)x\((size-16)/entrySize)" : ""
+
+        print("[Gestalt] CacheData: \(summary)")
+        print("[Gestalt] Hash hits: \(hashDetail)")
+        print("[Gestalt] Entry size guess: \(entryInfo)")
+        for line in hexLines.prefix(16) {
+            print("[Gestalt] \(line)")
+        }
+
+        return "\(size)B hashes:\(hashHits.count) strs:\(stringHits)\(entryInfo) [\(hashDetail)]"
     }
 
     // MARK: - Discover path
@@ -798,12 +834,11 @@ class GestaltManager: ObservableObject {
             }
             plist["CacheExtra"] = extra
 
-            // Step 2: Remove CacheData so MobileGestalt falls back to CacheExtra
+            // Step 2: Keep CacheData intact (iOS 27 only reads CacheData, not CacheExtra)
             var cacheDataStatus = "Not present"
             if plist["CacheData"] != nil {
-                plist.removeObject(forKey: "CacheData")
-                cacheDataStatus = "Removed (force CacheExtra fallback)"
-                print("[Gestalt] CacheData REMOVED to force CacheExtra usage")
+                cacheDataStatus = "Kept intact (preserved original)"
+                print("[Gestalt] CacheData kept intact")
             }
 
             // Step 3: Write the plist
