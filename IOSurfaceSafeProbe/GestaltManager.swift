@@ -798,19 +798,12 @@ class GestaltManager: ObservableObject {
             }
             plist["CacheExtra"] = extra
 
-            // Step 2: Patch CacheData in-place (raw byte patching, preserves option flags)
-            var cachePatched = 0
-            var cacheDataStatus = "No CacheData"
-            if let cacheBlob = plist["CacheData"] as? Data {
-                let result = self.patchCacheDataInPlace(
-                    cacheBlob, tweaks: toWrite, forceAll: forceAll
-                )
-                cachePatched = result.patched
-                cacheDataStatus = result.status
-                if let newBlob = result.data {
-                    plist["CacheData"] = newBlob
-                }
-                print("[Gestalt] CacheData patch: \(cacheDataStatus)")
+            // Step 2: Remove CacheData so MobileGestalt falls back to CacheExtra
+            var cacheDataStatus = "Not present"
+            if plist["CacheData"] != nil {
+                plist.removeObject(forKey: "CacheData")
+                cacheDataStatus = "Removed (force CacheExtra fallback)"
+                print("[Gestalt] CacheData REMOVED to force CacheExtra usage")
             }
 
             // Step 3: Write the plist
@@ -843,7 +836,7 @@ class GestaltManager: ObservableObject {
                     self.hasBackup = true
                     self.hasCacheData = plist["CacheData"] != nil
                     self.cacheDataPatchInfo = cacheDataStatus
-                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified). CacheData: \(cachePatched) patched. REBOOT required."
+                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified). CacheData: \(cacheDataStatus). REBOOT required."
                     self.isLoading = false
                 }
             } catch {

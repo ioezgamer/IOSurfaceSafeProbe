@@ -104,7 +104,7 @@ struct TweaksView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Rewrites ALL enabled tweaks to both CacheExtra and CacheData (in-place byte patching). Use this if tweaks show active but don't take effect.")
+                Text("Rewrites ALL enabled tweaks to CacheExtra and REMOVES CacheData (forces MobileGestalt to use CacheExtra). Use this if tweaks show active but don't take effect.")
             }
             .confirmationDialog("Respring?", isPresented: $showRespringConfirm, titleVisibility: .visible) {
                 Button("Respring Now", role: .destructive) {
@@ -453,9 +453,9 @@ struct TweaksView: View {
                 HStack {
                     Text("CacheData:")
                         .font(.caption.weight(.medium))
-                    Text(gestalt.hasCacheData ? "Present (in-place patch)" : "Not present — restore backup first")
+                    Text(gestalt.hasCacheData ? "Present (will be REMOVED on Apply)" : "Removed (CacheExtra active)")
                         .font(.caption.weight(.bold))
-                        .foregroundStyle(gestalt.hasCacheData ? .green : .orange)
+                        .foregroundStyle(gestalt.hasCacheData ? .yellow : .green)
                 }
                 if !gestalt.cacheDataPatchInfo.isEmpty {
                     HStack {
