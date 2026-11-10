@@ -104,7 +104,7 @@ struct TweaksView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Rewrites ALL enabled tweaks to the plist and removes CacheData. Use this if Apply shows 0 changes but tweaks aren't working.")
+                Text("Rewrites ALL enabled tweaks to both CacheExtra and CacheData (in-place byte patching). Use this if tweaks show active but don't take effect.")
             }
             .confirmationDialog("Respring?", isPresented: $showRespringConfirm, titleVisibility: .visible) {
                 Button("Respring Now", role: .destructive) {
@@ -453,9 +453,18 @@ struct TweaksView: View {
                 HStack {
                     Text("CacheData:")
                         .font(.caption.weight(.medium))
-                    Text(gestalt.hasCacheData ? "Present (will be patched on Apply)" : "Not present — restore backup first")
+                    Text(gestalt.hasCacheData ? "Present (in-place patch)" : "Not present — restore backup first")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(gestalt.hasCacheData ? .green : .orange)
+                }
+                if !gestalt.cacheDataPatchInfo.isEmpty {
+                    HStack {
+                        Text("CacheData Analysis:")
+                            .font(.caption.weight(.medium))
+                        Text(gestalt.cacheDataPatchInfo)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 HStack {
                     Text("Immutable:")

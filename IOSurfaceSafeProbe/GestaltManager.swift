@@ -57,6 +57,208 @@ struct TweakState: Identifiable {
     var tweak: GestaltTweak
 }
 
+// MARK: - Binary Plist In-Place Patcher
+
+struct BPlistPatcher {
+    private var bytes: [UInt8]
+    private let objectCount: Int
+    private let offsetTableOffset: Int
+    private let offsetSize: Int
+    private let objectRefSize: Int
+    private var objectOffsets: [Int]
+
+    init?(data: Data) {
+        guard data.count >= 40 else { return nil }
+        let arr = Array(data)
+        guard arr[0] == 0x62 && arr[1] == 0x70 && arr[2] == 0x6C && arr[3] == 0x69 &&
+              arr[4] == 0x73 && arr[5] == 0x74 && arr[6] == 0x30 && arr[7] == 0x30 else {
+            return nil // Not "bplist00"
+        }
+        self.bytes = arr
+        let trailerStart = arr.count - 32
+        self.offsetSize = Int(arr[trailerStart + 6])
+        self.objectRefSize = Int(arr[trailerStart + 7])
+        self.objectCount = BPlistPatcher.readBigEndian(arr, offset: trailerStart + 8, size: 8)
+        self.offsetTableOffset = BPlistPatcher.readBigEndian(arr, offset: trailerStart + 24, size: 8)
+
+        var offsets = [Int]()
+        for i in 0..<self.objectCount {
+            let off = BPlistPatcher.readBigEndian(arr, offset: self.offsetTableOffset + i * self.offsetSize, size: self.offsetSize)
+            offsets.append(off)
+        }
+        self.objectOffsets = offsets
+    }
+
+    static func readBigEndian(_ data: [UInt8], offset: Int, size: Int) -> Int {
+        var val = 0
+        for i in 0..<size {
+            val = (val << 8) | Int(data[offset + i])
+        }
+        return val
+    }
+
+    func readRef(_ offset: Int) -> Int {
+        BPlistPatcher.readBigEndian(bytes, offset: offset, size: objectRefSize)
+    }
+
+    enum BPObject {
+        case null
+        case bool(Bool)
+        case int(Int64)
+        case real(Double)
+        case string(String)
+        case data(Data)
+        case array([Int])
+        case dict(keys: [Int], values: [Int])
+        case uid(Int)
+        case unknown
+    }
+
+    func objectAt(_ index: Int) -> BPObject {
+        guard index < objectCount else { return .unknown }
+        let off = objectOffsets[index]
+        return parseObject(at: off)
+    }
+
+    func parseObject(at off: Int) -> BPObject {
+        guard off < bytes.count else { return .unknown }
+        let marker = bytes[off]
+        let hi = marker >> 4
+        let lo = marker & 0x0F
+
+        switch hi {
+        case 0x0:
+            if marker == 0x08 { return .bool(false) }
+            if marker == 0x09 { return .bool(true) }
+            if marker == 0x00 { return .null }
+            return .unknown
+        case 0x1: // int
+            let byteCount = 1 << Int(lo)
+            var val: Int64 = 0
+            for i in 0..<byteCount {
+                val = (val << 8) | Int64(bytes[off + 1 + i])
+            }
+            return .int(val)
+        case 0x2: // real
+            return .unknown
+        case 0x4: // data
+            let (count, dataStart) = readCountAndStart(off: off, lo: lo)
+            let d = Data(bytes[dataStart..<(dataStart + count)])
+            return .data(d)
+        case 0x5: // ASCII string
+            let (count, strStart) = readCountAndStart(off: off, lo: lo)
+            if let s = String(bytes: bytes[strStart..<(strStart + count)], encoding: .ascii) {
+                return .string(s)
+            }
+            return .unknown
+        case 0x6: // Unicode string
+            let (count, strStart) = readCountAndStart(off: off, lo: lo)
+            var chars = [UInt16]()
+            for i in 0..<count {
+                let c = UInt16(bytes[strStart + i*2]) << 8 | UInt16(bytes[strStart + i*2 + 1])
+                chars.append(c)
+            }
+            if let s = String(utf16CodeUnits: chars, count: count) as String? {
+                return .string(s)
+            }
+            return .unknown
+        case 0x8: // uid
+            let n = Int(lo) + 1
+            var val = 0
+            for i in 0..<n { val = (val << 8) | Int(bytes[off + 1 + i]) }
+            return .uid(val)
+        case 0xA: // array
+            let (count, refsStart) = readCountAndStart(off: off, lo: lo)
+            var refs = [Int]()
+            for i in 0..<count {
+                refs.append(readRef(refsStart + i * objectRefSize))
+            }
+            return .array(refs)
+        case 0xD: // dict
+            let (count, refsStart) = readCountAndStart(off: off, lo: lo)
+            var keys = [Int]()
+            var vals = [Int]()
+            for i in 0..<count {
+                keys.append(readRef(refsStart + i * objectRefSize))
+            }
+            for i in 0..<count {
+                vals.append(readRef(refsStart + count * objectRefSize + i * objectRefSize))
+            }
+            return .dict(keys: keys, values: vals)
+        default:
+            return .unknown
+        }
+    }
+
+    private func readCountAndStart(off: Int, lo: UInt8) -> (Int, Int) {
+        if lo != 0x0F {
+            return (Int(lo), off + 1)
+        }
+        let intMarker = bytes[off + 1]
+        let intLen = 1 << Int(intMarker & 0x0F)
+        var count = 0
+        for i in 0..<intLen {
+            count = (count << 8) | Int(bytes[off + 2 + i])
+        }
+        return (count, off + 2 + intLen)
+    }
+
+    func stringAt(_ index: Int) -> String? {
+        if case .string(let s) = objectAt(index) { return s }
+        return nil
+    }
+
+    // Find the object index for a given string
+    func findStringIndex(_ target: String) -> Int? {
+        for i in 0..<objectCount {
+            if stringAt(i) == target { return i }
+        }
+        return nil
+    }
+
+    // Find all dictionaries and their key-value mappings
+    func findDicts() -> [(index: Int, keys: [Int], values: [Int])] {
+        var result = [(index: Int, keys: [Int], values: [Int])]()
+        for i in 0..<objectCount {
+            if case .dict(let keys, let values) = objectAt(i) {
+                result.append((i, keys, values))
+            }
+        }
+        return result
+    }
+
+    // Patch a boolean value at a given object index: false(0x08) ↔ true(0x09)
+    mutating func patchBool(objectIndex: Int, value: Bool) -> Bool {
+        guard objectIndex < objectCount else { return false }
+        let off = objectOffsets[objectIndex]
+        let current = bytes[off]
+        if current == 0x08 || current == 0x09 {
+            bytes[off] = value ? 0x09 : 0x08
+            return true
+        }
+        return false
+    }
+
+    // Patch an integer value at a given object index (only if same byte-size)
+    mutating func patchInt(objectIndex: Int, value: Int64) -> Bool {
+        guard objectIndex < objectCount else { return false }
+        let off = objectOffsets[objectIndex]
+        let marker = bytes[off]
+        guard marker >> 4 == 0x1 else { return false }
+        let byteCount = 1 << Int(marker & 0x0F)
+        var v = value
+        for i in stride(from: byteCount - 1, through: 0, by: -1) {
+            bytes[off + 1 + i] = UInt8(v & 0xFF)
+            v >>= 8
+        }
+        return true
+    }
+
+    func toData() -> Data {
+        Data(bytes)
+    }
+}
+
 // MARK: - Manager
 
 class GestaltManager: ObservableObject {
@@ -72,6 +274,9 @@ class GestaltManager: ObservableObject {
     @Published var plistKeyCount = 0
     @Published var lastError = ""
     @Published var hasCacheData = false
+    @Published var eligibilityStatus = ""
+    @Published var isImmutable = false
+    @Published var cacheDataPatchInfo = ""
 
     private let knownPaths = [
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
@@ -271,7 +476,6 @@ class GestaltManager: ObservableObject {
 
             print("[Gestalt] Starting gestalt load...")
 
-            // Try known paths
             var foundPath: String?
             for path in self.knownPaths {
                 let dir = (path as NSString).deletingLastPathComponent
@@ -282,27 +486,20 @@ class GestaltManager: ObservableObject {
                         foundPath = path
                         print("[Gestalt] Plist found at: \(path)")
                         break
-                    } else {
-                        print("[Gestalt] Grant OK but plist not found at: \(path)")
                     }
-                } else {
-                    print("[Gestalt] Grant FAILED for: \(dir)")
                 }
             }
 
-            // Try discovering via Shared SystemGroup containers
             if foundPath == nil {
                 print("[Gestalt] Known paths failed, trying discovery...")
                 foundPath = self.discoverGestaltPath()
             }
 
             guard let path = foundPath else {
-                let msg = "Cannot access MobileGestalt — grant failed for all paths"
-                print("[Gestalt] \(msg)")
                 DispatchQueue.main.async {
-                    self.statusMessage = msg
+                    self.statusMessage = "Cannot access MobileGestalt"
                     self.grantStatus = "FAILED"
-                    self.lastError = "wq_grant returned false for all MobileGestalt paths. The exploit may not reach SystemGroup containers on this iOS version."
+                    self.lastError = "wq_grant failed for all paths"
                     self.isLoading = false
                     self.gestaltAccessible = false
                 }
@@ -310,22 +507,14 @@ class GestaltManager: ObservableObject {
             }
 
             self.plistPath = path
-            print("[Gestalt] Using plist: \(path)")
+            DispatchQueue.main.async { self.grantStatus = "OK" }
 
-            DispatchQueue.main.async {
-                self.grantStatus = "OK"
-            }
-
-            // Check backup
             let backupPath = path + self.backupSuffix
             let hasBackup = FileManager.default.fileExists(atPath: backupPath)
 
-            // Read plist as data first (to preserve binary format)
             guard let plistData = FileManager.default.contents(atPath: path) else {
-                print("[Gestalt] Cannot read plist data")
                 DispatchQueue.main.async {
-                    self.statusMessage = "Cannot read MobileGestalt plist"
-                    self.lastError = "FileManager.contents returned nil"
+                    self.statusMessage = "Cannot read plist"
                     self.isLoading = false
                 }
                 return
@@ -333,38 +522,35 @@ class GestaltManager: ObservableObject {
             self.originalPlistData = plistData
             print("[Gestalt] Plist data: \(plistData.count) bytes")
 
-            // Parse plist
             guard let plist = try? PropertyListSerialization.propertyList(
                 from: plistData, options: .mutableContainersAndLeaves, format: nil
             ) as? NSMutableDictionary else {
-                print("[Gestalt] Cannot parse plist")
                 DispatchQueue.main.async {
-                    self.statusMessage = "Cannot parse MobileGestalt plist"
-                    self.lastError = "PropertyListSerialization failed"
+                    self.statusMessage = "Cannot parse plist"
                     self.isLoading = false
                 }
                 return
             }
 
             guard let extra = plist["CacheExtra"] as? NSDictionary else {
-                print("[Gestalt] No CacheExtra key")
                 DispatchQueue.main.async {
-                    self.statusMessage = "MobileGestalt plist has no CacheExtra"
-                    self.lastError = "CacheExtra key missing"
+                    self.statusMessage = "No CacheExtra in plist"
                     self.isLoading = false
                 }
                 return
             }
 
             let cacheDataPresent = plist["CacheData"] != nil
-            print("[Gestalt] CacheData present: \(cacheDataPresent)")
+
+            // Analyze CacheData structure
+            var cacheDataInfo = ""
+            if let cdBlob = plist["CacheData"] as? Data {
+                cacheDataInfo = self.analyzeCacheData(cdBlob)
+            }
 
             let keyCount = extra.count
-            print("[Gestalt] CacheExtra has \(keyCount) keys")
-
             let subtype = extra["ArtworkDeviceSubType"] as? Int ?? 0
             let model = extra["h63QSdBCiT/z0WU6rdQr6Q"] as? String ?? "Unknown"
-            print("[Gestalt] Device model: \(model), subtype: \(subtype)")
 
             var states = [TweakState]()
             for tweak in Self.allTweaks {
@@ -383,15 +569,11 @@ class GestaltManager: ObservableObject {
                     isModified = false
                 }
                 states.append(TweakState(
-                    id: tweak.id,
-                    currentValue: current,
-                    originalValue: current,
-                    isModified: isModified,
-                    tweak: tweak
+                    id: tweak.id, currentValue: current,
+                    originalValue: current, isModified: isModified, tweak: tweak
                 ))
             }
 
-            // Check immutable flag
             var fileStat = stat()
             let immutable = stat(path, &fileStat) == 0 && (fileStat.st_flags & UInt32(UF_IMMUTABLE)) != 0
 
@@ -405,13 +587,38 @@ class GestaltManager: ObservableObject {
                 self.deviceModel = model
                 self.plistKeyCount = keyCount
                 self.modifiedCount = states.filter(\.isModified).count
-                self.statusMessage = "Loaded \(keyCount) keys from MobileGestalt"
+                self.cacheDataPatchInfo = cacheDataInfo
+                self.statusMessage = "Loaded \(keyCount) keys"
                 self.isLoading = false
             }
         }
     }
 
-    // MARK: - Discover path via scanning /var/containers/Shared/SystemGroup
+    // MARK: - Analyze CacheData structure
+
+    private func analyzeCacheData(_ data: Data) -> String {
+        guard let patcher = BPlistPatcher(data: data) else {
+            return "Not binary plist (\(data.prefix(8).map { String(format: "%02x", $0) }.joined()))"
+        }
+
+        var keyCount = 0
+        var tweakKeysFound = 0
+        let tweakKeys = Set(Self.allTweaks.map(\.key))
+
+        let dicts = patcher.findDicts()
+        for d in dicts {
+            for ki in d.keys {
+                if let s = patcher.stringAt(ki) {
+                    keyCount += 1
+                    if tweakKeys.contains(s) { tweakKeysFound += 1 }
+                }
+            }
+        }
+
+        return "\(data.count)B, \(dicts.count) dicts, \(keyCount) string keys, \(tweakKeysFound) tweak keys found"
+    }
+
+    // MARK: - Discover path
 
     private func discoverGestaltPath() -> String? {
         let bases = [
@@ -419,29 +626,19 @@ class GestaltManager: ObservableObject {
             "/private/var/containers/Shared/SystemGroup"
         ]
         for base in bases {
-            print("[Gestalt] Trying to grant base: \(base)")
             if wq_grant(base) {
-                print("[Gestalt] Base grant OK, listing...")
                 if let items = try? FileManager.default.contentsOfDirectory(atPath: base) {
-                    for item in items {
-                        if item.contains("mobilegestalt") {
-                            let candidate = "\(base)/\(item)/Library/Caches/com.apple.MobileGestalt.plist"
-                            let dir = (candidate as NSString).deletingLastPathComponent
-                            print("[Gestalt] Found gestalt dir: \(item), granting \(dir)")
-                            if wq_grant(dir) && FileManager.default.fileExists(atPath: candidate) {
-                                print("[Gestalt] Discovery found plist: \(candidate)")
-                                return candidate
-                            }
+                    for item in items where item.contains("mobilegestalt") {
+                        let candidate = "\(base)/\(item)/Library/Caches/com.apple.MobileGestalt.plist"
+                        let dir = (candidate as NSString).deletingLastPathComponent
+                        if wq_grant(dir) && FileManager.default.fileExists(atPath: candidate) {
+                            return candidate
                         }
                     }
                 }
-            } else {
-                print("[Gestalt] Base grant FAILED for: \(base)")
             }
 
-            // Try granting the specific systemgroup path directly
             let directPath = "\(base)/systemgroup.com.apple.mobilegestaltcache"
-            print("[Gestalt] Trying direct: \(directPath)")
             if wq_grant(directPath) {
                 let cachesDir = "\(directPath)/Library/Caches"
                 if wq_grant(cachesDir) {
@@ -470,15 +667,10 @@ class GestaltManager: ObservableObject {
         tweakStates[idx].isModified = true
     }
 
-    // MARK: - Apply (binary plist)
+    // MARK: - Apply
 
-    func applyChanges() {
-        writeGestalt(forceAll: false)
-    }
-
-    func forceRewrite() {
-        writeGestalt(forceAll: true)
-    }
+    func applyChanges() { writeGestalt(forceAll: false) }
+    func forceRewrite() { writeGestalt(forceAll: true) }
 
     private func writeGestalt(forceAll: Bool) {
         guard let path = plistPath else {
@@ -505,8 +697,7 @@ class GestaltManager: ObservableObject {
         }
 
         isLoading = true
-        let label = forceAll ? "Force rewriting" : "Applying"
-        statusMessage = "\(label) \(toWrite.count) tweaks..."
+        statusMessage = forceAll ? "Force rewriting..." : "Applying \(toWrite.count) tweaks..."
         lastError = ""
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -514,29 +705,23 @@ class GestaltManager: ObservableObject {
 
             let dir = (path as NSString).deletingLastPathComponent
             guard wq_grant(dir) else {
-                print("[Gestalt] Apply: grant failed for \(dir)")
                 DispatchQueue.main.async {
-                    self.statusMessage = "Grant failed — cannot write"
+                    self.statusMessage = "Grant failed"
                     self.lastError = "wq_grant failed during apply"
                     self.isLoading = false
                 }
                 return
             }
 
+            // Backup
             let backupPath = path + self.backupSuffix
             if !FileManager.default.fileExists(atPath: backupPath) {
-                do {
-                    try FileManager.default.copyItem(atPath: path, toPath: backupPath)
-                    print("[Gestalt] Backup created: \(backupPath)")
-                } catch {
-                    print("[Gestalt] Backup failed: \(error)")
-                }
+                try? FileManager.default.copyItem(atPath: path, toPath: backupPath)
             }
 
             guard let plistData = FileManager.default.contents(atPath: path) else {
-                print("[Gestalt] Apply: cannot read plist")
                 DispatchQueue.main.async {
-                    self.statusMessage = "Cannot read plist for modification"
+                    self.statusMessage = "Cannot read plist"
                     self.isLoading = false
                 }
                 return
@@ -546,7 +731,6 @@ class GestaltManager: ObservableObject {
             guard let plist = try? PropertyListSerialization.propertyList(
                 from: plistData, options: .mutableContainersAndLeaves, format: &format
             ) as? NSMutableDictionary else {
-                print("[Gestalt] Apply: cannot parse plist")
                 DispatchQueue.main.async {
                     self.statusMessage = "Cannot parse plist"
                     self.isLoading = false
@@ -555,123 +739,79 @@ class GestaltManager: ObservableObject {
             }
 
             guard let extra = plist["CacheExtra"] as? NSMutableDictionary else {
-                print("[Gestalt] Apply: no CacheExtra")
                 DispatchQueue.main.async {
-                    self.statusMessage = "No CacheExtra in plist"
+                    self.statusMessage = "No CacheExtra"
                     self.isLoading = false
                 }
                 return
             }
 
-            // Write all enabled tweaks to CacheExtra
+            // Step 1: Write all enabled tweaks to CacheExtra
             var writeCount = 0
             for state in toWrite {
                 if let val = state.currentValue {
                     extra[state.tweak.key] = val
-                    print("[Gestalt] Set \(state.tweak.key) = \(val)")
                     writeCount += 1
                 }
             }
-
-            // Also write bool tweaks that are explicitly OFF (ensure the key exists)
             if forceAll {
                 for state in self.tweakStates {
-                    if case .bool = state.tweak.type,
-                       (state.currentValue as? Bool) == false {
+                    if case .bool = state.tweak.type, (state.currentValue as? Bool) == false {
                         extra[state.tweak.key] = false
-                        print("[Gestalt] Set \(state.tweak.key) = false (explicit)")
                     }
                 }
             }
-
             plist["CacheExtra"] = extra
 
-            // Modify CacheData — iOS reads this serialized blob with HIGHER PRIORITY
-            // than CacheExtra. We must patch our values into it, not just remove it.
-            var cacheDataPatched = false
-            if let cacheDataBlob = plist["CacheData"] as? Data {
-                print("[Gestalt] CacheData found (\(cacheDataBlob.count) bytes), attempting to patch...")
-                if let cacheDict = self.deserializeCacheData(cacheDataBlob) {
-                    for state in toWrite {
-                        if let val = state.currentValue {
-                            cacheDict[state.tweak.key] = val
-                            print("[Gestalt] Patched CacheData: \(state.tweak.key) = \(val)")
-                        }
-                    }
-                    if forceAll {
-                        for state in self.tweakStates {
-                            if case .bool = state.tweak.type,
-                               (state.currentValue as? Bool) == false {
-                                cacheDict[state.tweak.key] = false
-                            }
-                        }
-                    }
-                    if let newBlob = self.serializeCacheData(cacheDict) {
-                        plist["CacheData"] = newBlob
-                        cacheDataPatched = true
-                        print("[Gestalt] CacheData patched (\(newBlob.count) bytes)")
-                    } else {
-                        print("[Gestalt] CacheData re-serialization failed, removing it")
-                        plist.removeObject(forKey: "CacheData")
-                    }
-                } else {
-                    print("[Gestalt] CacheData deserialization failed, removing it")
-                    plist.removeObject(forKey: "CacheData")
+            // Step 2: Patch CacheData in-place (raw byte patching, preserves option flags)
+            var cachePatched = 0
+            var cacheDataStatus = "No CacheData"
+            if let cacheBlob = plist["CacheData"] as? Data {
+                let result = self.patchCacheDataInPlace(
+                    cacheBlob, tweaks: toWrite, forceAll: forceAll
+                )
+                cachePatched = result.patched
+                cacheDataStatus = result.status
+                if let newBlob = result.data {
+                    plist["CacheData"] = newBlob
                 }
-            } else {
-                print("[Gestalt] No CacheData present")
+                print("[Gestalt] CacheData patch: \(cacheDataStatus)")
             }
 
+            // Step 3: Write the plist
             do {
                 let outputData = try PropertyListSerialization.data(
-                    fromPropertyList: plist,
-                    format: .binary,
-                    options: 0
+                    fromPropertyList: plist, format: .binary, options: 0
                 )
-                print("[Gestalt] Serialized \(outputData.count) bytes as binary plist")
 
-                // Clear immutable flag if set (so we can write)
-                chflags(path, 0)
-
+                chflags(path, 0) // Clear immutable
                 try (outputData as NSData).write(toFile: path, options: .atomic)
-                print("[Gestalt] Write completed")
 
-                // Set immutable to prevent iOS from overwriting on reboot
                 let immRet = chflags(path, UInt32(UF_IMMUTABLE))
                 let immOk = immRet == 0
-                print("[Gestalt] Set UF_IMMUTABLE: ret=\(immRet), errno=\(errno)")
                 DispatchQueue.main.async { self.isImmutable = immOk }
 
                 // Verify
                 var verified = 0
-                var cacheDataBack = false
                 if let verifyData = FileManager.default.contents(atPath: path),
                    let verifyDict = try? PropertyListSerialization.propertyList(
                     from: verifyData, options: [], format: nil
-                   ) as? [String: Any] {
-                    cacheDataBack = verifyDict["CacheData"] != nil
-                    if let verifyExtra = verifyDict["CacheExtra"] as? [String: Any] {
-                        for state in toWrite {
-                            if verifyExtra[state.tweak.key] != nil {
-                                verified += 1
-                            }
-                        }
+                   ) as? [String: Any],
+                   let verifyExtra = verifyDict["CacheExtra"] as? [String: Any] {
+                    for state in toWrite {
+                        if verifyExtra[state.tweak.key] != nil { verified += 1 }
                     }
                 }
-
-                let patchMsg = cacheDataPatched ? " CacheData patched." : " CacheData not present."
-
-                print("[Gestalt] Verified \(verified)/\(writeCount) changes.\(patchMsg)")
 
                 DispatchQueue.main.async {
                     self.modifiedCount = writeCount
                     self.hasBackup = true
-                    self.hasCacheData = cacheDataBack
-                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified).\(patchMsg) REBOOT required."
+                    self.hasCacheData = plist["CacheData"] != nil
+                    self.cacheDataPatchInfo = cacheDataStatus
+                    self.statusMessage = "Wrote \(writeCount) tweaks (\(verified) verified). CacheData: \(cachePatched) patched. REBOOT required."
                     self.isLoading = false
                 }
             } catch {
-                print("[Gestalt] Write error: \(error)")
                 DispatchQueue.main.async {
                     self.statusMessage = "Write failed: \(error.localizedDescription)"
                     self.lastError = error.localizedDescription
@@ -680,6 +820,86 @@ class GestaltManager: ObservableObject {
             }
         }
     }
+
+    // MARK: - CacheData In-Place Patching
+
+    private struct PatchResult {
+        let data: Data?
+        let patched: Int
+        let status: String
+    }
+
+    private func patchCacheDataInPlace(
+        _ blob: Data, tweaks: [TweakState], forceAll: Bool
+    ) -> PatchResult {
+        guard var patcher = BPlistPatcher(data: blob) else {
+            return PatchResult(data: nil, patched: 0, status: "Not bplist00")
+        }
+
+        let dicts = patcher.findDicts()
+        if dicts.isEmpty {
+            return PatchResult(data: nil, patched: 0, status: "No dicts found")
+        }
+
+        // Build a map of key-string → (dictIndex, valueObjectIndex) for ALL dicts
+        var keyToValue = [String: (dictIdx: Int, valObjIdx: Int)]()
+        for d in dicts {
+            for (i, ki) in d.keys.enumerated() {
+                if let s = patcher.stringAt(ki), i < d.values.count {
+                    keyToValue[s] = (d.index, d.values[i])
+                }
+            }
+        }
+
+        var patched = 0
+        var notFound = [String]()
+
+        // Patch boolean tweaks
+        let allStates = forceAll ? tweakStates : []
+        let tweaksToPatch = tweaks + allStates.filter { s in
+            if case .bool = s.tweak.type, (s.currentValue as? Bool) == false {
+                return !tweaks.contains(where: { $0.id == s.id })
+            }
+            return false
+        }
+
+        for state in tweaksToPatch {
+            guard let entry = keyToValue[state.tweak.key] else {
+                notFound.append(state.tweak.key)
+                continue
+            }
+
+            switch state.tweak.type {
+            case .bool:
+                let val = state.currentValue as? Bool ?? false
+                if patcher.patchBool(objectIndex: entry.valObjIdx, value: val) {
+                    print("[Gestalt] CacheData patched \(state.tweak.key) = \(val)")
+                    patched += 1
+                } else {
+                    print("[Gestalt] CacheData: \(state.tweak.key) not a bool object")
+                }
+            case .int:
+                if let val = state.currentValue as? Int {
+                    if patcher.patchInt(objectIndex: entry.valObjIdx, value: Int64(val)) {
+                        print("[Gestalt] CacheData patched \(state.tweak.key) = \(val)")
+                        patched += 1
+                    }
+                }
+            case .pick:
+                if let val = state.currentValue as? Int, val != 0 {
+                    if patcher.patchInt(objectIndex: entry.valObjIdx, value: Int64(val)) {
+                        print("[Gestalt] CacheData patched \(state.tweak.key) = \(val)")
+                        patched += 1
+                    }
+                }
+            }
+        }
+
+        let status = "\(patched) patched, \(notFound.count) not in CacheData"
+        return PatchResult(data: patcher.toData(), patched: patched, status: status)
+    }
+
+    // MARK: - Respring
 
     func respring() {
         let path = "/usr/bin/killall"
@@ -690,10 +910,8 @@ class GestaltManager: ObservableObject {
         let ret = posix_spawn(&pid, path, nil, nil, &argv, nil)
         argv.compactMap { $0 }.forEach { free($0) }
         if ret == 0 {
-            print("[Gestalt] Respring triggered (pid \(pid))")
-            statusMessage = "Respring sent — device should restart SpringBoard"
+            statusMessage = "Respring sent"
         } else {
-            print("[Gestalt] Respring failed: posix_spawn returned \(ret)")
             statusMessage = "Respring failed (code \(ret)) — reboot manually"
         }
     }
@@ -731,17 +949,15 @@ class GestaltManager: ObservableObject {
             }
 
             do {
-                chflags(path, 0) // Clear immutable before restore
+                chflags(path, 0)
                 try FileManager.default.removeItem(atPath: path)
                 try FileManager.default.copyItem(atPath: backupPath, toPath: path)
-                print("[Gestalt] Backup restored")
                 DispatchQueue.main.async {
                     self.statusMessage = "Backup restored — REBOOT to take effect"
                     self.isLoading = false
                     self.loadGestalt()
                 }
             } catch {
-                print("[Gestalt] Restore error: \(error)")
                 DispatchQueue.main.async {
                     self.statusMessage = "Restore failed: \(error.localizedDescription)"
                     self.isLoading = false
@@ -755,11 +971,9 @@ class GestaltManager: ObservableObject {
     func enableAll(in category: TweakCategory) {
         for i in tweakStates.indices {
             guard tweakStates[i].tweak.category == category else { continue }
-            switch tweakStates[i].tweak.type {
-            case .bool:
+            if case .bool = tweakStates[i].tweak.type {
                 tweakStates[i].currentValue = true
                 tweakStates[i].isModified = true
-            default: break
             }
         }
     }
@@ -767,19 +981,14 @@ class GestaltManager: ObservableObject {
     func disableAll(in category: TweakCategory) {
         for i in tweakStates.indices {
             guard tweakStates[i].tweak.category == category else { continue }
-            switch tweakStates[i].tweak.type {
-            case .bool:
+            if case .bool = tweakStates[i].tweak.type {
                 tweakStates[i].currentValue = false
                 tweakStates[i].isModified = true
-            default: break
             }
         }
     }
 
-    // MARK: - Eligibility Override (via SystemGroup discovery)
-
-    @Published var eligibilityStatus = ""
-    @Published var isImmutable = false
+    // MARK: - Eligibility
 
     func writeEligibility() {
         isLoading = true
@@ -814,7 +1023,6 @@ class GestaltManager: ObservableObject {
                 ]
             ]
 
-            // Strategy 1: Search SystemGroup containers for eligibility
             var wrote = false
             let bases = [
                 "/var/containers/Shared/SystemGroup",
@@ -827,9 +1035,6 @@ class GestaltManager: ObservableObject {
 
                 for item in items where item.lowercased().contains("eligib") {
                     let containerPath = "\(base)/\(item)"
-                    print("[Eligibility] Found container: \(containerPath)")
-
-                    // Try common plist locations within the container
                     let candidates = [
                         "\(containerPath)/Library/Caches/eligibility.plist",
                         "\(containerPath)/Library/eligibility.plist",
@@ -839,7 +1044,6 @@ class GestaltManager: ObservableObject {
                     for candidate in candidates {
                         let dir = (candidate as NSString).deletingLastPathComponent
                         guard wq_grant(dir) else { continue }
-
                         do {
                             if !FileManager.default.fileExists(atPath: dir) {
                                 try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -848,108 +1052,30 @@ class GestaltManager: ObservableObject {
                                 fromPropertyList: eligibility, format: .binary, options: 0
                             )
                             try (data as NSData).write(toFile: candidate, options: .atomic)
-                            print("[Eligibility] Wrote to: \(candidate)")
                             wrote = true
-                            DispatchQueue.main.async {
-                                self.eligibilityStatus = "OK — \(candidate)"
-                            }
+                            DispatchQueue.main.async { self.eligibilityStatus = "OK" }
                             break
-                        } catch {
-                            print("[Eligibility] Write failed at \(candidate): \(error)")
-                        }
+                        } catch {}
                     }
                     if wrote { break }
                 }
                 if wrote { break }
             }
 
-            // Strategy 2: Try /var/db paths (unlikely to work — not a container)
-            if !wrote {
-                let dbPaths = [
-                    "/var/db/eligibilityd/eligibility.plist",
-                    "/private/var/db/eligibilityd/eligibility.plist"
-                ]
-                for ePath in dbPaths {
-                    let dir = (ePath as NSString).deletingLastPathComponent
-                    guard wq_grant(dir) else {
-                        print("[Eligibility] Grant failed for \(dir) (expected — not a container)")
-                        continue
-                    }
-                    do {
-                        if !FileManager.default.fileExists(atPath: dir) {
-                            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                        }
-                        let data = try PropertyListSerialization.data(
-                            fromPropertyList: eligibility, format: .binary, options: 0
-                        )
-                        try (data as NSData).write(toFile: ePath, options: .atomic)
-                        wrote = true
-                        DispatchQueue.main.async {
-                            self.eligibilityStatus = "OK — \(ePath)"
-                        }
-                        break
-                    } catch {
-                        print("[Eligibility] Write error: \(error)")
-                    }
-                }
-            }
-
             DispatchQueue.main.async {
                 if wrote {
-                    self.statusMessage = "Eligibility override written — REBOOT required"
+                    self.statusMessage = "Eligibility written — REBOOT required"
                 } else {
-                    self.statusMessage = "Eligibility: no accessible path found (exploit only reaches containers)"
+                    self.statusMessage = "Eligibility: no accessible path"
                     self.eligibilityStatus = "N/A"
-                    self.lastError = "eligibilityd is not in a SystemGroup container — cannot access with worse_query"
+                    self.lastError = "eligibilityd not in SystemGroup container"
                 }
                 self.isLoading = false
             }
         }
     }
 
-    // MARK: - CacheData Serialization
-
-    private func deserializeCacheData(_ data: Data) -> NSMutableDictionary? {
-        // Try NSKeyedUnarchiver first (most common format)
-        if let dict = try? NSKeyedUnarchiver.unarchivedObject(
-            ofClasses: [NSDictionary.self, NSMutableDictionary.self, NSString.self,
-                        NSNumber.self, NSData.self, NSArray.self, NSMutableArray.self,
-                        NSDate.self, NSSet.self, NSMutableSet.self],
-            from: data
-        ) as? NSMutableDictionary {
-            print("[Gestalt] CacheData decoded via NSKeyedUnarchiver (\(dict.count) keys)")
-            return dict
-        }
-
-        // Try as a nested binary plist
-        if let dict = try? PropertyListSerialization.propertyList(
-            from: data, options: .mutableContainersAndLeaves, format: nil
-        ) as? NSMutableDictionary {
-            print("[Gestalt] CacheData decoded as binary plist (\(dict.count) keys)")
-            return dict
-        }
-
-        print("[Gestalt] CacheData: unknown format (first 4 bytes: \(data.prefix(4).map { String(format: "%02x", $0) }.joined()))")
-        return nil
-    }
-
-    private func serializeCacheData(_ dict: NSMutableDictionary) -> Data? {
-        // Re-encode with NSKeyedArchiver
-        if let data = try? NSKeyedArchiver.archivedData(
-            withRootObject: dict, requiringSecureCoding: false
-        ) {
-            return data
-        }
-
-        // Fallback to binary plist
-        if let data = try? PropertyListSerialization.data(
-            fromPropertyList: dict, format: .binary, options: 0
-        ) {
-            return data
-        }
-
-        return nil
-    }
+    // MARK: - Immutable Flag
 
     func checkImmutable() {
         guard let path = plistPath else { return }
@@ -959,20 +1085,12 @@ class GestaltManager: ObservableObject {
         }
     }
 
-    // MARK: - Immutable Flag
-
     func setImmutable() {
-        guard let path = plistPath else {
-            statusMessage = "No plist loaded"
-            return
-        }
-
+        guard let path = plistPath else { return }
         isLoading = true
-        statusMessage = "Setting immutable flag..."
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-
             let dir = (path as NSString).deletingLastPathComponent
             guard wq_grant(dir) else {
                 DispatchQueue.main.async {
@@ -983,15 +1101,14 @@ class GestaltManager: ObservableObject {
             }
 
             let ret = chflags(path, UInt32(UF_IMMUTABLE))
-            print("[Gestalt] chflags UF_IMMUTABLE on \(path): ret=\(ret), errno=\(errno)")
-
             DispatchQueue.main.async {
                 if ret == 0 {
-                    self.statusMessage = "Immutable flag set — iOS cannot overwrite the plist on reboot"
+                    self.isImmutable = true
+                    self.statusMessage = "Plist locked (immutable)"
                 } else {
                     let err = String(cString: strerror(errno))
                     self.statusMessage = "chflags failed: \(err)"
-                    self.lastError = "chflags errno \(errno): \(err)"
+                    self.lastError = "errno \(errno): \(err)"
                 }
                 self.isLoading = false
             }
@@ -1000,13 +1117,10 @@ class GestaltManager: ObservableObject {
 
     func clearImmutable() {
         guard let path = plistPath else { return }
-
         let dir = (path as NSString).deletingLastPathComponent
         guard wq_grant(dir) else { return }
-
-        let ret = chflags(path, 0)
-        print("[Gestalt] Cleared flags on \(path): ret=\(ret)")
-        if ret == 0 {
+        if chflags(path, 0) == 0 {
+            isImmutable = false
             statusMessage = "Immutable flag cleared"
         }
     }
