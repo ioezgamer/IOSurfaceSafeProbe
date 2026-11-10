@@ -35,15 +35,10 @@ jobs:
           DEVELOPMENT_TEAM="" \
           IPHONEOS_DEPLOYMENT_TARGET=16.0
 
-    - name: Install ldid
-      run: brew install ldid
-
-    - name: Sign with entitlements (ldid)
+    - name: Strip any code signature
       run: |
-        ldid -S./IOSurfaceSafeProbe/IOSurfaceSafeProbe.entitlements \
-          build/DerivedData/Build/Products/Release-iphoneos/IOSurfaceSafeProbe.app/IOSurfaceSafeProbe
-        echo "Verifying embedded entitlements:"
-        ldid -e build/DerivedData/Build/Products/Release-iphoneos/IOSurfaceSafeProbe.app/IOSurfaceSafeProbe
+        codesign --remove-signature build/DerivedData/Build/Products/Release-iphoneos/IOSurfaceSafeProbe.app/IOSurfaceSafeProbe 2>/dev/null || true
+        echo "Binary has no code signature (matches reference apps)"
 
     - name: Create IPA
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'

@@ -46,23 +46,29 @@ class CacheManager: ObservableObject {
 
     private func consumeExtensionTryingAllGroups(_ path: String) -> (Int64, String?) {
         let allGroups = KMWorseQuerySignatureGroups() as? [String] ?? []
-        let isAppGroup = path.contains("/var/mobile/Containers/Shared/AppGroup")
-        let isIOS26 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
+        let ver = ProcessInfo.processInfo.operatingSystemVersion
+        print("[Exploit] iOS \(ver.majorVersion).\(ver.minorVersion).\(ver.patchVersion)")
+        print("[Exploit] Target: \(path)")
+        print("[Exploit] Groups (\(allGroups.count)): \(allGroups)")
 
-        // Try both flag combos for every group
+        var lastErr: Int64 = 0
         for altFlags in [false, true] {
-            let flagLabel = altFlags ? "alt" : "primary"
-            let effectiveAlt = (isAppGroup && isIOS26) ? !altFlags : altFlags
+            let flagLabel = altFlags ? "alt(0x800000000)" : "primary(0x8000000000)"
             for group in allGroups {
-                let handle = worse_query(path, group, effectiveAlt, false)
+                let handle = worse_query(path, group, altFlags, true)
                 if handle > 0 {
                     print("[Exploit] SUCCESS group=\(group) flags=\(flagLabel) handle=\(handle)")
                     return (handle, group)
                 }
-                print("[Exploit] group=\(group) flags=\(flagLabel) err=\(handle)")
+                lastErr = handle
+                print("[Exploit] FAIL group=\(group) flags=\(flagLabel) err=\(handle)")
             }
         }
-        return (-6, nil)
+
+        DispatchQueue.main.async {
+            self.statusMessage = "Exploit failed (err=\(lastErr), \(allGroups.count) groups)"
+        }
+        return (lastErr, nil)
     }
 
     func scanCaches() {
