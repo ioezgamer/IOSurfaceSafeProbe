@@ -4,7 +4,6 @@
 <dict>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.apple.mobilegestaltcache</string>
 		<string>group.com.ioezgamer.cachewipe</string>
 	</array>
 </dict>
