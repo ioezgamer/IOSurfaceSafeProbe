@@ -566,9 +566,14 @@ static int s_slot_count = -1;
 static void mg_ensure_loaded(void) {
     if (s_mg_handle) return;
     s_mg_handle = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY | RTLD_NOLOAD);
-    if (!s_mg_handle)
+    if (!s_mg_handle) {
         s_mg_handle = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
-    if (!s_mg_handle) return;
+    }
+    if (!s_mg_handle) {
+        NSLog(@"[mg_cache] FAILED to dlopen libMobileGestalt: %s", dlerror());
+        return;
+    }
+    NSLog(@"[mg_cache] dlopen OK: %p", s_mg_handle);
 
     // Find the mach_header for libMobileGestalt
     uint32_t count = _dyld_image_count();
@@ -576,8 +581,12 @@ static void mg_ensure_loaded(void) {
         const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "libMobileGestalt")) {
             s_mg_header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            NSLog(@"[mg_cache] Found header at image %u: %s -> %p", i, name, s_mg_header);
             break;
         }
+    }
+    if (!s_mg_header) {
+        NSLog(@"[mg_cache] WARNING: header not found among %u images", count);
     }
 }
 
@@ -656,14 +665,21 @@ static int mg_compute_slot_count(const char *sectName) {
 
 int mg_cache_index(const char *keyHash) {
     mg_ensure_loaded();
-    if (!s_mg_header) return -1;
+    if (!s_mg_header) {
+        NSLog(@"[mg_cache] cache_index(%s): no header", keyHash);
+        return -1;
+    }
 
     const char *strAddr = mg_find_cstring(keyHash);
-    if (!strAddr) return -1;
+    if (!strAddr) {
+        NSLog(@"[mg_cache] cache_index(%s): string not found in __cstring", keyHash);
+        return -1;
+    }
+    NSLog(@"[mg_cache] cache_index(%s): string at %p", keyHash, strAddr);
 
     int idx = mg_scan_descriptors("__const", strAddr);
-    if (idx >= 0) return idx;
-    return -1;
+    NSLog(@"[mg_cache] cache_index(%s): descriptor scan -> %d", keyHash, idx);
+    return idx;
 }
 
 int mg_slot_count(void) {
@@ -672,4 +688,60 @@ int mg_slot_count(void) {
     if (s_slot_count >= 0) return s_slot_count;
     s_slot_count = mg_compute_slot_count("__const");
     return s_slot_count;
+}
+
+NSString * _Nonnull mg_diag(void) {
+    mg_ensure_loaded();
+    NSMutableString *s = [NSMutableString new];
+
+    [s appendFormat:@"handle=%p header=%p\n", s_mg_handle, s_mg_header];
+
+    if (!s_mg_header) {
+        [s appendString:@"FAILED: no mach header\n"];
+        if (!s_mg_handle) [s appendFormat:@"dlopen error: %s\n", dlerror()];
+        return s;
+    }
+
+    // Show __TEXT,__cstring info
+    unsigned long cstrSize = 0;
+    const uint8_t *cstr = getsectiondata(s_mg_header, "__TEXT", "__cstring", &cstrSize);
+    [s appendFormat:@"__TEXT,__cstring: %p size=%lu\n", cstr, cstrSize];
+
+    // Show __AUTH_CONST,__const info
+    unsigned long authSize = 0;
+    const uint8_t *auth = getsectiondata(s_mg_header, "__AUTH_CONST", "__const", &authSize);
+    [s appendFormat:@"__AUTH_CONST,__const: %p size=%lu entries=%lu\n",
+        auth, authSize, auth ? authSize / 64 : 0];
+
+    // Show __DATA_CONST,__const info
+    unsigned long dataSize = 0;
+    const uint8_t *dc = getsectiondata(s_mg_header, "__DATA_CONST", "__const", &dataSize);
+    [s appendFormat:@"__DATA_CONST,__const: %p size=%lu entries=%lu\n",
+        dc, dataSize, dc ? dataSize / 64 : 0];
+
+    // Try one known key
+    const char *testKey = "2OOJf1VhaM7NxfRok3HbWQ"; // AOD
+    const char *found = mg_find_cstring(testKey);
+    [s appendFormat:@"test key '%s': cstring=%p\n", testKey, found];
+
+    if (found) {
+        int idx = mg_scan_descriptors("__const", found);
+        [s appendFormat:@"  descriptor scan -> index %d\n", idx];
+    }
+
+    [s appendFormat:@"slot_count=%d\n", mg_slot_count()];
+
+    // List first few image names containing "Gestalt"
+    uint32_t count = _dyld_image_count();
+    [s appendFormat:@"dyld images: %u total\n", count];
+    int shown = 0;
+    for (uint32_t i = 0; i < count && shown < 5; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && (strstr(name, "estalt") || strstr(name, "ESTALT"))) {
+            [s appendFormat:@"  [%u] %s\n", i, name];
+            shown++;
+        }
+    }
+
+    return s;
 }

@@ -285,6 +285,7 @@ class GestaltManager: ObservableObject {
     @Published var cacheDataPatchInfo = ""
     @Published var cacheDataBase64 = ""
     @Published var cacheDataHexDump = ""
+    @Published var cacheIndexLog = ""
 
     private let knownPaths = [
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
@@ -557,6 +558,22 @@ class GestaltManager: ObservableObject {
                 cacheDataInfo = self.analyzeCacheData(cdBlob)
             }
 
+            // Run runtime index resolution diagnostics
+            let diag = String(mg_diag())
+            print("[v14-diag] \(diag)")
+            var indexLog = "mg_diag:\n\(diag)\n"
+            // Test resolve all tweak keys
+            for tweak in Self.allTweaks {
+                let idx = mg_cache_index(tweak.key)
+                indexLog += "\(tweak.id): \(tweak.key) -> \(idx)\n"
+            }
+            let gtIdx = mg_cache_index(kGreenTeaKey)
+            let ngtIdx = mg_cache_index(kNotGreenTeaKey)
+            indexLog += "greenTea: \(kGreenTeaKey) -> \(gtIdx)\n"
+            indexLog += "notGreenTea: \(kNotGreenTeaKey) -> \(ngtIdx)\n"
+            indexLog += "slot_count: \(mg_slot_count())\n"
+            print("[v14-diag] indices:\n\(indexLog)")
+
             let keyCount = extra.count
             let subtype = (extra["ArtworkDeviceSubType"] ?? extra["oPeik/9e8lQWMszEjbPzng"]) as? Int ?? 0
             let model = extra["h63QSdBCiT/z0WU6rdQr6Q"] as? String ?? "Unknown"
@@ -597,6 +614,7 @@ class GestaltManager: ObservableObject {
                 self.plistKeyCount = keyCount
                 self.modifiedCount = states.filter(\.isModified).count
                 self.cacheDataPatchInfo = cacheDataInfo
+                self.cacheIndexLog = indexLog
                 self.statusMessage = "Loaded \(keyCount) keys"
                 self.isLoading = false
             }
@@ -853,7 +871,15 @@ class GestaltManager: ObservableObject {
                 cdStatus = result.status
                 if result.patched > 0 {
                     plist["CacheData"] = cacheData
+                    print("[v14] CacheData patched: \(cdStatus)")
+                } else {
+                    print("[v14] CacheData: NO slots patched. \(cdStatus)")
                 }
+            }
+
+            // Update index log with patch results
+            DispatchQueue.main.async {
+                self.cacheIndexLog += "\n--- APPLY ---\n\(cdStatus)\n"
             }
 
             // Step 3: Write the plist

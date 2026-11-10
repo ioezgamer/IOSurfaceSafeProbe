@@ -534,6 +534,18 @@ struct TweaksView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+                if !gestalt.cacheIndexLog.isEmpty {
+                    DisclosureGroup("Cache Index Resolution") {
+                        ScrollView {
+                            Text(gestalt.cacheIndexLog)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        .frame(maxHeight: 300)
+                    }
+                    .font(.caption.weight(.medium))
+                }
             }
             .padding()
             .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))

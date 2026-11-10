@@ -42,4 +42,7 @@ int mg_cache_index(const char * _Nonnull keyHash);
 /// or -1 if libMobileGestalt could not be loaded.
 int mg_slot_count(void);
 
+/// Returns diagnostic info about libMobileGestalt loading and section scanning.
+NSString * _Nonnull mg_diag(void);
+
 #endif
