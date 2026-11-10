@@ -70,6 +70,7 @@ class GestaltManager: ObservableObject {
     @Published var grantStatus = ""
     @Published var plistKeyCount = 0
     @Published var lastError = ""
+    @Published var hasCacheData = false
 
     private let knownPaths = [
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
@@ -354,6 +355,9 @@ class GestaltManager: ObservableObject {
                 return
             }
 
+            let cacheDataPresent = plist["CacheData"] != nil
+            print("[Gestalt] CacheData present: \(cacheDataPresent)")
+
             let keyCount = extra.count
             print("[Gestalt] CacheExtra has \(keyCount) keys")
 
@@ -390,6 +394,7 @@ class GestaltManager: ObservableObject {
                 self.tweakStates = states
                 self.gestaltAccessible = true
                 self.hasBackup = hasBackup
+                self.hasCacheData = cacheDataPresent
                 self.deviceSubtype = subtype
                 self.deviceModel = model
                 self.plistKeyCount = keyCount
@@ -545,6 +550,13 @@ class GestaltManager: ObservableObject {
             }
 
             plist["CacheExtra"] = extra
+
+            // Remove CacheData — iOS uses this serialized blob over CacheExtra.
+            // Without removing it, CacheExtra modifications are ignored.
+            if plist["CacheData"] != nil {
+                plist.removeObject(forKey: "CacheData")
+                print("[Gestalt] Removed CacheData (forces iOS to use CacheExtra)")
+            }
 
             // Write back as BINARY plist (critical!)
             do {

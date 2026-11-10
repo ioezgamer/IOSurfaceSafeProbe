@@ -387,6 +387,13 @@ struct TweaksView: View {
                             .font(.caption.weight(.bold))
                     }
                 }
+                HStack {
+                    Text("CacheData:")
+                        .font(.caption.weight(.medium))
+                    Text(gestalt.hasCacheData ? "Present (will be removed on Apply)" : "Not present")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(gestalt.hasCacheData ? .orange : .green)
+                }
                 if !gestalt.deviceModel.isEmpty {
                     HStack {
                         Text("Device:")
