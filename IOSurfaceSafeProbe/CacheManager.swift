@@ -74,24 +74,7 @@ class CacheManager: ObservableObject {
     func scanCaches() {
         let allGroups = KMWorseQuerySignatureGroups() as? [String] ?? []
         guard !allGroups.isEmpty else {
-            // No groups from entitlements - try issue_file_to_self directly
-            statusMessage = "No App Groups, trying fallback..."
-            isScanning = true; apps = []; totalCacheSize = 0
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self = self else { return }
-                var found: [AppCacheInfo] = []
-                for basePath in self.cachePaths {
-                    let handle = worse_query_issue_self(basePath)
-                    if handle <= 0 {
-                        print("[Scan] issue_self failed for \(basePath): \(handle)")
-                        continue
-                    }
-                    print("[Scan] issue_self succeeded for \(basePath)")
-                    found += self.scanContainers(basePath: basePath)
-                    worse_query_release(handle)
-                }
-                self.finishScan(found)
-            }
+            statusMessage = "No App Groups found"
             return
         }
 
@@ -107,16 +90,7 @@ class CacheManager: ObservableObject {
                     found += self.scanContainers(basePath: basePath)
                     worse_query_release(handle)
                 } else {
-                    // Fallback: try issue_file_to_self
-                    let selfHandle = worse_query_issue_self(basePath)
-                    if selfHandle > 0 {
-                        print("[Scan] Fallback issue_self succeeded for \(basePath)")
-                        DispatchQueue.main.async { self.workingGroup = "issue_self" }
-                        found += self.scanContainers(basePath: basePath)
-                        worse_query_release(selfHandle)
-                    } else {
-                        print("[Scan] All methods failed for: \(basePath)")
-                    }
+                    print("[Scan] All methods failed for: \(basePath)")
                 }
             }
             self.finishScan(found)
@@ -164,11 +138,8 @@ class CacheManager: ObservableObject {
             let fm = FileManager.default; var freed: UInt64 = 0
             for app in toClean {
                 let (handle, _) = self.consumeExtensionTryingAllGroups(app.path)
-                var activeHandle = handle
-                if activeHandle <= 0 {
-                    activeHandle = worse_query_issue_self(app.path)
-                }
-                if activeHandle <= 0 { continue }
+                if handle <= 0 { continue }
+                let activeHandle = handle
                 let containerURL = URL(filePath: app.path)
                 for sub in ["Library/Caches", "tmp"] {
                     let cacheDir = containerURL.appending(path: sub)
