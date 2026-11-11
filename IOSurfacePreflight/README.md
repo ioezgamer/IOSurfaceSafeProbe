@@ -48,3 +48,36 @@ Los archivos exportados son:
 
 **Interpretacion estricta:** `observedCreateOverlap > 0` demuestra como maximo un solapamiento temporal de dos llamadas desde la aplicacion. La conexion cerrada es **independiente** de la gestion interna de `IOSurfaceCreate`. No comprueba que `register` y `stop` se ejecutaran en el mismo `IOSurfaceRootUserClient`, no indica una liberacion de objeto del kernel y no constituye prueba de una carrera explotable, UAF, kernel panic ni KernelRW. El resultado `DONE_NO_APP_OVERLAP_OBSERVED` tampoco descarta una vulnerabilidad en otras circunstancias.
 
+
+## v19: evidencia de reinicio sin falsos positivos
+
+La v18 comparaba cadenas de `kern.boottime` exactamente y podía anunciar un reinicio cuando el sello cambiaba por un ajuste del reloj. Además, su checkpoint de integridad no guardaba `systemUptime`; ese historial queda explícitamente marcado como `LEGACY_INDETERMINATE`.
+
+La v19 registra al abrir, entrar en segundo plano, volver a primer plano y cambiar de estado activo:
+- `IOSurfaceBootMonitor-checkpoint.json`: última observación atómica (uptime del sistema, sello de arranque, sesión y diagnóstico).
+- `IOSurfaceBootMonitor-trace.csv`: historial acotado de eventos, disponible con **Exportar registro, CSV y checkpoint**.
+
+Resultados posibles: `BASELINE_CREATED`, `INDETERMINATE`, `NO_UPTIME_ROLLBACK_OBSERVED`, `BOOT_EPOCH_SHIFT_UNCONFIRMED`, `UPTIME_ROLLBACK_REBOOT_INDICATED`. Un retroceso de uptime indica que el dispositivo probablemente se reinició entre observaciones, pero ni la causa ni un kernel panic se pueden inferir con estos datos. Ausencia de retroceso tampoco excluye un reinicio si transcurrió mucho tiempo entre muestras.
+
+**Privacidad:** la aplicación registra estas medidas localmente y solo las exporta cuando el usuario pulsa Exportar; el manifiesto declara las razones de uso de `systemUptime` y `UserDefaults` correspondientes al diagnóstico. No hay envío automático a servidores.
+
+**Prueba del clasificador:**
+
+```sh
+clang -std=c11 -Wall -Wextra -Werror IOSurfacePreflight/Tests/PFBootClassifierTests.c -lm -o /tmp/pf-boot-tests
+/tmp/pf-boot-tests
+```
+
+La compilación de la app iOS se ejecuta en GitHub Actions con `xcodebuild`. El artefacto no está firmado.
+
+## v19.1: correlación temporal de cada campaña con el monitor
+
+Una campaña de 100.000 casos ahora registra en el **mismo monitor de actividad**:
+- `BOUNDARY_BEGIN_<run-uuid>` antes de iniciar la ejecución.
+- `BOUNDARY_PROGRESS_<run-uuid>_<case>` en cada múltiplo de 10.000 casos.
+- `BOUNDARY_END_<run-uuid>_<status>` cuando se completa o se detiene.
+- `BOUNDARY_ERROR_<run-uuid>` si fallan las dependencias de API pública.
+
+Estos eventos permiten cruzar el tiempo de actividad y el identificador de campaña con los archivos `IOSurfaceBruteForce-v18-trace.csv` y `IOSurfaceBruteForce-v18-checkpoint.json` (el nombre del CSV se conserva por compatibilidad). El hecho de que existan eventos `BEGIN` y `END` no demuestra ausencia de errores del kernel; solo mejora la trazabilidad de lo observado desde la aplicación. Los eventos del monitor no son trazas internas del kernel.
+
+Para verificar esta mejora, ejecutar una campaña controlada y exportar `IOSurfaceBootMonitor-trace.csv`, `IOSurfaceBootMonitor-checkpoint.json`, la traza y el checkpoint de campaña. No repetir automáticamente el mismo conjunto de 100.000 casos salvo que se busque reproducibilidad.

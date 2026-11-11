@@ -10,6 +10,7 @@
 #import <string.h>
 #import <unistd.h>
 #import <stdatomic.h>
+#import "PFBootClassifier.h"
 
 // Diagnostic public-API harness, with bounded IOSurface read/write and owned references.
 // No private externalMethod dispatch, stale pointers or kernel modification.
@@ -75,6 +76,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
 
 @interface ProbeController : UIViewController
 @property(nonatomic, strong) UITextView *logView;
+@property(nonatomic, copy) NSString *bootSessionID;
 @property(nonatomic, strong) NSMutableString *events;
 @property(nonatomic, assign) BOOL matrixRunning;
 @property(nonatomic, assign) BOOL stressRunning;
@@ -97,6 +99,82 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     }
 }
 
+// Records observations, not kernel events or proof of a panic.
+- (void)recordBootEvent:(NSString *)event {
+    NSString *dir=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *checkpoint=[dir stringByAppendingPathComponent:@"IOSurfaceBootMonitor-checkpoint.json"];
+    NSString *tracePath=[dir stringByAppendingPathComponent:@"IOSurfaceBootMonitor-trace.csv"];
+    NSData *oldBytes=[NSData dataWithContentsOfFile:checkpoint];
+    id decoded=oldBytes?[NSJSONSerialization JSONObjectWithData:oldBytes options:0 error:NULL]:nil;
+    NSDictionary *previous=[decoded isKindOfClass:NSDictionary.class] ? decoded : nil;
+
+    double uptime=NSProcessInfo.processInfo.systemUptime;
+    NSString *stamp=preflightBootStamp();
+    BOOL haveEpoch=![stamp isEqualToString:@"UNAVAILABLE"];
+    double epoch=haveEpoch?stamp.doubleValue:0;
+    NSNumber *oldUptime=[previous[@"uptimeSeconds"] isKindOfClass:NSNumber.class] ?
+        previous[@"uptimeSeconds"] : nil;
+    NSNumber *oldEpoch=[previous[@"bootEpochSeconds"] isKindOfClass:NSNumber.class] ?
+        previous[@"bootEpochSeconds"] : nil;
+    PFBootResult verdict=PFDetermineBoot(
+        oldUptime.doubleValue,oldUptime!=nil,uptime,YES,
+        oldEpoch.doubleValue,oldEpoch!=nil,epoch,haveEpoch);
+    NSString *status=previous?[NSString stringWithUTF8String:PFBootResultName(verdict)]:
+        @"BASELINE_CREATED";
+    NSString *date=[NSDate date].description;
+    NSDictionary *sample=@{
+        @"schema":@"v19-uptime-observations",
+        @"event":event,@"sessionID":self.bootSessionID?:@"UNKNOWN",
+        @"uptimeSeconds":@(uptime),
+        @"bootEpochSeconds":haveEpoch?@(epoch):(id)NSNull.null,
+        @"previousUptimeSeconds":oldUptime?:NSNull.null,
+        @"previousBootEpochSeconds":oldEpoch?:NSNull.null,
+        @"status":status,@"timestamp":date,
+        @"rebootCause":@"NOT_DETERMINABLE_WITH_PUBLIC_API",
+        @"kernelPanicProven":@NO
+    };
+    NSData *json=[NSJSONSerialization dataWithJSONObject:sample
+                                      options:NSJSONWritingPrettyPrinted error:NULL];
+    BOOL persisted=json && [json writeToFile:checkpoint
+                                    options:NSDataWritingAtomic error:NULL];
+    // Bounded append-only diagnostic trail, separate from the current state.
+    NSString *header=@"timestamp,session,event,uptime_seconds,boot_epoch_seconds,previous_uptime_seconds,status,checkpoint_saved\n";
+    NSString *line=[NSString stringWithFormat:
+        @"%@,%@,%@,%.3f,%@,%@,%@,%d\n",
+        [date stringByReplacingOccurrencesOfString:@"," withString:@" "],
+        self.bootSessionID?:@"UNKNOWN",event,uptime,
+        haveEpoch?[NSString stringWithFormat:@"%.6f",epoch]:@"NA",
+        oldUptime?[NSString stringWithFormat:@"%.3f",oldUptime.doubleValue]:@"NA",
+        status,(int)persisted];
+    NSMutableData *csv=[[NSData dataWithContentsOfFile:tracePath] mutableCopy];
+    if(!csv || csv.length>65536)
+        csv=[[header dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+    [csv appendData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    BOOL saved=[csv writeToFile:tracePath options:NSDataWritingAtomic error:NULL];
+    [self note:[NSString stringWithFormat:
+        @"BOOTMON: %@ resultado=%@ uptime=%.3f prev=%@ epoch=%@ checkpoint=%@ trace=%@",
+        event,status,uptime,oldUptime?:@"NA",stamp,
+        persisted?@"OK":@"ERROR",saved?@"OK":@"ERROR"]];
+    if(verdict==PFBootUptimeRolledBack)
+        [self note:@"BOOTMON: retroceso de uptime indica reinicio entre observaciones, NO su causa."];
+    else if(verdict==PFBootBootEpochChangedUnconfirmed)
+        [self note:@"BOOTMON: cambió kern.boottime sin retroceso del uptime; INDETERMINADO, posible ajuste de reloj."];
+}
+
+- (void)observeAppLifecycle:(NSNotification *)notification {
+    NSString *event=[notification.name isEqualToString:UIApplicationDidEnterBackgroundNotification]?
+        @"DID_ENTER_BACKGROUND":
+        [notification.name isEqualToString:UIApplicationWillEnterForegroundNotification]?
+        @"WILL_ENTER_FOREGROUND":
+        [notification.name isEqualToString:UIApplicationDidBecomeActiveNotification]?
+        @"DID_BECOME_ACTIVE":@"WILL_RESIGN_ACTIVE";
+    [self recordBootEvent:event];
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
 - (UIButton *)button:(NSString *)title action:(SEL)selector {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     [b setTitle:title forState:UIControlStateNormal];
@@ -115,7 +193,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     self.events = [NSMutableString new];
 
     UILabel *title = [UILabel new];
-    title.text = @"IOSurface Preflight v18";
+    title.text = @"IOSurface Preflight v19.1";
     title.font = [UIFont boldSystemFontOfSize:26];
     UILabel *subtitle = [UILabel new];
     subtitle.text = @"Diagnóstico de acceso. No intenta provocar fallos ni obtener KernelRW.";
@@ -186,8 +264,17 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     char build[128] = {0}; size_t len = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &len, NULL, 0) == 0)
         [self note:[NSString stringWithFormat:@"build=%s", build]];
-    [self note:@"app=IOSurfacePreflight-v18"]; 
-    [self note:@"Modo diagnóstico: prueba opcional de un método externo, sin carreras ni acceso a punteros liberados."];
+    [self note:@"app=IOSurfacePreflight-v19.1"]; 
+    [self note:@"Modo diagnóstico: observaciones públicas sin afirmar fallos del kernel."];
+    self.bootSessionID=NSUUID.UUID.UUIDString;
+    [self recordBootEvent:@"APP_LAUNCHED"];
+    for(NSString *name in @[UIApplicationDidEnterBackgroundNotification,
+                              UIApplicationWillEnterForegroundNotification,
+                              UIApplicationDidBecomeActiveNotification,
+                              UIApplicationWillResignActiveNotification]) {
+        [NSNotificationCenter.defaultCenter addObserver:self
+            selector:@selector(observeAppLifecycle:) name:name object:nil];
+    }
     NSString *brutePath=[NSHomeDirectory() stringByAppendingPathComponent:
         @"Documents/IOSurfaceBruteForce-checkpoint.json"];
     NSData *bruteBytes=[NSData dataWithContentsOfFile:brutePath];
@@ -270,19 +357,13 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
     if(integrityPrevious) {
         NSDictionary *last=[NSJSONSerialization JSONObjectWithData:integrityPrevious options:0 error:NULL];
         if([last isKindOfClass:NSDictionary.class]) {
-            NSString *bootNow=preflightBootStamp();
-            NSString *bootThen=last[@"bootStamp"];
             [self note:[NSString stringWithFormat:
                 @"INTEGRITY: checkpoint previo status=%@ caso=%@ discrepancias=%@",
                 last[@"status"] ?: @"?",last[@"case"] ?: @"?",last[@"mismatches"] ?: @"?"]];
-            if([bootThen isKindOfClass:NSString.class] &&
-               ![bootNow isEqualToString:@"UNAVAILABLE"] &&
-               ![bootThen isEqualToString:@"UNAVAILABLE"] &&
-               ![bootThen isEqualToString:bootNow]) {
-                [self note:@"INTEGRITY: el dispositivo se reinició desde el checkpoint previo. La causa no está determinada."];
-            } else if([last[@"status"] isEqualToString:@"RUNNING"]) {
-                [self note:@"INTEGRITY: la ejecución anterior quedó incompleta; no equivale a kernel panic."];
-            }
+            if(last[@"bootStamp"] && !last[@"uptimeSeconds"])
+                [self note:@"INTEGRITY: checkpoint v18 solo contiene bootStamp: LEGACY_INDETERMINATE. No demuestra reinicio."];
+            if([last[@"status"] isEqualToString:@"RUNNING"])
+                [self note:@"INTEGRITY: ejecución incompleta; no equivale a kernel panic."];
         }
     }
     NSString *observerCheckpointPath=[NSHomeDirectory() stringByAppendingPathComponent:
@@ -1464,6 +1545,9 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                               @"phase":@"STARTED",@"timestamp":[NSDate date].description};
     NSData *first = [NSJSONSerialization dataWithJSONObject:initial options:0 error:NULL];
     if (first) [first writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
+    // Campaign UUID in the event allows time correlation with the separate trace.
+    // A bracket is created before running any public IOSurface API operations.
+    [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_BEGIN_%@",run]];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
@@ -1498,6 +1582,7 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                 if(encoded) [encoded writeToFile:checkpoint options:NSDataWritingAtomic error:NULL];
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.stressRunning=NO;
+                    [self recordBootEvent:[NSString stringWithFormat:@"BOUNDARY_ERROR_%@",run]];
                     [self note:@"BOUNDARY: no están disponibles todas las funciones públicas; prueba cancelada."];
                 });
                 return;
@@ -1673,6 +1758,9 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                     if(n%2500==0) {
                         unsigned done=n,ok=accepted,no=rejected,needsReview=review,passed=samplePassed;
                         dispatch_async(dispatch_get_main_queue(), ^{
+                            if(done%10000==0)
+                                [self recordBootEvent:[NSString stringWithFormat:
+                                    @"BOUNDARY_PROGRESS_%@_%u",run,done]];
                             [self note:[NSString stringWithFormat:
                                 @"BOUNDARY: %u/%u aceptadas=%u rechazadas=%u alertas=%u integridad_ok=%u",
                                 done,limit,ok,no,needsReview,passed]];
@@ -1710,6 +1798,10 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.stressCSV=exportCSV;
                 self.stressRunning=NO;
+                NSString *endStatus=(sampleMismatch||sampleUnlockFailed)?
+                    @"STOPPED_ON_INTEGRITY_ERROR":stopped?@"STOPPED":@"DONE";
+                [self recordBootEvent:[NSString stringWithFormat:
+                    @"BOUNDARY_END_%@_%@",run,endStatus]];
                 [self note:[NSString stringWithFormat:
                     @"BOUNDARY: %@ %u/%u seed=%u aceptadas=%u rechazadas=%u excepciones=%u",
                     stopped?@"STOPPED":@"DONE",attempts,limit,seed,accepted,rejected,exceptions]];
@@ -3178,6 +3270,13 @@ static uint8_t preflightExpectedByte(unsigned caseNo,size_t offset) {
                             stringByAppendingPathComponent:file];
         if([[NSFileManager defaultManager] fileExistsAtPath:path])
             [filesToShare addObject:[NSURL fileURLWithPath:path]];
+    }
+    for(NSString *name in @[@"IOSurfaceBootMonitor-checkpoint.json",
+                            @"IOSurfaceBootMonitor-trace.csv"]) {
+        NSString *p=[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                       stringByAppendingPathComponent:name];
+        if([[NSFileManager defaultManager] fileExistsAtPath:p])
+            [filesToShare addObject:[NSURL fileURLWithPath:p]];
     }
     UIActivityViewController *sharing = [[UIActivityViewController alloc]
       initWithActivityItems:filesToShare applicationActivities:nil];

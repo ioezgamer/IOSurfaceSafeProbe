@@ -5,6 +5,11 @@ on:
     paths:
       - 'IOSurfacePreflight/**'
       - '.github/workflows/ios-preflight-ipa.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'IOSurfacePreflight/**'
+      - '.github/workflows/ios-preflight-ipa.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,6 +22,12 @@ jobs:
         run: xcodebuild -version
       - name: Instalar XcodeGen
         run: brew install xcodegen
+      - name: Pruebas del clasificador de reinicios (C11)
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror \
+            IOSurfacePreflight/Tests/PFBootClassifierTests.c -lm \
+            -o "$RUNNER_TEMP/pf-boot-tests"
+          "$RUNNER_TEMP/pf-boot-tests"
       - name: Generar proyecto
         working-directory: IOSurfacePreflight
         run: xcodegen generate
@@ -27,6 +38,12 @@ jobs:
             -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/preflight-build" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Verificar versión real del Info.plist
+        run: |
+          INFO="$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")" = "0.19.1"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")" = "20"
+          test -f "$RUNNER_TEMP/preflight-build/Build/Products/Release-iphoneos/IOSurfacePreflight.app/PrivacyInfo.xcprivacy"
       - name: Crear IPA
         run: |
           mkdir -p "$RUNNER_TEMP/preflight-pkg/Payload"
