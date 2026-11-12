@@ -16,9 +16,9 @@
         {
           "version": "1.0.0",
           "date": "2026-11-12",
-          "localizedDescription": "Initial release. Patches greenTea/notGreenTea gate flags to enable MobileGestalt cache overrides.",
+          "localizedDescription": "See release notes on GitHub.",
           "downloadURL": "https://github.com/ioezgamer/IOSurfaceSafeProbe/releases/download/v1.0.0/CacheWipe.ipa",
-          "size": 0
+          "size": 343825
         }
       ],
       "appPermissions": {
