@@ -1,7 +1,7 @@
 {
   "name": "CacheWipe",
   "identifier": "com.ioezgamer.cachewipe.source",
-  "sourceURL": "https://raw.githubusercontent.com/ioezgamer/IOSurfaceSafeProbe/main/source.json",
+  "sourceURL": "https://ioezgamer.github.io/IOSurfaceSafeProbe/source.json",
   "apps": [
     {
       "name": "CacheWipe",

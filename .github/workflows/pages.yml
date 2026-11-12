@@ -1,0 +1,55 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ source.json ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Build site
+      run: |
+        mkdir -p _site
+        cp source.json _site/source.json
+        cat > _site/index.html <<'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><title>CacheWipe</title></head>
+        <body>
+        <h1>CacheWipe</h1>
+        <p>FlareStore source URL:</p>
+        <code>https://ioezgamer.github.io/IOSurfaceSafeProbe/source.json</code>
+        </body>
+        </html>
+        EOF
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v5
+
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: _site
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
