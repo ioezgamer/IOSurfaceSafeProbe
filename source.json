@@ -14,6 +14,13 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "v1.0.3",
+          "date": "2026-11-12",
+          "localizedDescription": "See release notes on GitHub.",
+          "downloadURL": "https://github.com/ioezgamer/IOSurfaceSafeProbe/releases/download/vv1.0.3/CacheWipe.ipa",
+          "size": 346749
+        },
+        {
           "version": "1.0.2",
           "date": "2026-11-12",
           "localizedDescription": "See release notes on GitHub.",
