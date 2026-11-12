@@ -74,8 +74,22 @@ jobs:
           --title "CacheWipe ${{ steps.meta.outputs.TAG_NAME }}" \
           --generate-notes
 
-    - name: Update source.json
+    - name: Update source.json on main
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VERSION: ${{ steps.meta.outputs.VERSION }}
+        DATE: ${{ steps.meta.outputs.DATE }}
+        SIZE: ${{ steps.meta.outputs.SIZE }}
+        DOWNLOAD_URL: ${{ steps.meta.outputs.DOWNLOAD_URL }}
+        TAG_NAME: ${{ steps.meta.outputs.TAG_NAME }}
       run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        # Switch to main first, then update source.json there
+        git fetch origin main
+        git checkout main
+
         python3 - <<'PYEOF'
         import json, os
 
@@ -107,21 +121,8 @@ jobs:
 
         print(f"source.json updated: v{version}, {size} bytes")
         PYEOF
-      env:
-        VERSION: ${{ steps.meta.outputs.VERSION }}
-        DATE: ${{ steps.meta.outputs.DATE }}
-        SIZE: ${{ steps.meta.outputs.SIZE }}
-        DOWNLOAD_URL: ${{ steps.meta.outputs.DOWNLOAD_URL }}
 
-    - name: Commit updated source.json to main
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git fetch origin main
-        git checkout main
         git add source.json
         git diff --staged --quiet && echo "No changes" && exit 0
-        git commit -m "chore: update source.json for ${{ steps.meta.outputs.TAG_NAME }}"
+        git commit -m "chore: update source.json for ${TAG_NAME}"
         git push origin main
