@@ -81,6 +81,7 @@ class GestaltManager: ObservableObject {
     @Published var eligibilityStatus = ""
     @Published var isImmutable = false
     @Published var cacheDataPatchInfo = ""
+    @Published var mgDiagText = ""
 
     private let knownPaths = [
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
@@ -312,7 +313,12 @@ class GestaltManager: ObservableObject {
             }
 
             self.plistPath = path
-            DispatchQueue.main.async { self.grantStatus = "OK" }
+            let diagText = mg_diag()
+            print("[Gestalt] mg_diag:\n\(diagText)")
+            DispatchQueue.main.async {
+                self.grantStatus = "OK"
+                self.mgDiagText = diagText
+            }
 
             let backupPath = path + self.backupSuffix
             let hasBackup = FileManager.default.fileExists(atPath: backupPath)

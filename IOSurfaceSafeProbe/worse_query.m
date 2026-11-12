@@ -590,75 +590,177 @@ static void mg_ensure_loaded(void) {
     }
 }
 
-// Walk __TEXT,__cstring to find the address of a key hash string
+// Walk ALL load-command segments to find `needle` in any __cstring section.
+// Applies dyld ASLR slide manually — more reliable than getsectiondata on
+// dyld-shared-cache images where getsectiondata can silently return NULL.
 static const char *mg_find_cstring(const char *needle) {
     if (!s_mg_header) return NULL;
-    unsigned long size = 0;
-    intptr_t slide = 0;
 
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
+    intptr_t slide = 0;
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
         if ((const struct mach_header_64 *)_dyld_get_image_header(i) == s_mg_header) {
             slide = _dyld_get_image_vmaddr_slide(i);
             break;
         }
     }
 
-    const uint8_t *sect = getsectiondata(s_mg_header, "__TEXT", "__cstring", &size);
-    if (!sect || size == 0) return NULL;
-
     size_t needleLen = strlen(needle);
-    const uint8_t *end = sect + size - needleLen;
-    for (const uint8_t *p = sect; p <= end; p++) {
-        if (memcmp(p, needle, needleLen) == 0 && p[needleLen] == '\0') {
-            return (const char *)p;
+    const uint8_t *lcp = (const uint8_t *)s_mg_header + sizeof(struct mach_header_64);
+    for (uint32_t ci = 0; ci < s_mg_header->ncmds; ci++) {
+        const struct load_command *lc = (const struct load_command *)lcp;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *s64 = (const struct section_64 *)(seg + 1);
+            for (uint32_t si = 0; si < seg->nsects; si++, s64++) {
+                char sname[17] = {0};
+                memcpy(sname, s64->sectname, 16);
+                if (strcmp(sname, "__cstring") != 0) continue;
+                uintptr_t addr = (uintptr_t)s64->addr + (uintptr_t)slide;
+                size_t sz = (size_t)s64->size;
+                if (sz < needleLen + 1) continue;
+                const uint8_t *data = (const uint8_t *)addr;
+                const uint8_t *end  = data + sz - needleLen;
+                for (const uint8_t *p = data; p <= end; p++) {
+                    if (memcmp(p, needle, needleLen) == 0 && p[needleLen] == '\0') {
+                        NSLog(@"[mg_cache] found '%s' in [%s,__cstring] via lc-walk at %p",
+                              needle, seg->segname, p);
+                        return (const char *)p;
+                    }
+                }
+            }
+        }
+        lcp += lc->cmdsize;
+    }
+
+    // Fallback: getsectiondata (may work when lc-walk fails)
+    unsigned long fbSz = 0;
+    const uint8_t *fbSect = getsectiondata(s_mg_header, "__TEXT", "__cstring", &fbSz);
+    if (fbSect && fbSz >= needleLen + 1) {
+        const uint8_t *end = fbSect + fbSz - needleLen;
+        for (const uint8_t *p = fbSect; p <= end; p++) {
+            if (memcmp(p, needle, needleLen) == 0 && p[needleLen] == '\0') {
+                NSLog(@"[mg_cache] found '%s' via getsectiondata fallback at %p", needle, p);
+                return (const char *)p;
+            }
         }
     }
+    NSLog(@"[mg_cache] string '%s' NOT found in any __cstring", needle);
     return NULL;
 }
 
-// Scan query descriptors (64-byte structs) for one whose key-hash pointer
-// matches `targetStr`. Returns the Int16 at +0x3A (the cache index).
-static int mg_scan_descriptors(const char *sectName, const char *targetStr) {
-    if (!s_mg_header) return -1;
-    unsigned long size = 0;
-    const uint8_t *sect = getsectiondata(s_mg_header, "__AUTH_CONST", sectName, &size);
-    if (!sect) sect = getsectiondata(s_mg_header, "__DATA_CONST", sectName, &size);
-    if (!sect || size < 64) return -1;
+// Scan descriptor section for a pointer matching `target`.
+// Tries multiple strides (48, 56, 64, 72) and multiple index-field offsets
+// (0x24 Int32, 0x26 Int16, 0x38 Int16, 0x3A Int16) to handle different iOS versions.
+static int mg_scan_section_for_ptr(const uint8_t *sect, size_t size, uintptr_t target) {
+    if (!sect || size < 16) return -1;
+    static const int strides[]    = { 48, 56, 64, 72, 80, 0 };
+    static const int int16Offs[]  = { 0x26, 0x38, 0x3A, 0x24, 0x2A, 0x28, 0x20, 0 };
+    static const int int32Offs[]  = { 0x24, 0x20, 0x28, 0x2C, 0x30, 0 };
 
-    uintptr_t target = (uintptr_t)targetStr;
-    size_t numEntries = size / 64;
+    for (int si = 0; strides[si]; si++) {
+        int stride = strides[si];
+        if ((size_t)stride > size) continue;
+        size_t n = size / (size_t)stride;
+        for (size_t ei = 0; ei < n; ei++) {
+            const uint8_t *entry = sect + ei * (size_t)stride;
+            uintptr_t rawPtr;
+            memcpy(&rawPtr, entry, 8);
+            if ((rawPtr & 0x0000FFFFFFFFFFFF) != target) continue;
 
-    for (size_t i = 0; i < numEntries; i++) {
-        const uint8_t *entry = sect + i * 64;
-        uintptr_t rawPtr;
-        memcpy(&rawPtr, entry, 8);
-        // Strip PAC bits (keep lower 48 bits)
-        uintptr_t stripped = rawPtr & 0x0000FFFFFFFFFFFF;
-        if (stripped == target) {
-            int16_t idx;
-            memcpy(&idx, entry + 0x3A, 2);
-            return (int)idx;
+            // Int16 offsets
+            for (int ii = 0; int16Offs[ii]; ii++) {
+                int off = int16Offs[ii];
+                if (off + 2 > stride) continue;
+                int16_t v; memcpy(&v, entry + off, 2);
+                if (v >= 0 && v < 4096) {
+                    NSLog(@"[mg_cache] descriptor hit: stride=%d entry=%zu Int16@0x%X=%d",
+                          stride, ei, off, (int)v);
+                    return (int)v;
+                }
+            }
+            // Int32 offsets
+            for (int ii = 0; int32Offs[ii]; ii++) {
+                int off = int32Offs[ii];
+                if (off + 4 > stride) continue;
+                int32_t v; memcpy(&v, entry + off, 4);
+                if (v >= 0 && v < 4096) {
+                    NSLog(@"[mg_cache] descriptor hit: stride=%d entry=%zu Int32@0x%X=%d",
+                          stride, ei, off, (int)v);
+                    return (int)v;
+                }
+            }
         }
     }
     return -1;
 }
 
-// Compute slot count from the descriptors: find the maximum index
+static int mg_scan_descriptors(const char *sectName, const char *targetStr) {
+    if (!s_mg_header) return -1;
+    uintptr_t target = (uintptr_t)targetStr;
+
+    intptr_t slide = 0;
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        if ((const struct mach_header_64 *)_dyld_get_image_header(i) == s_mg_header) {
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+
+    // Try all segments via load-command walk
+    const uint8_t *lcp = (const uint8_t *)s_mg_header + sizeof(struct mach_header_64);
+    for (uint32_t ci = 0; ci < s_mg_header->ncmds; ci++) {
+        const struct load_command *lc = (const struct load_command *)lcp;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *s64 = (const struct section_64 *)(seg + 1);
+            for (uint32_t si = 0; si < seg->nsects; si++, s64++) {
+                char sname[17] = {0};
+                memcpy(sname, s64->sectname, 16);
+                if (strcmp(sname, sectName) != 0) continue;
+                uintptr_t addr = (uintptr_t)s64->addr + (uintptr_t)slide;
+                int result = mg_scan_section_for_ptr((const uint8_t *)addr,
+                                                      (size_t)s64->size, target);
+                if (result >= 0) return result;
+            }
+        }
+        lcp += lc->cmdsize;
+    }
+
+    // Fallback: getsectiondata
+    const char *segs[] = { "__AUTH_CONST", "__DATA_CONST", "__AUTH_CONST", "__DATA_CONST", NULL };
+    const char *secs[] = { "__const",      "__const",      "__data",       "__data",       NULL };
+    for (int i = 0; segs[i]; i++) {
+        unsigned long sz = 0;
+        const uint8_t *fb = getsectiondata(s_mg_header, segs[i], secs[i], &sz);
+        if (!fb) continue;
+        int result = mg_scan_section_for_ptr(fb, sz, target);
+        if (result >= 0) return result;
+    }
+    return -1;
+}
+
+// Compute slot count: find the maximum index across all descriptor entries.
 static int mg_compute_slot_count(const char *sectName) {
     if (!s_mg_header) return -1;
+    // Use getsectiondata as a quick check
     unsigned long size = 0;
     const uint8_t *sect = getsectiondata(s_mg_header, "__AUTH_CONST", sectName, &size);
     if (!sect) sect = getsectiondata(s_mg_header, "__DATA_CONST", sectName, &size);
-    if (!sect || size < 64) return -1;
+    if (!sect || size < 48) return -1;
 
+    // With stride=64, int16 at 0x3A — scan for max plausible index
     int maxIdx = -1;
-    size_t numEntries = size / 64;
-    for (size_t i = 0; i < numEntries; i++) {
-        const uint8_t *entry = sect + i * 64;
-        int16_t idx;
-        memcpy(&idx, entry + 0x3A, 2);
-        if (idx > maxIdx) maxIdx = idx;
+    for (int stride = 48; stride <= 64; stride += 8) {
+        size_t n = size / (size_t)stride;
+        int localMax = -1;
+        for (size_t i = 0; i < n; i++) {
+            int16_t idx;
+            memcpy(&idx, sect + i * (size_t)stride + 0x26, 2);
+            if (idx > localMax && idx < 4096) localMax = idx;
+        }
+        if (localMax > maxIdx) maxIdx = localMax;
     }
     return maxIdx >= 0 ? maxIdx + 1 : -1;
 }
@@ -702,46 +804,53 @@ NSString * _Nonnull mg_diag(void) {
         return s;
     }
 
-    // Show __TEXT,__cstring info
-    unsigned long cstrSize = 0;
-    const uint8_t *cstr = getsectiondata(s_mg_header, "__TEXT", "__cstring", &cstrSize);
-    [s appendFormat:@"__TEXT,__cstring: %p size=%lu\n", cstr, cstrSize];
+    // getsectiondata probe (may be NULL for dyld shared cache images)
+    unsigned long cstrSz = 0, authSz = 0, dcSz = 0;
+    const uint8_t *cstrP  = getsectiondata(s_mg_header, "__TEXT",       "__cstring", &cstrSz);
+    const uint8_t *authP  = getsectiondata(s_mg_header, "__AUTH_CONST", "__const",   &authSz);
+    const uint8_t *dcP    = getsectiondata(s_mg_header, "__DATA_CONST", "__const",   &dcSz);
+    [s appendFormat:@"getsectdata: cstr=%p(%lu) auth=%p(%lu) dc=%p(%lu)\n",
+        cstrP, cstrSz, authP, authSz, dcP, dcSz];
 
-    // Show __AUTH_CONST,__const info
-    unsigned long authSize = 0;
-    const uint8_t *auth = getsectiondata(s_mg_header, "__AUTH_CONST", "__const", &authSize);
-    [s appendFormat:@"__AUTH_CONST,__const: %p size=%lu entries=%lu\n",
-        auth, authSize, auth ? authSize / 64 : 0];
-
-    // Show __DATA_CONST,__const info
-    unsigned long dataSize = 0;
-    const uint8_t *dc = getsectiondata(s_mg_header, "__DATA_CONST", "__const", &dataSize);
-    [s appendFormat:@"__DATA_CONST,__const: %p size=%lu entries=%lu\n",
-        dc, dataSize, dc ? dataSize / 64 : 0];
-
-    // Try one known key
-    const char *testKey = "2OOJf1VhaM7NxfRok3HbWQ"; // AOD
-    const char *found = mg_find_cstring(testKey);
-    [s appendFormat:@"test key '%s': cstring=%p\n", testKey, found];
-
-    if (found) {
-        int idx = mg_scan_descriptors("__const", found);
-        [s appendFormat:@"  descriptor scan -> index %d\n", idx];
-    }
-
-    [s appendFormat:@"slot_count=%d\n", mg_slot_count()];
-
-    // List first few image names containing "Gestalt"
-    uint32_t count = _dyld_image_count();
-    [s appendFormat:@"dyld images: %u total\n", count];
-    int shown = 0;
-    for (uint32_t i = 0; i < count && shown < 5; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && (strstr(name, "estalt") || strstr(name, "ESTALT"))) {
-            [s appendFormat:@"  [%u] %s\n", i, name];
-            shown++;
+    // Load-command walk: list all segments/sections
+    intptr_t slide = 0;
+    uint32_t imgCnt = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCnt; i++) {
+        if ((const struct mach_header_64 *)_dyld_get_image_header(i) == s_mg_header) {
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
         }
     }
+    [s appendFormat:@"slide=0x%lx ncmds=%u\n", (unsigned long)slide, s_mg_header->ncmds];
+    const uint8_t *lcp = (const uint8_t *)s_mg_header + sizeof(struct mach_header_64);
+    for (uint32_t ci = 0; ci < s_mg_header->ncmds; ci++) {
+        const struct load_command *lc = (const struct load_command *)lcp;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *s64 = (const struct section_64 *)(seg + 1);
+            for (uint32_t si = 0; si < seg->nsects; si++, s64++) {
+                char sname[17] = {0}; memcpy(sname, s64->sectname, 16);
+                uintptr_t addr = (uintptr_t)s64->addr + (uintptr_t)slide;
+                [s appendFormat:@"  [%s,%s] addr=%p sz=%llu\n",
+                    seg->segname, sname, (void *)addr, s64->size];
+            }
+        }
+        lcp += lc->cmdsize;
+    }
+
+    // Test keys
+    struct { const char *key; const char *label; } tests[] = {
+        { "2OOJf1VhaM7NxfRok3HbWQ",  "AOD"        },
+        { "iyfxmLogGVIaH7aEgqwcIA",  "greenTea"   },
+        { "4snMZS8LJkSctKypt2m+xA",  "notGreenTea"},
+        { NULL, NULL }
+    };
+    for (int ti = 0; tests[ti].key; ti++) {
+        const char *kp = mg_find_cstring(tests[ti].key);
+        int idx = kp ? mg_scan_descriptors("__const", kp) : -99;
+        [s appendFormat:@"%s: str=%p idx=%d\n", tests[ti].label, kp, idx];
+    }
+    [s appendFormat:@"slot_count=%d\n", mg_slot_count()];
 
     return s;
 }
