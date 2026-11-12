@@ -473,7 +473,7 @@ class GestaltManager: ObservableObject {
 
     func loadGestalt() {
         guard wq_app_group() != nil else {
-            statusMessage = "No App Group — install via FlareStore"
+            statusMessage = "No App Group container — install via FlareStore (needs group.1669a1048b00156e.X)"
             return
         }
         isLoading = true

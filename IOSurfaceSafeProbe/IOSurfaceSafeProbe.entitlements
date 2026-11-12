@@ -4,7 +4,11 @@
 <dict>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.ioezgamer.cachewipe</string>
+		<string>group.1669a1048b00156e.1</string>
+		<string>group.1669a1048b00156e.2</string>
+		<string>group.1669a1048b00156e.3</string>
+		<string>group.1669a1048b00156e.4</string>
+		<string>group.1669a1048b00156e.5</string>
 	</array>
 </dict>
 </plist>
