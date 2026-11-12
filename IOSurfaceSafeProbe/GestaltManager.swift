@@ -546,10 +546,12 @@ class GestaltManager: ObservableObject {
             }
             plist["CacheExtra"] = extra
 
-            // Step 2: Handle CacheData gate flags.
-            // Try to patch greenTea/notGreenTea. If the keys don't exist in this iOS
-            // version (iOS 26 removed them), delete CacheData entirely so the OS
-            // rebuilds the cache from CacheExtra on next boot.
+            // Step 2: Write gate flags into CacheExtra so MobileGestalt honours overrides.
+            extra[kGreenTeaKey] = false
+            extra[kNotGreenTeaKey] = true
+            plist["CacheExtra"] = extra
+
+            // Step 3: Handle CacheData gate flags.
             var cdStatus = "Not present"
             if var cacheData = plist["CacheData"] as? Data {
                 let result = self.patchGateFlags(&cacheData)
@@ -557,14 +559,13 @@ class GestaltManager: ObservableObject {
                     cdStatus = result
                     plist["CacheData"] = cacheData
                 } else {
-                    // Gate flags not patchable \u{2014} remove CacheData so iOS reads CacheExtra fresh
                     plist.removeObject(forKey: "CacheData")
-                    cdStatus = "Removed (gate keys absent, iOS will rebuild from CacheExtra)"
+                    cdStatus = "Removed (gate idx failed; CacheExtra has gate overrides)"
                 }
                 print("[gestalt] CacheData: \(cdStatus)")
             }
 
-            // Step 3: Write the plist
+            // Step 4: Write the plist
             do {
                 let outputData = try PropertyListSerialization.data(
                     fromPropertyList: plist, format: .binary, options: 0
