@@ -1,0 +1,56 @@
+{
+  "name": "CacheWipe",
+  "identifier": "com.ioezgamer.cachewipe.source",
+  "sourceURL": "https://ioezgamer.github.io/IOSurfaceSafeProbe/source.json",
+  "apps": [
+    {
+      "name": "CacheWipe",
+      "bundleIdentifier": "com.ioezgamer.IOSurfaceSafeProbe",
+      "developerName": "ioezgamer",
+      "subtitle": "MobileGestalt Cache Patcher",
+      "localizedDescription": "Patches the MobileGestalt cache to unlock iOS features like Dynamic Island, AOD, Action Button, Apple Intelligence, and more.\n\nRequiere instalar via FlareStore para que funcionen los grupos de app necesarios.",
+      "iconURL": "https://raw.githubusercontent.com/ioezgamer/IOSurfaceSafeProbe/main/icon.png",
+      "tintColor": "5A5DE8",
+      "screenshotURLs": [],
+      "versions": [
+        {
+          "version": "1.0.3",
+          "date": "2026-11-12",
+          "localizedDescription": "Write gate flags (greenTea/notGreenTea) to CacheExtra for iOS 27 compatibility.",
+          "downloadURL": "https://github.com/ioezgamer/IOSurfaceSafeProbe/releases/download/vv1.0.3/CacheWipe.ipa",
+          "size": 346749
+        },
+        {
+          "version": "1.0.2",
+          "date": "2026-11-12",
+          "localizedDescription": "See release notes on GitHub.",
+          "downloadURL": "https://github.com/ioezgamer/IOSurfaceSafeProbe/releases/download/v1.0.2/CacheWipe.ipa",
+          "size": 346712
+        },
+        {
+          "version": "1.0.1",
+          "date": "2026-11-12",
+          "localizedDescription": "See release notes on GitHub.",
+          "downloadURL": "https://github.com/ioezgamer/IOSurfaceSafeProbe/releases/download/v1.0.1/CacheWipe.ipa",
+          "size": 346621
+        },
+        {
+          "version": "1.0.0",
+          "date": "2026-11-12",
+          "localizedDescription": "See release notes on GitHub.",
+          "downloadURL": "https://github.com/ioezgamer/IOSurfaceSafeProbe/releases/download/v1.0.0/CacheWipe.ipa",
+          "size": 343825
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [
+          {
+            "name": "com.apple.security.application-groups",
+            "usageDescription": "Required to access MobileGestalt cache via FlareStore app group containers."
+          }
+        ]
+      }
+    }
+  ],
+  "news": []
+}
