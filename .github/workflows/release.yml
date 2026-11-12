@@ -1,0 +1,113 @@
+name: Release IPA
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Select Xcode 26.3
+      run: |
+        sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+        xcodebuild -version
+
+    - name: Build Release
+      run: |
+        xcodebuild build \
+          -project IOSurfaceSafeProbe.xcodeproj \
+          -scheme IOSurfaceSafeProbe \
+          -sdk iphoneos \
+          -configuration Release \
+          -derivedDataPath build/DerivedData \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          DEVELOPMENT_TEAM="" \
+          IPHONEOS_DEPLOYMENT_TARGET=26.0
+
+    - name: Create IPA
+      run: |
+        mkdir -p build/Payload
+        cp -r build/DerivedData/Build/Products/Release-iphoneos/IOSurfaceSafeProbe.app build/Payload/
+        cd build && zip -r CacheWipe.ipa Payload/
+
+    - name: Get version and size
+      id: meta
+      run: |
+        echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        echo "SIZE=$(stat -f%z build/CacheWipe.ipa)" >> $GITHUB_OUTPUT
+        echo "DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+        echo "DOWNLOAD_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/CacheWipe.ipa" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release create "${{ github.ref_name }}" \
+          build/CacheWipe.ipa \
+          --title "CacheWipe ${{ github.ref_name }}" \
+          --generate-notes
+
+    - name: Update source.json
+      run: |
+        python3 - <<'PYEOF'
+        import json, os
+
+        version    = os.environ["VERSION"]
+        date       = os.environ["DATE"]
+        size       = int(os.environ["SIZE"])
+        dl_url     = os.environ["DOWNLOAD_URL"]
+
+        with open("source.json") as f:
+            source = json.load(f)
+
+        new_entry = {
+            "version": version,
+            "date": date,
+            "localizedDescription": "See release notes on GitHub.",
+            "downloadURL": dl_url,
+            "size": size
+        }
+
+        versions = source["apps"][0]["versions"]
+        # Remove placeholder 0-size entry with same version if present
+        versions = [v for v in versions if not (v["version"] == version and v["size"] == 0)]
+        versions.insert(0, new_entry)
+        source["apps"][0]["versions"] = versions
+
+        with open("source.json", "w") as f:
+            json.dump(source, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+
+        print(f"source.json updated: v{version}, {size} bytes")
+        PYEOF
+      env:
+        VERSION: ${{ steps.meta.outputs.VERSION }}
+        DATE: ${{ steps.meta.outputs.DATE }}
+        SIZE: ${{ steps.meta.outputs.SIZE }}
+        DOWNLOAD_URL: ${{ steps.meta.outputs.DOWNLOAD_URL }}
+
+    - name: Commit updated source.json to main
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git fetch origin main
+        git checkout main
+        git add source.json
+        git diff --staged --quiet && echo "No changes" && exit 0
+        git commit -m "chore: update source.json for ${{ github.ref_name }}"
+        git push origin main

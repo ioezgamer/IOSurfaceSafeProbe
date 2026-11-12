@@ -63,208 +63,6 @@ struct TweakState: Identifiable {
     var tweak: GestaltTweak
 }
 
-// MARK: - Binary Plist In-Place Patcher
-
-struct BPlistPatcher {
-    private var bytes: [UInt8]
-    private let objectCount: Int
-    private let offsetTableOffset: Int
-    private let offsetSize: Int
-    private let objectRefSize: Int
-    private var objectOffsets: [Int]
-
-    init?(data: Data) {
-        guard data.count >= 40 else { return nil }
-        let arr = Array(data)
-        guard arr[0] == 0x62 && arr[1] == 0x70 && arr[2] == 0x6C && arr[3] == 0x69 &&
-              arr[4] == 0x73 && arr[5] == 0x74 && arr[6] == 0x30 && arr[7] == 0x30 else {
-            return nil // Not "bplist00"
-        }
-        self.bytes = arr
-        let trailerStart = arr.count - 32
-        self.offsetSize = Int(arr[trailerStart + 6])
-        self.objectRefSize = Int(arr[trailerStart + 7])
-        self.objectCount = BPlistPatcher.readBigEndian(arr, offset: trailerStart + 8, size: 8)
-        self.offsetTableOffset = BPlistPatcher.readBigEndian(arr, offset: trailerStart + 24, size: 8)
-
-        var offsets = [Int]()
-        for i in 0..<self.objectCount {
-            let off = BPlistPatcher.readBigEndian(arr, offset: self.offsetTableOffset + i * self.offsetSize, size: self.offsetSize)
-            offsets.append(off)
-        }
-        self.objectOffsets = offsets
-    }
-
-    static func readBigEndian(_ data: [UInt8], offset: Int, size: Int) -> Int {
-        var val = 0
-        for i in 0..<size {
-            val = (val << 8) | Int(data[offset + i])
-        }
-        return val
-    }
-
-    func readRef(_ offset: Int) -> Int {
-        BPlistPatcher.readBigEndian(bytes, offset: offset, size: objectRefSize)
-    }
-
-    enum BPObject {
-        case null
-        case bool(Bool)
-        case int(Int64)
-        case real(Double)
-        case string(String)
-        case data(Data)
-        case array([Int])
-        case dict(keys: [Int], values: [Int])
-        case uid(Int)
-        case unknown
-    }
-
-    func objectAt(_ index: Int) -> BPObject {
-        guard index < objectCount else { return .unknown }
-        let off = objectOffsets[index]
-        return parseObject(at: off)
-    }
-
-    func parseObject(at off: Int) -> BPObject {
-        guard off < bytes.count else { return .unknown }
-        let marker = bytes[off]
-        let hi = marker >> 4
-        let lo = marker & 0x0F
-
-        switch hi {
-        case 0x0:
-            if marker == 0x08 { return .bool(false) }
-            if marker == 0x09 { return .bool(true) }
-            if marker == 0x00 { return .null }
-            return .unknown
-        case 0x1: // int
-            let byteCount = 1 << Int(lo)
-            var val: Int64 = 0
-            for i in 0..<byteCount {
-                val = (val << 8) | Int64(bytes[off + 1 + i])
-            }
-            return .int(val)
-        case 0x2: // real
-            return .unknown
-        case 0x4: // data
-            let (count, dataStart) = readCountAndStart(off: off, lo: lo)
-            let d = Data(bytes[dataStart..<(dataStart + count)])
-            return .data(d)
-        case 0x5: // ASCII string
-            let (count, strStart) = readCountAndStart(off: off, lo: lo)
-            if let s = String(bytes: bytes[strStart..<(strStart + count)], encoding: .ascii) {
-                return .string(s)
-            }
-            return .unknown
-        case 0x6: // Unicode string
-            let (count, strStart) = readCountAndStart(off: off, lo: lo)
-            var chars = [UInt16]()
-            for i in 0..<count {
-                let c = UInt16(bytes[strStart + i*2]) << 8 | UInt16(bytes[strStart + i*2 + 1])
-                chars.append(c)
-            }
-            if let s = String(utf16CodeUnits: chars, count: count) as String? {
-                return .string(s)
-            }
-            return .unknown
-        case 0x8: // uid
-            let n = Int(lo) + 1
-            var val = 0
-            for i in 0..<n { val = (val << 8) | Int(bytes[off + 1 + i]) }
-            return .uid(val)
-        case 0xA: // array
-            let (count, refsStart) = readCountAndStart(off: off, lo: lo)
-            var refs = [Int]()
-            for i in 0..<count {
-                refs.append(readRef(refsStart + i * objectRefSize))
-            }
-            return .array(refs)
-        case 0xD: // dict
-            let (count, refsStart) = readCountAndStart(off: off, lo: lo)
-            var keys = [Int]()
-            var vals = [Int]()
-            for i in 0..<count {
-                keys.append(readRef(refsStart + i * objectRefSize))
-            }
-            for i in 0..<count {
-                vals.append(readRef(refsStart + count * objectRefSize + i * objectRefSize))
-            }
-            return .dict(keys: keys, values: vals)
-        default:
-            return .unknown
-        }
-    }
-
-    private func readCountAndStart(off: Int, lo: UInt8) -> (Int, Int) {
-        if lo != 0x0F {
-            return (Int(lo), off + 1)
-        }
-        let intMarker = bytes[off + 1]
-        let intLen = 1 << Int(intMarker & 0x0F)
-        var count = 0
-        for i in 0..<intLen {
-            count = (count << 8) | Int(bytes[off + 2 + i])
-        }
-        return (count, off + 2 + intLen)
-    }
-
-    func stringAt(_ index: Int) -> String? {
-        if case .string(let s) = objectAt(index) { return s }
-        return nil
-    }
-
-    // Find the object index for a given string
-    func findStringIndex(_ target: String) -> Int? {
-        for i in 0..<objectCount {
-            if stringAt(i) == target { return i }
-        }
-        return nil
-    }
-
-    // Find all dictionaries and their key-value mappings
-    func findDicts() -> [(index: Int, keys: [Int], values: [Int])] {
-        var result = [(index: Int, keys: [Int], values: [Int])]()
-        for i in 0..<objectCount {
-            if case .dict(let keys, let values) = objectAt(i) {
-                result.append((i, keys, values))
-            }
-        }
-        return result
-    }
-
-    // Patch a boolean value at a given object index: false(0x08) ↔ true(0x09)
-    mutating func patchBool(objectIndex: Int, value: Bool) -> Bool {
-        guard objectIndex < objectCount else { return false }
-        let off = objectOffsets[objectIndex]
-        let current = bytes[off]
-        if current == 0x08 || current == 0x09 {
-            bytes[off] = value ? 0x09 : 0x08
-            return true
-        }
-        return false
-    }
-
-    // Patch an integer value at a given object index (only if same byte-size)
-    mutating func patchInt(objectIndex: Int, value: Int64) -> Bool {
-        guard objectIndex < objectCount else { return false }
-        let off = objectOffsets[objectIndex]
-        let marker = bytes[off]
-        guard marker >> 4 == 0x1 else { return false }
-        let byteCount = 1 << Int(marker & 0x0F)
-        var v = value
-        for i in stride(from: byteCount - 1, through: 0, by: -1) {
-            bytes[off + 1 + i] = UInt8(v & 0xFF)
-            v >>= 8
-        }
-        return true
-    }
-
-    func toData() -> Data {
-        Data(bytes)
-    }
-}
-
 // MARK: - Manager
 
 class GestaltManager: ObservableObject {
@@ -283,9 +81,6 @@ class GestaltManager: ObservableObject {
     @Published var eligibilityStatus = ""
     @Published var isImmutable = false
     @Published var cacheDataPatchInfo = ""
-    @Published var cacheDataBase64 = ""
-    @Published var cacheDataHexDump = ""
-    @Published var cacheIndexLog = ""
 
     private let knownPaths = [
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
@@ -473,7 +268,7 @@ class GestaltManager: ObservableObject {
 
     func loadGestalt() {
         guard wq_app_group() != nil else {
-            statusMessage = "No App Group — install via FlareStore"
+            statusMessage = "No App Group container — install via FlareStore (needs group.1669a1048b00156e.X)"
             return
         }
         isLoading = true
@@ -552,28 +347,6 @@ class GestaltManager: ObservableObject {
 
             let cacheDataPresent = plist["CacheData"] != nil
 
-            // Analyze CacheData structure
-            var cacheDataInfo = ""
-            if let cdBlob = plist["CacheData"] as? Data {
-                cacheDataInfo = self.analyzeCacheData(cdBlob)
-            }
-
-            // Run runtime index resolution diagnostics
-            let diag = String(mg_diag())
-            print("[v14-diag] \(diag)")
-            var indexLog = "mg_diag:\n\(diag)\n"
-            // Test resolve all tweak keys
-            for tweak in Self.allTweaks {
-                let idx = mg_cache_index(tweak.key)
-                indexLog += "\(tweak.id): \(tweak.key) -> \(idx)\n"
-            }
-            let gtIdx = mg_cache_index(kGreenTeaKey)
-            let ngtIdx = mg_cache_index(kNotGreenTeaKey)
-            indexLog += "greenTea: \(kGreenTeaKey) -> \(gtIdx)\n"
-            indexLog += "notGreenTea: \(kNotGreenTeaKey) -> \(ngtIdx)\n"
-            indexLog += "slot_count: \(mg_slot_count())\n"
-            print("[v14-diag] indices:\n\(indexLog)")
-
             let keyCount = extra.count
             let subtype = (extra["ArtworkDeviceSubType"] ?? extra["oPeik/9e8lQWMszEjbPzng"]) as? Int ?? 0
             let model = extra["h63QSdBCiT/z0WU6rdQr6Q"] as? String ?? "Unknown"
@@ -613,105 +386,10 @@ class GestaltManager: ObservableObject {
                 self.deviceModel = model
                 self.plistKeyCount = keyCount
                 self.modifiedCount = states.filter(\.isModified).count
-                self.cacheDataPatchInfo = cacheDataInfo
-                self.cacheIndexLog = indexLog
                 self.statusMessage = "Loaded \(keyCount) keys"
                 self.isLoading = false
             }
         }
-    }
-
-    // MARK: - Analyze CacheData structure
-
-    private func analyzeCacheData(_ data: Data) -> String {
-        let size = data.count
-        let arr = Array(data)
-
-        // Store base64 for export
-        DispatchQueue.main.async {
-            self.cacheDataBase64 = data.base64EncodedString()
-        }
-
-        // Build hex dump of first 256 bytes
-        var hexLines = [String]()
-        let dumpLen = min(256, arr.count)
-        for i in stride(from: 0, to: dumpLen, by: 16) {
-            let end = min(i + 16, dumpLen)
-            let hex = arr[i..<end].map { String(format: "%02x", $0) }.joined(separator: " ")
-            let ascii = arr[i..<end].map { (32...126).contains(Int($0)) ? String(UnicodeScalar($0)) : "." }.joined()
-            hexLines.append(String(format: "%04x: %-48s %@", i, hex, ascii))
-        }
-        DispatchQueue.main.async {
-            self.cacheDataHexDump = hexLines.joined(separator: "\n")
-        }
-
-        // Search for base64-decoded key hashes (16 raw bytes each)
-        let gestaltxHashes: [(String, String)] = [
-            ("YlEtTtHlNesRBMal1CqRaA==", "DynamicIsland"),
-            ("2OOJf1VhaM7NxfRok3HbWQ==", "AOD"),
-            ("A62OafQ85EJAiiqKn4agtg==", "Intelligence"),
-            ("SAGvsp6O6kAQ4fEfDJpC4Q==", "BootChime"),
-            ("QHxt+hGLaBPbQJbXiUJX3w==", "ChgLimit"),
-            ("CwvKxM2cEogD3p+HYgaW0Q==", "CamControl"),
-            ("cT44WE1EohiwRzhsZ8xEsw==", "ActionBtn"),
-            ("yhHcB0iH0d1XzPO/CFd3ow==", "Pencil"),
-            ("qeaj75wk3HF4DwQ8qbIi7g==", "StageMgr"),
-        ]
-        var hashHits = [String]()
-        for (b64, label) in gestaltxHashes {
-            if let decoded = Data(base64Encoded: b64) {
-                if let range = data.range(of: decoded) {
-                    let off = range.lowerBound
-                    hashHits.append("\(label)@\(off)")
-                }
-            }
-        }
-
-        // Also search for our plist key strings
-        let tweakKeys = Self.allTweaks.map(\.key)
-        var stringHits = 0
-        for key in tweakKeys {
-            if let kd = key.data(using: .utf8), data.range(of: kd) != nil {
-                stringHits += 1
-            }
-        }
-
-        // Analyze byte patterns - look for repeating structures
-        var entrySize = 0
-        if size > 32 {
-            // Check common entry sizes
-            for candidate in [48, 64, 72, 80, 81, 96, 128] {
-                let headerSize = 16
-                let remaining = size - headerSize
-                if remaining > 0 && remaining % candidate == 0 {
-                    entrySize = candidate
-                    break
-                }
-            }
-        }
-
-        // Count unique non-zero 16-byte blocks
-        var uniqueBlocks = Set<Data>()
-        for i in stride(from: 16, to: size - 15, by: 16) {
-            let block = data[i..<i+16]
-            if block != Data(repeating: 0, count: 16) {
-                uniqueBlocks.insert(Data(block))
-            }
-        }
-
-        let h32 = arr.prefix(32).map { String(format: "%02x", $0) }.joined()
-        let summary = "\(size)B h:\(h32) hashes:\(hashHits.count) strs:\(stringHits) blk:\(uniqueBlocks.count)"
-        let hashDetail = hashHits.isEmpty ? "none" : hashHits.joined(separator: ",")
-        let entryInfo = entrySize > 0 ? " entry:\(entrySize)x\((size-16)/entrySize)" : ""
-
-        print("[Gestalt] CacheData: \(summary)")
-        print("[Gestalt] Hash hits: \(hashDetail)")
-        print("[Gestalt] Entry size guess: \(entryInfo)")
-        for line in hexLines.prefix(16) {
-            print("[Gestalt] \(line)")
-        }
-
-        return "\(size)B hashes:\(hashHits.count) strs:\(stringHits)\(entryInfo) [\(hashDetail)]"
     }
 
     // MARK: - Discover path
@@ -862,24 +540,14 @@ class GestaltManager: ObservableObject {
             }
             plist["CacheExtra"] = extra
 
-            // Step 2: Patch CacheData binary directly (iOS 27 reads ONLY CacheData)
+            // Step 2: Patch gate flags in CacheData (greenTea=false, notGreenTea=true)
+            // This tells iOS to trust CacheExtra values instead of querying the daemon.
             var cdStatus = "Not present"
-            var cdPatched = 0
             if var cacheData = plist["CacheData"] as? Data {
-                let result = self.patchCacheDataBinary(&cacheData, tweaks: toWrite, forceAll: forceAll)
-                cdPatched = result.patched
-                cdStatus = result.status
-                if result.patched > 0 {
-                    plist["CacheData"] = cacheData
-                    print("[v14] CacheData patched: \(cdStatus)")
-                } else {
-                    print("[v14] CacheData: NO slots patched. \(cdStatus)")
-                }
-            }
-
-            // Update index log with patch results
-            DispatchQueue.main.async {
-                self.cacheIndexLog += "\n--- APPLY ---\n\(cdStatus)\n"
+                let result = self.patchGateFlags(&cacheData)
+                cdStatus = result
+                plist["CacheData"] = cacheData
+                print("[gestalt] CacheData gate flags: \(cdStatus)")
             }
 
             // Step 3: Write the plist
@@ -912,7 +580,7 @@ class GestaltManager: ObservableObject {
                     self.hasBackup = true
                     self.hasCacheData = plist["CacheData"] != nil
                     self.cacheDataPatchInfo = cdStatus
-                    self.statusMessage = "CacheExtra: \(writeCount) (\(verified) ok). CacheData: \(cdPatched) patched. \(cdStatus). REBOOT required."
+                    self.statusMessage = "CacheExtra: \(writeCount) (\(verified) ok). Gates: \(cdStatus). REBOOT required."
                     self.isLoading = false
                 }
             } catch {
@@ -925,116 +593,45 @@ class GestaltManager: ObservableObject {
         }
     }
 
-    // MARK: - CacheData Binary Patching (v14)
+    // MARK: - CacheData Gate Flag Patching
     //
-    // CacheData layout: N slots × 9 bytes total
-    //   Bytes [0 ..< N*8]:        value slots (8 bytes LE each)
-    //   Bytes [N*8 ..< N*8 + N]:  validity bytes (1 = trust cached, 0 = query daemon)
+    // CacheData layout: N slots × 9 bytes
+    //   Bytes [0 ..< N*8]:       value slots (8 bytes LE each)
+    //   Bytes [N*8 ..< N*8+N]:   validity bytes (1 = trust cached value)
     //
-    // We resolve each tweak's slot index at runtime by calling mg_cache_index(),
-    // which scans libMobileGestalt's query descriptors in memory.
+    // Only the two gate flags need patching here; all tweak values go in CacheExtra.
+    //   greenTea    = false (0) → enables cache overrides
+    //   notGreenTea = true  (1) → confirms cache overrides enabled
 
-    private struct PatchResult {
-        let patched: Int
-        let status: String
-    }
-
-    private func patchCacheDataBinary(
-        _ data: inout Data, tweaks: [TweakState], forceAll: Bool
-    ) -> PatchResult {
+    private func patchGateFlags(_ data: inout Data) -> String {
         let size = data.count
-        guard size >= 9 else {
-            return PatchResult(patched: 0, status: "CacheData too small (\(size)B)")
-        }
-
-        // Derive slot count: size = slotCount * 9
-        guard size % 9 == 0 else {
-            return PatchResult(patched: 0, status: "CacheData size \(size) not divisible by 9")
+        guard size >= 9 && size % 9 == 0 else {
+            return "size \(size) not valid (need multiple of 9)"
         }
         let slotCount = size / 9
-        print("[v14] CacheData: \(size) bytes, \(slotCount) slots")
-
-        // Also try runtime slot count for cross-check
-        let runtimeSlots = Int(mg_slot_count())
-        if runtimeSlots > 0 && runtimeSlots != slotCount {
-            print("[v14] WARNING: runtime reports \(runtimeSlots) slots vs file \(slotCount)")
-        }
 
         var patched = 0
-        var failed = [String]()
+        var log = ""
 
-        // Collect all keys to patch (including disabled bools in forceAll mode)
-        var allToPatch = tweaks
-        if forceAll {
-            let extraDisabled = tweakStates.filter { s in
-                if case .bool = s.tweak.type, (s.currentValue as? Bool) == false {
-                    return !tweaks.contains(where: { $0.id == s.id })
-                }
-                return false
-            }
-            allToPatch.append(contentsOf: extraDisabled)
-        }
-
-        for state in allToPatch {
-            let idx = Int(mg_cache_index(state.tweak.key))
+        func patchSlot(key: String, label: String, value: UInt64) {
+            let idx = Int(mg_cache_index(key))
             guard idx >= 0 && idx < slotCount else {
-                failed.append(state.id)
-                print("[v14] \(state.id): index resolution failed (got \(idx))")
-                continue
+                log += "\(label): not found (\(idx)) "
+                return
             }
-
-            let valueOffset = idx * 8
-            let validityOffset = slotCount * 8 + idx
-
-            // Determine the 8-byte LE value to write
-            var value: UInt64
-            switch state.tweak.type {
-            case .bool:
-                value = (state.currentValue as? Bool ?? false) ? 1 : 0
-            case .int:
-                value = UInt64(bitPattern: Int64(state.currentValue as? Int ?? 0))
-            case .pick:
-                value = UInt64(state.currentValue as? Int ?? 0)
-            }
-
-            // Write value at slot
-            data.replaceSubrange(valueOffset ..< valueOffset + 8, with: withUnsafeBytes(of: value.littleEndian) { Data($0) })
-            // Mark validity byte = 1 (trust this cached value)
-            data[validityOffset] = 1
-
-            print("[v14] \(state.id) [\(state.tweak.key)] -> slot \(idx), value \(value)")
+            let valueOff = idx * 8
+            let validOff = slotCount * 8 + idx
+            data.replaceSubrange(valueOff ..< valueOff + 8,
+                                 with: withUnsafeBytes(of: value.littleEndian) { Data($0) })
+            data[validOff] = 1
+            log += "\(label)=\(value)@\(idx) "
             patched += 1
         }
 
-        // Patch greenTea/notGreenTea master flags
-        let greenTeaIdx = Int(mg_cache_index(kGreenTeaKey))
-        let notGreenTeaIdx = Int(mg_cache_index(kNotGreenTeaKey))
+        patchSlot(key: kGreenTeaKey,    label: "greenTea",    value: 0)
+        patchSlot(key: kNotGreenTeaKey, label: "notGreenTea", value: 1)
 
-        if greenTeaIdx >= 0 && greenTeaIdx < slotCount {
-            // greenTea = false (0) to ENABLE overrides
-            let off = greenTeaIdx * 8
-            let zero = UInt64(0)
-            data.replaceSubrange(off ..< off + 8, with: withUnsafeBytes(of: zero.littleEndian) { Data($0) })
-            data[slotCount * 8 + greenTeaIdx] = 1
-            print("[v14] greenTea -> slot \(greenTeaIdx) = 0 (disabled)")
-        } else {
-            print("[v14] WARNING: greenTea index not resolved (\(greenTeaIdx))")
-        }
-
-        if notGreenTeaIdx >= 0 && notGreenTeaIdx < slotCount {
-            // notGreenTea = true (1) to ENABLE overrides
-            let off = notGreenTeaIdx * 8
-            let one = UInt64(1)
-            data.replaceSubrange(off ..< off + 8, with: withUnsafeBytes(of: one.littleEndian) { Data($0) })
-            data[slotCount * 8 + notGreenTeaIdx] = 1
-            print("[v14] notGreenTea -> slot \(notGreenTeaIdx) = 1 (enabled)")
-        } else {
-            print("[v14] WARNING: notGreenTea index not resolved (\(notGreenTeaIdx))")
-        }
-
-        let gtStatus = greenTeaIdx >= 0 && notGreenTeaIdx >= 0 ? "gates OK" : "gates PARTIAL"
-        let status = "\(patched)/\(allToPatch.count) slots, \(gtStatus), \(failed.count) unresolved"
-        return PatchResult(patched: patched, status: status)
+        return patched > 0 ? "OK (\(log.trimmingCharacters(in: .whitespaces)))" : "FAIL: \(log)"
     }
 
     // MARK: - Respring
