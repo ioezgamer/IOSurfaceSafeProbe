@@ -269,7 +269,7 @@ class GestaltManager: ObservableObject {
 
     func loadGestalt() {
         guard wq_app_group() != nil else {
-            statusMessage = "No App Group container — install via FlareStore (needs group.1669a1048b00156e.X)"
+            statusMessage = "No App Group container \u{2014} install via FlareStore (needs group.1669a1048b00156e.X)"
             return
         }
         isLoading = true
@@ -546,14 +546,22 @@ class GestaltManager: ObservableObject {
             }
             plist["CacheExtra"] = extra
 
-            // Step 2: Patch gate flags in CacheData (greenTea=false, notGreenTea=true)
-            // This tells iOS to trust CacheExtra values instead of querying the daemon.
+            // Step 2: Handle CacheData gate flags.
+            // Try to patch greenTea/notGreenTea. If the keys don't exist in this iOS
+            // version (iOS 26 removed them), delete CacheData entirely so the OS
+            // rebuilds the cache from CacheExtra on next boot.
             var cdStatus = "Not present"
             if var cacheData = plist["CacheData"] as? Data {
                 let result = self.patchGateFlags(&cacheData)
-                cdStatus = result
-                plist["CacheData"] = cacheData
-                print("[gestalt] CacheData gate flags: \(cdStatus)")
+                if result.hasPrefix("OK") {
+                    cdStatus = result
+                    plist["CacheData"] = cacheData
+                } else {
+                    // Gate flags not patchable \u{2014} remove CacheData so iOS reads CacheExtra fresh
+                    plist.removeObject(forKey: "CacheData")
+                    cdStatus = "Removed (gate keys absent, iOS will rebuild from CacheExtra)"
+                }
+                print("[gestalt] CacheData: \(cdStatus)")
             }
 
             // Step 3: Write the plist
@@ -653,7 +661,7 @@ class GestaltManager: ObservableObject {
         if ret == 0 {
             statusMessage = "Respring sent"
         } else {
-            statusMessage = "Respring failed (code \(ret)) — reboot manually"
+            statusMessage = "Respring failed (code \(ret)) \u{2014} reboot manually"
         }
     }
 
@@ -694,7 +702,7 @@ class GestaltManager: ObservableObject {
                 try FileManager.default.removeItem(atPath: path)
                 try FileManager.default.copyItem(atPath: backupPath, toPath: path)
                 DispatchQueue.main.async {
-                    self.statusMessage = "Backup restored — REBOOT to take effect"
+                    self.statusMessage = "Backup restored \u{2014} REBOOT to take effect"
                     self.isLoading = false
                     self.loadGestalt()
                 }
@@ -805,7 +813,7 @@ class GestaltManager: ObservableObject {
 
             DispatchQueue.main.async {
                 if wrote {
-                    self.statusMessage = "Eligibility written — REBOOT required"
+                    self.statusMessage = "Eligibility written \u{2014} REBOOT required"
                 } else {
                     self.statusMessage = "Eligibility: no accessible path"
                     self.eligibilityStatus = "N/A"
