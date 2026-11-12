@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 1.0.2)'
+        required: true
+        type: string
 
 jobs:
   release:
@@ -46,18 +52,26 @@ jobs:
     - name: Get version and size
       id: meta
       run: |
-        echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          V="${{ github.event.inputs.version }}"
+          TAG_NAME="v${V}"
+        else
+          TAG_NAME="${GITHUB_REF_NAME}"
+          V="${GITHUB_REF_NAME#v}"
+        fi
+        echo "VERSION=${V}" >> $GITHUB_OUTPUT
+        echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_OUTPUT
         echo "SIZE=$(stat -f%z build/CacheWipe.ipa)" >> $GITHUB_OUTPUT
         echo "DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
-        echo "DOWNLOAD_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/CacheWipe.ipa" >> $GITHUB_OUTPUT
+        echo "DOWNLOAD_URL=https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/CacheWipe.ipa" >> $GITHUB_OUTPUT
 
     - name: Create GitHub Release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh release create "${{ github.ref_name }}" \
+        gh release create "${{ steps.meta.outputs.TAG_NAME }}" \
           build/CacheWipe.ipa \
-          --title "CacheWipe ${{ github.ref_name }}" \
+          --title "CacheWipe ${{ steps.meta.outputs.TAG_NAME }}" \
           --generate-notes
 
     - name: Update source.json
@@ -109,5 +123,5 @@ jobs:
         git checkout main
         git add source.json
         git diff --staged --quiet && echo "No changes" && exit 0
-        git commit -m "chore: update source.json for ${{ github.ref_name }}"
+        git commit -m "chore: update source.json for ${{ steps.meta.outputs.TAG_NAME }}"
         git push origin main
