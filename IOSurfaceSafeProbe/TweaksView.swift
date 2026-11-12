@@ -467,6 +467,16 @@ struct TweaksView: View {
                             .textSelection(.enabled)
                     }
                 }
+                if !gestalt.mgDiagText.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Binary Scan Diag:")
+                            .font(.caption.weight(.medium))
+                        Text(gestalt.mgDiagText)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
                 HStack {
                     Text("Immutable:")
                         .font(.caption.weight(.medium))
