@@ -467,32 +467,6 @@ struct TweaksView: View {
                             .textSelection(.enabled)
                     }
                 }
-                if !gestalt.cacheDataHexDump.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Hex Dump (first 256B):")
-                                .font(.caption.weight(.medium))
-                            Spacer()
-                            if !gestalt.cacheDataBase64.isEmpty {
-                                Button {
-                                    UIPasteboard.general.string = gestalt.cacheDataBase64
-                                } label: {
-                                    Label("Copy Base64", systemImage: "doc.on.doc")
-                                        .font(.caption2)
-                                }
-                                .buttonStyle(.bordered)
-                                .tint(.blue)
-                            }
-                        }
-                        ScrollView(.horizontal) {
-                            Text(gestalt.cacheDataHexDump)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
-                        .frame(maxHeight: 200)
-                    }
-                }
                 HStack {
                     Text("Immutable:")
                         .font(.caption.weight(.medium))
@@ -533,18 +507,6 @@ struct TweaksView: View {
                             .foregroundStyle(.red.opacity(0.8))
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                }
-                if !gestalt.cacheIndexLog.isEmpty {
-                    DisclosureGroup("Cache Index Resolution") {
-                        ScrollView {
-                            Text(gestalt.cacheIndexLog)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
-                        .frame(maxHeight: 300)
-                    }
-                    .font(.caption.weight(.medium))
                 }
             }
             .padding()
