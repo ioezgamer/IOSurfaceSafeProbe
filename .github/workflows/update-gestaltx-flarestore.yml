@@ -1,0 +1,39 @@
+name: Actualizar GestaltX para FlareStore
+
+on:
+  schedule:
+    - cron: '15 13 * * *' # Cada dia, 7:15 a. m. de Nicaragua (UTC-6)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-gestaltx-flarestore
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener repositorio
+        uses: actions/checkout@v4
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Buscar y verificar nuevos IPA oficiales
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/update_gestaltx_source.py
+      - name: Publicar actualizaciones en el catalogo
+        run: |
+          if git diff --quiet -- gestaltx.json; then
+            echo 'Sin versiones nuevas.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add gestaltx.json
+          git commit -m 'chore: actualizar GestaltX desde releases oficiales'
+          git push origin HEAD:main
