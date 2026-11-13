@@ -1,0 +1,41 @@
+{
+  "name": "GestaltX para FlareStore",
+  "identifier": "com.ioezgamer.flarestore.gestaltx",
+  "subtitle": "Actualizaciones oficiales de GestaltX en una fuente no oficial",
+  "description": "Fuente comunitaria independiente, mantenida por ioezgamer. Los IPA se descargan sin modificar desde los lanzamientos oficiales de huamidev en GitHub.",
+  "iconURL": "https://raw.githubusercontent.com/huamidev/GestaltX/main/GestaltX/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+  "website": "https://github.com/huamidev/GestaltX",
+  "tintColor": "#536DFE",
+  "featuredApps": [
+    "com.huami.gestultx"
+  ],
+  "apps": [
+    {
+      "name": "GestaltX",
+      "bundleIdentifier": "com.huami.gestultx",
+      "developerName": "huamidev",
+      "subtitle": "Editor MobileGestalt para iOS y iPadOS 27",
+      "localizedDescription": "GestaltX permite explorar y editar opciones MobileGestalt, crear copias de seguridad y restaurar cambios. Esta fuente NO es oficial: cada IPA se descarga directamente de GitHub del desarrollador, sin modificaciones. Modificar opciones del sistema puede afectar la estabilidad del dispositivo; haz una copia de seguridad antes de usar la aplicación. Requiere firmar la app y su extensión compartiendo un App Group válido.",
+      "iconURL": "https://raw.githubusercontent.com/huamidev/GestaltX/main/GestaltX/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+      "tintColor": "#536DFE",
+      "category": "utilities",
+      "versions": [
+        {
+          "version": "1.0.7",
+          "buildVersion": "11130112",
+          "date": "2026-11-12T17:14:29Z",
+          "localizedDescription": "Se corrigió la detección de contenedores en iOS 27.3 para localizar fondos de pantalla e imágenes de inicio de aplicaciones.",
+          "downloadURL": "https://github.com/huamidev/GestaltX/releases/download/v1.0.7/GestaltX_1.0.7.ipa",
+          "size": 3563948,
+          "minOSVersion": "27.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [
+          "com.apple.security.application-groups"
+        ]
+      }
+    }
+  ],
+  "news": []
+}
