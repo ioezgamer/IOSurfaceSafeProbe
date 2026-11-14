@@ -130,12 +130,23 @@ struct ResearchView: View {
         ("compuaf", "UAF Compositor", "xmark.octagon.fill",
          "Libera surface mientras el compositor la usa — detecta acceso stale",
          { log, done in iosurface_research_compositor_uaf({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+
         ("harvest", "Kernel Harvest", "server.rack",
          "Extrae toda la metadata IOSurface buscando leaks de punteros kernel",
          { log, done in iosurface_research_kernel_harvest({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
         ("chain", "Full Chain", "link.badge.plus",
          "Cadena completa: mach hijack + CG OOB + compositor TOCTOU combinados",
          { log, done in iosurface_research_full_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 13
+        ("uafrealloc", "UAF Realloc", "arrow.triangle.swap",
+         "Release + reclaim memoria — escribe via ref dangling para corromper nueva surface",
+         { log, done in iosurface_research_uaf_realloc({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("aslrdefeat", "ASLR Defeat", "eye.trianglebadge.exclamationmark.fill",
+         "Recolecta direcciones base de multiples surfaces para calcular ASLR slide",
+         { log, done in iosurface_research_aslr_defeat({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("rwprim", "R/W Primitive", "arrow.left.arrow.right.circle.fill",
+         "Escritura dangling + lectura CG OOB para flujo de datos controlado cross-surface",
+         { log, done in iosurface_research_rw_primitive({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -318,7 +329,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 36), id: \.id) { probe in
+            ForEach(probes[36..<39], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 13 ---
+            Text("Round 13 — Real Exploit Primitives")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 39), id: \.id) { probe in
                 probeCard(probe)
             }
 
