@@ -195,5 +195,16 @@ void iosurface_research_xsurf_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 /// Probe 51: Fake object forge — stride overflow write to inject fake kernel object patterns in adjacent surface memory.
 void iosurface_research_fake_object(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 17: Mach port structure exploitation ---
+
+/// Probe 52: Port structure map — fine-grained OOB dump to map ipc_port layout and identify kernel fields.
+void iosurface_research_port_map(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 53: Port field corruption — write to ipc_port fields via stride OOB, verify via mach_port_get_refs.
+void iosurface_research_port_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 54: Kernel R/W chain — full chain: spray + port locate + kobject read + redirect + arbitrary R/W.
+void iosurface_research_krw_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
