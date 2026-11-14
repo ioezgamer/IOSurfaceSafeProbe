@@ -4265,3 +4265,1002 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
         }
     });
 }
+
+#pragma mark - Round 7: Deep Kernel Attack Surface
+
+// --- Probe 22: Property Injection ---
+
+void iosurface_research_property_inject(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PROPINJECT: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*ISR_SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*ISR_CopyValueFn)(IOSurfaceRef, CFStringRef);
+            typedef void (*ISR_RemoveValueFn)(IOSurfaceRef, CFStringRef);
+            typedef CFDictionaryRef (*ISR_CopyAllValuesFn)(IOSurfaceRef);
+
+            ISR_SetValueFn setValue = (ISR_SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            ISR_CopyValueFn copyValue = (ISR_CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            ISR_RemoveValueFn removeValue = (ISR_RemoveValueFn)dlsym(sym.iosurface, "IOSurfaceRemoveValue");
+            ISR_CopyAllValuesFn copyAllValues = (ISR_CopyAllValuesFn)dlsym(sym.iosurface, "IOSurfaceCopyAllValues");
+
+            if (!setValue || !copyValue || !removeValue) {
+                log(@"PROPINJECT: Missing IOSurface property APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PROPINJECT: Starting property injection analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            NSDictionary *params = isr_default_surface_params(64, 64);
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+            if (!surf) {
+                log(@"PROPINJECT: Failed to create surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            size_t origWidth = sym.getWidth(surf);
+            size_t origHeight = sym.getHeight(surf);
+            size_t origAllocSize = sym.getAllocSize(surf);
+
+            // Phase A — Property stress: 500 properties x 1024 bytes = 512KB into kernel
+            log(@"PROPINJECT: Phase A — property stress test (500 x 1KB)");
+            uint8_t filler[1024];
+            memset(filler, 0xBE, sizeof(filler));
+            CFDataRef bigData = CFDataCreate(kCFAllocatorDefault, filler, sizeof(filler));
+
+            uint32_t propsSet = 0;
+            BOOL surfaceCorrupted = NO;
+            for (int i = 0; i < 500 && !isr_stopped(); i++) {
+                NSString *key = [NSString stringWithFormat:@"prop_%03d", i];
+                setValue(surf, (__bridge CFStringRef)key, bigData);
+                propsSet++;
+
+                if ((i + 1) % 50 == 0) {
+                    size_t curWidth = sym.getWidth(surf);
+                    size_t curAllocSize = sym.getAllocSize(surf);
+                    if (curWidth != origWidth) {
+                        anomalies++;
+                        surfaceCorrupted = YES;
+                        log([NSString stringWithFormat:
+                            @"PROPINJECT: ANOMALY — width changed from %zu to %zu after %d props!",
+                            origWidth, curWidth, i + 1]);
+                    }
+                    if (curAllocSize != origAllocSize) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"PROPINJECT: ANOMALY — allocSize changed from %zu to %zu after %d props!",
+                            origAllocSize, curAllocSize, i + 1]);
+                    }
+                    log([NSString stringWithFormat:
+                        @"PROPINJECT: %d props set, width=%zu allocSize=%zu — %@",
+                        i + 1, curWidth, curAllocSize,
+                        (curWidth == origWidth && curAllocSize == origAllocSize) ? @"OK" : @"CHANGED"]);
+                }
+            }
+            CFRelease(bigData);
+
+            if (propsSet > 0 && !isr_stopped()) {
+                CFTypeRef readback = copyValue(surf, CFSTR("prop_000"));
+                if (!readback) {
+                    anomalies++;
+                    log(@"PROPINJECT: ANOMALY — first property read back as NULL");
+                } else {
+                    if (CFGetTypeID(readback) != CFDataGetTypeID()) {
+                        anomalies++;
+                        log(@"PROPINJECT: ANOMALY — property type changed on readback!");
+                    }
+                    CFRelease(readback);
+                }
+            }
+
+            if (copyAllValues && !isr_stopped()) {
+                CFDictionaryRef all = copyAllValues(surf);
+                if (all) {
+                    CFIndex count = CFDictionaryGetCount(all);
+                    log([NSString stringWithFormat:@"PROPINJECT: Total properties stored: %ld", (long)count]);
+                    if (count < (CFIndex)propsSet) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"PROPINJECT: ANOMALY — expected %u properties but only %ld stored (silent drop)",
+                            propsSet, (long)count]);
+                    }
+                    CFRelease(all);
+                }
+            }
+
+            log([NSString stringWithFormat:@"PROPINJECT: Phase A — %u properties injected, corrupted=%@",
+                propsSet, surfaceCorrupted ? @"YES" : @"NO"]);
+
+            // Phase B — Oversized value injection
+            if (!isr_stopped()) {
+                log(@"PROPINJECT: Phase B — oversized value injection");
+
+                size_t mbSize = 1024 * 1024;
+                uint8_t *mbBuf = calloc(1, mbSize);
+                if (mbBuf) {
+                    memset(mbBuf, 0xDD, mbSize);
+                    CFDataRef mbData = CFDataCreate(kCFAllocatorDefault, mbBuf, (CFIndex)mbSize);
+                    if (mbData) {
+                        setValue(surf, CFSTR("giant_value"), mbData);
+                        CFTypeRef rb = copyValue(surf, CFSTR("giant_value"));
+                        if (rb) {
+                            if (CFGetTypeID(rb) == CFDataGetTypeID()) {
+                                CFIndex len = CFDataGetLength((CFDataRef)rb);
+                                log([NSString stringWithFormat:@"PROPINJECT: 1MB value stored, readback=%ld bytes", (long)len]);
+                                if (len != (CFIndex)mbSize) {
+                                    anomalies++;
+                                    log(@"PROPINJECT: ANOMALY — 1MB value size mismatch on readback!");
+                                }
+                            } else {
+                                anomalies++;
+                                log(@"PROPINJECT: ANOMALY — 1MB value type changed on readback!");
+                            }
+                            CFRelease(rb);
+                        } else {
+                            log(@"PROPINJECT: 1MB value could not be read back (silently dropped)");
+                        }
+                        CFRelease(mbData);
+                    }
+                    free(mbBuf);
+                }
+
+                NSMutableString *longKey = [NSMutableString stringWithCapacity:10000];
+                for (int i = 0; i < 10000; i++) [longKey appendString:@"K"];
+                int32_t num42 = 42;
+                CFNumberRef val42 = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &num42);
+                setValue(surf, (__bridge CFStringRef)longKey, val42);
+                CFTypeRef rbLong = copyValue(surf, (__bridge CFStringRef)longKey);
+                if (rbLong) {
+                    log(@"PROPINJECT: 10000-char key accepted and readable");
+                    CFRelease(rbLong);
+                } else {
+                    log(@"PROPINJECT: 10000-char key rejected or unreadable");
+                }
+                CFRelease(val42);
+
+                int32_t n99 = 99;
+                CFNumberRef cfNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &n99);
+                CFStringRef cfStr = CFStringCreateWithCString(kCFAllocatorDefault, "test_string", kCFStringEncodingUTF8);
+                uint8_t db[] = {0x01, 0x02, 0x03};
+                CFDataRef cfDat = CFDataCreate(kCFAllocatorDefault, db, 3);
+                CFTypeRef arrVals[] = { kCFBooleanTrue };
+                CFArrayRef cfArr = CFArrayCreate(kCFAllocatorDefault, arrVals, 1, &kCFTypeArrayCallBacks);
+                CFStringRef dk = CFSTR("k");
+                CFTypeRef dv = kCFBooleanFalse;
+                CFDictionaryRef cfDict = CFDictionaryCreate(kCFAllocatorDefault,
+                    (const void **)&dk, (const void **)&dv, 1,
+                    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+                struct { const char *label; CFTypeRef val; CFTypeID expected; } types[] = {
+                    {"CFNumber", cfNum, CFNumberGetTypeID()},
+                    {"CFString", cfStr, CFStringGetTypeID()},
+                    {"CFData", cfDat, CFDataGetTypeID()},
+                    {"CFBoolean", kCFBooleanTrue, CFBooleanGetTypeID()},
+                    {"CFArray", cfArr, CFArrayGetTypeID()},
+                    {"CFDictionary", cfDict, CFDictionaryGetTypeID()},
+                };
+
+                uint32_t typeMismatches = 0;
+                for (int t = 0; t < 6; t++) {
+                    NSString *tkey = [NSString stringWithFormat:@"typetest_%s", types[t].label];
+                    setValue(surf, (__bridge CFStringRef)tkey, types[t].val);
+                    CFTypeRef rb = copyValue(surf, (__bridge CFStringRef)tkey);
+                    if (rb) {
+                        if (CFGetTypeID(rb) != types[t].expected) {
+                            typeMismatches++;
+                            log([NSString stringWithFormat:
+                                @"PROPINJECT: ANOMALY — type confusion! Set %s, got typeID %lu",
+                                types[t].label, CFGetTypeID(rb)]);
+                        }
+                        CFRelease(rb);
+                    } else {
+                        log([NSString stringWithFormat:@"PROPINJECT: %s value silently dropped", types[t].label]);
+                    }
+                }
+                CFRelease(cfNum); CFRelease(cfStr); CFRelease(cfDat);
+                CFRelease(cfArr); CFRelease(cfDict);
+
+                if (typeMismatches > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"PROPINJECT: %u type mismatches detected", typeMismatches]);
+                } else {
+                    log(@"PROPINJECT: Phase B — all types preserved correctly");
+                }
+            }
+
+            // Phase C — Reserved key injection
+            if (!isr_stopped()) {
+                log(@"PROPINJECT: Phase C — reserved key injection");
+                size_t preWidth = sym.getWidth(surf);
+                size_t preHeight = sym.getHeight(surf);
+                size_t preAlloc = sym.getAllocSize(surf);
+                size_t preBPR = sym.getBytesPerRow(surf);
+
+                NSArray *reservedKeys = @[
+                    @"IOSurfaceWidth", @"IOSurfaceHeight", @"IOSurfaceAllocSize",
+                    @"IOSurfaceBytesPerRow", @"IOSurfacePixelFormat", @"IOSurfaceBytesPerElement",
+                    @"IOSurfaceIsGlobal"
+                ];
+                NSArray *reservedVals = @[@9999, @9999, @999999, @9999, @0x00000000, @8, @YES];
+
+                for (NSUInteger i = 0; i < reservedKeys.count && !isr_stopped(); i++) {
+                    NSString *rk = reservedKeys[i];
+                    id rv = reservedVals[i];
+                    setValue(surf, (__bridge CFStringRef)rk, (__bridge CFTypeRef)rv);
+
+                    CFTypeRef readback = copyValue(surf, (__bridge CFStringRef)rk);
+                    BOOL wasSet = (readback != NULL);
+                    if (readback) CFRelease(readback);
+
+                    log([NSString stringWithFormat:@"PROPINJECT: Set %@ = %@ — stored=%@",
+                        rk, rv, wasSet ? @"YES" : @"NO"]);
+                }
+
+                size_t postWidth = sym.getWidth(surf);
+                size_t postHeight = sym.getHeight(surf);
+                size_t postAlloc = sym.getAllocSize(surf);
+                size_t postBPR = sym.getBytesPerRow(surf);
+
+                if (postWidth != preWidth) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PROPINJECT: ANOMALY — WIDTH CHANGED via reserved key! %zu -> %zu", preWidth, postWidth]);
+                }
+                if (postHeight != preHeight) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PROPINJECT: ANOMALY — HEIGHT CHANGED via reserved key! %zu -> %zu", preHeight, postHeight]);
+                }
+                if (postAlloc != preAlloc) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PROPINJECT: ANOMALY — ALLOCSIZE CHANGED via reserved key! %zu -> %zu", preAlloc, postAlloc]);
+                }
+                if (postBPR != preBPR) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PROPINJECT: ANOMALY — BYTESPERROW CHANGED via reserved key! %zu -> %zu", preBPR, postBPR]);
+                }
+                if (postWidth == preWidth && postHeight == preHeight &&
+                    postAlloc == preAlloc && postBPR == preBPR) {
+                    log(@"PROPINJECT: Phase C — reserved keys did NOT change surface geometry");
+                }
+
+                IOSurfaceID sid = sym.getID(surf);
+                IOSurfaceRef globalLookup = sym.lookup(sid);
+                if (globalLookup) {
+                    log(@"PROPINJECT: Surface is globally visible via lookup");
+                    CFRelease(globalLookup);
+                } else {
+                    log(@"PROPINJECT: Surface NOT globally visible (IOSurfaceIsGlobal had no effect)");
+                }
+            }
+
+            // Phase D — Remove-while-reading race
+            if (!isr_stopped()) {
+                log(@"PROPINJECT: Phase D — property read/write/remove race");
+
+                for (int i = 0; i < 10; i++) {
+                    NSString *rk = [NSString stringWithFormat:@"race_%d", i];
+                    int32_t v = i;
+                    CFNumberRef nv = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &v);
+                    setValue(surf, (__bridge CFStringRef)rk, nv);
+                    CFRelease(nv);
+                }
+
+                __block atomic_uint raceAnomalies = 0;
+                __block atomic_bool raceRunning = true;
+
+                dispatch_group_t grp = dispatch_group_create();
+                for (int t = 0; t < 4; t++) {
+                    dispatch_group_async(grp, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                        while (atomic_load(&raceRunning)) {
+                            int idx = arc4random_uniform(10);
+                            NSString *rk = [NSString stringWithFormat:@"race_%d", idx];
+                            if (t < 2) {
+                                int32_t v = (int32_t)arc4random();
+                                CFNumberRef nv = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &v);
+                                setValue(surf, (__bridge CFStringRef)rk, nv);
+                                CFRelease(nv);
+                            } else {
+                                CFTypeRef rb = copyValue(surf, (__bridge CFStringRef)rk);
+                                if (rb) {
+                                    if (CFGetTypeID(rb) != CFNumberGetTypeID()) {
+                                        atomic_fetch_add(&raceAnomalies, 1);
+                                    }
+                                    CFRelease(rb);
+                                }
+                                if (arc4random_uniform(4) == 0) {
+                                    removeValue(surf, (__bridge CFStringRef)rk);
+                                }
+                            }
+                        }
+                    });
+                }
+
+                usleep(100000);
+                atomic_store(&raceRunning, false);
+                dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+
+                uint32_t raceAnom = atomic_load(&raceAnomalies);
+                if (raceAnom > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PROPINJECT: ANOMALY — %u type mismatches during race!", raceAnom]);
+                } else {
+                    log(@"PROPINJECT: Phase D — no type confusion during race");
+                }
+            }
+
+            CFRelease(surf);
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PROPINJECT: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"propsSet": @(propsSet),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PropertyInject-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+// --- Probe 23: Plane Overlap Attack ---
+
+void iosurface_research_plane_overlap(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PLANEOVLAP: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef size_t (*ISR_PlaneCountFn)(IOSurfaceRef);
+            typedef size_t (*ISR_PlaneDimFn)(IOSurfaceRef, size_t);
+            typedef void * (*ISR_PlaneBaseFn)(IOSurfaceRef, size_t);
+
+            ISR_PlaneCountFn getPlaneCount = (ISR_PlaneCountFn)dlsym(sym.iosurface, "IOSurfaceGetPlaneCount");
+            ISR_PlaneDimFn getPlaneWidth = (ISR_PlaneDimFn)dlsym(sym.iosurface, "IOSurfaceGetWidthOfPlane");
+            ISR_PlaneDimFn getPlaneHeight = (ISR_PlaneDimFn)dlsym(sym.iosurface, "IOSurfaceGetHeightOfPlane");
+            ISR_PlaneDimFn getPlaneBPR = (ISR_PlaneDimFn)dlsym(sym.iosurface, "IOSurfaceGetBytesPerRowOfPlane");
+            ISR_PlaneBaseFn getPlaneBase = (ISR_PlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
+
+            if (!getPlaneCount || !getPlaneBase) {
+                log(@"PLANEOVLAP: Missing plane APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PLANEOVLAP: Starting plane overlap analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // Phase A — Overlapping planes (both at offset 0)
+            log(@"PLANEOVLAP: Phase A — overlapping plane offsets");
+            {
+                NSDictionary *plane0 = @{
+                    @"IOSurfacePlaneWidth": @64,
+                    @"IOSurfacePlaneHeight": @64,
+                    @"IOSurfacePlaneBytesPerElement": @1,
+                    @"IOSurfacePlaneOffset": @0,
+                    @"IOSurfacePlaneBytesPerRow": @64,
+                    @"IOSurfacePlaneSize": @4096
+                };
+                NSDictionary *plane1 = @{
+                    @"IOSurfacePlaneWidth": @64,
+                    @"IOSurfacePlaneHeight": @64,
+                    @"IOSurfacePlaneBytesPerElement": @1,
+                    @"IOSurfacePlaneOffset": @0,
+                    @"IOSurfacePlaneBytesPerRow": @64,
+                    @"IOSurfacePlaneSize": @4096
+                };
+                NSDictionary *params = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @1,
+                    @"IOSurfaceBytesPerRow": @64,
+                    @"IOSurfaceAllocSize": @8192,
+                    @"IOSurfacePixelFormat": @0x34323076,
+                    @"IOSurfacePlaneInfo": @[plane0, plane1]
+                };
+
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+                if (surf) {
+                    size_t planes = getPlaneCount(surf);
+                    log([NSString stringWithFormat:@"PLANEOVLAP: Overlap surface created — %zu planes", planes]);
+
+                    sym.lock(surf, 0, NULL);
+                    void *base0 = getPlaneBase(surf, 0);
+                    void *base1 = getPlaneBase(surf, 1);
+
+                    if (base0 && base1) {
+                        memset(base0, 0xAA, 64);
+                        uint8_t readByte = ((uint8_t *)base1)[0];
+                        log([NSString stringWithFormat:
+                            @"PLANEOVLAP: Wrote 0xAA to plane0, read 0x%02X from plane1, base0=%p base1=%p",
+                            readByte, base0, base1]);
+
+                        if (readByte == 0xAA && base0 == base1) {
+                            anomalies++;
+                            log(@"PLANEOVLAP: ANOMALY — planes SHARE memory! Cross-plane data leak confirmed!");
+                        } else if (readByte == 0xAA && base0 != base1) {
+                            anomalies++;
+                            log(@"PLANEOVLAP: ANOMALY — different base addresses but data leaked across planes!");
+                        } else {
+                            log(@"PLANEOVLAP: Planes isolated despite same offset (kernel corrected)");
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"PLANEOVLAP: base0=%p base1=%p", base0, base1]);
+                    }
+                    sym.unlock(surf, 0, NULL);
+                    CFRelease(surf);
+                } else {
+                    log(@"PLANEOVLAP: Kernel rejected overlapping plane config");
+                }
+            }
+
+            // Phase B — Plane extending beyond allocSize
+            if (!isr_stopped()) {
+                log(@"PLANEOVLAP: Phase B — oversized plane for OOB read");
+                NSDictionary *bigPlane = @{
+                    @"IOSurfacePlaneWidth": @128,
+                    @"IOSurfacePlaneHeight": @128,
+                    @"IOSurfacePlaneBytesPerElement": @1,
+                    @"IOSurfacePlaneOffset": @0,
+                    @"IOSurfacePlaneBytesPerRow": @128,
+                    @"IOSurfacePlaneSize": @16384
+                };
+                NSDictionary *params = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @1,
+                    @"IOSurfaceBytesPerRow": @64,
+                    @"IOSurfaceAllocSize": @4096,
+                    @"IOSurfacePixelFormat": @0x34323076,
+                    @"IOSurfacePlaneInfo": @[bigPlane]
+                };
+
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+                if (surf) {
+                    size_t actualAlloc = sym.getAllocSize(surf);
+                    size_t planes = getPlaneCount(surf);
+                    log([NSString stringWithFormat:
+                        @"PLANEOVLAP: Oversized plane surface created — allocSize=%zu planes=%zu",
+                        actualAlloc, planes]);
+
+                    if (planes > 0 && getPlaneBPR) {
+                        size_t planeBPR = getPlaneBPR(surf, 0);
+                        size_t planeH = getPlaneHeight ? getPlaneHeight(surf, 0) : 0;
+                        size_t planeBytes = planeBPR * planeH;
+                        log([NSString stringWithFormat:
+                            @"PLANEOVLAP: Plane claims %zu bytes (bpr=%zu h=%zu), alloc=%zu",
+                            planeBytes, planeBPR, planeH, actualAlloc]);
+
+                        if (planeBytes > actualAlloc) {
+                            anomalies++;
+                            log([NSString stringWithFormat:
+                                @"PLANEOVLAP: ANOMALY — plane claims %zu bytes beyond %zu alloc (potential OOB!)",
+                                planeBytes, actualAlloc]);
+
+                            sym.lock(surf, 0, NULL);
+                            void *pBase = getPlaneBase(surf, 0);
+                            if (pBase) {
+                                volatile uint8_t oobRead = ((uint8_t *)pBase)[actualAlloc - 1];
+                                log([NSString stringWithFormat:
+                                    @"PLANEOVLAP: Read at allocSize-1 = 0x%02X (within bounds)", oobRead]);
+                            }
+                            sym.unlock(surf, 0, NULL);
+                        } else {
+                            log(@"PLANEOVLAP: Kernel adjusted plane to fit allocSize");
+                        }
+                    }
+                    CFRelease(surf);
+                } else {
+                    log(@"PLANEOVLAP: Kernel rejected oversized plane config");
+                }
+            }
+
+            // Phase C — Plane count manipulation and OOB plane index
+            if (!isr_stopped()) {
+                log(@"PLANEOVLAP: Phase C — plane count manipulation");
+                int testCounts[] = {1, 2, 3, 4};
+                uint32_t oobAccess = 0;
+
+                for (int tc = 0; tc < 4 && !isr_stopped(); tc++) {
+                    int nPlanes = testCounts[tc];
+                    NSMutableArray *planeArr = [NSMutableArray array];
+                    for (int p = 0; p < nPlanes; p++) {
+                        [planeArr addObject:@{
+                            @"IOSurfacePlaneWidth": @32,
+                            @"IOSurfacePlaneHeight": @32,
+                            @"IOSurfacePlaneBytesPerElement": @1,
+                            @"IOSurfacePlaneOffset": @(p * 1024),
+                            @"IOSurfacePlaneBytesPerRow": @32,
+                            @"IOSurfacePlaneSize": @1024
+                        }];
+                    }
+                    NSDictionary *params = @{
+                        @"IOSurfaceWidth": @32,
+                        @"IOSurfaceHeight": @32,
+                        @"IOSurfaceBytesPerElement": @1,
+                        @"IOSurfaceBytesPerRow": @32,
+                        @"IOSurfaceAllocSize": @(nPlanes * 1024),
+                        @"IOSurfacePixelFormat": @0x34323076,
+                        @"IOSurfacePlaneInfo": planeArr
+                    };
+
+                    IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+                    if (!surf) {
+                        log([NSString stringWithFormat:@"PLANEOVLAP: %d-plane surface rejected", nPlanes]);
+                        continue;
+                    }
+
+                    size_t actual = getPlaneCount(surf);
+                    log([NSString stringWithFormat:@"PLANEOVLAP: Requested %d planes, got %zu", nPlanes, actual]);
+                    if ((int)actual != nPlanes) {
+                        anomalies++;
+                        log(@"PLANEOVLAP: ANOMALY — plane count mismatch!");
+                    }
+
+                    sym.lock(surf, 0, NULL);
+                    size_t oobIdx = actual + 2;
+                    void *oobBase = getPlaneBase(surf, oobIdx);
+                    if (oobBase != NULL) {
+                        oobAccess++;
+                        log([NSString stringWithFormat:
+                            @"PLANEOVLAP: ANOMALY — OOB plane index %zu returned base %p!", oobIdx, oobBase]);
+                    }
+                    sym.unlock(surf, 0, NULL);
+                    CFRelease(surf);
+                }
+
+                if (oobAccess > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PLANEOVLAP: %u OOB plane index accesses returned non-NULL", oobAccess]);
+                } else {
+                    log(@"PLANEOVLAP: Phase C — all OOB plane accesses returned NULL");
+                }
+            }
+
+            // Phase D — Format/plane count mismatch
+            if (!isr_stopped()) {
+                log(@"PLANEOVLAP: Phase D — format/plane mismatch");
+
+                NSDictionary *p0 = @{@"IOSurfacePlaneWidth": @32, @"IOSurfacePlaneHeight": @32,
+                    @"IOSurfacePlaneBytesPerElement": @1, @"IOSurfacePlaneOffset": @0,
+                    @"IOSurfacePlaneBytesPerRow": @32, @"IOSurfacePlaneSize": @1024};
+                NSDictionary *p1 = @{@"IOSurfacePlaneWidth": @16, @"IOSurfacePlaneHeight": @16,
+                    @"IOSurfacePlaneBytesPerElement": @2, @"IOSurfacePlaneOffset": @1024,
+                    @"IOSurfacePlaneBytesPerRow": @32, @"IOSurfacePlaneSize": @512};
+                NSDictionary *p2 = @{@"IOSurfacePlaneWidth": @16, @"IOSurfacePlaneHeight": @16,
+                    @"IOSurfacePlaneBytesPerElement": @2, @"IOSurfacePlaneOffset": @1536,
+                    @"IOSurfacePlaneBytesPerRow": @32, @"IOSurfacePlaneSize": @512};
+
+                // Test 1: 420v expects 2 planes, provide 3
+                NSDictionary *test1Params = @{
+                    @"IOSurfaceWidth": @32, @"IOSurfaceHeight": @32,
+                    @"IOSurfaceBytesPerElement": @1, @"IOSurfaceBytesPerRow": @32,
+                    @"IOSurfaceAllocSize": @2048,
+                    @"IOSurfacePixelFormat": @0x34323076,
+                    @"IOSurfacePlaneInfo": @[p0, p1, p2]
+                };
+                IOSurfaceRef s1 = sym.create((__bridge CFDictionaryRef)test1Params);
+                if (s1) {
+                    size_t pc = getPlaneCount(s1);
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PLANEOVLAP: ANOMALY — 420v+3planes accepted! planes=%zu", pc]);
+                    CFRelease(s1);
+                } else {
+                    log(@"PLANEOVLAP: 420v+3planes correctly rejected");
+                }
+
+                // Test 2: BGRA expects 1 plane, provide 2
+                NSDictionary *test2Params = @{
+                    @"IOSurfaceWidth": @32, @"IOSurfaceHeight": @32,
+                    @"IOSurfaceBytesPerElement": @1, @"IOSurfaceBytesPerRow": @32,
+                    @"IOSurfaceAllocSize": @2048,
+                    @"IOSurfacePixelFormat": @0x42475241,
+                    @"IOSurfacePlaneInfo": @[p0, p1]
+                };
+                IOSurfaceRef s2 = sym.create((__bridge CFDictionaryRef)test2Params);
+                if (s2) {
+                    size_t pc = getPlaneCount(s2);
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PLANEOVLAP: ANOMALY — BGRA+2planes accepted! planes=%zu", pc]);
+                    CFRelease(s2);
+                } else {
+                    log(@"PLANEOVLAP: BGRA+2planes correctly rejected");
+                }
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PLANEOVLAP: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PlaneOverlap-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+// --- Probe 24: Mach Port & ID Race ---
+
+void iosurface_research_port_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PORTRACE: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef mach_port_t (*ISR_CreatePortFn)(IOSurfaceRef);
+            typedef IOSurfaceRef (*ISR_LookupPortFn)(mach_port_t);
+            typedef CFDictionaryRef (*ISR_CopyAllValuesFn)(IOSurfaceRef);
+
+            ISR_CreatePortFn createPort = (ISR_CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            ISR_LookupPortFn lookupPort = (ISR_LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+            ISR_CopyAllValuesFn copyAllValues = (ISR_CopyAllValuesFn)dlsym(sym.iosurface, "IOSurfaceCopyAllValues");
+
+            if (!createPort || !lookupPort) {
+                log(@"PORTRACE: Missing mach port APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PORTRACE: Starting mach port race analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // Phase A — Dangling port test
+            log(@"PORTRACE: Phase A — mach port lifecycle (dangling port test)");
+            {
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(32, 32));
+                if (surf) {
+                    IOSurfaceID origID = sym.getID(surf);
+                    mach_port_t port = createPort(surf);
+
+                    if (port != MACH_PORT_NULL) {
+                        IOSurfaceRef fromPort = lookupPort(port);
+                        if (fromPort) {
+                            IOSurfaceID fromPortID = sym.getID(fromPort);
+                            log([NSString stringWithFormat:
+                                @"PORTRACE: Port lookup OK — origID=%u portID=%u match=%@",
+                                origID, fromPortID, origID == fromPortID ? @"YES" : @"NO"]);
+                            if (origID != fromPortID) {
+                                anomalies++;
+                                log(@"PORTRACE: ANOMALY — port resolved to different surface!");
+                            }
+                            CFRelease(fromPort);
+                        }
+
+                        CFRelease(surf);
+                        surf = NULL;
+
+                        IOSurfaceRef dangling = lookupPort(port);
+                        if (dangling) {
+                            IOSurfaceID danglingID = sym.getID(dangling);
+                            anomalies++;
+                            log([NSString stringWithFormat:
+                                @"PORTRACE: ANOMALY — DANGLING PORT! Destroyed surface still accessible via port, id=%u",
+                                danglingID]);
+                            CFRelease(dangling);
+                        } else {
+                            log(@"PORTRACE: Port correctly invalidated after surface destroy");
+                        }
+
+                        mach_port_deallocate(mach_task_self(), port);
+                    } else {
+                        log(@"PORTRACE: CreateMachPort returned NULL");
+                        CFRelease(surf);
+                    }
+                }
+            }
+
+            // Phase B — Port reuse attack
+            if (!isr_stopped()) {
+                log(@"PORTRACE: Phase B — port reuse attack (100 surfaces)");
+                mach_port_t oldPorts[100];
+                IOSurfaceID oldIDs[100];
+                memset(oldPorts, 0, sizeof(oldPorts));
+
+                IOSurfaceRef surfs[100];
+                uint32_t created = 0;
+                for (int i = 0; i < 100 && !isr_stopped(); i++) {
+                    surfs[i] = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(16, 16));
+                    if (surfs[i]) {
+                        oldIDs[i] = sym.getID(surfs[i]);
+                        oldPorts[i] = createPort(surfs[i]);
+                        created++;
+                    }
+                }
+                log([NSString stringWithFormat:@"PORTRACE: Created %u surfaces with ports", created]);
+
+                for (uint32_t i = 0; i < created; i++) {
+                    CFRelease(surfs[i]);
+                    surfs[i] = NULL;
+                }
+
+                IOSurfaceRef newSurfs[100];
+                uint32_t newCreated = 0;
+                for (int i = 0; i < 100 && !isr_stopped(); i++) {
+                    newSurfs[i] = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(16, 16));
+                    if (newSurfs[i]) newCreated++;
+                }
+
+                uint32_t portConfusion = 0;
+                uint32_t portStillValid = 0;
+                for (uint32_t i = 0; i < created && !isr_stopped(); i++) {
+                    if (oldPorts[i] == MACH_PORT_NULL) continue;
+                    IOSurfaceRef resolved = lookupPort(oldPorts[i]);
+                    if (resolved) {
+                        IOSurfaceID resolvedID = sym.getID(resolved);
+                        portStillValid++;
+                        if (resolvedID != oldIDs[i]) {
+                            portConfusion++;
+                            log([NSString stringWithFormat:
+                                @"PORTRACE: ANOMALY — old port[%u] (was id=%u) now resolves to id=%u!",
+                                i, oldIDs[i], resolvedID]);
+                        }
+                        CFRelease(resolved);
+                    }
+                    mach_port_deallocate(mach_task_self(), oldPorts[i]);
+                }
+
+                for (uint32_t i = 0; i < newCreated; i++) {
+                    if (newSurfs[i]) CFRelease(newSurfs[i]);
+                }
+
+                if (portConfusion > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"PORTRACE: ANOMALY — %u ports resolved to WRONG surface!", portConfusion]);
+                }
+                if (portStillValid > 0 && portConfusion == 0) {
+                    log([NSString stringWithFormat:
+                        @"PORTRACE: %u old ports still valid (port retains surface ref)", portStillValid]);
+                }
+                if (portStillValid == 0) {
+                    log(@"PORTRACE: All old ports correctly invalidated");
+                }
+            }
+
+            // Phase C — Massive 50-thread race
+            if (!isr_stopped()) {
+                log(@"PORTRACE: Phase C — 50-thread race condition");
+                IOSurfaceRef raceSurf = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(32, 32));
+                if (raceSurf) {
+                    IOSurfaceID raceID = sym.getID(raceSurf);
+                    mach_port_t racePort = createPort(raceSurf);
+
+                    __block atomic_uint wrongLookups = 0;
+                    __block atomic_uint nullPorts = 0;
+                    __block atomic_uint totalOps = 0;
+                    __block atomic_bool running = true;
+
+                    dispatch_group_t grp = dispatch_group_create();
+                    dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+
+                    for (int t = 0; t < 10; t++) {
+                        dispatch_group_async(grp, q, ^{
+                            while (atomic_load(&running)) {
+                                IOSurfaceRef found = sym.lookup(raceID);
+                                if (found) {
+                                    IOSurfaceID fid = sym.getID(found);
+                                    if (fid != raceID) atomic_fetch_add(&wrongLookups, 1);
+                                    CFRelease(found);
+                                }
+                                atomic_fetch_add(&totalOps, 1);
+                            }
+                        });
+                    }
+
+                    for (int t = 0; t < 10; t++) {
+                        dispatch_group_async(grp, q, ^{
+                            while (atomic_load(&running)) {
+                                mach_port_t p = createPort(raceSurf);
+                                if (p == MACH_PORT_NULL) {
+                                    atomic_fetch_add(&nullPorts, 1);
+                                } else {
+                                    mach_port_deallocate(mach_task_self(), p);
+                                }
+                                atomic_fetch_add(&totalOps, 1);
+                            }
+                        });
+                    }
+
+                    for (int t = 0; t < 10; t++) {
+                        dispatch_group_async(grp, q, ^{
+                            while (atomic_load(&running)) {
+                                if (racePort != MACH_PORT_NULL) {
+                                    IOSurfaceRef found = lookupPort(racePort);
+                                    if (found) {
+                                        IOSurfaceID fid = sym.getID(found);
+                                        if (fid != raceID) atomic_fetch_add(&wrongLookups, 1);
+                                        CFRelease(found);
+                                    }
+                                }
+                                atomic_fetch_add(&totalOps, 1);
+                            }
+                        });
+                    }
+
+                    for (int t = 0; t < 10; t++) {
+                        dispatch_group_async(grp, q, ^{
+                            while (atomic_load(&running)) {
+                                IOSurfaceRef tmp = sym.create((__bridge CFDictionaryRef)
+                                    isr_default_surface_params(8, 8));
+                                if (tmp) CFRelease(tmp);
+                                atomic_fetch_add(&totalOps, 1);
+                            }
+                        });
+                    }
+
+                    for (int t = 0; t < 10; t++) {
+                        dispatch_group_async(grp, q, ^{
+                            while (atomic_load(&running)) {
+                                if (copyAllValues) {
+                                    CFDictionaryRef all = copyAllValues(raceSurf);
+                                    if (all) CFRelease(all);
+                                }
+                                atomic_fetch_add(&totalOps, 1);
+                            }
+                        });
+                    }
+
+                    usleep(200000);
+                    atomic_store(&running, false);
+                    dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+
+                    uint32_t wrong = atomic_load(&wrongLookups);
+                    uint32_t nullP = atomic_load(&nullPorts);
+                    uint32_t ops = atomic_load(&totalOps);
+
+                    log([NSString stringWithFormat:
+                        @"PORTRACE: Race done — %u ops, %u wrong lookups, %u null ports",
+                        ops, wrong, nullP]);
+
+                    if (wrong > 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"PORTRACE: ANOMALY — %u lookups returned wrong surface during race!", wrong]);
+                    }
+                    if (nullP > 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"PORTRACE: ANOMALY — %u CreateMachPort calls returned NULL on valid surface!", nullP]);
+                    }
+
+                    if (racePort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), racePort);
+                    CFRelease(raceSurf);
+                }
+            }
+
+            // Phase D — ID prediction and preemptive lookup
+            if (!isr_stopped()) {
+                log(@"PORTRACE: Phase D — ID prediction and preemptive lookup");
+
+                IOSurfaceID ids[20];
+                for (int i = 0; i < 20; i++) {
+                    IOSurfaceRef tmp = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(8, 8));
+                    if (tmp) {
+                        ids[i] = sym.getID(tmp);
+                        CFRelease(tmp);
+                    } else {
+                        ids[i] = 0;
+                    }
+                }
+
+                BOOL sequential = YES;
+                int32_t delta = 0;
+                uint32_t reuseCount = 0;
+                for (int i = 1; i < 20; i++) {
+                    if (ids[i] == 0 || ids[i-1] == 0) continue;
+                    int32_t d = (int32_t)ids[i] - (int32_t)ids[i-1];
+                    if (i == 1) {
+                        delta = d;
+                    } else if (d != delta) {
+                        sequential = NO;
+                    }
+                    if (d <= 0) reuseCount++;
+                }
+
+                log([NSString stringWithFormat:
+                    @"PORTRACE: ID pattern — sequential=%@ delta=%d reuse=%u range=[%u..%u]",
+                    sequential ? @"YES" : @"NO", delta, reuseCount, ids[0], ids[19]]);
+
+                IOSurfaceID predicted = ids[19] + (uint32_t)delta;
+                log([NSString stringWithFormat:@"PORTRACE: Predicted next ID = %u", predicted]);
+
+                IOSurfaceRef preempt = sym.lookup(predicted);
+                if (preempt) {
+                    anomalies++;
+                    IOSurfaceID preemptID = sym.getID(preempt);
+                    log([NSString stringWithFormat:
+                        @"PORTRACE: ANOMALY — preemptive lookup for %u succeeded (got id=%u)!",
+                        predicted, preemptID]);
+                    CFRelease(preempt);
+                } else {
+                    log([NSString stringWithFormat:
+                        @"PORTRACE: Preemptive lookup for %u returned NULL (correct)", predicted]);
+                }
+
+                IOSurfaceRef next = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(8, 8));
+                if (next) {
+                    IOSurfaceID actualNext = sym.getID(next);
+                    BOOL matched = (actualNext == predicted);
+                    log([NSString stringWithFormat:
+                        @"PORTRACE: Actual next ID = %u, predicted = %u — %@",
+                        actualNext, predicted, matched ? @"PREDICTED CORRECTLY" : @"MISMATCH"]);
+                    if (matched) {
+                        anomalies++;
+                        log(@"PORTRACE: ANOMALY — ID allocation is fully predictable!");
+                    }
+                    CFRelease(next);
+                }
+
+                IOSurfaceRef reuse1 = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(8, 8));
+                if (reuse1) {
+                    IOSurfaceID idN = sym.getID(reuse1);
+                    CFRelease(reuse1);
+                    IOSurfaceRef reuse2 = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(8, 8));
+                    if (reuse2) {
+                        IOSurfaceID idAfter = sym.getID(reuse2);
+                        if (idAfter == idN) {
+                            log([NSString stringWithFormat:@"PORTRACE: ID %u was REUSED immediately", idN]);
+                        } else {
+                            log([NSString stringWithFormat:
+                                @"PORTRACE: ID %u -> %u (delta=%d, no immediate reuse)",
+                                idN, idAfter, (int32_t)(idAfter - idN)]);
+                        }
+                        CFRelease(reuse2);
+                    }
+                }
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PORTRACE: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PortRace-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}

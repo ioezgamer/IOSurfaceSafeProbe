@@ -85,5 +85,16 @@ void iosurface_research_cache_channel(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 /// Probe 21: Confused deputy — pass IOSurface handles through IOKit services, test unvalidated access.
 void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 7: Deep kernel attack surface ---
+
+/// Probe 22: Property injection — stress kernel property dictionary with oversized/reserved keys.
+void iosurface_research_property_inject(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 23: Plane overlap — multi-plane surfaces with overlapping offsets for cross-plane reads.
+void iosurface_research_plane_overlap(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 24: Mach port race — port lifecycle attacks, reuse, and 50-thread race condition.
+void iosurface_research_port_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
