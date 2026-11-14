@@ -294,5 +294,16 @@ void iosurface_research_jpeg_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 /// Probe 78: Service chain — pass IOSurface through IOMobileFramebuffer and AppleJPEGDriver, detect cross-service memory corruption.
 void iosurface_research_service_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 26: Maximum Aggression ---
+
+/// Probe 79: VM remap attack — mach_vm_remap IOSurface pages, destroy surface, read freed kernel memory.
+void iosurface_research_vm_remap(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 80: IOSurfaceAccelerator — find and fuzz hardware blit services for OOB via stride mismatch.
+void iosurface_research_surf_accel(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 81: Syscall storm — task_info, mach_make_memory_entry, vm_remap, mach_vm_region for kernel leaks.
+void iosurface_research_syscall_storm(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
