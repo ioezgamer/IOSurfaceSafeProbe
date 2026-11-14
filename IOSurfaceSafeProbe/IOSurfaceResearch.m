@@ -9249,7 +9249,6 @@ void iosurface_research_rw_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
             } // end step 4
             } // end step 3
             } // end step 2
-            } // end step 1
 
             if (hijackRef) CFRelease(hijackRef);
             if (hijackPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), hijackPort);
