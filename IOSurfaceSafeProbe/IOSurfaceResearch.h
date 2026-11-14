@@ -63,5 +63,16 @@ void iosurface_research_format_mismatch(ISRLogBlock _Nonnull log, ISRDoneBlock _
 /// Probe 15: Kernel info leak — extract metadata, seed values, plane info for kernel pointer disclosure.
 void iosurface_research_info_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 5: Exploitation primitives ---
+
+/// Probe 16: Heap spray — measure address distribution and grooming success for IOSurface buffers.
+void iosurface_research_heap_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 17: UAF window — nanosecond-precision timing of ID reuse and residual data detection.
+void iosurface_research_uaf_window(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 18: Kernel timing oracle — side-channel timing analysis of IOSurface kernel operations.
+void iosurface_research_timing_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
