@@ -116,6 +116,16 @@ struct ResearchView: View {
         ("toctou", "Global TOCTOU", "arrow.triangle.2.circlepath.circle.fill",
          "Race condition TOCTOU: spy modifica datos entre check y use del owner",
          { log, done in iosurface_research_global_toctou({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 11
+        ("comprace", "Compositor TOCTOU", "display",
+         "Race contra backboardd/render server via CALayer-backed IOSurface",
+         { log, done in iosurface_research_compositor_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("syssniff", "System Sniff", "antenna.radiowaves.left.and.right",
+         "Detecta acceso de daemons del sistema via use-count y bootstrap lookup",
+         { log, done in iosurface_research_system_sniff({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("rendcorr", "Render Corrupt", "paintbrush.pointed.fill",
+         "Surface dual-plane como input del compositor — busca leak cross-plane",
+         { log, done in iosurface_research_render_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -274,7 +284,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 30), id: \.id) { probe in
+            ForEach(probes[30..<33], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 11 ---
+            Text("Round 11 — System Service TOCTOU")
+                .font(.caption.bold())
+                .foregroundStyle(.indigo)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 33), id: \.id) { probe in
                 probeCard(probe)
             }
 

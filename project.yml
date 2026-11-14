@@ -26,3 +26,4 @@ targets:
     dependencies:
       - sdk: IOSurface.framework
       - sdk: CoreGraphics.framework
+      - sdk: QuartzCore.framework
