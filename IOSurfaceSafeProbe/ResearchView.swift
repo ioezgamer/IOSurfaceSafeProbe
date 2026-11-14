@@ -177,6 +177,16 @@ struct ResearchView: View {
         ("fakeobject", "Fake Object", "hammer.fill",
          "Inyecta patrones de objetos kernel falsos via stride overflow en memoria adyacente",
          { log, done in iosurface_research_fake_object({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 17
+        ("portmap", "Port Map", "map.fill",
+         "Mapeo fino de estructura ipc_port en OOB — identifica campos kernel",
+         { log, done in iosurface_research_port_map({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("portcorrupt", "Port Corrupt", "bolt.trianglebadge.exclamationmark.fill",
+         "Corrupción de campos ipc_port via stride OOB — verifica via mach_port_get_refs",
+         { log, done in iosurface_research_port_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("krwchain", "K-R/W Chain", "link.circle.fill",
+         "Cadena completa: spray + port locate + kobject read + redirect + R/W arbitrario",
+         { log, done in iosurface_research_krw_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -407,7 +417,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 48), id: \.id) { probe in
+            ForEach(probes[48..<51], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 17 ---
+            Text("Round 17 — Mach Port Structure Exploitation")
+                .font(.caption.bold())
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 51), id: \.id) { probe in
                 probeCard(probe)
             }
 
