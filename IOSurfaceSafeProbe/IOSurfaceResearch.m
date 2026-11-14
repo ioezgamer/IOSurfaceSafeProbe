@@ -15785,7 +15785,7 @@ void iosurface_research_metal_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                         log([NSString stringWithFormat:@"METALCRPT: Created surface ID=%u, alloc=%zu", surfID, (size_t)sym.getAllocSize(surf)]);
 
                         sym.lock(surf, 0, NULL);
-                        void *base = sym.getBase(surf, 0);
+                        void *base = sym.getBase(surf);
                         if (base) {
                             uint32_t *pixels = (uint32_t *)base;
                             size_t count = sym.getAllocSize(surf) / 4;
@@ -15868,7 +15868,7 @@ void iosurface_research_metal_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                                                         log(@"METALCRPT: GPU command completed with modified stride");
 
                                                         sym.lock(surf, kIOSurfaceLockReadOnly, NULL);
-                                                        void *postBase = sym.getBase(surf, 0);
+                                                        void *postBase = sym.getBase(surf);
                                                         if (postBase) {
                                                             uint32_t *check = (uint32_t *)postBase;
                                                             int changed = 0;
@@ -16171,7 +16171,7 @@ void iosurface_research_gpu_dma_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
             if (!surf) continue;
 
             sym.lock(surf, 0, NULL);
-            void *base = sym.getBase(surf, 0);
+            void *base = sym.getBase(surf);
             if (base) {
                 memset(base, 0xAA, sym.getAllocSize(surf));
             }
@@ -16225,7 +16225,7 @@ void iosurface_research_gpu_dma_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
                         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
                             for (int w = 0; w < 1000 && !isr_stopped(); w++) {
                                 sym.lock(surf, 0, NULL);
-                                void *b = sym.getBase(surf, 0);
+                                void *b = sym.getBase(surf);
                                 if (b) memset(b, 0xBB, 128 * 128 * 4);
                                 sym.unlock(surf, 0, NULL);
                             }
@@ -16251,7 +16251,7 @@ void iosurface_research_gpu_dma_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
                         while (!cpuDone && !isr_stopped()) { usleep(1000); }
 
                         sym.lock(surf, kIOSurfaceLockReadOnly, NULL);
-                        void *checkBase = sym.getBase(surf, 0);
+                        void *checkBase = sym.getBase(surf);
                         if (checkBase) {
                             uint8_t *bytes = (uint8_t *)checkBase;
                             int aa = 0, bb = 0, other = 0;
