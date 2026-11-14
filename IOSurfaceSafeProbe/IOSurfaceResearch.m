@@ -63,6 +63,7 @@ typedef struct {
     ISR_CloseFn  close;
     ISR_ReleaseFn release;
     ISR_CallFn   call;
+    ISR_DimFn    getBytesPerRow;
 } ISRSymbols;
 
 static BOOL isr_load(ISRSymbols *s) {
@@ -87,9 +88,11 @@ static BOOL isr_load(ISRSymbols *s) {
     s->close     = (ISR_CloseFn)dlsym(s->iokit, "IOServiceClose");
     s->release   = (ISR_ReleaseFn)dlsym(s->iokit, "IOObjectRelease");
     s->call      = (ISR_CallFn)dlsym(s->iokit, "IOConnectCallMethod");
+    s->getBytesPerRow = (ISR_DimFn)dlsym(s->iosurface, "IOSurfaceGetBytesPerRow");
     return s->create && s->getID && s->lookup && s->getWidth && s->getHeight &&
            s->getAllocSize && s->getBase && s->lock && s->unlock &&
-           s->matching && s->getMatch && s->open && s->close && s->release && s->call;
+           s->matching && s->getMatch && s->open && s->close && s->release && s->call &&
+           s->getBytesPerRow;
 }
 
 static void isr_unload(ISRSymbols *s) {
