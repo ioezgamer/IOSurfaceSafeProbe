@@ -167,6 +167,16 @@ struct ResearchView: View {
         ("portpropchain", "Port+Prop Chain", "link.badge.plus",
          "Property override + mach port transfer + CG OOB — lectura kernel-adyacente",
          { log, done in iosurface_research_port_prop_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 16
+        ("stridekern", "Stride Kernel", "cpu.fill",
+         "Stride confusion para leer memoria kernel-adyacente — escanea patrones de datos kernel",
+         { log, done in iosurface_research_stride_kernel({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("xsurfcorrupt", "XSurf Corrupt", "arrow.triangle.swap",
+         "Stride OOB write para corromper propiedades OSDictionary de surfaces adyacentes",
+         { log, done in iosurface_research_xsurf_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("fakeobject", "Fake Object", "hammer.fill",
+         "Inyecta patrones de objetos kernel falsos via stride overflow en memoria adyacente",
+         { log, done in iosurface_research_fake_object({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -385,7 +395,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 45), id: \.id) { probe in
+            ForEach(probes[45..<48], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 16 ---
+            Text("Round 16 — Kernel R/W Weaponization")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 48), id: \.id) { probe in
                 probeCard(probe)
             }
 
