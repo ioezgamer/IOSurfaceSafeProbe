@@ -335,5 +335,15 @@ void iosurface_research_refcount_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock 
 /// Probe 90: Pipe kernel R/W — use pipe buffers as kernel heap oracles for read/write primitive.
 void iosurface_research_pipe_krw(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// Round 30: Strategy Pivot
+/// Probe 91: Mach OOL message spray — controlled kernel heap allocations via OOL descriptors + IOSurface reclaim.
+void iosurface_research_ool_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 92: IOKit external method fuzzing — call IOSurface user client selectors 0-33 with crafted inputs.
+void iosurface_research_ioconn_call(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 93: Task port self-inspection — harvest kernel info via task_info, vm_region, host_info, commpage.
+void iosurface_research_task_intro(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
