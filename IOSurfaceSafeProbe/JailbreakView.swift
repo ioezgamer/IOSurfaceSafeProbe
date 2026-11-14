@@ -22,10 +22,13 @@ struct JailbreakView: View {
         ("154 Kernel Ptr Leak", .confirmed, "R27"),
         ("Cross-Surface Sentinel", .confirmed, "R28"),
         ("7 Vtable Candidates", .confirmed, "R28"),
-        ("Vtable Confusion", .pending, "R29"),
-        ("Controlled UAF", .pending, "R29"),
-        ("Pipe Kernel R/W", .pending, "R29"),
-        ("Kernel R/W Primitive", .pending, "R29"),
+        ("Vtable Confusion", .notFound, "R29"),
+        ("Controlled UAF", .notFound, "R29"),
+        ("Pipe Kernel R/W", .notFound, "R29"),
+        ("Mach OOL Heap Control", .pending, "R30"),
+        ("IOKit Method Exploit", .pending, "R30"),
+        ("Kernel Info Harvest", .pending, "R30"),
+        ("Kernel R/W Primitive", .pending, "R30"),
     ]
 
     var body: some View {
@@ -155,7 +158,7 @@ struct JailbreakView: View {
             }
             .disabled(true)
 
-            Text("Requiere kernel R/W primitiva — Round 29 en progreso")
+            Text("Requiere kernel R/W primitiva — Round 30 en progreso")
                 .font(.caption2)
                 .foregroundStyle(.gray.opacity(0.5))
         }
