@@ -1020,3 +1020,605 @@ void iosurface_research_mach(ISRLogBlock log, ISRDoneBlock done) {
         }
     });
 }
+
+#pragma mark - Probe 6: Timed Race (Round 2)
+
+void iosurface_research_timed_race(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"TIMED_RACE: ERROR — failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"TIMED_RACE: === Precision UAF Window Detector ===");
+            log(@"TIMED_RACE: Creating surfaces, measuring destroy-to-reuse timing");
+
+            mach_timebase_info_data_t tbi;
+            mach_timebase_info(&tbi);
+
+            uint32_t uafWindows = 0;
+            uint32_t staleHits = 0;
+            uint32_t anomalies = 0;
+            uint32_t trials = 200;
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+
+            for (uint32_t t = 0; t < trials && !isr_stopped(); t++) {
+                isr_checkpoint(@"ISR-TimedRace-checkpoint.json", @{
+                    @"trial": @(t), @"uafWindows": @(uafWindows), @"staleHits": @(staleHits)
+                });
+
+                NSDictionary *params = isr_default_surface_params(64, 64);
+                IOSurfaceRef s1 = sym.create((__bridge CFDictionaryRef)params);
+                if (!s1) continue;
+                IOSurfaceID id1 = sym.getID(s1);
+
+                // Lock and write a marker pattern
+                sym.lock(s1, 0, NULL);
+                void *base1 = sym.getBase(s1);
+                if (base1) {
+                    memset(base1, 0xAB, MIN(sym.getAllocSize(s1), (size_t)256));
+                }
+                sym.unlock(s1, 0, NULL);
+
+                // Measure time from release to reuse
+                uint64_t t_before = mach_absolute_time();
+                CFRelease(s1);
+                // Immediately try to create a new one
+                IOSurfaceRef s2 = sym.create((__bridge CFDictionaryRef)params);
+                uint64_t t_after = mach_absolute_time();
+
+                if (!s2) continue;
+                IOSurfaceID id2 = sym.getID(s2);
+
+                uint64_t delta_ns = (t_after - t_before) * tbi.numer / tbi.denom;
+
+                if (id2 == id1) {
+                    uafWindows++;
+                    // Check if old data persists in new surface (kernel memory leak)
+                    sym.lock(s2, 3, NULL); // read-only
+                    void *base2 = sym.getBase(s2);
+                    BOOL staleData = NO;
+                    if (base2) {
+                        uint8_t *p = (uint8_t *)base2;
+                        int markerCount = 0;
+                        for (int i = 0; i < 256 && i < (int)sym.getAllocSize(s2); i++) {
+                            if (p[i] == 0xAB) markerCount++;
+                        }
+                        if (markerCount > 128) {
+                            staleData = YES;
+                            staleHits++;
+                            anomalies++;
+                        }
+                    }
+                    sym.unlock(s2, 0, NULL);
+
+                    if (t % 20 == 0 || staleData) {
+                        log([NSString stringWithFormat:
+                            @"TIMED_RACE: trial=%u ID_REUSED id=%u delta=%lluns staleData=%s",
+                            t, id1, delta_ns, staleData ? "YES" : "NO"]);
+                    }
+                }
+                CFRelease(s2);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"TIMED_RACE: DONE trials=%u uafWindows=%u staleHits=%u anomalies=%u elapsed=%.3fs",
+                trials, uafWindows, staleHits, anomalies, elapsed]);
+
+            if (staleHits > 0) {
+                log([NSString stringWithFormat:
+                    @"TIMED_RACE: CRITICAL — %u surfaces retained stale data after recycle (kernel memory leak)", staleHits]);
+            }
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"trials": @(trials),
+                @"uafWindows": @(uafWindows),
+                @"staleHits": @(staleHits),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-TimedRace-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 7: Pixel Buffer Leak (Round 2)
+
+void iosurface_research_buffer_leak(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"BUFLEAK: ERROR — failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"BUFLEAK: === Pixel Buffer Cross-Surface Leak Detector ===");
+            log(@"BUFLEAK: Tests if freed surface memory leaks into newly allocated surfaces");
+
+            uint32_t anomalies = 0;
+            uint32_t leaksDetected = 0;
+            uint32_t partialLeaks = 0;
+            uint32_t trials = 100;
+            // Test multiple surface sizes — the allocator may behave differently
+            size_t sizes[][2] = {{32,32},{64,64},{128,128},{256,256},{512,512},{1024,1024},{16,1024},{1024,16}};
+            int nSizes = sizeof(sizes)/sizeof(sizes[0]);
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+
+            for (int si = 0; si < nSizes && !isr_stopped(); si++) {
+                size_t w = sizes[si][0], h = sizes[si][1];
+                NSDictionary *params = isr_default_surface_params(w, h);
+                uint32_t sizeLeaks = 0;
+                uint32_t sizePartials = 0;
+
+                log([NSString stringWithFormat:@"BUFLEAK: testing %zux%zu (%zu bytes)", w, h, w*4*h]);
+
+                for (uint32_t t = 0; t < trials && !isr_stopped(); t++) {
+                    isr_checkpoint(@"ISR-BufLeak-checkpoint.json", @{
+                        @"size": [NSString stringWithFormat:@"%zux%zu", w, h],
+                        @"trial": @(t), @"leaks": @(leaksDetected)
+                    });
+
+                    // Phase 1: Create surface, write unique pattern
+                    uint8_t marker = (uint8_t)((t * 37 + si * 13) & 0xFF);
+                    if (marker == 0) marker = 0xCD;
+
+                    IOSurfaceRef victim = sym.create((__bridge CFDictionaryRef)params);
+                    if (!victim) continue;
+
+                    sym.lock(victim, 0, NULL);
+                    void *vbase = sym.getBase(victim);
+                    size_t allocSz = sym.getAllocSize(victim);
+                    size_t fillSz = MIN(allocSz, (size_t)4096);
+                    if (vbase) {
+                        memset(vbase, marker, fillSz);
+                    }
+                    sym.unlock(victim, 0, NULL);
+
+                    // Phase 2: Destroy victim
+                    CFRelease(victim);
+
+                    // Phase 3: Allocate N new surfaces, check each for stale marker
+                    int sprayCount = 4;
+                    IOSurfaceRef sprayed[4] = {};
+                    for (int s = 0; s < sprayCount; s++) {
+                        sprayed[s] = sym.create((__bridge CFDictionaryRef)params);
+                    }
+
+                    for (int s = 0; s < sprayCount; s++) {
+                        if (!sprayed[s]) continue;
+                        sym.lock(sprayed[s], 3, NULL);
+                        void *sbase = sym.getBase(sprayed[s]);
+                        if (sbase) {
+                            uint8_t *p = (uint8_t *)sbase;
+                            size_t checkSz = MIN(sym.getAllocSize(sprayed[s]), (size_t)4096);
+                            int markerCount = 0;
+                            for (size_t i = 0; i < checkSz; i++) {
+                                if (p[i] == marker) markerCount++;
+                            }
+                            double ratio = (double)markerCount / checkSz;
+                            if (ratio > 0.8) {
+                                sizeLeaks++;
+                                leaksDetected++;
+                                anomalies++;
+                                log([NSString stringWithFormat:
+                                    @"BUFLEAK: LEAK %zux%zu trial=%u spray=%d marker=0x%02x ratio=%.1f%%",
+                                    w, h, t, s, marker, ratio * 100]);
+                            } else if (ratio > 0.1) {
+                                sizePartials++;
+                                partialLeaks++;
+                                log([NSString stringWithFormat:
+                                    @"BUFLEAK: PARTIAL %zux%zu trial=%u spray=%d marker=0x%02x ratio=%.1f%%",
+                                    w, h, t, s, marker, ratio * 100]);
+                            }
+                        }
+                        sym.unlock(sprayed[s], 0, NULL);
+                    }
+                    for (int s = 0; s < sprayCount; s++) {
+                        if (sprayed[s]) CFRelease(sprayed[s]);
+                    }
+                }
+
+                log([NSString stringWithFormat:
+                    @"BUFLEAK: %zux%zu done — leaks=%u partial=%u", w, h, sizeLeaks, sizePartials]);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"BUFLEAK: DONE trials=%u leaks=%u partial=%u anomalies=%u elapsed=%.3fs",
+                trials * nSizes, leaksDetected, partialLeaks, anomalies, elapsed]);
+
+            if (leaksDetected > 0) {
+                log([NSString stringWithFormat:
+                    @"BUFLEAK: CRITICAL — %u full leaks: freed surface data readable by new allocations", leaksDetected]);
+            }
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"totalTrials": @(trials * nSizes),
+                @"leaksDetected": @(leaksDetected),
+                @"partialLeaks": @(partialLeaks),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-BufLeak-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 8: IOKit Connection Types (Round 2)
+
+void iosurface_research_conn_types(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"CONN: ERROR — failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"CONN: === IOKit Connection Type Scanner ===");
+            log(@"CONN: Testing IOSurfaceRoot with connection types 0-15 and alternate tasks");
+
+            CFDictionaryRef match = sym.matching("IOSurfaceRoot");
+            if (!match) {
+                log(@"CONN: ERROR — IOSurfaceRoot not found");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // We need multiple match dicts since IOServiceGetMatchingService consumes them
+            uint32_t accepted = 0;
+            uint32_t rejected = 0;
+            uint32_t anomalies = 0;
+            uint32_t maxType = 15;
+            CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+
+            // Phase A: Connection types 0-15 on IOSurfaceRoot
+            log(@"CONN: Phase A — connection types 0-15");
+            for (uint32_t connType = 0; connType <= maxType && !isr_stopped(); connType++) {
+                isr_checkpoint(@"ISR-Conn-checkpoint.json", @{
+                    @"phase": @"A", @"connType": @(connType), @"accepted": @(accepted)
+                });
+
+                CFDictionaryRef m = sym.matching("IOSurfaceRoot");
+                if (!m) continue;
+                io_service_t svc = sym.getMatch(kIOMasterPortDefault, m);
+                if (!svc) continue;
+
+                io_connect_t conn = 0;
+                kern_return_t kr = sym.open(svc, mach_task_self(), connType, &conn);
+
+                if (kr == KERN_SUCCESS && conn) {
+                    accepted++;
+                    log([NSString stringWithFormat:
+                        @"CONN: ACCEPTED type=%u conn=0x%x", connType, conn]);
+
+                    // Try selectors 0-5 on this connection type
+                    for (uint32_t sel = 0; sel <= 5; sel++) {
+                        uint64_t scalarOut[4] = {};
+                        uint32_t scalarOutCnt = 4;
+                        kern_return_t skr = sym.call(conn, sel, NULL, 0, NULL, 0,
+                                                      scalarOut, &scalarOutCnt, NULL, NULL);
+                        if (skr == KERN_SUCCESS) {
+                            anomalies++;
+                            log([NSString stringWithFormat:
+                                @"CONN: ANOMALY type=%u sel=%u ACCEPTED scalarOut[0]=0x%llx",
+                                connType, sel, scalarOut[0]]);
+                        }
+                    }
+                    sym.close(conn);
+                } else {
+                    rejected++;
+                    if (kr != KERN_INVALID_ARGUMENT &&
+                        kr != 0xe00002be && // kIOReturnNotPermitted
+                        kr != 0xe00002bc && // kIOReturnUnsupported
+                        kr != 0xe0000001)   // kIOReturnError
+                    {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"CONN: UNEXPECTED type=%u kr=0x%08x", connType, (unsigned)kr]);
+                    }
+                }
+                sym.release(svc);
+            }
+
+            // Phase B: Try opening with different task ports
+            log(@"CONN: Phase B — alternate task port variants");
+            struct { mach_port_t port; const char *label; } tasks[] = {
+                { mach_task_self(), "self" },
+                { MACH_PORT_NULL, "null" },
+                { 1, "port_1" },
+                { MACH_PORT_DEAD, "dead" },
+            };
+            int nTasks = sizeof(tasks)/sizeof(tasks[0]);
+
+            for (int ti = 0; ti < nTasks && !isr_stopped(); ti++) {
+                CFDictionaryRef m2 = sym.matching("IOSurfaceRoot");
+                if (!m2) continue;
+                io_service_t svc2 = sym.getMatch(kIOMasterPortDefault, m2);
+                if (!svc2) continue;
+
+                io_connect_t conn2 = 0;
+                kern_return_t kr2 = sym.open(svc2, tasks[ti].port, 0, &conn2);
+
+                if (kr2 == KERN_SUCCESS && conn2) {
+                    log([NSString stringWithFormat:
+                        @"CONN: ACCEPTED task=%s conn=0x%x", tasks[ti].label, conn2]);
+                    if (tasks[ti].port != mach_task_self()) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"CONN: ANOMALY — non-self task '%s' accepted!", tasks[ti].label]);
+                    }
+                    sym.close(conn2);
+                } else {
+                    log([NSString stringWithFormat:
+                        @"CONN: REJECTED task=%s kr=0x%08x", tasks[ti].label, (unsigned)kr2]);
+                }
+                sym.release(svc2);
+            }
+
+            // Phase C: Try other IOSurface-related services
+            log(@"CONN: Phase C — related IOKit services");
+            const char *services[] = {
+                "IOSurfaceRoot",
+                "IOSurfaceClient",
+                "IOGraphicsAccelerator2",
+                "IOMobileGraphicsFamily",
+                "AppleCLCD",
+                "IOAccelerator",
+                "AGXAccelerator",
+                "AGXFamilyAccelerator",
+            };
+            int nServices = sizeof(services)/sizeof(services[0]);
+
+            for (int si = 1; si < nServices && !isr_stopped(); si++) {
+                CFDictionaryRef m3 = sym.matching(services[si]);
+                if (!m3) continue;
+                io_service_t svc3 = sym.getMatch(kIOMasterPortDefault, m3);
+                if (!svc3) {
+                    log([NSString stringWithFormat:@"CONN: service '%s' not found", services[si]]);
+                    continue;
+                }
+
+                io_connect_t conn3 = 0;
+                kern_return_t kr3 = sym.open(svc3, mach_task_self(), 0, &conn3);
+                if (kr3 == KERN_SUCCESS && conn3) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"CONN: INTERESTING — '%s' opened! conn=0x%x", services[si], conn3]);
+                    sym.close(conn3);
+                } else {
+                    log([NSString stringWithFormat:
+                        @"CONN: '%s' rejected kr=0x%08x", services[si], (unsigned)kr3]);
+                }
+                sym.release(svc3);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - startTime;
+            log([NSString stringWithFormat:
+                @"CONN: DONE accepted=%u rejected=%u anomalies=%u elapsed=%.3fs",
+                accepted, rejected, anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"accepted": @(accepted),
+                @"rejected": @(rejected),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-Conn-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 9: Alloc Boundary (Round 2)
+
+void iosurface_research_alloc_boundary(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"BOUNDARY: ERROR — failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"BOUNDARY: === Allocation Boundary Scanner ===");
+            log(@"BOUNDARY: Probing exact rejection thresholds and mismatch behavior");
+
+            uint32_t anomalies = 0;
+            uint32_t created = 0;
+            uint32_t rejected = 0;
+            uint32_t mismatchHits = 0;
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+
+            // Phase A: Binary search for exact max alloc threshold per width
+            log(@"BOUNDARY: Phase A — binary search for max height at w=131071");
+            size_t testW = 131071;
+            size_t lo = 0, hi = 256;
+            size_t lastAccepted = 0;
+
+            while (lo <= hi && !isr_stopped()) {
+                size_t mid = (lo + hi) / 2;
+                if (mid == 0) { lo = 1; continue; }
+
+                isr_checkpoint(@"ISR-Boundary-checkpoint.json", @{
+                    @"phase": @"A", @"w": @(testW), @"testH": @(mid)
+                });
+
+                NSDictionary *params = isr_default_surface_params(testW, mid);
+                IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)params);
+                if (s) {
+                    lastAccepted = mid;
+                    lo = mid + 1;
+                    log([NSString stringWithFormat:@"BOUNDARY: w=%zu h=%zu ACCEPTED alloc=%zu",
+                        testW, mid, sym.getAllocSize(s)]);
+                    CFRelease(s);
+                } else {
+                    hi = mid - 1;
+                    log([NSString stringWithFormat:@"BOUNDARY: w=%zu h=%zu REJECTED", testW, mid]);
+                }
+            }
+            log([NSString stringWithFormat:@"BOUNDARY: w=%zu max_h=%zu", testW, lastAccepted]);
+
+            // Phase B: Test bytesPerRow / allocSize mismatches near the boundary
+            log(@"BOUNDARY: Phase B — bytesPerRow/allocSize mismatches at boundary");
+            struct {
+                size_t w, h, bpr, allocSz;
+                const char *label;
+            } mismatchTests[] = {
+                // Correct bytesPerRow but undersized allocSize
+                { 1024, 1024, 4096, 1024,        "undersized_alloc" },
+                { 1024, 1024, 4096, 4096*1024+1,  "oversized_alloc_by_1" },
+                { 1024, 1024, 4096, 4096*1024-1,  "undersized_alloc_by_1" },
+                // bytesPerRow smaller than width*bpe
+                { 1024, 1024, 1024, 1024*1024,    "bpr_too_small" },
+                // bytesPerRow = 0
+                { 1024, 1024, 0,    4096*1024,    "bpr_zero" },
+                // Huge bytesPerRow but small alloc
+                { 32, 32, 0x7FFFFFFF, 4096,        "bpr_huge" },
+                // allocSize = 0
+                { 64, 64, 256, 0,                  "alloc_zero" },
+                // w*bpe overflow: w=0x40000000, bpe=4 => w*bpe = 0 (overflow)
+                { 0x40000000, 1, 0, 4,              "width_overflow" },
+                // h very large with small w
+                { 1, 0x40000000, 4, 0x40000000UL*4, "height_overflow" },
+                // Mismatched pixel format
+                { 64, 64, 256, 64*4*64,            "normal_baseline" },
+            };
+            int nMismatch = sizeof(mismatchTests)/sizeof(mismatchTests[0]);
+
+            for (int i = 0; i < nMismatch && !isr_stopped(); i++) {
+                isr_checkpoint(@"ISR-Boundary-checkpoint.json", @{
+                    @"phase": @"B", @"test": @(mismatchTests[i].label)
+                });
+
+                NSMutableDictionary *p = [NSMutableDictionary dictionary];
+                p[@"IOSurfaceWidth"] = @(mismatchTests[i].w);
+                p[@"IOSurfaceHeight"] = @(mismatchTests[i].h);
+                p[@"IOSurfaceBytesPerElement"] = @4;
+                p[@"IOSurfacePixelFormat"] = @(0x42475241);
+                if (mismatchTests[i].bpr > 0)
+                    p[@"IOSurfaceBytesPerRow"] = @(mismatchTests[i].bpr);
+                if (mismatchTests[i].allocSz > 0)
+                    p[@"IOSurfaceAllocSize"] = @(mismatchTests[i].allocSz);
+
+                IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)p);
+                if (s) {
+                    created++;
+                    size_t actualW = sym.getWidth(s);
+                    size_t actualH = sym.getHeight(s);
+                    size_t actualAlloc = sym.getAllocSize(s);
+                    BOOL wMismatch = (actualW != mismatchTests[i].w);
+                    BOOL hMismatch = (actualH != mismatchTests[i].h);
+
+                    log([NSString stringWithFormat:
+                        @"BOUNDARY: CREATED '%s' w=%zu(req %zu) h=%zu(req %zu) alloc=%zu%s",
+                        mismatchTests[i].label,
+                        actualW, mismatchTests[i].w,
+                        actualH, mismatchTests[i].h,
+                        actualAlloc,
+                        (wMismatch || hMismatch) ? " MISMATCH" : ""]);
+
+                    if (wMismatch || hMismatch) {
+                        mismatchHits++;
+                    }
+
+                    // Check if we can lock and access memory safely
+                    kern_return_t lkr = sym.lock(s, 0, NULL);
+                    if (lkr == KERN_SUCCESS) {
+                        void *base = sym.getBase(s);
+                        if (base && actualAlloc > 0) {
+                            // Write and read back — detect if alloc is really that size
+                            volatile uint8_t *vp = (volatile uint8_t *)base;
+                            vp[0] = 0x42;
+                            if (actualAlloc > 1) vp[actualAlloc - 1] = 0x43;
+                            if (vp[0] != 0x42) {
+                                anomalies++;
+                                log([NSString stringWithFormat:
+                                    @"BOUNDARY: ANOMALY '%s' — write/read mismatch at base!",
+                                    mismatchTests[i].label]);
+                            }
+                        }
+                        sym.unlock(s, 0, NULL);
+                    }
+                    CFRelease(s);
+                } else {
+                    rejected++;
+                    log([NSString stringWithFormat:
+                        @"BOUNDARY: REJECTED '%s'", mismatchTests[i].label]);
+                }
+            }
+
+            // Phase C: Pixel format fuzzing — non-standard formats
+            log(@"BOUNDARY: Phase C — pixel format edge cases");
+            uint32_t formats[] = {
+                0x42475241, // BGRA (normal)
+                0x00000000, // zero
+                0xFFFFFFFF, // max
+                0x41524742, // ARGB (reversed)
+                0x59555932, // YUV2
+                0x4E563132, // NV12
+                0x00000001, // unusual small value
+                0x80000000, // high bit set
+            };
+            int nFormats = sizeof(formats)/sizeof(formats[0]);
+
+            for (int fi = 0; fi < nFormats && !isr_stopped(); fi++) {
+                NSDictionary *fp = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfaceBytesPerRow": @(256),
+                    @"IOSurfaceAllocSize": @(256 * 64),
+                    @"IOSurfacePixelFormat": @(formats[fi])
+                };
+                IOSurfaceRef fs = sym.create((__bridge CFDictionaryRef)fp);
+                if (fs) {
+                    log([NSString stringWithFormat:
+                        @"BOUNDARY: format=0x%08x CREATED alloc=%zu", formats[fi], sym.getAllocSize(fs)]);
+                    CFRelease(fs);
+                } else {
+                    log([NSString stringWithFormat:
+                        @"BOUNDARY: format=0x%08x REJECTED", formats[fi]]);
+                }
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"BOUNDARY: DONE created=%u rejected=%u mismatches=%u anomalies=%u elapsed=%.3fs",
+                created, rejected, mismatchHits, anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"created": @(created),
+                @"rejected": @(rejected),
+                @"mismatchHits": @(mismatchHits),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-Boundary-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
