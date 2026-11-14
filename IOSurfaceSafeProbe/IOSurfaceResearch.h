@@ -315,5 +315,15 @@ void iosurface_research_remap_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
 /// Probe 84: Kernel slide calculator — compute KASLR slide from leaked pointers + probe kernel memory.
 void iosurface_research_kslide(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// Round 28: Kernel R/W Construction
+/// Probe 85: Pointer classifier — categorize 154 leaked kernel ptrs, find IOSurface objects in heap.
+void iosurface_research_ptr_classifier(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 86: Stride corruption engine — exploit stride confusion for cross-surface OOB write.
+void iosurface_research_stride_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 87: Arbitrary read probe — combine all primitives to attempt kernel memory read.
+void iosurface_research_arb_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

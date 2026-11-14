@@ -17,8 +17,11 @@ struct JailbreakView: View {
         ("VM Remap + Syscall", .confirmed, "R26"),
         ("Kernel Address Leak", .confirmed, "R26"),
         ("OOB Heap Read", .confirmed, "R26"),
-        ("Kernel R/W Primitive", .pending, "R27"),
-        ("KASLR Slide Calc", .pending, "R27"),
+        ("KASLR Slide Defeated", .confirmed, "R27"),
+        ("Cross-Surface Data Leak", .confirmed, "R27"),
+        ("154 Kernel Ptr Leak", .confirmed, "R27"),
+        ("Kernel R/W Primitive", .pending, "R28"),
+        ("Stride OOB Write", .pending, "R28"),
     ]
 
     var body: some View {
@@ -148,7 +151,7 @@ struct JailbreakView: View {
             }
             .disabled(true)
 
-            Text("Requiere kernel R/W primitiva — Round 22 en progreso")
+            Text("Requiere kernel R/W primitiva — Round 28 en progreso")
                 .font(.caption2)
                 .foregroundStyle(.gray.opacity(0.5))
         }
