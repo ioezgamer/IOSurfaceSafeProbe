@@ -283,5 +283,16 @@ void iosurface_research_agx_driver(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// Probe 75: GPU DMA race — race between CPU modifying IOSurface and GPU rendering, exploit DMA window.
 void iosurface_research_gpu_dma_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 25: Deep Service Exploitation ---
+
+/// Probe 76: IOMobileFramebuffer deep — intensive selector fuzzing on type 4 with crafted structs, output capture, memory mapping.
+void iosurface_research_fb_deep(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 77: AppleJPEGDriver exploit — fuzz selectors on all 5 connection types with JPEG markers and IOSurface IDs.
+void iosurface_research_jpeg_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 78: Service chain — pass IOSurface through IOMobileFramebuffer and AppleJPEGDriver, detect cross-service memory corruption.
+void iosurface_research_service_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
