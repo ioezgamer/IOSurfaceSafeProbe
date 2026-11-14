@@ -2250,7 +2250,7 @@ void iosurface_research_xref_attack(ISRLogBlock log, ISRDoneBlock done) {
 
             // Phase C: Concurrent lookup + property read race
             log(@"XREF: Phase C — concurrent lookup/property-read race");
-            __block uint32_t propRaceAnomalies = 0;
+            __block _Atomic uint32_t propRaceAnomalies = 0;
             NSDictionary *raceParams = isr_default_surface_params(64, 64);
             IOSurfaceRef raceSurf = sym.create((__bridge CFDictionaryRef)raceParams);
 
@@ -2267,7 +2267,7 @@ void iosurface_research_xref_attack(ISRLogBlock log, ISRDoneBlock done) {
                                 size_t rw = sym.getWidth(l);
                                 size_t rh = sym.getHeight(l);
                                 if (rw != 64 || rh != 64) {
-                                    OSAtomicIncrement32((volatile int32_t *)&propRaceAnomalies);
+                                    atomic_fetch_add_explicit(&propRaceAnomalies, 1, memory_order_relaxed);
                                 }
                                 CFRelease(l);
                             }
