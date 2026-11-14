@@ -27,3 +27,4 @@ targets:
       - sdk: IOSurface.framework
       - sdk: CoreGraphics.framework
       - sdk: QuartzCore.framework
+      - sdk: Metal.framework

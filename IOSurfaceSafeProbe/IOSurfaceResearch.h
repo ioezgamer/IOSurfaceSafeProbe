@@ -272,5 +272,16 @@ void iosurface_research_struct_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
 /// Probe 72: Race exploit — multi-threaded IOConnectCallMethod + create/destroy TOCTOU race.
 void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 24: GPU/Metal Exploitation ---
+
+/// Probe 73: Metal corrupt — pass IOSurface to Metal as texture, modify stride mid-render for GPU OOB.
+void iosurface_research_metal_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 74: AGX driver — fuzz selectors on AGXAccelerator/AGXG15P GPU driver, much larger attack surface.
+void iosurface_research_agx_driver(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 75: GPU DMA race — race between CPU modifying IOSurface and GPU rendering, exploit DMA window.
+void iosurface_research_gpu_dma_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
