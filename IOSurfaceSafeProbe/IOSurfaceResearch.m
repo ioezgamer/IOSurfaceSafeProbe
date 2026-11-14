@@ -4048,9 +4048,9 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
             CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
             __block uint32_t anomalies = 0;
 
-            // Phase A: Pass IOSurface ID to IOKit services as scalar input
-            // Test if services blindly use the surface ID without validation
-            log(@"DEPUTY: Phase A — IOSurface ID injection into IOKit services");
+            // Phase A: Pass IOSurface ID as scalar input to IOSurfaceRoot only
+            // Other services (AVE2, AGX, GPU) can crash the process — skip them
+            log(@"DEPUTY: Phase A — IOSurface ID injection into IOSurfaceRoot");
 
             NSDictionary *params = isr_default_surface_params(64, 64);
             IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
@@ -4065,92 +4065,82 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
             sym.lock(surf, 0, NULL);
             void *base = sym.getBase(surf);
             if (base) {
-                memset(base, 0xCC, 64 * 64 * 4); // sentinel pattern
+                memset(base, 0xCC, 64 * 64 * 4);
             }
             sym.unlock(surf, 0, NULL);
 
             log([NSString stringWithFormat:@"DEPUTY: Test surface id=%u", surfID]);
 
-            // Try passing surface ID as selector input to IOSurfaceRoot
-            const char *services[] = {
-                "IOSurfaceRoot",
-                "IOMobileFramebuffer",
-                "AppleAVE2Driver",
-                "IOGPUDevice",
-                "AGXAccelerator"
-            };
-
-            typedef kern_return_t (*ISR_MapFn)(io_connect_t, uint32_t, mach_vm_address_t *, mach_vm_size_t *);
-            ISR_MapFn mapMem = (ISR_MapFn)dlsym(sym.iokit, "IOConnectMapMemory64");
-
             uint32_t servicesOpened = 0;
             uint32_t selectorsAccepted = 0;
-            uint32_t mapSuccess = 0;
 
-            for (int s = 0; s < 5 && !isr_stopped(); s++) {
-                CFMutableDictionaryRef match = sym.matching(services[s]);
-                if (!match) continue;
-
+            // Only test IOSurfaceRoot — safe, well-known service
+            CFMutableDictionaryRef match = sym.matching("IOSurfaceRoot");
+            if (match) {
                 io_service_t svc = sym.getMatch(MACH_PORT_NULL, match);
-                if (!svc) continue;
-
-                // Try connection types 0-3
-                for (uint32_t connType = 0; connType < 4; connType++) {
+                if (svc) {
                     io_connect_t conn = 0;
-                    kern_return_t kr = sym.open(svc, mach_task_self(), connType, &conn);
-                    if (kr != KERN_SUCCESS || !conn) continue;
-                    servicesOpened++;
+                    kern_return_t kr = sym.open(svc, mach_task_self(), 0, &conn);
+                    if (kr == KERN_SUCCESS && conn) {
+                        servicesOpened++;
+                        uint64_t scalarIn[2] = { surfID, 0 };
+                        uint64_t scalarOut[4] = {0};
+                        uint32_t outCnt = 4;
 
-                    // Pass surface ID as scalar input to selectors 0-10
-                    uint64_t scalarIn[2] = { surfID, 0 };
-                    uint64_t scalarOut[4] = {0};
-                    uint32_t outCnt = 4;
-
-                    for (uint32_t sel = 0; sel < 11 && !isr_stopped(); sel++) {
-                        kr = sym.call(conn, sel, scalarIn, 2, NULL, 0,
-                                      scalarOut, &outCnt, NULL, NULL);
-                        if (kr == KERN_SUCCESS) {
-                            selectorsAccepted++;
-                            log([NSString stringWithFormat:
-                                @"DEPUTY: %s type=%u sel=%u ACCEPTED with surfID — out=[%llu,%llu,%llu,%llu]",
-                                services[s], connType, sel,
-                                scalarOut[0], scalarOut[1], scalarOut[2], scalarOut[3]]);
-                        }
-                        outCnt = 4;
-                    }
-
-                    // Try IOConnectMapMemory with surface-related memory types
-                    if (mapMem) {
-                        for (uint32_t memType = 0; memType < 4; memType++) {
-                            mach_vm_address_t addr = 0;
-                            mach_vm_size_t size = 0;
-                            kr = mapMem(conn, memType, &addr, &size);
-                            if (kr == KERN_SUCCESS && addr != 0) {
-                                mapSuccess++;
+                        for (uint32_t sel = 0; sel < 11 && !isr_stopped(); sel++) {
+                            kr = sym.call(conn, sel, scalarIn, 2, NULL, 0,
+                                          scalarOut, &outCnt, NULL, NULL);
+                            if (kr == KERN_SUCCESS) {
+                                selectorsAccepted++;
                                 log([NSString stringWithFormat:
-                                    @"DEPUTY: %s type=%u mapMem(%u) = addr=0x%llx size=%llu",
-                                    services[s], connType, memType,
-                                    (uint64_t)addr, (uint64_t)size]);
+                                    @"DEPUTY: IOSurfaceRoot sel=%u ACCEPTED surfID — out=[%llu,%llu,%llu,%llu]",
+                                    sel, scalarOut[0], scalarOut[1], scalarOut[2], scalarOut[3]]);
                             }
+                            outCnt = 4;
                         }
+                        sym.close(conn);
                     }
-
-                    sym.close(conn);
+                    sym.release(svc);
                 }
-                sym.release(svc);
+            }
+
+            // Also test IOMobileFramebuffer type 0 only (known safe from Round 4)
+            CFMutableDictionaryRef fbMatch = sym.matching("IOMobileFramebuffer");
+            if (fbMatch) {
+                io_service_t fbSvc = sym.getMatch(MACH_PORT_NULL, fbMatch);
+                if (fbSvc) {
+                    io_connect_t fbConn = 0;
+                    kern_return_t kr = sym.open(fbSvc, mach_task_self(), 0, &fbConn);
+                    if (kr == KERN_SUCCESS && fbConn) {
+                        servicesOpened++;
+                        uint64_t scalarIn[2] = { surfID, 0 };
+                        uint64_t scalarOut[4] = {0};
+                        uint32_t outCnt = 4;
+
+                        for (uint32_t sel = 0; sel < 6 && !isr_stopped(); sel++) {
+                            kr = sym.call(fbConn, sel, scalarIn, 2, NULL, 0,
+                                          scalarOut, &outCnt, NULL, NULL);
+                            if (kr == KERN_SUCCESS) {
+                                selectorsAccepted++;
+                                log([NSString stringWithFormat:
+                                    @"DEPUTY: IOMobileFramebuffer sel=%u ACCEPTED surfID — out=[%llu,%llu,%llu,%llu]",
+                                    sel, scalarOut[0], scalarOut[1], scalarOut[2], scalarOut[3]]);
+                            }
+                            outCnt = 4;
+                        }
+                        sym.close(fbConn);
+                    }
+                    sym.release(fbSvc);
+                }
             }
 
             log([NSString stringWithFormat:
-                @"DEPUTY: Phase A — opened=%u accepted=%u maps=%u",
-                servicesOpened, selectorsAccepted, mapSuccess]);
+                @"DEPUTY: Phase A — opened=%u accepted=%u",
+                servicesOpened, selectorsAccepted]);
 
             if (selectorsAccepted > 0) {
                 anomalies++;
                 log(@"DEPUTY: ANOMALY — services accepted surface ID as input");
-            }
-            if (mapSuccess > 0) {
-                anomalies++;
-                log(@"DEPUTY: ANOMALY — shared memory mapped from IOKit services");
             }
 
             // Phase B: Stale ID injection — destroy surface then pass old ID
@@ -4159,7 +4149,6 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
             CFRelease(surf);
             surf = NULL;
 
-            // Try to use stale ID via IOSurfaceLookup
             IOSurfaceRef staleLookup = sym.lookup(staleID);
             if (staleLookup) {
                 anomalies++;
@@ -4171,7 +4160,7 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
                     @"DEPUTY: Stale ID %u correctly invalidated", staleID]);
             }
 
-            // Pass stale ID to IOSurfaceRoot
+            // Pass stale ID to IOSurfaceRoot only
             CFMutableDictionaryRef rootMatch = sym.matching("IOSurfaceRoot");
             if (rootMatch) {
                 io_service_t rootSvc = sym.getMatch(MACH_PORT_NULL, rootMatch);
@@ -4184,7 +4173,7 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
                         uint32_t outCnt = 4;
 
                         uint32_t staleAccepted = 0;
-                        for (uint32_t sel = 0; sel < 20; sel++) {
+                        for (uint32_t sel = 0; sel < 11; sel++) {
                             kr = sym.call(rootConn, sel, staleIn, 2, NULL, 0,
                                           out, &outCnt, NULL, NULL);
                             if (kr == KERN_SUCCESS) {
@@ -4207,7 +4196,8 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
                 }
             }
 
-            // Phase C: Type confusion — create surface, pass its ID as struct input
+            // Phase C: Type confusion — pass surface ID as small struct input
+            // Use only 16-byte struct to avoid triggering kernel panics
             log(@"DEPUTY: Phase C — type confusion via struct input");
             IOSurfaceRef confSurf = sym.create((__bridge CFDictionaryRef)
                 isr_default_surface_params(128, 128));
@@ -4216,13 +4206,10 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
             if (confSurf) {
                 IOSurfaceID confID = sym.getID(confSurf);
 
-                // Build a struct with the surface ID embedded at various offsets
-                uint8_t structBuf[256];
+                uint8_t structBuf[16];
                 memset(structBuf, 0, sizeof(structBuf));
-                // Place surface ID at offset 0, 4, 8
                 memcpy(&structBuf[0], &confID, sizeof(confID));
                 memcpy(&structBuf[4], &confID, sizeof(confID));
-                memcpy(&structBuf[8], &confID, sizeof(confID));
 
                 CFMutableDictionaryRef m2 = sym.matching("IOSurfaceRoot");
                 if (m2) {
@@ -4230,10 +4217,10 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
                     if (svc2) {
                         io_connect_t conn2 = 0;
                         if (sym.open(svc2, mach_task_self(), 0, &conn2) == KERN_SUCCESS && conn2) {
-                            for (uint32_t sel = 0; sel < 20 && !isr_stopped(); sel++) {
+                            for (uint32_t sel = 0; sel < 11 && !isr_stopped(); sel++) {
                                 uint64_t out[4] = {0};
                                 uint32_t outCnt = 4;
-                                uint8_t outStruct[256] = {0};
+                                uint8_t outStruct[64] = {0};
                                 size_t outStructSz = sizeof(outStruct);
 
                                 kern_return_t kr = sym.call(conn2, sel,
@@ -4268,7 +4255,6 @@ void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _
                 @"status": isr_stopped() ? @"STOPPED" : @"DONE",
                 @"servicesOpened": @(servicesOpened),
                 @"selectorsAccepted": @(selectorsAccepted),
-                @"mapSuccess": @(mapSuccess),
                 @"structAccepted": @(structAccepted),
                 @"anomalies": @(anomalies),
                 @"elapsed": @(elapsed)
