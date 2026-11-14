@@ -1298,7 +1298,7 @@ void iosurface_research_conn_types(ISRLogBlock log, ISRDoneBlock done) {
 
                 CFDictionaryRef m = sym.matching("IOSurfaceRoot");
                 if (!m) continue;
-                io_service_t svc = sym.getMatch(kIOMasterPortDefault, m);
+                io_service_t svc = sym.getMatch(MACH_PORT_NULL, m);
                 if (!svc) continue;
 
                 io_connect_t conn = 0;
@@ -1351,7 +1351,7 @@ void iosurface_research_conn_types(ISRLogBlock log, ISRDoneBlock done) {
             for (int ti = 0; ti < nTasks && !isr_stopped(); ti++) {
                 CFDictionaryRef m2 = sym.matching("IOSurfaceRoot");
                 if (!m2) continue;
-                io_service_t svc2 = sym.getMatch(kIOMasterPortDefault, m2);
+                io_service_t svc2 = sym.getMatch(MACH_PORT_NULL, m2);
                 if (!svc2) continue;
 
                 io_connect_t conn2 = 0;
@@ -1390,7 +1390,7 @@ void iosurface_research_conn_types(ISRLogBlock log, ISRDoneBlock done) {
             for (int si = 1; si < nServices && !isr_stopped(); si++) {
                 CFDictionaryRef m3 = sym.matching(services[si]);
                 if (!m3) continue;
-                io_service_t svc3 = sym.getMatch(kIOMasterPortDefault, m3);
+                io_service_t svc3 = sym.getMatch(MACH_PORT_NULL, m3);
                 if (!svc3) {
                     log([NSString stringWithFormat:@"CONN: service '%s' not found", services[si]]);
                     continue;
