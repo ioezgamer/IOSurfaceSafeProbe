@@ -96,5 +96,16 @@ void iosurface_research_plane_overlap(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 /// Probe 24: Mach port race — port lifecycle attacks, reuse, and 50-thread race condition.
 void iosurface_research_port_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 8: Exploit confirmed vulnerabilities ---
+
+/// Probe 25: Phantom plane — write to phantom planes in format-mismatched surfaces.
+void iosurface_research_phantom_plane(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 26: Global spy — espionage via IOSurfaceIsGlobal cross-lookup and tampering.
+void iosurface_research_global_spy(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 27: ID oracle — predictable ID exploitation and stale reference persistence.
+void iosurface_research_id_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

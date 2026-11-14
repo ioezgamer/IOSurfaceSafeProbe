@@ -86,6 +86,16 @@ struct ResearchView: View {
         ("portrace", "Mach Port Race", "bolt.shield.fill",
          "Ataque de puertos Mach: lifecycle, reuso y race masivo 50 hilos",
          { log, done in iosurface_research_port_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 8
+        ("phantom", "Phantom Plane", "rectangle.stack.badge.play.fill",
+         "Escritura en planos fantasma de surfaces con format mismatch",
+         { log, done in iosurface_research_phantom_plane({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("globalspy", "Global Spy", "eye.circle.fill",
+         "Espionaje via IOSurfaceIsGlobal — acceso cross-lookup y tampering",
+         { log, done in iosurface_research_global_spy({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("idoracle", "ID Oracle", "number.circle.fill",
+         "Prediccion de IDs y ataque de referencia stale post-destroy",
+         { log, done in iosurface_research_id_oracle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -211,7 +221,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 21), id: \.id) { probe in
+            ForEach(probes[21..<24], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 8 — Explotacion de Vulnerabilidades")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.yellow)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 24), id: \.id) { probe in
                 probeCard(probe)
             }
 
