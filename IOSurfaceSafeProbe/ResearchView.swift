@@ -297,6 +297,16 @@ struct ResearchView: View {
         ("arbread", "Arbitrary Read", "eye.trianglebadge.exclamationmark.fill",
          "Combina todas las primitivas para intentar lectura arbitraria de memoria kernel",
          { log, done in iosurface_research_arb_read({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 29
+        ("vtblspray", "Vtable Spray", "cpu.fill",
+         "Spray 200 surfaces, localiza vtables via OOB, intenta overwrite para confusión",
+         { log, done in iosurface_research_vtbl_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("refcorr", "Refcount Corrupt", "bolt.trianglebadge.exclamationmark.fill",
+         "Busca header IOSurface via OOB, corrompe refcount para UAF controlado + reclaim",
+         { log, done in iosurface_research_refcount_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("pipekrw", "Pipe Kernel R/W", "arrow.left.arrow.right.circle.fill",
+         "256 pipes como oráculos de heap kernel — localiza buffers via OOB para R/W primitiva",
+         { log, done in iosurface_research_pipe_krw({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -670,7 +680,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 84), id: \.id) { probe in
+            ForEach(probes[84..<87], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 29 ---
+            Text("Round 29 — Kernel Takeover")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 87), id: \.id) { probe in
                 probeCard(probe)
             }
 

