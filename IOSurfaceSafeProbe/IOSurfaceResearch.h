@@ -325,5 +325,15 @@ void iosurface_research_stride_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _N
 /// Probe 87: Arbitrary read probe — combine all primitives to attempt kernel memory read.
 void iosurface_research_arb_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// Round 29: Kernel Takeover
+/// Probe 88: Vtable spray + confusion — spray IOSurfaces, locate vtables via OOB, attempt overwrite.
+void iosurface_research_vtbl_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 89: Refcount corruption — find IOSurface header via sentinel, corrupt refcount for controlled UAF.
+void iosurface_research_refcount_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 90: Pipe kernel R/W — use pipe buffers as kernel heap oracles for read/write primitive.
+void iosurface_research_pipe_krw(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
