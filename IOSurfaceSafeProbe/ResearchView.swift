@@ -197,6 +197,16 @@ struct ResearchView: View {
         ("kobjredir", "Kobject Redir", "arrow.triangle.turn.up.right.diamond.fill",
          "Kernel R/W completo — port locate iterativo + kobject redirect + verificación R/W",
          { log, done in iosurface_research_kobject_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 19
+        ("dicthijack", "Dict Hijack", "book.closed.fill",
+         "Stride OOB write para corromper propiedades de surfaces adyacentes — hijack diccionario kernel",
+         { log, done in iosurface_research_dict_hijack({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("propfake", "Prop Fake", "wand.and.stars",
+         "Escribe patrones AAAA via stride OOB — verifica si getters del target devuelven datos corruptos",
+         { log, done in iosurface_research_prop_fake({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kernread", "Kernel Read", "eye.trianglebadge.exclamationmark.fill",
+         "Localiza metadata de surface en OOB — corrompe campos de tamaño — escanea punteros kernel",
+         { log, done in iosurface_research_kernel_read({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -451,7 +461,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 54), id: \.id) { probe in
+            ForEach(probes[54..<57], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 19 ---
+            Text("Round 19 — Property Dictionary Hijack")
+                .font(.caption.bold())
+                .foregroundStyle(.cyan)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 57), id: \.id) { probe in
                 probeCard(probe)
             }
 
