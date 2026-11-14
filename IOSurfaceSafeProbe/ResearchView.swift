@@ -187,6 +187,16 @@ struct ResearchView: View {
         ("krwchain", "K-R/W Chain", "link.circle.fill",
          "Cadena completa: spray + port locate + kobject read + redirect + R/W arbitrario",
          { log, done in iosurface_research_krw_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 18
+        ("megaspray", "Mega Spray", "drop.deferred.fill",
+         "Grooming masivo del heap — 5 ciclos con 100 surfaces + 200 ports para adjacencia fiable",
+         { log, done in iosurface_research_mega_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("porthunt", "Port Hunt", "binoculars.fill",
+         "Búsqueda iterativa de port — hasta 10 intentos spray+scan, mapeo completo de 256 bytes",
+         { log, done in iosurface_research_port_hunt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kobjredir", "Kobject Redir", "arrow.triangle.turn.up.right.diamond.fill",
+         "Kernel R/W completo — port locate iterativo + kobject redirect + verificación R/W",
+         { log, done in iosurface_research_kobject_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -429,7 +439,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 51), id: \.id) { probe in
+            ForEach(probes[51..<54], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 18 ---
+            Text("Round 18 — Stable Heap Grooming")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 54), id: \.id) { probe in
                 probeCard(probe)
             }
 
