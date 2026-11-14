@@ -106,6 +106,16 @@ struct ResearchView: View {
         ("globalovf", "Global+Overflow", "globe.badge.chevron.backward",
          "Combo global surface + CG overflow con analisis de entropia Shannon",
          { log, done in iosurface_research_global_overflow({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 10
+        ("cgread", "CG Cross-Plane Read", "doc.text.magnifyingglass",
+         "OOB read REAL: lee datos de plane1 via contexto CG en plane0",
+         { log, done in iosurface_research_cg_crossplane_read({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("machijack", "Mach Port Hijack", "lock.open.rotation",
+         "Secuestra surface via mach port: lectura y tamper desde segunda referencia",
+         { log, done in iosurface_research_mach_hijack({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("toctou", "Global TOCTOU", "arrow.triangle.2.circlepath.circle.fill",
+         "Race condition TOCTOU: spy modifica datos entre check y use del owner",
+         { log, done in iosurface_research_global_toctou({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -253,7 +263,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 27), id: \.id) { probe in
+            ForEach(probes[27..<30], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 10 — Explotacion Real")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 30), id: \.id) { probe in
                 probeCard(probe)
             }
 
