@@ -96,6 +96,16 @@ struct ResearchView: View {
         ("idoracle", "ID Oracle", "number.circle.fill",
          "Prediccion de IDs y ataque de referencia stale post-destroy",
          { log, done in iosurface_research_id_oracle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 9
+        ("cgoverflow", "CG Overflow", "rectangle.expand.vertical",
+         "Amplificador de overflow CG: lectura maxima cross-plane y cross-surface",
+         { log, done in iosurface_research_cg_overflow({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("spraycg", "Spray+CG Chain", "link.badge.plus",
+         "Cadena heap spray + CG overflow para harvest de datos cross-surface",
+         { log, done in iosurface_research_spray_cg_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("globalovf", "Global+Overflow", "globe.badge.chevron.backward",
+         "Combo global surface + CG overflow con analisis de entropia Shannon",
+         { log, done in iosurface_research_global_overflow({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -232,7 +242,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 24), id: \.id) { probe in
+            ForEach(probes[24..<27], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 9 — Cadena CG Overflow")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.pink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 27), id: \.id) { probe in
                 probeCard(probe)
             }
 
