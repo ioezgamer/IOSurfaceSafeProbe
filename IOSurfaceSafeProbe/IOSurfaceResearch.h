@@ -52,5 +52,16 @@ void iosurface_research_format_render(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 /// Probe 12: Cross-reference attack — share surfaces between connections with conflicting properties.
 void iosurface_research_xref_attack(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 4: Deep exploitation vectors ---
+
+/// Probe 13: IOMobileFramebuffer deep scan — selector fuzzing on all 8 connection types.
+void iosurface_research_framebuffer(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 14: Format mismatch attack — pass IOSurface buffers to CG with conflicting bitmap info.
+void iosurface_research_format_mismatch(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 15: Kernel info leak — extract metadata, seed values, plane info for kernel pointer disclosure.
+void iosurface_research_info_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
