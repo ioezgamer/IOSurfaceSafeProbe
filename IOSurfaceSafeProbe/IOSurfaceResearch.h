@@ -206,5 +206,16 @@ void iosurface_research_port_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 /// Probe 54: Kernel R/W chain — full chain: spray + port locate + kobject read + redirect + arbitrary R/W.
 void iosurface_research_krw_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 18: Stable heap grooming ---
+
+/// Probe 55: Mega spray groom — massive heap grooming for reliable port adjacency.
+void iosurface_research_mega_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 56: Iterative port hunt — repeat spray+scan cycles until port found, then map completely.
+void iosurface_research_port_hunt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 57: Kobject redirect — full kernel R/W via iterative port locate + kobject redirect.
+void iosurface_research_kobject_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
