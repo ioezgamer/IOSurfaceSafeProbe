@@ -129,5 +129,16 @@ void iosurface_research_mach_hijack(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
 /// Probe 33: Global surface TOCTOU — race between lookup and write for time-of-check/time-of-use.
 void iosurface_research_global_toctou(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 11: System service TOCTOU attacks ---
+
+/// Probe 34: Compositor TOCTOU — race against backboardd render server via CALayer-backed IOSurface.
+void iosurface_research_compositor_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 35: System surface sniff — detect system daemon access via use-count and bootstrap enumeration.
+void iosurface_research_system_sniff(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 36: Render server corruption — dual-plane surface as compositor input for cross-plane leak.
+void iosurface_research_render_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

