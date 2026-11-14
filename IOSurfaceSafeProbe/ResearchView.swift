@@ -46,6 +46,16 @@ struct ResearchView: View {
         ("xref", "Cross-Reference", "arrow.triangle.swap",
          "Comparte surfaces entre conexiones con propiedades conflictivas",
          { log, done in iosurface_research_xref_attack({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 4
+        ("fb", "Framebuffer", "rectangle.on.rectangle.angled",
+         "Fuzzing de selectores en IOMobileFramebuffer — 8 tipos de conexion abiertos",
+         { log, done in iosurface_research_framebuffer({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("mismatch", "Format Mismatch", "exclamationmark.triangle.fill",
+         "Ataque de mismatch: bpe/formato IOSurface vs bitmap info de CoreGraphics",
+         { log, done in iosurface_research_format_mismatch({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("infoleak", "Info Leak", "eye.trianglebadge.exclamationmark.fill",
+         "Busca disclosure de punteros kernel, seeds, planos y entropia de direcciones",
+         { log, done in iosurface_research_info_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -127,7 +137,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 9), id: \.id) { probe in
+            ForEach(probes[9..<12], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 4 — Explotacion Profunda")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 12), id: \.id) { probe in
                 probeCard(probe)
             }
 

@@ -2307,3 +2307,729 @@ void iosurface_research_xref_attack(ISRLogBlock log, ISRDoneBlock done) {
         }
     });
 }
+
+#pragma mark - Probe 13: IOMobileFramebuffer Deep Scan (Round 4)
+
+void iosurface_research_framebuffer(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"FB: ERROR — failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"FB: === IOMobileFramebuffer Deep Scanner ===");
+            log(@"FB: Round 3 found 8 connection types open — now fuzzing selectors on each");
+
+            uint32_t anomalies = 0;
+            uint32_t selectorsAccepted = 0;
+            uint32_t dataReturned = 0;
+            uint32_t unusualErrors = 0;
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+
+            CFDictionaryRef m = sym.matching("IOMobileFramebuffer");
+            if (!m) {
+                log(@"FB: ERROR — service matching dict creation failed");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            io_service_t svc = sym.getMatch(MACH_PORT_NULL, m);
+            if (!svc) {
+                log(@"FB: ERROR — IOMobileFramebuffer service not found");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"FB: IOMobileFramebuffer service found");
+
+            // Phase A: Selector fuzzing on all 8 connection types
+            for (uint32_t ct = 0; ct <= 7 && !isr_stopped(); ct++) {
+                isr_checkpoint(@"ISR-FB-checkpoint.json", @{
+                    @"phase": @"A", @"connType": @(ct), @"accepted": @(selectorsAccepted)
+                });
+
+                io_connect_t conn = 0;
+                kern_return_t kr = sym.open(svc, mach_task_self(), ct, &conn);
+
+                if (kr != KERN_SUCCESS || !conn) {
+                    log([NSString stringWithFormat:@"FB: type=%u connection failed kr=0x%08x", ct, (unsigned)kr]);
+                    continue;
+                }
+
+                log([NSString stringWithFormat:@"FB: type=%u OPENED conn=0x%x — fuzzing selectors 0-50", ct, conn]);
+
+                for (uint32_t sel = 0; sel <= 50 && !isr_stopped(); sel++) {
+                    // Pattern 1: Empty call
+                    uint64_t scalarOut[16] = {};
+                    uint32_t scalarOutCnt = 16;
+                    kern_return_t skr = sym.call(conn, sel,
+                        NULL, 0, NULL, 0,
+                        scalarOut, &scalarOutCnt, NULL, NULL);
+
+                    if (skr == KERN_SUCCESS) {
+                        selectorsAccepted++;
+                        NSMutableString *vals = [NSMutableString new];
+                        for (uint32_t i = 0; i < scalarOutCnt && i < 8; i++) {
+                            [vals appendFormat:@"0x%llx ", scalarOut[i]];
+                        }
+                        log([NSString stringWithFormat:
+                            @"FB: ACCEPTED type=%u sel=%u outCnt=%u vals=[%@]",
+                            ct, sel, scalarOutCnt, vals]);
+                        if (scalarOutCnt > 0) dataReturned++;
+                    }
+
+                    // Pattern 2: Scalar inputs (0-3 scalars)
+                    for (uint32_t nScalars = 1; nScalars <= 3 && !isr_stopped(); nScalars++) {
+                        uint64_t scalarIn[3] = {0, 0, 0};
+                        scalarOutCnt = 16;
+                        memset(scalarOut, 0, sizeof(scalarOut));
+                        skr = sym.call(conn, sel,
+                            scalarIn, nScalars, NULL, 0,
+                            scalarOut, &scalarOutCnt, NULL, NULL);
+
+                        if (skr == KERN_SUCCESS) {
+                            selectorsAccepted++;
+                            log([NSString stringWithFormat:
+                                @"FB: ACCEPTED type=%u sel=%u nScIn=%u outCnt=%u",
+                                ct, sel, nScalars, scalarOutCnt]);
+                        }
+                    }
+
+                    // Pattern 3: Struct input — IOSurface ID as first field
+                    NSDictionary *surfParams = isr_default_surface_params(64, 64);
+                    IOSurfaceRef testSurf = sym.create((__bridge CFDictionaryRef)surfParams);
+                    if (testSurf) {
+                        IOSurfaceID surfID = sym.getID(testSurf);
+                        uint8_t structIn[128] = {};
+                        *(uint32_t *)structIn = surfID;
+                        *(uint32_t *)(structIn + 4) = 64;  // width
+                        *(uint32_t *)(structIn + 8) = 64;  // height
+                        *(uint32_t *)(structIn + 12) = 0x42475241; // BGRA
+
+                        uint8_t structOut[512] = {};
+                        size_t structOutSz = sizeof(structOut);
+                        scalarOutCnt = 16;
+                        memset(scalarOut, 0, sizeof(scalarOut));
+
+                        skr = sym.call(conn, sel,
+                            NULL, 0, structIn, 64,
+                            scalarOut, &scalarOutCnt, structOut, &structOutSz);
+
+                        if (skr == KERN_SUCCESS) {
+                            selectorsAccepted++;
+                            BOOL hasData = NO;
+                            for (size_t i = 0; i < structOutSz && i < 64; i++) {
+                                if (structOut[i] != 0) { hasData = YES; break; }
+                            }
+                            if (hasData) {
+                                dataReturned++;
+                                NSMutableString *hex = [NSMutableString new];
+                                for (size_t i = 0; i < MIN(structOutSz, (size_t)32); i++) {
+                                    [hex appendFormat:@"%02x", structOut[i]];
+                                    if ((i + 1) % 8 == 0) [hex appendString:@" "];
+                                }
+                                log([NSString stringWithFormat:
+                                    @"FB: DATA type=%u sel=%u structOut[%zu]: %@",
+                                    ct, sel, structOutSz, hex]);
+                                anomalies++;
+                            }
+                        }
+                        CFRelease(testSurf);
+                    }
+
+                    // Track unusual error codes
+                    if (skr != KERN_SUCCESS &&
+                        skr != KERN_INVALID_ARGUMENT &&
+                        skr != KERN_NOT_SUPPORTED &&
+                        skr != 0xe00002c2 &&
+                        skr != 0xe00002bc &&
+                        skr != 0xe00002be &&
+                        skr != 0xe0000001 &&
+                        skr != 0xe00002cd)
+                    {
+                        unusualErrors++;
+                        if (unusualErrors <= 20) {
+                            log([NSString stringWithFormat:
+                                @"FB: UNUSUAL type=%u sel=%u kr=0x%08x",
+                                ct, sel, (unsigned)skr]);
+                        }
+                    }
+                }
+
+                sym.close(conn);
+            }
+
+            // Phase B: Try to pass IOSurface to framebuffer via IOConnectMapMemory
+            log(@"FB: Phase B — IOConnectMapMemory probing");
+            typedef kern_return_t (*IOConnectMapMemoryFn)(io_connect_t, uint32_t, task_port_t,
+                mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+            void *iokitLib = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+            IOConnectMapMemoryFn mapMem = NULL;
+            if (iokitLib) {
+                mapMem = (IOConnectMapMemoryFn)dlsym(iokitLib, "IOConnectMapMemory64");
+            }
+
+            if (mapMem) {
+                for (uint32_t ct = 0; ct <= 3 && !isr_stopped(); ct++) {
+                    io_connect_t conn = 0;
+                    kern_return_t kr = sym.open(svc, mach_task_self(), ct, &conn);
+                    if (kr != KERN_SUCCESS || !conn) continue;
+
+                    for (uint32_t memType = 0; memType <= 10; memType++) {
+                        mach_vm_address_t addr = 0;
+                        mach_vm_size_t size = 0;
+                        kr = mapMem(conn, memType, mach_task_self(), &addr, &size, 1);
+
+                        if (kr == KERN_SUCCESS && addr && size) {
+                            anomalies++;
+                            log([NSString stringWithFormat:
+                                @"FB: MAPPED type=%u memType=%u addr=0x%llx size=%llu",
+                                ct, memType, (unsigned long long)addr, (unsigned long long)size]);
+
+                            // Check what's at the mapped address
+                            uint8_t *p = (uint8_t *)(uintptr_t)addr;
+                            NSMutableString *hex = [NSMutableString new];
+                            for (size_t i = 0; i < MIN((size_t)size, (size_t)64); i++) {
+                                [hex appendFormat:@"%02x", p[i]];
+                                if ((i + 1) % 16 == 0) [hex appendString:@" "];
+                            }
+                            log([NSString stringWithFormat:@"FB: MAP_DATA: %@", hex]);
+                        } else if (kr != KERN_NOT_SUPPORTED && kr != 0xe00002c2 && kr != KERN_INVALID_ARGUMENT) {
+                            log([NSString stringWithFormat:
+                                @"FB: mapMem type=%u memType=%u kr=0x%08x",
+                                ct, memType, (unsigned)kr]);
+                        }
+                    }
+                    sym.close(conn);
+                }
+            }
+            if (iokitLib) dlclose(iokitLib);
+
+            sym.release(svc);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"FB: DONE selectors=%u dataReturned=%u unusualErrs=%u anomalies=%u elapsed=%.3fs",
+                selectorsAccepted, dataReturned, unusualErrors, anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"selectorsAccepted": @(selectorsAccepted),
+                @"dataReturned": @(dataReturned),
+                @"unusualErrors": @(unusualErrors),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-FB-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 14: Format Mismatch Attack (Round 4)
+
+void iosurface_research_format_mismatch(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"MISMATCH: ERROR — failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"MISMATCH: === Format Mismatch Attack ===");
+            log(@"MISMATCH: IOSurface accepts ANY format — testing what happens downstream");
+
+            uint32_t anomalies = 0;
+            uint32_t memoryCorruption = 0;
+            uint32_t oobReads = 0;
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+
+            void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+                              RTLD_LAZY | RTLD_LOCAL);
+            if (!cg) {
+                log(@"MISMATCH: ERROR — CoreGraphics load failed");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef CGColorSpaceRef (*CGCSCreateFn)(void);
+            typedef CGContextRef (*CGBCCreateFn)(void *, size_t, size_t, size_t, size_t,
+                                                  CGColorSpaceRef, uint32_t);
+            typedef void (*CGCtxRelFn)(CGContextRef);
+            typedef void (*CGCSRelFn)(CGColorSpaceRef);
+            typedef void (*CGCtxSetFillFn)(CGContextRef, CGFloat, CGFloat, CGFloat, CGFloat);
+            typedef void (*CGCtxFillRectFn)(CGContextRef, CGRect);
+            typedef CGImageRef (*CGBCCreateImgFn)(CGContextRef);
+            typedef void (*CGImgRelFn)(CGImageRef);
+            typedef size_t (*CGImgGetWFn)(CGImageRef);
+            typedef size_t (*CGImgGetHFn)(CGImageRef);
+            typedef size_t (*CGImgGetBPCFn)(CGImageRef);
+            typedef size_t (*CGImgGetBPPFn)(CGImageRef);
+
+            CGCSCreateFn csCreate = (CGCSCreateFn)dlsym(cg, "CGColorSpaceCreateDeviceRGB");
+            CGBCCreateFn bcCreate = (CGBCCreateFn)dlsym(cg, "CGBitmapContextCreate");
+            CGCtxRelFn ctxRel = (CGCtxRelFn)dlsym(cg, "CGContextRelease");
+            CGCSRelFn csRel = (CGCSRelFn)dlsym(cg, "CGColorSpaceRelease");
+            CGCtxSetFillFn setFill = (CGCtxSetFillFn)dlsym(cg, "CGContextSetRGBFillColor");
+            CGCtxFillRectFn fillRect = (CGCtxFillRectFn)dlsym(cg, "CGContextFillRect");
+            CGBCCreateImgFn createImg = (CGBCCreateImgFn)dlsym(cg, "CGBitmapContextCreateImage");
+            CGImgRelFn imgRel = (CGImgRelFn)dlsym(cg, "CGImageRelease");
+            CGImgGetWFn imgW = (CGImgGetWFn)dlsym(cg, "CGImageGetWidth");
+            CGImgGetHFn imgH = (CGImgGetHFn)dlsym(cg, "CGImageGetHeight");
+            CGImgGetBPCFn imgBPC = (CGImgGetBPCFn)dlsym(cg, "CGImageGetBitsPerComponent");
+            CGImgGetBPPFn imgBPP = (CGImgGetBPPFn)dlsym(cg, "CGImageGetBitsPerPixel");
+
+            if (!csCreate || !bcCreate || !ctxRel || !csRel) {
+                log(@"MISMATCH: ERROR — CG symbols missing");
+                dlclose(cg);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            CGColorSpaceRef cs = csCreate();
+
+            // Test: Create IOSurface with format X but bytesPerElement Y (mismatch)
+            struct {
+                uint32_t format;
+                uint32_t bpe;       // bytes per element declared
+                uint32_t cgInfo;    // CGBitmapInfo for CG context
+                size_t cgBPC;       // bits per component for CG
+                const char *label;
+            } tests[] = {
+                // Normal: 4 bpe, BGRA premul
+                { 0x42475241, 4, 1 | (2 << 12), 8, "normal_4bpe" },
+                // Mismatch: declared 1 bpe but buffer is 4 bytes wide per pixel
+                { 0x42475241, 1, 1 | (2 << 12), 8, "bpe1_cgBGRA" },
+                // Mismatch: declared 8 bpe (16-bit) but CG uses 8-bit
+                { 0x42475241, 8, 1 | (2 << 12), 8, "bpe8_cg8bit" },
+                // Mismatch: declared 2 bpe (16-bit pixel) but CG uses 32-bit
+                { 0x42475241, 2, 1 | (2 << 12), 8, "bpe2_cg32bit" },
+                // Format 0 but valid CG context
+                { 0x00000000, 4, 1 | (2 << 12), 8, "fmt0_cg32" },
+                // Huge bpe
+                { 0x42475241, 64, 1 | (2 << 12), 8, "bpe64_cg32" },
+                // Float format with integer CG
+                { 0x42475241, 4, 6 | (2 << 12), 8, "int_cgFloat" },
+                // Normal format, CG float 16bpc
+                { 0x42475241, 4, 6 | (2 << 12), 16, "bgra_cg16float" },
+            };
+            int nTests = sizeof(tests) / sizeof(tests[0]);
+
+            size_t w = 64, h = 64;
+
+            for (int ti = 0; ti < nTests && !isr_stopped(); ti++) {
+                isr_checkpoint(@"ISR-Mismatch-checkpoint.json", @{
+                    @"test": @(tests[ti].label), @"anomalies": @(anomalies)
+                });
+
+                size_t bpr = w * tests[ti].bpe;
+                size_t allocSz = bpr * h;
+                if (allocSz == 0 || allocSz > 1024 * 1024) allocSz = w * 4 * h;
+                if (bpr == 0) bpr = w * 4;
+
+                NSDictionary *params = @{
+                    @"IOSurfaceWidth": @(w),
+                    @"IOSurfaceHeight": @(h),
+                    @"IOSurfaceBytesPerElement": @(tests[ti].bpe),
+                    @"IOSurfaceBytesPerRow": @(bpr),
+                    @"IOSurfaceAllocSize": @(allocSz),
+                    @"IOSurfacePixelFormat": @(tests[ti].format),
+                };
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+                if (!surf) {
+                    log([NSString stringWithFormat:@"MISMATCH: '%s' creation failed", tests[ti].label]);
+                    continue;
+                }
+
+                size_t realAlloc = sym.getAllocSize(surf);
+                size_t realBpr = sym.getBytesPerRow(surf);
+                log([NSString stringWithFormat:
+                    @"MISMATCH: '%s' created — declared bpe=%u bpr=%zu alloc=%zu real_bpr=%zu real_alloc=%zu",
+                    tests[ti].label, tests[ti].bpe, bpr, allocSz, realBpr, realAlloc]);
+
+                // Write a known pattern
+                sym.lock(surf, 0, NULL);
+                void *base = sym.getBase(surf);
+                if (base) {
+                    memset(base, 0xAA, realAlloc);
+                    // Write canary at end
+                    if (realAlloc >= 16) {
+                        uint8_t *end = (uint8_t *)base + realAlloc - 16;
+                        memset(end, 0xCC, 16);
+                    }
+                }
+                sym.unlock(surf, 0, NULL);
+
+                // Now create CG context using the REAL buffer but with DIFFERENT dimensions
+                size_t cgBpr = w * 4;
+                sym.lock(surf, 0, NULL);
+                base = sym.getBase(surf);
+
+                if (base && realAlloc >= cgBpr * h) {
+                    CGContextRef ctx = bcCreate(base, w, h, tests[ti].cgBPC, cgBpr, cs, tests[ti].cgInfo);
+
+                    if (ctx) {
+                        // Draw to the surface via CG
+                        if (setFill && fillRect) {
+                            setFill(ctx, 0.0, 1.0, 0.0, 1.0);
+                            fillRect(ctx, CGRectMake(0, 0, w, h));
+                        }
+
+                        // Create image — this forces CG to read the buffer
+                        if (createImg) {
+                            CGImageRef img = createImg(ctx);
+                            if (img) {
+                                size_t iw = imgW ? imgW(img) : 0;
+                                size_t ih = imgH ? imgH(img) : 0;
+                                size_t ibpc = imgBPC ? imgBPC(img) : 0;
+                                size_t ibpp = imgBPP ? imgBPP(img) : 0;
+
+                                log([NSString stringWithFormat:
+                                    @"MISMATCH: '%s' image %zux%zu bpc=%zu bpp=%zu",
+                                    tests[ti].label, iw, ih, ibpc, ibpp]);
+
+                                // Check if CG image dimensions match IOSurface or are confused
+                                if (iw != w || ih != h) {
+                                    anomalies++;
+                                    memoryCorruption++;
+                                    log([NSString stringWithFormat:
+                                        @"MISMATCH: DIMENSION CONFUSION '%s' expected %zux%zu got %zux%zu!",
+                                        tests[ti].label, w, h, iw, ih]);
+                                }
+                                if (imgRel) imgRel(img);
+                            }
+                        }
+
+                        // Check canary — did CG write beyond what it should?
+                        if (realAlloc >= 16) {
+                            uint8_t *end = (uint8_t *)base + realAlloc - 16;
+                            int canaryIntact = 1;
+                            for (int i = 0; i < 16; i++) {
+                                if (end[i] != 0xCC) { canaryIntact = 0; break; }
+                            }
+                            if (!canaryIntact && realAlloc > cgBpr * h + 16) {
+                                anomalies++;
+                                oobReads++;
+                                log([NSString stringWithFormat:
+                                    @"MISMATCH: OOB_WRITE '%s' — canary at end of buffer corrupted!",
+                                    tests[ti].label]);
+                            }
+                        }
+
+                        ctxRel(ctx);
+                    } else {
+                        log([NSString stringWithFormat:@"MISMATCH: '%s' CG context failed", tests[ti].label]);
+                    }
+                }
+                sym.unlock(surf, 0, NULL);
+                CFRelease(surf);
+            }
+
+            if (cs) csRel(cs);
+            dlclose(cg);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"MISMATCH: DONE corruption=%u oobWrites=%u anomalies=%u elapsed=%.3fs",
+                memoryCorruption, oobReads, anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"memoryCorruption": @(memoryCorruption),
+                @"oobWrites": @(oobReads),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-Mismatch-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 15: Kernel Info Leak (Round 4)
+
+void iosurface_research_info_leak(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"INFOLEAK: ERROR — failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"INFOLEAK: === Kernel Info Leak Scanner ===");
+            log(@"INFOLEAK: Searches for kernel pointers or metadata disclosure via IOSurface properties");
+
+            uint32_t anomalies = 0;
+            uint32_t suspiciousValues = 0;
+            uint32_t planeLeaks = 0;
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+
+            // Phase A: Check if IOSurface property values contain kernel-like pointers
+            log(@"INFOLEAK: Phase A — property value analysis");
+
+            NSDictionary *params = isr_default_surface_params(128, 128);
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+            if (!surf) {
+                log(@"INFOLEAK: ERROR — surface creation failed");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            IOSurfaceID sid = sym.getID(surf);
+            size_t allocSz = sym.getAllocSize(surf);
+            size_t bpr = sym.getBytesPerRow(surf);
+
+            log([NSString stringWithFormat:@"INFOLEAK: Surface id=%u alloc=%zu bpr=%zu", sid, allocSz, bpr]);
+
+            // Check if ID values are sequential or reveal allocation patterns
+            IOSurfaceRef surfaces[20];
+            IOSurfaceID ids[20];
+            for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                surfaces[i] = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(64, 64));
+                ids[i] = surfaces[i] ? sym.getID(surfaces[i]) : 0;
+            }
+
+            BOOL sequential = YES;
+            for (int i = 1; i < 20; i++) {
+                if (ids[i] != ids[i-1] + 1) {
+                    sequential = NO;
+                    break;
+                }
+            }
+
+            log([NSString stringWithFormat:@"INFOLEAK: ID allocation %@ — range [%u..%u]",
+                sequential ? @"SEQUENTIAL" : @"NON-SEQUENTIAL", ids[0], ids[19]]);
+
+            // Free alternating surfaces and check what IDs get reused
+            for (int i = 0; i < 20; i += 2) {
+                if (surfaces[i]) CFRelease(surfaces[i]);
+                surfaces[i] = NULL;
+            }
+
+            IOSurfaceRef reused[10];
+            IOSurfaceID reusedIds[10];
+            for (int i = 0; i < 10 && !isr_stopped(); i++) {
+                reused[i] = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(64, 64));
+                reusedIds[i] = reused[i] ? sym.getID(reused[i]) : 0;
+            }
+
+            int reuseCount = 0;
+            for (int i = 0; i < 10; i++) {
+                for (int j = 0; j < 20; j += 2) {
+                    if (reusedIds[i] == ids[j]) {
+                        reuseCount++;
+                        break;
+                    }
+                }
+            }
+
+            log([NSString stringWithFormat:@"INFOLEAK: ID reuse pattern — %d/10 freed IDs reused", reuseCount]);
+            if (reuseCount > 0) {
+                log([NSString stringWithFormat:@"INFOLEAK: Reuse is predictable — aids use-after-free targeting"]);
+            }
+
+            for (int i = 0; i < 10; i++) if (reused[i]) CFRelease(reused[i]);
+            for (int i = 1; i < 20; i += 2) if (surfaces[i]) CFRelease(surfaces[i]);
+
+            // Phase B: Plane info extraction
+            log(@"INFOLEAK: Phase B — plane and property extraction");
+            isr_checkpoint(@"ISR-InfoLeak-checkpoint.json", @{@"phase": @"B"});
+
+            typedef CFTypeRef (*IOSurfaceCopyValueFn)(IOSurfaceRef, CFStringRef);
+            IOSurfaceCopyValueFn copyValue = NULL;
+            void *iosLib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+            if (iosLib) {
+                copyValue = (IOSurfaceCopyValueFn)dlsym(iosLib, "IOSurfaceCopyValue");
+            }
+
+            NSDictionary *richParams = @{
+                @"IOSurfaceWidth": @256,
+                @"IOSurfaceHeight": @256,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @1024,
+                @"IOSurfaceAllocSize": @(1024 * 256),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfacePlaneCount": @2,
+                @"IOSurfacePlaneInfo": @[
+                    @{@"IOSurfacePlaneWidth": @256, @"IOSurfacePlaneHeight": @256,
+                      @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneBytesPerRow": @1024,
+                      @"IOSurfacePlaneOffset": @0, @"IOSurfacePlaneSize": @(1024 * 256)},
+                    @{@"IOSurfacePlaneWidth": @128, @"IOSurfacePlaneHeight": @128,
+                      @"IOSurfacePlaneBytesPerElement": @2, @"IOSurfacePlaneBytesPerRow": @256,
+                      @"IOSurfacePlaneOffset": @(1024 * 256), @"IOSurfacePlaneSize": @(256 * 128)},
+                ],
+            };
+
+            IOSurfaceRef richSurf = sym.create((__bridge CFDictionaryRef)richParams);
+            if (richSurf) {
+                size_t rAlloc = sym.getAllocSize(richSurf);
+                log([NSString stringWithFormat:@"INFOLEAK: Multi-plane surface alloc=%zu (expected %d)",
+                    rAlloc, 1024 * 256 + 256 * 128]);
+
+                if (rAlloc != (size_t)(1024 * 256 + 256 * 128)) {
+                    anomalies++;
+                    planeLeaks++;
+                    log([NSString stringWithFormat:
+                        @"INFOLEAK: ANOMALY — alloc size mismatch! kernel added %zd bytes",
+                        (ssize_t)rAlloc - (1024 * 256 + 256 * 128)]);
+                }
+
+                // Try to read known property keys that might leak info
+                NSArray *probeKeys = @[
+                    @"IOSurfaceAllocSize", @"IOSurfaceBytesPerRow",
+                    @"IOSurfaceSeed", @"IOSurfaceOffset",
+                    @"IOSurfaceIsGlobal", @"IOSurfaceCacheMode",
+                    @"IOSurfaceAddress", @"IOSurfaceKernelAddress",
+                    @"IOSurfaceRegistryID", @"IOSurfaceCreatorPID",
+                    @"IOSurfacePurgeWhenNotInUse", @"IOSurfaceUseCounterAccounting",
+                ];
+
+                if (copyValue) {
+                    for (NSString *key in probeKeys) {
+                        if (isr_stopped()) break;
+                        CFTypeRef val = copyValue(richSurf, (__bridge CFStringRef)key);
+                        if (val) {
+                            NSString *desc = [(__bridge id)val description];
+                            log([NSString stringWithFormat:@"INFOLEAK: %@ = %@", key, desc]);
+
+                            // Check if value looks like a kernel pointer (high bits set)
+                            if ([(__bridge id)val isKindOfClass:[NSNumber class]]) {
+                                uint64_t numVal = [(__bridge NSNumber *)val unsignedLongLongValue];
+                                if (numVal > 0xFFFF000000000000ULL) {
+                                    anomalies++;
+                                    suspiciousValues++;
+                                    log([NSString stringWithFormat:
+                                        @"INFOLEAK: SUSPICIOUS '%@' = 0x%llx — possible kernel pointer!",
+                                        key, numVal]);
+                                }
+                            }
+                            CFRelease(val);
+                        }
+                    }
+                } else {
+                    log(@"INFOLEAK: IOSurfaceCopyValue not available");
+                }
+
+                // Phase C: Seed value analysis — does the seed reveal timing info?
+                log(@"INFOLEAK: Phase C — seed increment analysis");
+
+                typedef uint32_t (*IOSurfaceGetSeedFn)(IOSurfaceRef);
+                IOSurfaceGetSeedFn getSeed = NULL;
+                if (iosLib) {
+                    getSeed = (IOSurfaceGetSeedFn)dlsym(iosLib, "IOSurfaceGetSeed");
+                }
+
+                if (getSeed) {
+                    uint32_t seed0 = getSeed(richSurf);
+
+                    // Lock/unlock to increment seed
+                    sym.lock(richSurf, 0, NULL);
+                    void *rbase = sym.getBase(richSurf);
+                    if (rbase) ((uint8_t *)rbase)[0] = 0xFF;
+                    sym.unlock(richSurf, 0, NULL);
+
+                    uint32_t seed1 = getSeed(richSurf);
+
+                    sym.lock(richSurf, 0, NULL);
+                    rbase = sym.getBase(richSurf);
+                    if (rbase) ((uint8_t *)rbase)[0] = 0xFE;
+                    sym.unlock(richSurf, 0, NULL);
+
+                    uint32_t seed2 = getSeed(richSurf);
+
+                    log([NSString stringWithFormat:
+                        @"INFOLEAK: Seed progression: %u -> %u -> %u (deltas: %u, %u)",
+                        seed0, seed1, seed2, seed1 - seed0, seed2 - seed1]);
+
+                    if (seed1 - seed0 != seed2 - seed1) {
+                        anomalies++;
+                        log(@"INFOLEAK: ANOMALY — non-uniform seed increments (timing leak?)");
+                    }
+                } else {
+                    log(@"INFOLEAK: IOSurfaceGetSeed not available");
+                }
+
+                CFRelease(richSurf);
+            } else {
+                log(@"INFOLEAK: Multi-plane surface creation failed");
+            }
+
+            if (iosLib) dlclose(iosLib);
+
+            // Phase D: Buffer base address analysis
+            log(@"INFOLEAK: Phase D — buffer address entropy analysis");
+
+            uintptr_t addrs[10];
+            for (int i = 0; i < 10 && !isr_stopped(); i++) {
+                IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)isr_default_surface_params(64, 64));
+                if (s) {
+                    sym.lock(s, 0, NULL);
+                    void *b = sym.getBase(s);
+                    addrs[i] = (uintptr_t)b;
+                    sym.unlock(s, 0, NULL);
+                    CFRelease(s);
+                } else {
+                    addrs[i] = 0;
+                }
+            }
+
+            // Check address randomization
+            int sameHighBits = 0;
+            for (int i = 1; i < 10; i++) {
+                if ((addrs[i] >> 32) == (addrs[0] >> 32)) sameHighBits++;
+            }
+
+            log([NSString stringWithFormat:
+                @"INFOLEAK: Buffer addresses — %d/9 share high 32 bits with first (0x%lx)",
+                sameHighBits, (unsigned long)(addrs[0] >> 32)]);
+
+            // Check alignment patterns
+            int page_aligned = 0;
+            for (int i = 0; i < 10; i++) {
+                if ((addrs[i] & 0xFFF) == 0) page_aligned++;
+            }
+
+            log([NSString stringWithFormat:@"INFOLEAK: %d/10 addresses are page-aligned", page_aligned]);
+
+            if (sameHighBits >= 8) {
+                anomalies++;
+                log(@"INFOLEAK: ANOMALY — low address entropy, predictable user-space mapping");
+            }
+
+            CFRelease(surf);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"INFOLEAK: DONE suspicious=%u planeLeaks=%u anomalies=%u elapsed=%.3fs",
+                suspiciousValues, planeLeaks, anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"suspiciousValues": @(suspiciousValues),
+                @"planeLeaks": @(planeLeaks),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-InfoLeak-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
