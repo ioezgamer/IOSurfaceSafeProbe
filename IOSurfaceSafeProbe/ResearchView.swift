@@ -76,6 +76,16 @@ struct ResearchView: View {
         ("deputy", "Confused Deputy", "person.badge.key.fill",
          "Inyeccion de IDs IOSurface en servicios IOKit — test de acceso sin validar",
          { log, done in iosurface_research_confused_deputy({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 7
+        ("propinject", "Property Injection", "text.badge.plus",
+         "Inyeccion de propiedades en diccionario kernel de IOSurface",
+         { log, done in iosurface_research_property_inject({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("planeovlap", "Plane Overlap", "square.stack.3d.up.fill",
+         "Planos solapados para lectura cross-plane y OOB read",
+         { log, done in iosurface_research_plane_overlap({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("portrace", "Mach Port Race", "bolt.shield.fill",
+         "Ataque de puertos Mach: lifecycle, reuso y race masivo 50 hilos",
+         { log, done in iosurface_research_port_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -190,7 +200,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 18), id: \.id) { probe in
+            ForEach(probes[18..<21], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 7 — Superficie de Ataque Kernel")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 21), id: \.id) { probe in
                 probeCard(probe)
             }
 
