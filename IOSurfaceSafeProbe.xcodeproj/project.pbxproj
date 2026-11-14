@@ -16,6 +16,8 @@
 		A10007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10007; };
 		A10008 /* GestaltManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10012; };
 		A10009 /* TweaksView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10013; };
+		A10010 /* IOSurfaceResearch.m in Sources */ = {isa = PBXBuildFile; fileRef = B10015; };
+		A10011 /* ResearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10016; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +34,9 @@
 		B10011 /* IOSurfaceSafeProbe.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = IOSurfaceSafeProbe.entitlements; sourceTree = "<group>"; };
 		B10012 /* GestaltManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestaltManager.swift; sourceTree = "<group>"; };
 		B10013 /* TweaksView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TweaksView.swift; sourceTree = "<group>"; };
+		B10014 /* IOSurfaceResearch.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOSurfaceResearch.h; sourceTree = "<group>"; };
+		B10015 /* IOSurfaceResearch.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = IOSurfaceResearch.m; sourceTree = "<group>"; };
+		B10016 /* ResearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResearchView.swift; sourceTree = "<group>"; };
 		B10099 /* IOSurfaceSafeProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IOSurfaceSafeProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -67,6 +72,9 @@
 				B10005 /* worse_query.m */,
 				B10009 /* pathleak.h */,
 				B10006 /* pathleak.m */,
+				B10014 /* IOSurfaceResearch.h */,
+				B10015 /* IOSurfaceResearch.m */,
+				B10016 /* ResearchView.swift */,
 				B10010 /* IOSurfaceSafeProbe-Bridging-Header.h */,
 				B10011 /* IOSurfaceSafeProbe.entitlements */,
 				B10007 /* Assets.xcassets */,
@@ -154,6 +162,8 @@
 				A10006 /* pathleak.m in Sources */,
 				A10008 /* GestaltManager.swift in Sources */,
 				A10009 /* TweaksView.swift in Sources */,
+				A10010 /* IOSurfaceResearch.m in Sources */,
+				A10011 /* ResearchView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

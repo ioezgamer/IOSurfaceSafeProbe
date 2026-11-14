@@ -32,6 +32,12 @@ struct MainTabView: View {
                     Label("Tweaks", systemImage: "wrench.and.screwdriver.fill")
                 }
                 .tag(1)
+
+            ResearchView()
+                .tabItem {
+                    Label("Research", systemImage: "shield.lefthalf.filled.badge.checkmark")
+                }
+                .tag(2)
         }
         .tint(.purple)
     }
