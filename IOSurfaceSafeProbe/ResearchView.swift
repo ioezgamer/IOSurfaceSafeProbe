@@ -277,6 +277,16 @@ struct ResearchView: View {
         ("syscallstorm", "Syscall Storm", "tornado",
          "task_info ASLR leak, mach_make_memory_entry, vm_remap post-destroy, vm_region enum, OOB reads",
          { log, done in iosurface_research_syscall_storm({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 27
+        ("oobscan", "OOB Heap Scanner", "magnifyingglass.circle.fill",
+         "Lectura OOB sistemática 0-16MB mapeando heap layout, kernel ptrs, vtables adyacentes",
+         { log, done in iosurface_research_oob_scanner({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("remapspray", "Remap Spray Oracle", "arrow.triangle.2.circlepath.circle.fill",
+         "vm_remap + destroy + spray 500 surfaces — lee metadata de superficie nueva via UAF read",
+         { log, done in iosurface_research_remap_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kslide", "Kernel Slide Calc", "function",
+         "Calcula KASLR slide desde punteros filtrados + prueba mapear memoria de kernel",
+         { log, done in iosurface_research_kslide({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -627,7 +637,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 78), id: \.id) { probe in
+            ForEach(probes[78..<81], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 27 ---
+            Text("Round 27 — Kernel Primitives")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 81), id: \.id) { probe in
                 probeCard(probe)
             }
 

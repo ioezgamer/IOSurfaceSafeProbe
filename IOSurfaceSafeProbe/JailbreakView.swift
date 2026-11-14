@@ -14,9 +14,11 @@ struct JailbreakView: View {
         ("IOKit Selector Fuzzing", .confirmed, "R23"),
         ("GPU/Metal Service Access", .confirmed, "R24"),
         ("Service Exploit Chain", .confirmed, "R25"),
-        ("VM Remap + Syscall", .pending, "R26"),
-        ("Kernel Address Leak", .pending, "—"),
-        ("Kernel R/W Primitive", .notFound, "—"),
+        ("VM Remap + Syscall", .confirmed, "R26"),
+        ("Kernel Address Leak", .confirmed, "R26"),
+        ("OOB Heap Read", .confirmed, "R26"),
+        ("Kernel R/W Primitive", .pending, "R27"),
+        ("KASLR Slide Calc", .pending, "R27"),
     ]
 
     var body: some View {
