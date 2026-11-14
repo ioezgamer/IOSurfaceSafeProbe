@@ -107,5 +107,16 @@ void iosurface_research_global_spy(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// Probe 27: ID oracle — predictable ID exploitation and stale reference persistence.
 void iosurface_research_id_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 9: CG Overflow exploitation chain ---
+
+/// Probe 28: CG overflow amplifier — maximum overflow, cross-surface read, 16bpc confusion.
+void iosurface_research_cg_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 29: Spray+CG chain — heap spray with CG overflow for cross-surface data harvest.
+void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 30: Global+overflow combo — global surface as overflow target with entropy analysis.
+void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
