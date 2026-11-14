@@ -247,6 +247,16 @@ struct ResearchView: View {
         ("raceexpl", "Race Exploit", "bolt.horizontal.fill",
          "Exploit de carrera — 8 hilos simultáneos: IOConnectCallMethod + create/destroy TOCTOU",
          { log, done in iosurface_research_race_exploit({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 24
+        ("metalcrpt", "Metal Corrupt", "cpu.fill",
+         "Corrupción Metal — pasa IOSurface como textura GPU, modifica stride durante render para OOB",
+         { log, done in iosurface_research_metal_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("agxdrv", "AGX Driver", "gamecontroller.fill",
+         "Fuzzing GPU — selectores 0-99 en AGXAccelerator, IOGPU, IOMobileFramebuffer y más drivers",
+         { log, done in iosurface_research_agx_driver({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("gpudma", "GPU DMA Race", "bolt.trianglebadge.exclamationmark.fill",
+         "Carrera DMA — CPU escribe vs GPU lee simultáneamente en IOSurface compartido, busca torn reads",
+         { log, done in iosurface_research_gpu_dma_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -561,7 +571,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 69), id: \.id) { probe in
+            ForEach(probes[69..<72], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 24 ---
+            Text("Round 24 — GPU/Metal Exploitation")
+                .font(.caption.bold())
+                .foregroundStyle(.cyan)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 72), id: \.id) { probe in
                 probeCard(probe)
             }
 

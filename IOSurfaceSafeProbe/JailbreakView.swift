@@ -11,7 +11,8 @@ struct JailbreakView: View {
         ("Stable Heap Groom (60%)", .confirmed, "R18"),
         ("Stale Read Post-Destroy", .confirmed, "R20"),
         ("Zone Isolation Confirmed", .confirmed, "R21"),
-        ("IOKit Selector Fuzzing", .pending, "R23"),
+        ("IOKit Selector Fuzzing", .confirmed, "R23"),
+        ("GPU/Metal DMA Race", .pending, "R24"),
         ("Kernel Address Leak", .pending, "—"),
         ("Kernel R/W Primitive", .notFound, "—"),
     ]

