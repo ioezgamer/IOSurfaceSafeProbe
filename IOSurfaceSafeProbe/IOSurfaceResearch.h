@@ -228,5 +228,16 @@ void iosurface_research_prop_fake(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
 /// Probe 60: Kernel read — find target surface metadata in OOB, corrupt size fields, scan expanded memory for kernel pointers.
 void iosurface_research_kernel_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 20: Kalloc Zone Reclaim ---
+
+/// Probe 61: Zone spray — spray IOSurface properties into kalloc zones, free/reclaim, detect cross-contamination.
+void iosurface_research_zone_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 62: Zone reclaim — destroy surface, spray mach OOL data into freed zone, read stale reference.
+void iosurface_research_zone_reclaim(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 63: Ptr leak — full chain: zone spray + reclaim + scan for kernel pointer patterns.
+void iosurface_research_ptr_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
