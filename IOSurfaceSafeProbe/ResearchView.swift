@@ -237,6 +237,16 @@ struct ResearchView: View {
         ("addredir", "Addr Redirect", "arrow.uturn.right.circle.fill",
          "Intenta redirigir el mapeo de memoria via claves internas — busca kernel R/W primitiva",
          { log, done in iosurface_research_addr_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 23
+        ("iokbrute", "IOKit Brute", "hammer.fill",
+         "Fuerza bruta masiva — fuzzing de selectores 0-199 en IOSurfaceRootUserClient con inputs crafteados",
+         { log, done in iosurface_research_iokit_brute({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("structovf", "Struct Overflow", "arrow.up.doc.fill",
+         "Overflow de structs — envía inputs progresivamente más grandes a selectores del kernel, busca OOB",
+         { log, done in iosurface_research_struct_overflow({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("raceexpl", "Race Exploit", "bolt.horizontal.fill",
+         "Exploit de carrera — 8 hilos simultáneos: IOConnectCallMethod + create/destroy TOCTOU",
+         { log, done in iosurface_research_race_exploit({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -539,7 +549,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 66), id: \.id) { probe in
+            ForEach(probes[66..<69], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 23 ---
+            Text("Round 23 — IOKit Brute Force")
+                .font(.caption.bold())
+                .foregroundStyle(.purple)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 69), id: \.id) { probe in
                 probeCard(probe)
             }
 

