@@ -19,7 +19,8 @@
 #import <libkern/OSAtomic.h>
 #import <pthread.h>
 #import <sys/time.h>
-#import <servers/bootstrap.h>
+extern mach_port_t bootstrap_port;
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
 #include <math.h>
 #import "IOSurfaceResearch.h"
 
