@@ -140,5 +140,16 @@ void iosurface_research_system_sniff(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 /// Probe 36: Render server corruption — dual-plane surface as compositor input for cross-plane leak.
 void iosurface_research_render_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 12: Aggressive exploitation chains ---
+
+/// Probe 37: UAF compositor — free surface while compositor still renders it, detect stale access.
+void iosurface_research_compositor_uaf(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 38: Kernel metadata harvest — extract all IOSurface properties to find kernel pointer leaks.
+void iosurface_research_kernel_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 39: Full chain — combine mach port hijack + compositor TOCTOU + CG OOB for multi-primitive attack.
+void iosurface_research_full_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

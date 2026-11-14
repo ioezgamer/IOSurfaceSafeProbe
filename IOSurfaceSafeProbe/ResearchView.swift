@@ -126,6 +126,16 @@ struct ResearchView: View {
         ("rendcorr", "Render Corrupt", "paintbrush.pointed.fill",
          "Surface dual-plane como input del compositor — busca leak cross-plane",
          { log, done in iosurface_research_render_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 12
+        ("compuaf", "UAF Compositor", "xmark.octagon.fill",
+         "Libera surface mientras el compositor la usa — detecta acceso stale",
+         { log, done in iosurface_research_compositor_uaf({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("harvest", "Kernel Harvest", "server.rack",
+         "Extrae toda la metadata IOSurface buscando leaks de punteros kernel",
+         { log, done in iosurface_research_kernel_harvest({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("chain", "Full Chain", "link.badge.plus",
+         "Cadena completa: mach hijack + CG OOB + compositor TOCTOU combinados",
+         { log, done in iosurface_research_full_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -296,7 +306,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 33), id: \.id) { probe in
+            ForEach(probes[33..<36], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 12 ---
+            Text("Round 12 — Aggressive Exploitation")
+                .font(.caption.bold())
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 36), id: \.id) { probe in
                 probeCard(probe)
             }
 
