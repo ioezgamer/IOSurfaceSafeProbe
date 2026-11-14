@@ -261,5 +261,16 @@ void iosurface_research_key_override(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 /// Probe 69: Address redirect — attempt to redirect surface mapping via internal key manipulation.
 void iosurface_research_addr_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 23: IOKit Brute Force ---
+
+/// Probe 70: IOKit brute — massive selector fuzzing on IOSurfaceRootUserClient with crafted inputs.
+void iosurface_research_iokit_brute(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 71: Struct overflow — oversized struct inputs to accepting selectors, trigger kernel OOB.
+void iosurface_research_struct_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 72: Race exploit — multi-threaded IOConnectCallMethod + create/destroy TOCTOU race.
+void iosurface_research_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
