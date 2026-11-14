@@ -74,5 +74,16 @@ void iosurface_research_uaf_window(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// Probe 18: Kernel timing oracle — side-channel timing analysis of IOSurface kernel operations.
 void iosurface_research_timing_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 6: Combined attack chains ---
+
+/// Probe 19: Heap Feng Shui — precise object placement with spray, grooming and cross-boundary probing.
+void iosurface_research_feng_shui(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 20: Cache covert channel — build reliable timing oracle from lock/unlock, measure bandwidth.
+void iosurface_research_cache_channel(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 21: Confused deputy — pass IOSurface handles through IOKit services, test unvalidated access.
+void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
