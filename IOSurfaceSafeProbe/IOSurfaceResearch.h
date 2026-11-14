@@ -173,5 +173,16 @@ void iosurface_research_property_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock 
 /// Probe 45: Mach port kernel spray — spray ipc_port objects to reclaim freed IOSurface memory, detect kernel data.
 void iosurface_research_port_kernel_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 15: Kernel R/W hunt ---
+
+/// Probe 46: Property size confusion — override AllocSize in kernel dict, attempt OOB read beyond real backing.
+void iosurface_research_size_confusion(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 47: BytesPerRow overflow — override BytesPerRow in kernel dict, use CG to read with corrupted stride.
+void iosurface_research_bpr_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 48: Mach port property chain — property override + mach port transfer + CG OOB for kernel-adjacent read.
+void iosurface_research_port_prop_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

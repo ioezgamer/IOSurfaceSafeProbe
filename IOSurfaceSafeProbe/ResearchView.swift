@@ -157,6 +157,16 @@ struct ResearchView: View {
         ("portkspray", "Port Kernel Spray", "network.badge.shield.half.filled",
          "Spray ipc_port kernel objects para reclamar memoria IOSurface liberada",
          { log, done in iosurface_research_port_kernel_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 15
+        ("sizeconfuse", "Size Confusion", "arrow.up.left.and.arrow.down.right.circle.fill",
+         "Override AllocSize en kernel dict — intenta lectura OOB mas alla del backing real",
+         { log, done in iosurface_research_size_confusion({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("bproverflow", "BPR Overflow", "rectangle.expand.vertical",
+         "Override BytesPerRow en kernel dict — usa CG para leer con stride corrupto",
+         { log, done in iosurface_research_bpr_overflow({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("portpropchain", "Port+Prop Chain", "link.badge.plus",
+         "Property override + mach port transfer + CG OOB — lectura kernel-adyacente",
+         { log, done in iosurface_research_port_prop_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -363,7 +373,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 42), id: \.id) { probe in
+            ForEach(probes[42..<45], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 15 ---
+            Text("Round 15 — Kernel R/W Hunt")
+                .font(.caption.bold())
+                .foregroundStyle(.purple)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 45), id: \.id) { probe in
                 probeCard(probe)
             }
 

