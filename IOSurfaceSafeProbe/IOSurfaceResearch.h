@@ -217,5 +217,16 @@ void iosurface_research_port_hunt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
 /// Probe 57: Kobject redirect — full kernel R/W via iterative port locate + kobject redirect.
 void iosurface_research_kobject_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 19: Property Dictionary Hijack ---
+
+/// Probe 58: Dict hijack — stride OOB write to corrupt adjacent surface properties via IOSurfaceCopyValue.
+void iosurface_research_dict_hijack(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 59: Prop fake — write crafted patterns via stride OOB, check if target surface getters return corrupted values.
+void iosurface_research_prop_fake(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 60: Kernel read — find target surface metadata in OOB, corrupt size fields, scan expanded memory for kernel pointers.
+void iosurface_research_kernel_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

