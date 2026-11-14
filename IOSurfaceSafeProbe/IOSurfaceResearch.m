@@ -7972,8 +7972,7 @@ void iosurface_research_render_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _N
                 log(@"RENDCORR: 30 frames of plane1 modification during compositing complete");
             }
 
-            if (isr_stopped()) { CFRelease(dSurf); goto rendcorr_done; }
-
+            if (!isr_stopped()) {
             // === Test B: Snapshot the composited result to detect cross-plane leak ===
             log(@"RENDCORR: Test B — snapshot composited output");
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -8032,10 +8031,10 @@ void iosurface_research_render_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _N
                     }
                 }
             });
+            } // end if (!isr_stopped())
 
             CFRelease(dSurf);
 
-        rendcorr_done:;
             double elapsed = CFAbsoluteTimeGetCurrent() - start;
             log([NSString stringWithFormat:@"RENDCORR: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
             NSDictionary *res = @{
