@@ -3036,3 +3036,594 @@ void iosurface_research_info_leak(ISRLogBlock log, ISRDoneBlock done) {
         }
     });
 }
+
+#pragma mark - Probe 16: Heap Spray — Address Distribution & Grooming
+
+void iosurface_research_heap_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"HEAPSPRAY: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+            log(@"HEAPSPRAY: Starting heap spray analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // Phase A: Address distribution across sizes
+            log(@"HEAPSPRAY: Phase A — address distribution by size");
+            size_t widths[] = {64, 128, 256, 512, 1024};
+            size_t numWidths = sizeof(widths) / sizeof(widths[0]);
+
+            for (size_t wi = 0; wi < numWidths && !isr_stopped(); wi++) {
+                size_t w = widths[wi];
+                size_t h = 64;
+                NSDictionary *params = isr_default_surface_params(w, h);
+                CFDictionaryRef cfParams = (__bridge CFDictionaryRef)params;
+
+                uintptr_t addrs[20];
+                IOSurfaceRef surfs[20];
+                uint32_t count = 0;
+
+                for (uint32_t i = 0; i < 20 && !isr_stopped(); i++) {
+                    IOSurfaceRef s = sym.create(cfParams);
+                    if (!s) continue;
+                    sym.lock(s, 0, NULL);
+                    void *base = sym.getBase(s);
+                    sym.unlock(s, 0, NULL);
+                    if (base) {
+                        addrs[count] = (uintptr_t)base;
+                        surfs[count] = s;
+                        count++;
+                    } else {
+                        CFRelease(s);
+                    }
+                }
+
+                if (count >= 2) {
+                    uint32_t sameOffset = 0;
+                    int64_t firstDelta = (int64_t)(addrs[1] - addrs[0]);
+                    uintptr_t minAddr = addrs[0], maxAddr = addrs[0];
+                    uint32_t highBitsMatch = 0;
+                    uint32_t pageAligned = 0;
+
+                    for (uint32_t i = 0; i < count; i++) {
+                        if (addrs[i] < minAddr) minAddr = addrs[i];
+                        if (addrs[i] > maxAddr) maxAddr = addrs[i];
+                        if ((addrs[i] & 0xFFF) == 0) pageAligned++;
+                        if ((addrs[i] >> 32) == (addrs[0] >> 32)) highBitsMatch++;
+                        if (i > 0) {
+                            int64_t delta = (int64_t)(addrs[i] - addrs[i-1]);
+                            if (delta == firstDelta) sameOffset++;
+                        }
+                    }
+
+                    uintptr_t range = maxAddr - minAddr;
+                    uint32_t effectiveBits = 0;
+                    uintptr_t r = range;
+                    while (r > 0) { effectiveBits++; r >>= 1; }
+
+                    log([NSString stringWithFormat:
+                        @"HEAPSPRAY: w=%zu count=%u range=0x%lx effectiveBits=%u pageAligned=%u/%u highMatch=%u/%u sameOffset=%u/%u",
+                        w, count, (unsigned long)range, effectiveBits, pageAligned, count,
+                        highBitsMatch, count, sameOffset, count - 1]);
+
+                    if (effectiveBits < 24) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"HEAPSPRAY: ANOMALY — low entropy %u bits for w=%zu", effectiveBits, w]);
+                    }
+                    if (sameOffset > (count - 1) * 3 / 4) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"HEAPSPRAY: ANOMALY — predictable offsets (%u/%u same delta) for w=%zu",
+                            sameOffset, count - 1, w]);
+                    }
+                }
+
+                for (uint32_t i = 0; i < count; i++) CFRelease(surfs[i]);
+            }
+
+            if (isr_stopped()) goto heapspray_done;
+
+            // Phase B: Heap grooming — alloc N, free every other, realloc
+            log(@"HEAPSPRAY: Phase B — heap grooming");
+            {
+                size_t w = 256, h = 64;
+                NSDictionary *params = isr_default_surface_params(w, h);
+                CFDictionaryRef cfParams = (__bridge CFDictionaryRef)params;
+                uint32_t N = 30;
+                IOSurfaceRef surfs[30];
+                uintptr_t origAddrs[30];
+                uint32_t created = 0;
+
+                for (uint32_t i = 0; i < N && !isr_stopped(); i++) {
+                    surfs[i] = sym.create(cfParams);
+                    if (surfs[i]) {
+                        sym.lock(surfs[i], 0, NULL);
+                        void *base = sym.getBase(surfs[i]);
+                        sym.unlock(surfs[i], 0, NULL);
+                        origAddrs[i] = base ? (uintptr_t)base : 0;
+                        created++;
+                    }
+                }
+
+                uintptr_t freedAddrs[15];
+                uint32_t freedCount = 0;
+                for (uint32_t i = 0; i < created && i < N; i += 2) {
+                    if (surfs[i]) {
+                        freedAddrs[freedCount++] = origAddrs[i];
+                        CFRelease(surfs[i]);
+                        surfs[i] = NULL;
+                    }
+                }
+
+                IOSurfaceRef newSurfs[15];
+                uint32_t newCount = 0;
+                uint32_t slotHits = 0;
+
+                for (uint32_t i = 0; i < freedCount && !isr_stopped(); i++) {
+                    IOSurfaceRef s = sym.create(cfParams);
+                    if (!s) continue;
+                    sym.lock(s, 0, NULL);
+                    void *base = sym.getBase(s);
+                    sym.unlock(s, 0, NULL);
+                    uintptr_t addr = base ? (uintptr_t)base : 0;
+                    newSurfs[newCount] = s;
+                    newCount++;
+
+                    for (uint32_t j = 0; j < freedCount; j++) {
+                        if (addr == freedAddrs[j]) { slotHits++; break; }
+                    }
+                }
+
+                log([NSString stringWithFormat:
+                    @"HEAPSPRAY: Grooming — freed=%u realloc=%u slotHits=%u/%u (%.0f%%)",
+                    freedCount, newCount, slotHits, newCount,
+                    newCount > 0 ? (slotHits * 100.0 / newCount) : 0.0]);
+
+                if (slotHits > newCount / 2) {
+                    anomalies++;
+                    log(@"HEAPSPRAY: ANOMALY — high grooming success (>50% slot reuse)");
+                }
+
+                for (uint32_t i = 0; i < N; i++) {
+                    if (surfs[i]) CFRelease(surfs[i]);
+                }
+                for (uint32_t i = 0; i < newCount; i++) {
+                    CFRelease(newSurfs[i]);
+                }
+            }
+
+        heapspray_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"HEAPSPRAY: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-HeapSpray-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 17: UAF Window — ID Reuse Timing & Residual Data
+
+void iosurface_research_uaf_window(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"UAFWINDOW: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+            log(@"UAFWINDOW: Starting UAF window analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            mach_timebase_info_data_t timebase;
+            mach_timebase_info(&timebase);
+
+            // Phase A: Create-Destroy-Lookup cycle timing
+            log(@"UAFWINDOW: Phase A — create/destroy/lookup cycle timing");
+            {
+                uint32_t trials = 50;
+                uint64_t totalCreateNs = 0, totalDestroyNs = 0, totalLookupNs = 0;
+                uint32_t lookupSuccessAfterDestroy = 0;
+                NSDictionary *params = isr_default_surface_params(64, 64);
+                CFDictionaryRef cfParams = (__bridge CFDictionaryRef)params;
+
+                for (uint32_t t = 0; t < trials && !isr_stopped(); t++) {
+                    uint64_t t0 = mach_absolute_time();
+                    IOSurfaceRef s = sym.create(cfParams);
+                    uint64_t t1 = mach_absolute_time();
+                    if (!s) continue;
+
+                    IOSurfaceID sid = sym.getID(s);
+                    CFRelease(s);
+                    uint64_t t2 = mach_absolute_time();
+
+                    IOSurfaceRef looked = sym.lookup(sid);
+                    uint64_t t3 = mach_absolute_time();
+
+                    if (looked) {
+                        lookupSuccessAfterDestroy++;
+                        CFRelease(looked);
+                    }
+
+                    totalCreateNs  += (t1 - t0) * timebase.numer / timebase.denom;
+                    totalDestroyNs += (t2 - t1) * timebase.numer / timebase.denom;
+                    totalLookupNs  += (t3 - t2) * timebase.numer / timebase.denom;
+                }
+
+                uint64_t avgCreate  = trials > 0 ? totalCreateNs / trials : 0;
+                uint64_t avgDestroy = trials > 0 ? totalDestroyNs / trials : 0;
+                uint64_t avgLookup  = trials > 0 ? totalLookupNs / trials : 0;
+
+                log([NSString stringWithFormat:
+                    @"UAFWINDOW: Avg create=%lluns destroy=%lluns lookup=%lluns postDestroyHits=%u/%u",
+                    avgCreate, avgDestroy, avgLookup, lookupSuccessAfterDestroy, trials]);
+
+                if (lookupSuccessAfterDestroy > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"UAFWINDOW: ANOMALY — %u lookups succeeded after destroy (UAF window)",
+                        lookupSuccessAfterDestroy]);
+                }
+            }
+
+            if (isr_stopped()) goto uafwindow_done;
+
+            // Phase B: Sentinel data residual detection
+            log(@"UAFWINDOW: Phase B — sentinel residual data detection");
+            {
+                uint32_t residualHits = 0;
+                uint32_t trials = 30;
+                NSDictionary *params = isr_default_surface_params(64, 64);
+                CFDictionaryRef cfParams = (__bridge CFDictionaryRef)params;
+
+                for (uint32_t t = 0; t < trials && !isr_stopped(); t++) {
+                    IOSurfaceRef s1 = sym.create(cfParams);
+                    if (!s1) continue;
+
+                    sym.lock(s1, 0, NULL);
+                    void *base1 = sym.getBase(s1);
+                    uint32_t sentinel = 0xDEAD0000 | t;
+                    if (base1) {
+                        size_t allocSz = sym.getAllocSize(s1);
+                        size_t fillCount = allocSz / sizeof(uint32_t);
+                        uint32_t *buf = (uint32_t *)base1;
+                        for (size_t i = 0; i < fillCount; i++) {
+                            buf[i] = sentinel;
+                        }
+                    }
+                    sym.unlock(s1, 0, NULL);
+                    CFRelease(s1);
+
+                    IOSurfaceRef s2 = sym.create(cfParams);
+                    if (!s2) continue;
+
+                    sym.lock(s2, 0, NULL);
+                    void *base2 = sym.getBase(s2);
+                    if (base2) {
+                        uint32_t *buf2 = (uint32_t *)base2;
+                        size_t allocSz2 = sym.getAllocSize(s2);
+                        size_t checkCount = allocSz2 / sizeof(uint32_t);
+                        uint32_t found = 0;
+                        for (size_t i = 0; i < checkCount && i < 64; i++) {
+                            if (buf2[i] == sentinel) found++;
+                        }
+                        if (found > 0) residualHits++;
+                    }
+                    sym.unlock(s2, 0, NULL);
+                    CFRelease(s2);
+                }
+
+                log([NSString stringWithFormat:
+                    @"UAFWINDOW: Residual sentinel detected in %u/%u trials", residualHits, trials]);
+
+                if (residualHits > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"UAFWINDOW: ANOMALY — residual data in %u surfaces (dangling data)", residualHits]);
+                }
+            }
+
+            if (isr_stopped()) goto uafwindow_done;
+
+            // Phase C: Multi-thread destroy/lookup race
+            log(@"UAFWINDOW: Phase C — multi-thread destroy/lookup race");
+            {
+                NSDictionary *params = isr_default_surface_params(64, 64);
+                CFDictionaryRef cfParams = (__bridge CFDictionaryRef)params;
+                uint32_t raceTrials = 20;
+                __block _Atomic uint32_t totalPostDestroyLookups = 0;
+
+                for (uint32_t t = 0; t < raceTrials && !isr_stopped(); t++) {
+                    IOSurfaceRef s = sym.create(cfParams);
+                    if (!s) continue;
+                    IOSurfaceID sid = sym.getID(s);
+
+                    __block atomic_bool destroyed = false;
+                    __block _Atomic uint32_t postHits = 0;
+
+                    dispatch_group_t group = dispatch_group_create();
+
+                    dispatch_group_enter(group);
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        usleep(arc4random_uniform(50));
+                        CFRelease(s);
+                        atomic_store(&destroyed, true);
+                        dispatch_group_leave(group);
+                    });
+
+                    dispatch_group_enter(group);
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        for (int i = 0; i < 200; i++) {
+                            IOSurfaceRef looked = sym.lookup(sid);
+                            if (looked) {
+                                if (atomic_load(&destroyed)) {
+                                    atomic_fetch_add_explicit(&postHits, 1, memory_order_relaxed);
+                                }
+                                CFRelease(looked);
+                            }
+                        }
+                        dispatch_group_leave(group);
+                    });
+
+                    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+                    uint32_t hits = atomic_load(&postHits);
+                    if (hits > 0) {
+                        atomic_fetch_add_explicit(&totalPostDestroyLookups, hits, memory_order_relaxed);
+                    }
+                }
+
+                uint32_t totalHits = atomic_load(&totalPostDestroyLookups);
+                log([NSString stringWithFormat:
+                    @"UAFWINDOW: Race — %u post-destroy lookups across %u trials",
+                    totalHits, raceTrials]);
+
+                if (totalHits > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"UAFWINDOW: ANOMALY — %u post-destroy lookups (UAF race window)", totalHits]);
+                }
+            }
+
+        uafwindow_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"UAFWINDOW: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-UAFWindow-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 18: Kernel Timing Oracle — Side-Channel Analysis
+
+static int isr_compare_uint64(const void *a, const void *b) {
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+void iosurface_research_timing_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"TIMING: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+            log(@"TIMING: Starting kernel timing oracle");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            mach_timebase_info_data_t timebase;
+            mach_timebase_info(&timebase);
+
+            // Phase A: Create/destroy timing by surface size
+            log(@"TIMING: Phase A — create/destroy timing by size");
+            {
+                size_t sizes[] = {1, 4, 16, 64, 256, 1024};
+                size_t numSizes = sizeof(sizes) / sizeof(sizes[0]);
+                uint64_t medianCreateNs[6] = {0};
+
+                for (size_t si = 0; si < numSizes && !isr_stopped(); si++) {
+                    size_t w = sizes[si];
+                    size_t h = (w < 4) ? 256 : 64;
+                    NSDictionary *params = isr_default_surface_params(w, h);
+                    CFDictionaryRef cfParams = (__bridge CFDictionaryRef)params;
+
+                    uint32_t trials = 30;
+                    uint64_t createTimes[30];
+                    uint64_t destroyTimes[30];
+
+                    for (uint32_t t = 0; t < trials && !isr_stopped(); t++) {
+                        uint64_t t0 = mach_absolute_time();
+                        IOSurfaceRef s = sym.create(cfParams);
+                        uint64_t t1 = mach_absolute_time();
+                        if (s) CFRelease(s);
+                        uint64_t t2 = mach_absolute_time();
+                        createTimes[t]  = (t1 - t0) * timebase.numer / timebase.denom;
+                        destroyTimes[t] = (t2 - t1) * timebase.numer / timebase.denom;
+                    }
+
+                    qsort(createTimes, trials, sizeof(uint64_t), isr_compare_uint64);
+                    qsort(destroyTimes, trials, sizeof(uint64_t), isr_compare_uint64);
+
+                    uint64_t medCreate  = createTimes[trials / 2];
+                    uint64_t medDestroy = destroyTimes[trials / 2];
+                    medianCreateNs[si] = medCreate;
+
+                    log([NSString stringWithFormat:
+                        @"TIMING: size=%zux%zu create_med=%lluns destroy_med=%lluns",
+                        w, h, medCreate, medDestroy]);
+                }
+
+                if (numSizes >= 3 && medianCreateNs[0] > 0) {
+                    double ratio_small = (double)medianCreateNs[numSizes/2] / (double)medianCreateNs[0];
+                    double ratio_large = (double)medianCreateNs[numSizes-1] / (double)medianCreateNs[numSizes/2];
+                    if (ratio_large > ratio_small * 3.0) {
+                        anomalies++;
+                        log(@"TIMING: ANOMALY — non-linear create scaling reveals allocator behavior");
+                    }
+                    log([NSString stringWithFormat:
+                        @"TIMING: Scaling — small/mid=%.2fx mid/large=%.2fx",
+                        ratio_small, ratio_large]);
+                }
+            }
+
+            if (isr_stopped()) goto timing_done;
+
+            // Phase B: Lock/unlock timing variance
+            log(@"TIMING: Phase B — lock/unlock timing analysis");
+            {
+                NSDictionary *params = isr_default_surface_params(256, 256);
+                CFDictionaryRef cfParams = (__bridge CFDictionaryRef)params;
+                IOSurfaceRef surf = sym.create(cfParams);
+                if (surf) {
+                    uint32_t trials = 40;
+                    uint64_t lockTimes[40];
+                    uint64_t unlockTimes[40];
+
+                    for (uint32_t t = 0; t < trials && !isr_stopped(); t++) {
+                        uint64_t t0 = mach_absolute_time();
+                        sym.lock(surf, 0, NULL);
+                        uint64_t t1 = mach_absolute_time();
+                        void *base = sym.getBase(surf);
+                        if (base) {
+                            volatile uint8_t x = ((uint8_t *)base)[0];
+                            (void)x;
+                        }
+                        uint64_t t2 = mach_absolute_time();
+                        sym.unlock(surf, 0, NULL);
+                        uint64_t t3 = mach_absolute_time();
+                        (void)t2;
+
+                        lockTimes[t]   = (t1 - t0) * timebase.numer / timebase.denom;
+                        unlockTimes[t] = (t3 - t2) * timebase.numer / timebase.denom;
+                    }
+
+                    qsort(lockTimes, trials, sizeof(uint64_t), isr_compare_uint64);
+                    qsort(unlockTimes, trials, sizeof(uint64_t), isr_compare_uint64);
+                    uint64_t medLock   = lockTimes[trials / 2];
+                    uint64_t medUnlock = unlockTimes[trials / 2];
+                    uint64_t maxLock   = lockTimes[trials - 1];
+                    uint64_t maxUnlock = unlockTimes[trials - 1];
+
+                    log([NSString stringWithFormat:
+                        @"TIMING: lock med=%lluns max=%lluns  unlock med=%lluns max=%lluns",
+                        medLock, maxLock, medUnlock, maxUnlock]);
+
+                    if (medLock > 0 && maxLock > medLock * 3) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"TIMING: ANOMALY — lock outlier %lluns vs median %lluns (cache leak)",
+                            maxLock, medLock]);
+                    }
+                    if (medUnlock > 0 && maxUnlock > medUnlock * 3) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"TIMING: ANOMALY — unlock outlier %lluns vs median %lluns",
+                            maxUnlock, medUnlock]);
+                    }
+
+                    CFRelease(surf);
+                }
+            }
+
+            if (isr_stopped()) goto timing_done;
+
+            // Phase C: IOConnectCallMethod selector timing on IOSurfaceRoot
+            log(@"TIMING: Phase C — selector timing on IOSurfaceRoot");
+            {
+                CFMutableDictionaryRef matchDict = sym.matching("IOSurfaceRoot");
+                if (matchDict) {
+                    io_service_t svc = sym.getMatch(MACH_PORT_NULL, matchDict);
+                    if (svc) {
+                        io_connect_t conn = 0;
+                        kern_return_t kr = sym.open(svc, mach_task_self(), 0, &conn);
+                        if (kr == KERN_SUCCESS && conn) {
+                            uint32_t selectorCount = 32;
+                            uint32_t trials = 20;
+                            uint64_t selectorMedians[32];
+                            uint32_t timingAnomalies = 0;
+
+                            for (uint32_t sel = 0; sel < selectorCount && !isr_stopped(); sel++) {
+                                uint64_t times[20];
+                                for (uint32_t t = 0; t < trials; t++) {
+                                    uint64_t scalarOut[2] = {0};
+                                    uint32_t outCnt = 2;
+                                    uint64_t t0 = mach_absolute_time();
+                                    sym.call(conn, sel, NULL, 0, NULL, 0,
+                                             scalarOut, &outCnt, NULL, NULL);
+                                    uint64_t t1 = mach_absolute_time();
+                                    times[t] = (t1 - t0) * timebase.numer / timebase.denom;
+                                }
+                                qsort(times, trials, sizeof(uint64_t), isr_compare_uint64);
+                                selectorMedians[sel] = times[trials / 2];
+                            }
+
+                            uint64_t sorted[32];
+                            memcpy(sorted, selectorMedians, selectorCount * sizeof(uint64_t));
+                            qsort(sorted, selectorCount, sizeof(uint64_t), isr_compare_uint64);
+                            uint64_t overallMedian = sorted[selectorCount / 2];
+
+                            for (uint32_t sel = 0; sel < selectorCount && !isr_stopped(); sel++) {
+                                if (overallMedian > 0 && selectorMedians[sel] > overallMedian * 3) {
+                                    timingAnomalies++;
+                                    log([NSString stringWithFormat:
+                                        @"TIMING: Selector %u slow — %lluns vs median %lluns",
+                                        sel, selectorMedians[sel], overallMedian]);
+                                }
+                            }
+
+                            log([NSString stringWithFormat:
+                                @"TIMING: Selectors — overallMedian=%lluns anomalies=%u/%u",
+                                overallMedian, timingAnomalies, selectorCount]);
+
+                            anomalies += timingAnomalies;
+                            sym.close(conn);
+                        }
+                        sym.release(svc);
+                    }
+                }
+            }
+
+        timing_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"TIMING: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-TimingOracle-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}

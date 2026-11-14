@@ -56,6 +56,16 @@ struct ResearchView: View {
         ("infoleak", "Info Leak", "eye.trianglebadge.exclamationmark.fill",
          "Busca disclosure de punteros kernel, seeds, planos y entropia de direcciones",
          { log, done in iosurface_research_info_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 5
+        ("heapspray", "Heap Spray", "square.grid.3x3.fill",
+         "Mide distribucion de direcciones y grooming de heap con IOSurfaces",
+         { log, done in iosurface_research_heap_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("uafwindow", "UAF Window", "clock.badge.exclamationmark.fill",
+         "Detecta ventana UAF con timing nanosegundos y datos residuales",
+         { log, done in iosurface_research_uaf_window({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("timingoracle", "Timing Oracle", "stopwatch.fill",
+         "Side-channel de timing en operaciones kernel de IOSurface",
+         { log, done in iosurface_research_timing_oracle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -148,7 +158,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 12), id: \.id) { probe in
+            ForEach(probes[12..<15], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 5 — Primitivas de Explotacion")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.cyan)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 15), id: \.id) { probe in
                 probeCard(probe)
             }
 
