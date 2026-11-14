@@ -267,6 +267,16 @@ struct ResearchView: View {
         ("svcchain", "Service Chain", "link.circle.fill",
          "Cadena multi-servicio — pasa IOSurface por FB+JPEG, detecta corrupción cruzada y kernel leaks",
          { log, done in iosurface_research_service_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 26
+        ("vmremap", "VM Remap", "arrow.triangle.swap",
+         "mach_vm_remap IOSurface pages, destroy surface, read freed memory, OOL spray, cross-write check",
+         { log, done in iosurface_research_vm_remap({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("surfaccel", "Surf Accelerator", "bolt.horizontal.fill",
+         "IOSurfaceAccelerator/Blitter — fuzzing hardware blit services, stride mismatch OOB",
+         { log, done in iosurface_research_surf_accel({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("syscallstorm", "Syscall Storm", "tornado",
+         "task_info ASLR leak, mach_make_memory_entry, vm_remap post-destroy, vm_region enum, OOB reads",
+         { log, done in iosurface_research_syscall_storm({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -605,7 +615,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 75), id: \.id) { probe in
+            ForEach(probes[75..<78], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 26 ---
+            Text("Round 26 — Maximum Aggression")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 78), id: \.id) { probe in
                 probeCard(probe)
             }
 

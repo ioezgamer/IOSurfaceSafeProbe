@@ -13,7 +13,8 @@ struct JailbreakView: View {
         ("Zone Isolation Confirmed", .confirmed, "R21"),
         ("IOKit Selector Fuzzing", .confirmed, "R23"),
         ("GPU/Metal Service Access", .confirmed, "R24"),
-        ("Service Exploit Chain", .pending, "R25"),
+        ("Service Exploit Chain", .confirmed, "R25"),
+        ("VM Remap + Syscall", .pending, "R26"),
         ("Kernel Address Leak", .pending, "—"),
         ("Kernel R/W Primitive", .notFound, "—"),
     ]
