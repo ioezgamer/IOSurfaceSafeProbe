@@ -41,5 +41,16 @@ void iosurface_research_conn_types(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// Probe 9: Alloc boundary — dimensions at exact rejection thresholds from Round 1 data.
 void iosurface_research_alloc_boundary(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 3: Targeted exploitation vectors ---
+
+/// Probe 10: AGX deep scan — enumerate GPU services, connection types, selector fuzzing on AGX.
+void iosurface_research_agx_scan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 11: Format corruption — create surfaces with invalid formats, render via CoreGraphics.
+void iosurface_research_format_render(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 12: Cross-reference attack — share surfaces between connections with conflicting properties.
+void iosurface_research_xref_attack(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
