@@ -36,6 +36,16 @@ struct ResearchView: View {
         ("boundary", "Limites Alloc", "ruler.fill",
          "Busqueda binaria de umbrales, mismatches bytesPerRow/allocSize, formatos",
          { log, done in iosurface_research_alloc_boundary({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 3
+        ("agx", "AGX Deep Scan", "gpu",
+         "Enumera servicios GPU, tipos de conexion y fuzzing de selectores en AGX",
+         { log, done in iosurface_research_agx_scan({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("fmtrender", "Format Render", "paintbrush.fill",
+         "Crea surfaces con formatos invalidos y renderiza via CoreGraphics",
+         { log, done in iosurface_research_format_render({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("xref", "Cross-Reference", "arrow.triangle.swap",
+         "Comparte surfaces entre conexiones con propiedades conflictivas",
+         { log, done in iosurface_research_xref_attack({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -106,7 +116,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 5), id: \.id) { probe in
+            ForEach(probes[5..<9], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 3 — Vectores de Explotacion")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 9), id: \.id) { probe in
                 probeCard(probe)
             }
 
