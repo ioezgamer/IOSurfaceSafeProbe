@@ -151,5 +151,16 @@ void iosurface_research_kernel_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _N
 /// Probe 39: Full chain — combine mach port hijack + compositor TOCTOU + CG OOB for multi-primitive attack.
 void iosurface_research_full_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 13: Real exploit primitives ---
+
+/// Probe 40: UAF realloc — release+reclaim backing memory, write via dangling ref to corrupt new surface.
+void iosurface_research_uaf_realloc(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 41: ASLR defeat — collect base addresses from multiple surfaces to compute kernel ASLR slide.
+void iosurface_research_aslr_defeat(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 42: Read-write primitive — dangling write + CG OOB read for controlled cross-surface data flow.
+void iosurface_research_rw_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
