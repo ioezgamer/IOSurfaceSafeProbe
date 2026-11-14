@@ -257,6 +257,16 @@ struct ResearchView: View {
         ("gpudma", "GPU DMA Race", "bolt.trianglebadge.exclamationmark.fill",
          "Carrera DMA — CPU escribe vs GPU lee simultáneamente en IOSurface compartido, busca torn reads",
          { log, done in iosurface_research_gpu_dma_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 25
+        ("fbdeep", "FB Deep Fuzz", "display",
+         "IOMobileFramebuffer tipo 4 — fuzzing intensivo sel 70-99, structs crafteados, MapMemory, captura outputs",
+         { log, done in iosurface_research_fb_deep({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("jpegexp", "JPEG Exploit", "photo.fill",
+         "AppleJPEGDriver — fuzzing en 5 tipos de conexión con markers JPEG + IOSurface IDs, MapMemory",
+         { log, done in iosurface_research_jpeg_exploit({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("svcchain", "Service Chain", "link.circle.fill",
+         "Cadena multi-servicio — pasa IOSurface por FB+JPEG, detecta corrupción cruzada y kernel leaks",
+         { log, done in iosurface_research_service_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -583,7 +593,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 72), id: \.id) { probe in
+            ForEach(probes[72..<75], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 25 ---
+            Text("Round 25 — Deep Service Exploitation")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 75), id: \.id) { probe in
                 probeCard(probe)
             }
 

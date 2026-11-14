@@ -12,7 +12,8 @@ struct JailbreakView: View {
         ("Stale Read Post-Destroy", .confirmed, "R20"),
         ("Zone Isolation Confirmed", .confirmed, "R21"),
         ("IOKit Selector Fuzzing", .confirmed, "R23"),
-        ("GPU/Metal DMA Race", .pending, "R24"),
+        ("GPU/Metal Service Access", .confirmed, "R24"),
+        ("Service Exploit Chain", .pending, "R25"),
         ("Kernel Address Leak", .pending, "—"),
         ("Kernel R/W Primitive", .notFound, "—"),
     ]
