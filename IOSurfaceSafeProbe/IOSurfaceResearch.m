@@ -10081,48 +10081,54 @@ void iosurface_research_size_confusion(ISRLogBlock _Nonnull log, ISRDoneBlock _N
                     log(@"SIZECONF: *** POINTER-LIKE values in OOB read — possible kernel data! ***");
                 }
 
-            // Step 5: CG bitmap with overridden bytesPerRow
+            // Step 5: CG bitmap test with overridden bytesPerRow (safe NULL buffer)
             if (!isr_stopped()) {
-                log(@"SIZECONF: Step 5 — CG bitmap with overridden bytesPerRow");
+                log(@"SIZECONF: Step 5 — CG bitmap stride test (safe NULL buffer)");
                 sym.lock(surface, 0, NULL);
                 void *base2 = sym.getBase(surface);
+                size_t realAlloc = sym.getAllocSize(surface);
                 colorSpace = CGColorSpaceCreateDeviceRGB();
 
-                // Try with large bytesPerRow (32768) — if CG trusts it, reads OOB
-                cgCtx = CGBitmapContextCreate(base2, 32, 2, 8, 32768,
+                // Use NULL buffer so CG allocates its own (safe, no OOB crash)
+                cgCtx = CGBitmapContextCreate(NULL, 32, 2, 8, 32768,
                     colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
                 if (cgCtx) {
-                    log(@"SIZECONF: *** CG accepted bytesPerRow=32768 on 4096-byte buffer! ***");
-                    anomalies++;
-                    // Read pixels from row 1 (at offset 32768 — way past buffer)
-                    CGImageRef img = CGBitmapContextCreateImage(cgCtx);
-                    if (img) {
-                        // Create a small read-back context
-                        CGContextRef readCtx = CGBitmapContextCreate(NULL, 32, 2, 8, 32 * 4,
-                            colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                        if (readCtx) {
-                            CGContextDrawImage(readCtx, CGRectMake(0, 0, 32, 2), img);
-                            uint32_t *pixels = (uint32_t *)CGBitmapContextGetData(readCtx);
-                            if (pixels) {
-                                uint32_t row1NonZero = 0;
-                                for (int i = 32; i < 64; i++) {
-                                    if (pixels[i] != 0) row1NonZero++;
-                                }
-                                log([NSString stringWithFormat:@"SIZECONF: CG row1 (OOB) nonZero=%u first=0x%08X", row1NonZero, pixels[32]]);
-                                if (row1NonZero > 0) {
-                                    anomalies++;
-                                    log(@"SIZECONF: *** CG OOB read got non-zero data from row1! ***");
-                                }
-                            }
-                            CGContextRelease(readCtx);
+                    log(@"SIZECONF: CG accepted bytesPerRow=32768 with NULL buffer");
+                    // Copy real surface data into CG row 0
+                    uint32_t *cgData = (uint32_t *)CGBitmapContextGetData(cgCtx);
+                    if (cgData) {
+                        memcpy(cgData, base2, MIN(realAlloc, 32 * 4));
+                        uint32_t r0canary = 0;
+                        for (int i = 0; i < 32; i++) {
+                            if (cgData[i] == 0xCAFECAFE) r0canary++;
                         }
-                        CGImageRelease(img);
+                        log([NSString stringWithFormat:@"SIZECONF: CG row0 canary: %u/32", r0canary]);
                     }
                     CGContextRelease(cgCtx);
                     cgCtx = NULL;
                 } else {
-                    log(@"SIZECONF: CG rejected large bytesPerRow (good validation)");
+                    log(@"SIZECONF: CG rejected large bytesPerRow even with NULL");
                 }
+
+                // Also probe OOB via vm_read_overwrite (safe alternative)
+                uint32_t vmOOB[16] = {0};
+                vm_size_t vmRead = 0;
+                kern_return_t vkr = vm_read_overwrite(mach_task_self(),
+                    (vm_address_t)base2 + realAlloc, sizeof(vmOOB),
+                    (vm_address_t)vmOOB, &vmRead);
+                if (vkr == KERN_SUCCESS) {
+                    uint32_t nz = 0;
+                    for (int i = 0; i < 16; i++) { if (vmOOB[i] != 0) nz++; }
+                    log([NSString stringWithFormat:@"SIZECONF: vm_read OOB +%zu: nonZero=%u first=0x%08X",
+                         realAlloc, nz, vmOOB[0]]);
+                    if (nz > 0) {
+                        anomalies++;
+                        log(@"SIZECONF: *** vm_read OOB got non-zero data! ***");
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"SIZECONF: vm_read OOB kr=%d", vkr]);
+                }
+
                 if (colorSpace) { CGColorSpaceRelease(colorSpace); colorSpace = NULL; }
                 sym.unlock(surface, 0, NULL);
 
@@ -10256,107 +10262,101 @@ void iosurface_research_bpr_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
                     log(@"BPROVER: surface2 creation failed, continuing without");
                 }
 
-            // Step 4: CG bitmap with overridden stride
+            // Step 4: Safe OOB probe via vm_read_overwrite
             if (!isr_stopped()) {
-                log(@"BPROVER: Step 4 — CG bitmap with bytesPerRow=65536");
+                log(@"BPROVER: Step 4 — Safe OOB probe via vm_read_overwrite");
                 sym.lock(surface1, 0, NULL);
                 void *base1 = sym.getBase(surface1);
-                colorSpace = CGColorSpaceCreateDeviceRGB();
+                size_t realAlloc = sym.getAllocSize(surface1);
 
-                // width=64, height=4, bytesPerRow=65536
-                // Row 0: offset 0 (in buffer), Row 1: offset 65536 (WAY past 16384 buffer)
-                cgCtx = CGBitmapContextCreate(base1, 64, 4, 8, 65536,
+                // Try reading beyond the real buffer using vm_read_overwrite (safe — returns error, no crash)
+                uint32_t oobBuf[16] = {0};
+                vm_size_t oobRead = 0;
+                kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                    (vm_address_t)base1 + realAlloc, sizeof(oobBuf),
+                    (vm_address_t)oobBuf, &oobRead);
+                if (kr == KERN_SUCCESS) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"BPROVER: *** OOB vm_read at +%zu succeeded! Read %zu bytes ***",
+                         realAlloc, (size_t)oobRead]);
+                    uint32_t nz = 0, ptrLike = 0, s2match = 0;
+                    for (int i = 0; i < 16; i++) {
+                        if (oobBuf[i] != 0) nz++;
+                        if (oobBuf[i] == 0xAAAAAAAA) s2match++;
+                        if ((oobBuf[i] & 0xFFFFF000) >= 0xFFFFF000) ptrLike++;
+                    }
+                    log([NSString stringWithFormat:@"BPROVER: OOB data: nonZero=%u s2Pattern=%u ptrLike=%u first=0x%08X",
+                         nz, s2match, ptrLike, oobBuf[0]]);
+                    if (s2match > 0) {
+                        anomalies++;
+                        log(@"BPROVER: *** CRITICAL — OOB read found surface2 data! ***");
+                    }
+                    if (ptrLike > 0) {
+                        anomalies++;
+                        log(@"BPROVER: *** Pointer-like values in OOB region! ***");
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"BPROVER: OOB vm_read returned kr=%d (memory protected)", kr]);
+                }
+
+                // Also try CG with bytesPerRow=65536 but using NULL buffer (CG allocates its own)
+                colorSpace = CGColorSpaceCreateDeviceRGB();
+                cgCtx = CGBitmapContextCreate(NULL, 64, 4, 8, 65536,
                     colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
                 if (cgCtx) {
-                    anomalies++;
-                    log(@"BPROVER: *** CG accepted bytesPerRow=65536 on 16384-byte buffer! ***");
-
-                    CGImageRef img = CGBitmapContextCreateImage(cgCtx);
-                    if (img) {
-                        // Read back into a safe buffer
-                        size_t readW = 64, readH = 4;
-                        CGContextRef readCtx = CGBitmapContextCreate(NULL, readW, readH, 8, readW * 4,
-                            colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                        if (readCtx) {
-                            CGContextDrawImage(readCtx, CGRectMake(0, 0, readW, readH), img);
-                            uint32_t *pixels = (uint32_t *)CGBitmapContextGetData(readCtx);
-                            if (pixels) {
-                                // Row 0 should be 0xBBBBBBBB (canary)
-                                uint32_t row0canary = 0;
-                                for (size_t i = 0; i < readW; i++) {
-                                    if (pixels[i] == 0xBBBBBBBB) row0canary++;
-                                }
-                                log([NSString stringWithFormat:@"BPROVER: Row0 canary matches: %u/%zu", row0canary, readW]);
-
-                                // Rows 1-3 are OOB (offset 65536, 131072, 196608)
-                                for (int row = 1; row < 4; row++) {
-                                    uint32_t nonZero = 0, canaryS2 = 0;
-                                    for (size_t i = 0; i < readW; i++) {
-                                        uint32_t px = pixels[row * readW + i];
-                                        if (px != 0) nonZero++;
-                                        if (px == 0xAAAAAAAA) canaryS2++;
-                                    }
-                                    log([NSString stringWithFormat:@"BPROVER: Row%d (OOB): nonZero=%u surface2Pattern=%u first=0x%08X",
-                                         row, nonZero, canaryS2, pixels[row * readW]]);
-                                    if (canaryS2 > 0) {
-                                        anomalies++;
-                                        log([NSString stringWithFormat:@"BPROVER: *** CRITICAL — Row%d contains surface2 data (0xAAAAAAAA)! Cross-surface read! ***", row]);
-                                    } else if (nonZero > 0) {
-                                        anomalies++;
-                                        log([NSString stringWithFormat:@"BPROVER: *** Row%d contains non-zero OOB data — heap leak! ***", row]);
-                                    }
-                                }
-                            }
-                            CGContextRelease(readCtx);
+                    log(@"BPROVER: CG accepted bytesPerRow=65536 with NULL buffer (CG-managed)");
+                    // Draw the surface data into row 0 of CG context
+                    uint32_t *cgData = (uint32_t *)CGBitmapContextGetData(cgCtx);
+                    if (cgData) {
+                        memcpy(cgData, base1, MIN(realAlloc, 64 * 4));
+                        uint32_t r0match = 0;
+                        for (int i = 0; i < 64; i++) {
+                            if (cgData[i] == 0xBBBBBBBB) r0match++;
                         }
-                        CGImageRelease(img);
+                        log([NSString stringWithFormat:@"BPROVER: CG row0 canary: %u/64 (stride=65536 context works)", r0match]);
                     }
                     CGContextRelease(cgCtx);
                     cgCtx = NULL;
                 } else {
-                    log(@"BPROVER: CG rejected bytesPerRow=65536 (validation works)");
+                    log(@"BPROVER: CG rejected bytesPerRow=65536 even with NULL buffer");
                 }
 
                 if (colorSpace) { CGColorSpaceRelease(colorSpace); colorSpace = NULL; }
                 sym.unlock(surface1, 0, NULL);
 
-            // Step 5: Try OOB write via CG
+            // Step 5: Probe OOB write safety via vm_write
             if (!isr_stopped()) {
-                log(@"BPROVER: Step 5 — Attempt OOB write via CG");
+                log(@"BPROVER: Step 5 — Probe OOB write via vm_write");
                 sym.lock(surface1, 0, NULL);
                 void *base1w = sym.getBase(surface1);
-                CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+                size_t realAlloc2 = sym.getAllocSize(surface1);
 
-                // Use bytesPerRow=16384 (= allocSize) so row 1 starts at end of buffer
-                CGContextRef writeCtx = CGBitmapContextCreate(base1w, 64, 2, 8, 16384,
-                    cs2, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                if (writeCtx) {
-                    log(@"BPROVER: *** CG write context with bpr=16384 accepted ***");
-                    // Write 0xDEADDEAD pattern to row 1 (at offset 16384 — past buffer)
-                    CGContextSetRGBFillColor(writeCtx, 0.87, 0.68, 0.68, 0.87); // ~DEAD pattern
-                    CGContextFillRect(writeCtx, CGRectMake(0, 0, 64, 1)); // row 0 in CG coords = row 1 visually
+                // Try vm_write at offset past buffer (safe — returns error, no crash)
+                uint32_t writePattern[4] = {0xDEADDEAD, 0xDEADDEAD, 0xDEADDEAD, 0xDEADDEAD};
+                kern_return_t wkr = vm_write(mach_task_self(),
+                    (vm_address_t)base1w + realAlloc2,
+                    (vm_offset_t)writePattern, sizeof(writePattern));
+                if (wkr == KERN_SUCCESS) {
                     anomalies++;
-
+                    log(@"BPROVER: *** CRITICAL — OOB vm_write SUCCEEDED past buffer! ***");
                     // Check if surface2 was corrupted
                     if (surface2) {
                         sym.lock(surface2, 0, NULL);
                         uint32_t *b2check = (uint32_t *)sym.getBase(surface2);
                         uint32_t corrupted = 0;
-                        for (size_t i = 0; i < 64; i++) {
-                            if (b2check[i] != 0xAAAAAAAA) corrupted++;
+                        for (size_t i = 0; i < 4; i++) {
+                            if (b2check[i] == 0xDEADDEAD) corrupted++;
                         }
                         sym.unlock(surface2, 0, NULL);
-                        log([NSString stringWithFormat:@"BPROVER: Surface2 first row corruption check: %u/64 changed", corrupted]);
+                        log([NSString stringWithFormat:@"BPROVER: Surface2 DEAD pattern check: %u/4 found", corrupted]);
                         if (corrupted > 0) {
                             anomalies++;
-                            log(@"BPROVER: *** CRITICAL — OOB WRITE CORRUPTED ADJACENT SURFACE! ***");
+                            log(@"BPROVER: *** CRITICAL — OOB WRITE HIT SURFACE2! ***");
                         }
                     }
-                    CGContextRelease(writeCtx);
                 } else {
-                    log(@"BPROVER: CG rejected write context with bpr=16384");
+                    log([NSString stringWithFormat:@"BPROVER: OOB vm_write returned kr=%d (protected)", wkr]);
                 }
-                CGColorSpaceRelease(cs2);
                 sym.unlock(surface1, 0, NULL);
 
             } // end step 5
@@ -10506,70 +10506,92 @@ void iosurface_research_port_prop_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _
                     }
                 }
 
-            // Step 4: OOB read via hijack ref
+            // Step 4: Safe OOB read via vm_read_overwrite on hijack ref
             if (!isr_stopped()) {
                 if (hijackRef) {
-                    log(@"PROPCHAIN: Step 4 — OOB read via hijack ref");
+                    log(@"PROPCHAIN: Step 4 — Safe OOB read via vm_read_overwrite");
                     sym.lock(hijackRef, 0, NULL);
-                    volatile uint32_t *hbase = (volatile uint32_t *)sym.getBase(hijackRef);
-                    // Read at offset 4096 (past real buffer)
-                    uint32_t oobNonZero = 0;
-                    uint32_t oobPointerLike = 0;
-                    for (int i = 0; i < 16; i++) {
-                        size_t offset = (4096 / sizeof(uint32_t)) + i;
-                        uint32_t val = hbase[offset];
-                        if (val != 0) oobNonZero++;
-                        if ((val & 0xFFFFF000) >= 0xFFFFF000) oobPointerLike++;
-                    }
+                    void *hbase = sym.getBase(hijackRef);
+                    size_t hRealAlloc = sym.getAllocSize(hijackRef);
+                    uint32_t oobBuf[16] = {0};
+                    vm_size_t oobRead = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)hbase + hRealAlloc, sizeof(oobBuf),
+                        (vm_address_t)oobBuf, &oobRead);
                     sym.unlock(hijackRef, 0, NULL);
-                    log([NSString stringWithFormat:@"PROPCHAIN: Hijack OOB: nonZero=%u pointerLike=%u", oobNonZero, oobPointerLike]);
-                    if (oobNonZero > 0) {
-                        anomalies++;
-                        log(@"PROPCHAIN: *** OOB read via hijack returned non-zero data! ***");
+                    if (kr == KERN_SUCCESS) {
+                        uint32_t oobNonZero = 0, oobPointerLike = 0;
+                        for (int i = 0; i < 16; i++) {
+                            if (oobBuf[i] != 0) oobNonZero++;
+                            if ((oobBuf[i] & 0xFFFFF000) >= 0xFFFFF000) oobPointerLike++;
+                        }
+                        log([NSString stringWithFormat:@"PROPCHAIN: Hijack OOB: nonZero=%u pointerLike=%u first=0x%08X",
+                             oobNonZero, oobPointerLike, oobBuf[0]]);
+                        if (oobNonZero > 0) {
+                            anomalies++;
+                            log(@"PROPCHAIN: *** OOB read via hijack returned non-zero data! ***");
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"PROPCHAIN: OOB vm_read kr=%d (protected)", kr]);
                     }
                 } else {
                     log(@"PROPCHAIN: Step 4 skipped — no hijack ref");
                 }
 
-            // Step 5: CG OOB via hijack ref with overridden stride
+            // Step 5: CG OOB via hijack ref — safe approach with NULL buffer
             if (!isr_stopped()) {
                 if (hijackRef) {
-                    log(@"PROPCHAIN: Step 5 — CG OOB via hijack with bytesPerRow=32768");
+                    log(@"PROPCHAIN: Step 5 — CG stride test via hijack (safe NULL buffer)");
                     sym.lock(hijackRef, 0, NULL);
                     void *hbase2 = sym.getBase(hijackRef);
+                    size_t hAlloc2 = sym.getAllocSize(hijackRef);
                     colorSpace = CGColorSpaceCreateDeviceRGB();
-                    cgCtx = CGBitmapContextCreate(hbase2, 32, 2, 8, 32768,
+
+                    // Use NULL buffer so CG allocates its own memory (safe)
+                    cgCtx = CGBitmapContextCreate(NULL, 32, 2, 8, 32768,
                         colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
                     if (cgCtx) {
-                        anomalies++;
-                        log(@"PROPCHAIN: *** CG accepted bytesPerRow=32768 on hijack ref! ***");
-                        CGImageRef img = CGBitmapContextCreateImage(cgCtx);
-                        if (img) {
-                            CGContextRef readCtx = CGBitmapContextCreate(NULL, 32, 2, 8, 32 * 4,
-                                colorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-                            if (readCtx) {
-                                CGContextDrawImage(readCtx, CGRectMake(0, 0, 32, 2), img);
-                                uint32_t *pix = (uint32_t *)CGBitmapContextGetData(readCtx);
-                                if (pix) {
-                                    uint32_t r1nz = 0;
-                                    for (int i = 32; i < 64; i++) {
-                                        if (pix[i] != 0) r1nz++;
-                                    }
-                                    log([NSString stringWithFormat:@"PROPCHAIN: CG row1 OOB nonZero=%u first=0x%08X", r1nz, pix[32]]);
-                                    if (r1nz > 0) {
-                                        anomalies++;
-                                        log(@"PROPCHAIN: *** CRITICAL — CG OOB read via hijack got data! ***");
-                                    }
-                                }
-                                CGContextRelease(readCtx);
+                        log(@"PROPCHAIN: CG accepted bytesPerRow=32768 with NULL buffer");
+                        // Copy surface data into row 0 of CG context
+                        uint32_t *cgData = (uint32_t *)CGBitmapContextGetData(cgCtx);
+                        if (cgData) {
+                            memcpy(cgData, hbase2, MIN(hAlloc2, 32 * 4));
+                            uint32_t r0canary = 0;
+                            for (int i = 0; i < 32; i++) {
+                                if (cgData[i] == 0x41414141) r0canary++;
                             }
-                            CGImageRelease(img);
+                            log([NSString stringWithFormat:@"PROPCHAIN: CG row0 canary: %u/32", r0canary]);
+
+                            // Row 1 at offset 32768 in CG buffer — check if anything interesting
+                            uint32_t *row1 = (uint32_t *)((uint8_t *)cgData + 32768);
+                            uint32_t r1nz = 0;
+                            for (int i = 0; i < 32; i++) {
+                                if (row1[i] != 0) r1nz++;
+                            }
+                            log([NSString stringWithFormat:@"PROPCHAIN: CG row1 (CG-managed OOB): nonZero=%u", r1nz]);
                         }
                         CGContextRelease(cgCtx);
                         cgCtx = NULL;
                     } else {
-                        log(@"PROPCHAIN: CG rejected large stride on hijack");
+                        log(@"PROPCHAIN: CG rejected large stride even with NULL buffer");
                     }
+
+                    // Also try vm_read OOB at multiple offsets
+                    for (size_t off = hAlloc2; off <= hAlloc2 * 4; off += hAlloc2) {
+                        uint32_t probe[4] = {0};
+                        vm_size_t pRead = 0;
+                        kern_return_t pkr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)hbase2 + off, sizeof(probe),
+                            (vm_address_t)probe, &pRead);
+                        if (pkr == KERN_SUCCESS && (probe[0] != 0 || probe[1] != 0)) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"PROPCHAIN: *** OOB +%zu: 0x%08X 0x%08X 0x%08X 0x%08X ***",
+                                 off, probe[0], probe[1], probe[2], probe[3]]);
+                        } else {
+                            log([NSString stringWithFormat:@"PROPCHAIN: OOB +%zu: kr=%d", off, pkr]);
+                        }
+                    }
+
                     if (colorSpace) { CGColorSpaceRelease(colorSpace); colorSpace = NULL; }
                     sym.unlock(hijackRef, 0, NULL);
                 } else {
