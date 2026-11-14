@@ -287,6 +287,16 @@ struct ResearchView: View {
         ("kslide", "Kernel Slide Calc", "function",
          "Calcula KASLR slide desde punteros filtrados + prueba mapear memoria de kernel",
          { log, done in iosurface_research_kslide({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 28
+        ("ptrclass", "Pointer Classifier", "cpu.fill",
+         "Clasifica 154 kernel ptrs filtrados, encuentra objetos IOSurface en heap, busca vtables",
+         { log, done in iosurface_research_ptr_classifier({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("stridecorr", "Stride Corruption", "arrow.up.and.down.text.horizontal",
+         "Explota confusión de stride para escritura OOB cross-surface + manipulación de geometría",
+         { log, done in iosurface_research_stride_corrupt({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("arbread", "Arbitrary Read", "eye.trianglebadge.exclamationmark.fill",
+         "Combina todas las primitivas para intentar lectura arbitraria de memoria kernel",
+         { log, done in iosurface_research_arb_read({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -649,7 +659,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 81), id: \.id) { probe in
+            ForEach(probes[81..<84], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Round 28 — Kernel R/W Construction")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 84), id: \.id) { probe in
                 probeCard(probe)
             }
 

