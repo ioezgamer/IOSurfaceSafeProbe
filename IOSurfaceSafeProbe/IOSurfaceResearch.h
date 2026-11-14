@@ -239,5 +239,16 @@ void iosurface_research_zone_reclaim(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 /// Probe 63: Ptr leak — full chain: zone spray + reclaim + scan for kernel pointer patterns.
 void iosurface_research_ptr_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 21: Kalloc Bucket Precision ---
+
+/// Probe 64: Kalloc size sweep — try multiple OOL sizes to find the exact kalloc bucket that overlaps with IOSurface property storage.
+void iosurface_research_size_sweep(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 65: Property cross-spray — use IOSurface properties as both victim and spray for guaranteed same-bucket reclaim.
+void iosurface_research_prop_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 66: ID reuse confusion — destroy surface and create many until same ID is assigned, check for property confusion.
+void iosurface_research_id_reuse(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

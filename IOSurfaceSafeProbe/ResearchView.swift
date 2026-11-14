@@ -217,6 +217,16 @@ struct ResearchView: View {
         ("ptrleak", "Ptr Leak", "lock.open.trianglebadge.exclamationmark.fill",
          "Cadena completa: zone spray + reclaim + escaneo de punteros kernel 0xFFFFxxxxxxxx",
          { log, done in iosurface_research_ptr_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 21
+        ("sizesweep", "Size Sweep", "ruler.fill",
+         "Barrido de 14 tamaños OOL (16B–2KB) para encontrar el bucket kalloc exacto que solapa con IOSurface",
+         { log, done in iosurface_research_size_sweep({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("propspray", "Prop Spray", "arrow.triangle.swap",
+         "Cross-spray con propiedades IOSurface como víctima y spray — mismo allocator, mismo bucket garantizado",
+         { log, done in iosurface_research_prop_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("idreuse", "ID Reuse", "arrow.2.squarepath",
+         "Confusión por reutilización de ID — destruir y recrear hasta obtener mismo ID, verificar confusión de propiedades",
+         { log, done in iosurface_research_id_reuse({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -495,7 +505,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 60), id: \.id) { probe in
+            ForEach(probes[60..<63], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 21 ---
+            Text("Round 21 — Kalloc Bucket Precision")
+                .font(.caption.bold())
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 63), id: \.id) { probe in
                 probeCard(probe)
             }
 
