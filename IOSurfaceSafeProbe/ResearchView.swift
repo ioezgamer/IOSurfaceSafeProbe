@@ -37,7 +37,7 @@ struct ResearchView: View {
          "Busqueda binaria de umbrales, mismatches bytesPerRow/allocSize, formatos",
          { log, done in iosurface_research_alloc_boundary({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
         // Round 3
-        ("agx", "AGX Deep Scan", "gpu",
+        ("agx", "AGX Deep Scan", "bolt.horizontal.fill",
          "Enumera servicios GPU, tipos de conexion y fuzzing de selectores en AGX",
          { log, done in iosurface_research_agx_scan({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
         ("fmtrender", "Format Render", "paintbrush.fill",

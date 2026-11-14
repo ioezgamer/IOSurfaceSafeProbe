@@ -25,3 +25,4 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
     dependencies:
       - sdk: IOSurface.framework
+      - sdk: CoreGraphics.framework

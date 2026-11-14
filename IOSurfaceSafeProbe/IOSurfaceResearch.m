@@ -9,6 +9,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <dlfcn.h>
