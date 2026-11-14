@@ -307,6 +307,16 @@ struct ResearchView: View {
         ("pipekrw", "Pipe Kernel R/W", "arrow.left.arrow.right.circle.fill",
          "256 pipes como oráculos de heap kernel — localiza buffers via OOB para R/W primitiva",
          { log, done in iosurface_research_pipe_krw({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 30
+        ("oolspray", "OOL Msg Spray", "envelope.fill",
+         "Spray 1024 mach OOL messages, libera mitad, reclama con IOSurface para cross-contamination",
+         { log, done in iosurface_research_ool_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("ioconncall", "IOKit Method Fuzz", "hammer.fill",
+         "Fuzzing de selectores 0-99 en IOSurface user client con inputs crafteados",
+         { log, done in iosurface_research_ioconn_call({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("taskintro", "Task Introspection", "brain.filled.head.profile",
+         "Harvest kernel info via task_info, vm_region, commpage, host_info, thread state",
+         { log, done in iosurface_research_task_intro({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -692,7 +702,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 87), id: \.id) { probe in
+            ForEach(probes[87..<90], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 30 ---
+            Text("Round 30 — Strategy Pivot")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 90), id: \.id) { probe in
                 probeCard(probe)
             }
 
