@@ -305,5 +305,15 @@ void iosurface_research_surf_accel(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// Probe 81: Syscall storm — task_info, mach_make_memory_entry, vm_remap, mach_vm_region for kernel leaks.
 void iosurface_research_syscall_storm(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// Round 27: Kernel Primitives Exploitation
+/// Probe 82: OOB heap scanner — systematic OOB reads mapping heap layout around IOSurface.
+void iosurface_research_oob_scanner(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 83: Remap spray oracle — vm_remap + destroy + spray to read freed IOSurface metadata.
+void iosurface_research_remap_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 84: Kernel slide calculator — compute KASLR slide from leaked pointers + probe kernel memory.
+void iosurface_research_kslide(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

