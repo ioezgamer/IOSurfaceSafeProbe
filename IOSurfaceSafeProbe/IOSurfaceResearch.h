@@ -250,5 +250,16 @@ void iosurface_research_prop_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// Probe 66: ID reuse confusion — destroy surface and create many until same ID is assigned, check for property confusion.
 void iosurface_research_id_reuse(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 22: Internal Key Exploitation ---
+
+/// Probe 67: Key enum — enumerate all internal IOSurface keys via IOSurfaceCopyValue.
+void iosurface_research_key_enum(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 68: Key override — write controlled values to internal keys, check if surface behavior changes.
+void iosurface_research_key_override(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 69: Address redirect — attempt to redirect surface mapping via internal key manipulation.
+void iosurface_research_addr_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

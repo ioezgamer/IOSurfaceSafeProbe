@@ -227,6 +227,16 @@ struct ResearchView: View {
         ("idreuse", "ID Reuse", "arrow.2.squarepath",
          "Confusión por reutilización de ID — destruir y recrear hasta obtener mismo ID, verificar confusión de propiedades",
          { log, done in iosurface_research_id_reuse({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 22
+        ("keyenum", "Key Enum", "list.bullet.rectangle.portrait.fill",
+         "Enumera TODAS las claves internas de IOSurface — detecta valores tipo address expuestos via API",
+         { log, done in iosurface_research_key_enum({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("keyoverride", "Key Override", "pencil.and.list.clipboard",
+         "Sobrescribe claves internas — verifica si cambian base address, tamaño o mapeo de la superficie",
+         { log, done in iosurface_research_key_override({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("addredir", "Addr Redirect", "arrow.uturn.right.circle.fill",
+         "Intenta redirigir el mapeo de memoria via claves internas — busca kernel R/W primitiva",
+         { log, done in iosurface_research_addr_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -517,7 +527,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 63), id: \.id) { probe in
+            ForEach(probes[63..<66], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 22 ---
+            Text("Round 22 — Internal Key Exploitation")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 66), id: \.id) { probe in
                 probeCard(probe)
             }
 

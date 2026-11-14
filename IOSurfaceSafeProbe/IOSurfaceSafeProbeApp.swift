@@ -38,6 +38,12 @@ struct MainTabView: View {
                     Label("Research", systemImage: "shield.lefthalf.filled.badge.checkmark")
                 }
                 .tag(2)
+
+            JailbreakView()
+                .tabItem {
+                    Label("Jailbreak", systemImage: "lock.open.fill")
+                }
+                .tag(3)
         }
         .tint(.purple)
     }
