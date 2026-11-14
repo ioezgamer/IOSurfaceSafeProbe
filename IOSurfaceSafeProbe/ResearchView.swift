@@ -66,6 +66,16 @@ struct ResearchView: View {
         ("timingoracle", "Timing Oracle", "stopwatch.fill",
          "Side-channel de timing en operaciones kernel de IOSurface",
          { log, done in iosurface_research_timing_oracle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 6
+        ("fengshui", "Heap Feng Shui", "square.grid.3x3.topleft.filled",
+         "Colocacion precisa de objetos con spray, grooming y sondeo cross-boundary",
+         { log, done in iosurface_research_feng_shui({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("cachechannel", "Cache Channel", "antenna.radiowaves.left.and.right",
+         "Canal encubierto via cache: señalizacion por eviccion y ratio hot/cold",
+         { log, done in iosurface_research_cache_channel({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("deputy", "Confused Deputy", "person.badge.key.fill",
+         "Inyeccion de IDs IOSurface en servicios IOKit — test de acceso sin validar",
+         { log, done in iosurface_research_confused_deputy({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -169,7 +179,18 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 15), id: \.id) { probe in
+            ForEach(probes[15..<18], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            Text("Ronda 6 — Cadenas de Ataque")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.green)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 18), id: \.id) { probe in
                 probeCard(probe)
             }
 

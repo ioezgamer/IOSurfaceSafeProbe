@@ -3627,3 +3627,655 @@ void iosurface_research_timing_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         }
     });
 }
+
+#pragma mark - Probe 19: Heap Feng Shui
+
+void iosurface_research_feng_shui(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"FENGSHUI: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"FENGSHUI: Starting heap feng shui analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // Phase A: Adjacent surface placement
+            // Allocate surfaces of identical size, record addresses, verify they land adjacently
+            log(@"FENGSHUI: Phase A — adjacent placement analysis");
+            #define FS_COUNT 30
+            #define FS_SIZE 256
+            IOSurfaceRef surfs[FS_COUNT] = {0};
+            uintptr_t addrs[FS_COUNT] = {0};
+            size_t allocSizes[FS_COUNT] = {0};
+
+            NSDictionary *params = isr_default_surface_params(FS_SIZE, FS_SIZE);
+            for (int i = 0; i < FS_COUNT && !isr_stopped(); i++) {
+                surfs[i] = sym.create((__bridge CFDictionaryRef)params);
+                if (surfs[i]) {
+                    sym.lock(surfs[i], 0, NULL);
+                    addrs[i] = (uintptr_t)sym.getBase(surfs[i]);
+                    allocSizes[i] = sym.getAllocSize(surfs[i]);
+                    sym.unlock(surfs[i], 0, NULL);
+                }
+            }
+
+            // Sort addresses to find adjacencies
+            uintptr_t sorted[FS_COUNT];
+            memcpy(sorted, addrs, sizeof(sorted));
+            for (int i = 0; i < FS_COUNT - 1; i++) {
+                for (int j = i + 1; j < FS_COUNT; j++) {
+                    if (sorted[j] < sorted[i]) {
+                        uintptr_t tmp = sorted[i];
+                        sorted[i] = sorted[j];
+                        sorted[j] = tmp;
+                    }
+                }
+            }
+
+            uint32_t adjacentPairs = 0;
+            uint32_t gapCount = 0;
+            size_t expectedAlloc = allocSizes[0];
+            for (int i = 0; i < FS_COUNT - 1 && sorted[i] != 0; i++) {
+                if (sorted[i + 1] == 0) break;
+                size_t gap = sorted[i + 1] - sorted[i];
+                if (gap == expectedAlloc) {
+                    adjacentPairs++;
+                } else if (gap < expectedAlloc * 2) {
+                    gapCount++;
+                }
+            }
+
+            log([NSString stringWithFormat:
+                @"FENGSHUI: Adjacent pairs=%u/%d gaps=%u allocSize=%zu",
+                adjacentPairs, FS_COUNT - 1, gapCount, expectedAlloc]);
+
+            if (adjacentPairs > FS_COUNT / 2) {
+                anomalies++;
+                log(@"FENGSHUI: ANOMALY — high adjacency rate, predictable heap layout");
+            }
+
+            // Phase B: Targeted hole filling
+            // Free every other surface, then reallocate with sentinel patterns
+            log(@"FENGSHUI: Phase B — targeted hole filling");
+            uint8_t sentinel_A = 0xAA;
+            uint8_t sentinel_B = 0xBB;
+
+            // Write sentinel_A to even surfaces
+            for (int i = 0; i < FS_COUNT; i += 2) {
+                if (surfs[i]) {
+                    sym.lock(surfs[i], 0, NULL);
+                    void *base = sym.getBase(surfs[i]);
+                    if (base) memset(base, sentinel_A, 64);
+                    sym.unlock(surfs[i], 0, NULL);
+                }
+            }
+
+            // Free odd surfaces (create holes between sentineled surfaces)
+            uintptr_t freedAddrs[FS_COUNT / 2];
+            int freedCount = 0;
+            for (int i = 1; i < FS_COUNT; i += 2) {
+                if (surfs[i]) {
+                    freedAddrs[freedCount++] = addrs[i];
+                    CFRelease(surfs[i]);
+                    surfs[i] = NULL;
+                }
+            }
+
+            // Reallocate — try to land in freed holes with sentinel_B pattern
+            IOSurfaceRef refills[FS_COUNT / 2];
+            uint32_t holeHits = 0;
+            for (int i = 0; i < freedCount && !isr_stopped(); i++) {
+                refills[i] = sym.create((__bridge CFDictionaryRef)params);
+                if (refills[i]) {
+                    sym.lock(refills[i], 0, NULL);
+                    uintptr_t newAddr = (uintptr_t)sym.getBase(refills[i]);
+                    void *base = sym.getBase(refills[i]);
+                    if (base) memset(base, sentinel_B, 64);
+                    sym.unlock(refills[i], 0, NULL);
+                    // Check if we landed in a freed slot
+                    for (int j = 0; j < freedCount; j++) {
+                        if (newAddr == freedAddrs[j]) {
+                            holeHits++;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            log([NSString stringWithFormat:
+                @"FENGSHUI: Hole filling — freed=%d refilled=%d holeHits=%u (%.0f%%)",
+                freedCount, freedCount, holeHits,
+                freedCount > 0 ? (holeHits * 100.0 / freedCount) : 0.0]);
+
+            if (holeHits > freedCount / 2) {
+                anomalies++;
+                log(@"FENGSHUI: ANOMALY — high hole-fill rate, deterministic placement");
+            }
+
+            // Phase C: Cross-boundary probe
+            // Check if adjacent surfaces can observe each other's sentinel patterns
+            // Read boundary bytes of even (sentinel_A) surfaces after filling holes with sentinel_B
+            log(@"FENGSHUI: Phase C — cross-boundary probe");
+            uint32_t boundaryLeaks = 0;
+
+            for (int i = 0; i < FS_COUNT; i += 2) {
+                if (!surfs[i] || isr_stopped()) continue;
+                sym.lock(surfs[i], 0, NULL);
+                void *base = sym.getBase(surfs[i]);
+                size_t allocSz = sym.getAllocSize(surfs[i]);
+                if (base && allocSz > 0) {
+                    // Check the last page of the buffer for any sentinel_B contamination
+                    uint8_t *end = (uint8_t *)base + allocSz - 64;
+                    if ((uintptr_t)end > (uintptr_t)base) {
+                        for (int b = 0; b < 64; b++) {
+                            if (end[b] == sentinel_B) {
+                                boundaryLeaks++;
+                                log([NSString stringWithFormat:
+                                    @"FENGSHUI: BOUNDARY LEAK at surface %d offset %zu+%d",
+                                    i, allocSz - 64, b]);
+                                break;
+                            }
+                        }
+                    }
+                }
+                sym.unlock(surfs[i], 0, NULL);
+            }
+
+            if (boundaryLeaks > 0) {
+                anomalies++;
+                log([NSString stringWithFormat:
+                    @"FENGSHUI: ANOMALY — %u cross-boundary leaks detected!", boundaryLeaks]);
+            } else {
+                log(@"FENGSHUI: No cross-boundary leaks — kernel enforces page isolation");
+            }
+
+            // Cleanup
+            for (int i = 0; i < FS_COUNT; i++) {
+                if (surfs[i]) CFRelease(surfs[i]);
+            }
+            for (int i = 0; i < freedCount; i++) {
+                if (refills[i]) CFRelease(refills[i]);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"FENGSHUI: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"adjacentPairs": @(adjacentPairs),
+                @"holeHits": @(holeHits),
+                @"boundaryLeaks": @(boundaryLeaks),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-FengShui-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 20: Cache Covert Channel
+
+void iosurface_research_cache_channel(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"CACHE: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"CACHE: Starting cache covert channel analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            mach_timebase_info_data_t tbi;
+            mach_timebase_info(&tbi);
+
+            // Phase A: Establish baseline lock/unlock timing
+            log(@"CACHE: Phase A — baseline timing calibration");
+            #define CC_SAMPLES 200
+            #define CC_SURFACES 5
+
+            NSDictionary *params = isr_default_surface_params(512, 512);
+            IOSurfaceRef calibSurf = sym.create((__bridge CFDictionaryRef)params);
+            if (!calibSurf) {
+                log(@"CACHE: Failed to create calibration surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            uint64_t lockTimes[CC_SAMPLES];
+            uint64_t unlockTimes[CC_SAMPLES];
+
+            for (int i = 0; i < CC_SAMPLES && !isr_stopped(); i++) {
+                uint64_t t0 = mach_absolute_time();
+                sym.lock(calibSurf, 0, NULL);
+                uint64_t t1 = mach_absolute_time();
+                sym.unlock(calibSurf, 0, NULL);
+                uint64_t t2 = mach_absolute_time();
+                lockTimes[i] = (t1 - t0) * tbi.numer / tbi.denom;
+                unlockTimes[i] = (t2 - t1) * tbi.numer / tbi.denom;
+            }
+
+            // Sort to get percentiles
+            for (int i = 0; i < CC_SAMPLES - 1; i++)
+                for (int j = i + 1; j < CC_SAMPLES; j++) {
+                    if (lockTimes[j] < lockTimes[i]) {
+                        uint64_t tmp = lockTimes[i]; lockTimes[i] = lockTimes[j]; lockTimes[j] = tmp;
+                    }
+                    if (unlockTimes[j] < unlockTimes[i]) {
+                        uint64_t tmp = unlockTimes[i]; unlockTimes[i] = unlockTimes[j]; unlockTimes[j] = tmp;
+                    }
+                }
+
+            uint64_t lockP50 = lockTimes[CC_SAMPLES / 2];
+            uint64_t lockP95 = lockTimes[(int)(CC_SAMPLES * 0.95)];
+            uint64_t lockP99 = lockTimes[(int)(CC_SAMPLES * 0.99)];
+            uint64_t unlockP50 = unlockTimes[CC_SAMPLES / 2];
+            uint64_t unlockP95 = unlockTimes[(int)(CC_SAMPLES * 0.95)];
+
+            log([NSString stringWithFormat:
+                @"CACHE: Lock p50=%lluns p95=%lluns p99=%lluns", lockP50, lockP95, lockP99]);
+            log([NSString stringWithFormat:
+                @"CACHE: Unlock p50=%lluns p95=%lluns", unlockP50, unlockP95]);
+
+            // Phase B: Eviction-based signaling
+            // Allocate many surfaces to evict cache, then measure timing difference
+            log(@"CACHE: Phase B — cache eviction signaling");
+            #define CC_EVICT 50
+
+            IOSurfaceRef evictSurfs[CC_EVICT] = {0};
+            NSDictionary *bigParams = isr_default_surface_params(1024, 1024);
+
+            uint64_t postEvictLock[30];
+            uint32_t bitsSent = 0;
+            uint32_t bitsCorrect = 0;
+
+            for (int trial = 0; trial < 30 && !isr_stopped(); trial++) {
+                BOOL sendBit = (trial % 2 == 0); // alternating 1/0 pattern
+
+                if (sendBit) {
+                    // "Send 1" — evict cache by allocating/touching many surfaces
+                    for (int i = 0; i < CC_EVICT; i++) {
+                        evictSurfs[i] = sym.create((__bridge CFDictionaryRef)bigParams);
+                        if (evictSurfs[i]) {
+                            sym.lock(evictSurfs[i], 0, NULL);
+                            void *base = sym.getBase(evictSurfs[i]);
+                            if (base) memset(base, 0xFF, 4096); // touch pages
+                            sym.unlock(evictSurfs[i], 0, NULL);
+                        }
+                    }
+                }
+
+                // "Receive" — measure lock timing on calibration surface
+                uint64_t t0 = mach_absolute_time();
+                sym.lock(calibSurf, 0, NULL);
+                uint64_t t1 = mach_absolute_time();
+                sym.unlock(calibSurf, 0, NULL);
+                uint64_t elapsed_ns = (t1 - t0) * tbi.numer / tbi.denom;
+                postEvictLock[trial] = elapsed_ns;
+
+                // Decode: if timing > p95, interpret as "1" (cache evicted)
+                BOOL receivedBit = (elapsed_ns > lockP95);
+                bitsSent++;
+                if (receivedBit == sendBit) bitsCorrect++;
+
+                // Cleanup eviction surfaces
+                if (sendBit) {
+                    for (int i = 0; i < CC_EVICT; i++) {
+                        if (evictSurfs[i]) { CFRelease(evictSurfs[i]); evictSurfs[i] = NULL; }
+                    }
+                }
+            }
+
+            double accuracy = bitsSent > 0 ? (bitsCorrect * 100.0 / bitsSent) : 0;
+            log([NSString stringWithFormat:
+                @"CACHE: Signaling — sent=%u correct=%u accuracy=%.1f%%",
+                bitsSent, bitsCorrect, accuracy]);
+
+            if (accuracy > 70.0) {
+                anomalies++;
+                log(@"CACHE: ANOMALY — cache covert channel viable (>70% accuracy)");
+            }
+
+            // Phase C: Timing histogram for bandwidth estimation
+            log(@"CACHE: Phase C — timing distribution analysis");
+
+            uint64_t coldTimes[20];
+            uint64_t hotTimes[20];
+
+            for (int i = 0; i < 20 && !isr_stopped(); i++) {
+                // Hot: repeated lock/unlock (cached)
+                sym.lock(calibSurf, 0, NULL);
+                sym.unlock(calibSurf, 0, NULL);
+                sym.lock(calibSurf, 0, NULL);
+                sym.unlock(calibSurf, 0, NULL);
+                uint64_t t0 = mach_absolute_time();
+                sym.lock(calibSurf, 0, NULL);
+                uint64_t t1 = mach_absolute_time();
+                sym.unlock(calibSurf, 0, NULL);
+                hotTimes[i] = (t1 - t0) * tbi.numer / tbi.denom;
+
+                // Cold: evict then measure
+                IOSurfaceRef trash[20];
+                for (int j = 0; j < 20; j++) {
+                    trash[j] = sym.create((__bridge CFDictionaryRef)bigParams);
+                    if (trash[j]) {
+                        sym.lock(trash[j], 0, NULL);
+                        void *b = sym.getBase(trash[j]);
+                        if (b) memset(b, 0, 4096);
+                        sym.unlock(trash[j], 0, NULL);
+                    }
+                }
+                t0 = mach_absolute_time();
+                sym.lock(calibSurf, 0, NULL);
+                t1 = mach_absolute_time();
+                sym.unlock(calibSurf, 0, NULL);
+                coldTimes[i] = (t1 - t0) * tbi.numer / tbi.denom;
+
+                for (int j = 0; j < 20; j++) {
+                    if (trash[j]) CFRelease(trash[j]);
+                }
+            }
+
+            // Calculate medians
+            for (int i = 0; i < 19; i++)
+                for (int j = i + 1; j < 20; j++) {
+                    if (hotTimes[j] < hotTimes[i]) { uint64_t t = hotTimes[i]; hotTimes[i] = hotTimes[j]; hotTimes[j] = t; }
+                    if (coldTimes[j] < coldTimes[i]) { uint64_t t = coldTimes[i]; coldTimes[i] = coldTimes[j]; coldTimes[j] = t; }
+                }
+
+            uint64_t hotMed = hotTimes[10];
+            uint64_t coldMed = coldTimes[10];
+            double ratio = hotMed > 0 ? (double)coldMed / hotMed : 0;
+
+            log([NSString stringWithFormat:
+                @"CACHE: Hot median=%lluns Cold median=%lluns ratio=%.1fx",
+                hotMed, coldMed, ratio]);
+
+            if (ratio > 2.0) {
+                anomalies++;
+                log([NSString stringWithFormat:
+                    @"CACHE: ANOMALY — %.1fx cold/hot ratio, reliable cache distinguisher", ratio]);
+            }
+
+            CFRelease(calibSurf);
+
+            double elapsedTotal = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"CACHE: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsedTotal]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"accuracy": @(accuracy),
+                @"coldHotRatio": @(ratio),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsedTotal)
+            };
+            isr_checkpoint(@"ISR-CacheChannel-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
+
+#pragma mark - Probe 21: Confused Deputy
+
+void iosurface_research_confused_deputy(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            ISRSymbols sym;
+            if (!isr_load(&sym)) {
+                log(@"DEPUTY: Failed to load symbols");
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            log(@"DEPUTY: Starting confused deputy analysis");
+            CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+            __block uint32_t anomalies = 0;
+
+            // Phase A: Pass IOSurface ID to IOKit services as scalar input
+            // Test if services blindly use the surface ID without validation
+            log(@"DEPUTY: Phase A — IOSurface ID injection into IOKit services");
+
+            NSDictionary *params = isr_default_surface_params(64, 64);
+            IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+            if (!surf) {
+                log(@"DEPUTY: Failed to create surface");
+                isr_unload(&sym);
+                done(@{@"status": @"ERROR", @"anomalies": @0});
+                return;
+            }
+
+            IOSurfaceID surfID = sym.getID(surf);
+            sym.lock(surf, 0, NULL);
+            void *base = sym.getBase(surf);
+            if (base) {
+                memset(base, 0xCC, 64 * 64 * 4); // sentinel pattern
+            }
+            sym.unlock(surf, 0, NULL);
+
+            log([NSString stringWithFormat:@"DEPUTY: Test surface id=%u", surfID]);
+
+            // Try passing surface ID as selector input to IOSurfaceRoot
+            const char *services[] = {
+                "IOSurfaceRoot",
+                "IOMobileFramebuffer",
+                "AppleAVE2Driver",
+                "IOGPUDevice",
+                "AGXAccelerator"
+            };
+
+            typedef kern_return_t (*ISR_MapFn)(io_connect_t, uint32_t, mach_vm_address_t *, mach_vm_size_t *);
+            ISR_MapFn mapMem = (ISR_MapFn)dlsym(sym.iokit, "IOConnectMapMemory64");
+
+            uint32_t servicesOpened = 0;
+            uint32_t selectorsAccepted = 0;
+            uint32_t mapSuccess = 0;
+
+            for (int s = 0; s < 5 && !isr_stopped(); s++) {
+                CFMutableDictionaryRef match = sym.matching(services[s]);
+                if (!match) continue;
+
+                io_service_t svc = sym.getMatch(MACH_PORT_NULL, match);
+                if (!svc) continue;
+
+                // Try connection types 0-3
+                for (uint32_t connType = 0; connType < 4; connType++) {
+                    io_connect_t conn = 0;
+                    kern_return_t kr = sym.open(svc, mach_task_self(), connType, &conn);
+                    if (kr != KERN_SUCCESS || !conn) continue;
+                    servicesOpened++;
+
+                    // Pass surface ID as scalar input to selectors 0-10
+                    uint64_t scalarIn[2] = { surfID, 0 };
+                    uint64_t scalarOut[4] = {0};
+                    uint32_t outCnt = 4;
+
+                    for (uint32_t sel = 0; sel < 11 && !isr_stopped(); sel++) {
+                        kr = sym.call(conn, sel, scalarIn, 2, NULL, 0,
+                                      scalarOut, &outCnt, NULL, NULL);
+                        if (kr == KERN_SUCCESS) {
+                            selectorsAccepted++;
+                            log([NSString stringWithFormat:
+                                @"DEPUTY: %s type=%u sel=%u ACCEPTED with surfID — out=[%llu,%llu,%llu,%llu]",
+                                services[s], connType, sel,
+                                scalarOut[0], scalarOut[1], scalarOut[2], scalarOut[3]]);
+                        }
+                        outCnt = 4;
+                    }
+
+                    // Try IOConnectMapMemory with surface-related memory types
+                    if (mapMem) {
+                        for (uint32_t memType = 0; memType < 4; memType++) {
+                            mach_vm_address_t addr = 0;
+                            mach_vm_size_t size = 0;
+                            kr = mapMem(conn, memType, &addr, &size);
+                            if (kr == KERN_SUCCESS && addr != 0) {
+                                mapSuccess++;
+                                log([NSString stringWithFormat:
+                                    @"DEPUTY: %s type=%u mapMem(%u) = addr=0x%llx size=%llu",
+                                    services[s], connType, memType,
+                                    (uint64_t)addr, (uint64_t)size]);
+                            }
+                        }
+                    }
+
+                    sym.close(conn);
+                }
+                sym.release(svc);
+            }
+
+            log([NSString stringWithFormat:
+                @"DEPUTY: Phase A — opened=%u accepted=%u maps=%u",
+                servicesOpened, selectorsAccepted, mapSuccess]);
+
+            if (selectorsAccepted > 0) {
+                anomalies++;
+                log(@"DEPUTY: ANOMALY — services accepted surface ID as input");
+            }
+            if (mapSuccess > 0) {
+                anomalies++;
+                log(@"DEPUTY: ANOMALY — shared memory mapped from IOKit services");
+            }
+
+            // Phase B: Stale ID injection — destroy surface then pass old ID
+            log(@"DEPUTY: Phase B — stale ID injection");
+            IOSurfaceID staleID = surfID;
+            CFRelease(surf);
+            surf = NULL;
+
+            // Try to use stale ID via IOSurfaceLookup
+            IOSurfaceRef staleLookup = sym.lookup(staleID);
+            if (staleLookup) {
+                anomalies++;
+                log([NSString stringWithFormat:
+                    @"DEPUTY: ANOMALY — stale ID %u still resolves after destroy!", staleID]);
+                CFRelease(staleLookup);
+            } else {
+                log([NSString stringWithFormat:
+                    @"DEPUTY: Stale ID %u correctly invalidated", staleID]);
+            }
+
+            // Pass stale ID to IOSurfaceRoot
+            CFMutableDictionaryRef rootMatch = sym.matching("IOSurfaceRoot");
+            if (rootMatch) {
+                io_service_t rootSvc = sym.getMatch(MACH_PORT_NULL, rootMatch);
+                if (rootSvc) {
+                    io_connect_t rootConn = 0;
+                    kern_return_t kr = sym.open(rootSvc, mach_task_self(), 0, &rootConn);
+                    if (kr == KERN_SUCCESS && rootConn) {
+                        uint64_t staleIn[2] = { staleID, 0 };
+                        uint64_t out[4] = {0};
+                        uint32_t outCnt = 4;
+
+                        uint32_t staleAccepted = 0;
+                        for (uint32_t sel = 0; sel < 20; sel++) {
+                            kr = sym.call(rootConn, sel, staleIn, 2, NULL, 0,
+                                          out, &outCnt, NULL, NULL);
+                            if (kr == KERN_SUCCESS) {
+                                staleAccepted++;
+                                log([NSString stringWithFormat:
+                                    @"DEPUTY: IOSurfaceRoot sel=%u ACCEPTED stale ID", sel]);
+                            }
+                            outCnt = 4;
+                        }
+
+                        if (staleAccepted > 0) {
+                            anomalies++;
+                            log([NSString stringWithFormat:
+                                @"DEPUTY: ANOMALY — %u selectors accepted stale surface ID", staleAccepted]);
+                        }
+
+                        sym.close(rootConn);
+                    }
+                    sym.release(rootSvc);
+                }
+            }
+
+            // Phase C: Type confusion — create surface, pass its ID as struct input
+            log(@"DEPUTY: Phase C — type confusion via struct input");
+            IOSurfaceRef confSurf = sym.create((__bridge CFDictionaryRef)
+                isr_default_surface_params(128, 128));
+
+            uint32_t structAccepted = 0;
+            if (confSurf) {
+                IOSurfaceID confID = sym.getID(confSurf);
+
+                // Build a struct with the surface ID embedded at various offsets
+                uint8_t structBuf[256];
+                memset(structBuf, 0, sizeof(structBuf));
+                // Place surface ID at offset 0, 4, 8
+                memcpy(&structBuf[0], &confID, sizeof(confID));
+                memcpy(&structBuf[4], &confID, sizeof(confID));
+                memcpy(&structBuf[8], &confID, sizeof(confID));
+
+                CFMutableDictionaryRef m2 = sym.matching("IOSurfaceRoot");
+                if (m2) {
+                    io_service_t svc2 = sym.getMatch(MACH_PORT_NULL, m2);
+                    if (svc2) {
+                        io_connect_t conn2 = 0;
+                        if (sym.open(svc2, mach_task_self(), 0, &conn2) == KERN_SUCCESS && conn2) {
+                            for (uint32_t sel = 0; sel < 20 && !isr_stopped(); sel++) {
+                                uint64_t out[4] = {0};
+                                uint32_t outCnt = 4;
+                                uint8_t outStruct[256] = {0};
+                                size_t outStructSz = sizeof(outStruct);
+
+                                kern_return_t kr = sym.call(conn2, sel,
+                                    NULL, 0, structBuf, sizeof(structBuf),
+                                    out, &outCnt, outStruct, &outStructSz);
+                                if (kr == KERN_SUCCESS) {
+                                    structAccepted++;
+                                    log([NSString stringWithFormat:
+                                        @"DEPUTY: IOSurfaceRoot sel=%u accepted struct with embedded surfID", sel]);
+                                }
+                            }
+                            sym.close(conn2);
+                        }
+                        sym.release(svc2);
+                    }
+                }
+
+                if (structAccepted > 0) {
+                    anomalies++;
+                    log([NSString stringWithFormat:
+                        @"DEPUTY: ANOMALY — %u selectors accepted struct with surface ID", structAccepted]);
+                }
+
+                CFRelease(confSurf);
+            }
+
+            double elapsed = CFAbsoluteTimeGetCurrent() - start;
+            log([NSString stringWithFormat:
+                @"DEPUTY: DONE anomalies=%u elapsed=%.3fs", anomalies, elapsed]);
+
+            NSDictionary *results = @{
+                @"status": isr_stopped() ? @"STOPPED" : @"DONE",
+                @"servicesOpened": @(servicesOpened),
+                @"selectorsAccepted": @(selectorsAccepted),
+                @"mapSuccess": @(mapSuccess),
+                @"structAccepted": @(structAccepted),
+                @"anomalies": @(anomalies),
+                @"elapsed": @(elapsed)
+            };
+            isr_checkpoint(@"ISR-ConfusedDeputy-checkpoint.json", results);
+            isr_unload(&sym);
+            done(results);
+        }
+    });
+}
