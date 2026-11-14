@@ -23,6 +23,19 @@ struct ResearchView: View {
         ("mach", "Mach/IOKit", "cpu.fill",
          "Escanea selectores 0-32 en IOSurfaceRoot con patrones de entrada",
          { log, done in iosurface_research_mach({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 2
+        ("timed_race", "Race Precisa", "timer",
+         "UAF con timing nanosegundos — detecta datos residuales en IDs reciclados",
+         { log, done in iosurface_research_timed_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("bufleak", "Buffer Leak", "memorychip.fill",
+         "Escribe patrones en buffer, destruye, verifica si persisten en nuevas surfaces",
+         { log, done in iosurface_research_buffer_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("conn", "Conexiones IOKit", "link.circle.fill",
+         "Prueba tipos de conexion 0-15, task ports alternativos, servicios relacionados",
+         { log, done in iosurface_research_conn_types({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("boundary", "Limites Alloc", "ruler.fill",
+         "Busqueda binaria de umbrales, mismatches bytesPerRow/allocSize, formatos",
+         { log, done in iosurface_research_alloc_boundary({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -31,7 +44,6 @@ struct ResearchView: View {
                 VStack(spacing: 16) {
                     headerSection
                     probeCards
-                    if !log.isEmpty { logSection }
                 }
                 .padding(.horizontal)
                 .padding(.bottom, 30)
@@ -77,45 +89,68 @@ struct ResearchView: View {
 
     private var probeCards: some View {
         VStack(spacing: 10) {
-            ForEach(probes, id: \.id) { probe in
-                Button {
-                    runProbe(probe)
-                } label: {
-                    HStack(spacing: 14) {
-                        Image(systemName: probe.icon)
-                            .font(.title2)
-                            .foregroundStyle(.purple)
-                            .frame(width: 36)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(probe.name)
-                                .font(.headline)
-                                .foregroundStyle(.primary)
-                            Text(probe.desc)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-                        Spacer()
-                        if activeProbe == probe.id {
-                            ProgressView()
-                        } else {
-                            Image(systemName: "play.circle.fill")
-                                .font(.title2)
-                                .foregroundStyle(.purple.opacity(0.7))
-                        }
-                    }
-                    .padding(14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .fill(activeProbe == probe.id
-                                  ? Color.purple.opacity(0.08)
-                                  : Color(.secondarySystemGroupedBackground))
-                    )
-                }
-                .disabled(running)
-                .buttonStyle(.plain)
+            Text("Ronda 1 — Reconocimiento")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+
+            ForEach(probes.prefix(5), id: \.id) { probe in
+                probeCard(probe)
             }
+
+            Text("Ronda 2 — Sondas Avanzadas")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.purple)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 5), id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            if !log.isEmpty { logSection }
         }
+    }
+
+    private func probeCard(_ probe: (id: String, name: String, icon: String, desc: String, action: (@escaping (String) -> Void, @escaping ([String: Any]) -> Void) -> Void)) -> some View {
+        Button {
+            runProbe(probe)
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: probe.icon)
+                    .font(.title2)
+                    .foregroundStyle(.purple)
+                    .frame(width: 36)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(probe.name)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Text(probe.desc)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer()
+                if activeProbe == probe.id {
+                    ProgressView()
+                } else {
+                    Image(systemName: "play.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.purple.opacity(0.7))
+                }
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(activeProbe == probe.id
+                          ? Color.purple.opacity(0.08)
+                          : Color(.secondarySystemGroupedBackground))
+            )
+        }
+        .disabled(running)
+        .buttonStyle(.plain)
     }
 
     private var logSection: some View {
