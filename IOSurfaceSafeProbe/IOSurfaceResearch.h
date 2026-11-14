@@ -118,5 +118,16 @@ void iosurface_research_spray_cg_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _N
 /// Probe 30: Global+overflow combo — global surface as overflow target with entropy analysis.
 void iosurface_research_global_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 10: Real exploitation probes ---
+
+/// Probe 31: CG cross-plane read — actual OOB read of plane1 data via CG h=128 within allocSize.
+void iosurface_research_cg_crossplane_read(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 32: Mach port surface hijack — transfer surface via mach port, tamper from second ref.
+void iosurface_research_mach_hijack(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 33: Global surface TOCTOU — race between lookup and write for time-of-check/time-of-use.
+void iosurface_research_global_toctou(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
