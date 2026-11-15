@@ -22175,6 +22175,14 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             return;
         }
 
+        NSDictionary *prevCrash = [[NSUserDefaults standardUserDefaults] objectForKey:@"ISR_StructMethod_LastCall"];
+        if (prevCrash) {
+            log([NSString stringWithFormat:@"STRUCTMETHOD: PREVIOUS CRASH detected at — selector=%@, input=%@, inputSize=%@, step=%@",
+                 prevCrash[@"selector"], prevCrash[@"input"], prevCrash[@"inputSize"], prevCrash[@"step"]]);
+            [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ISR_StructMethod_LastCall"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+
         typedef kern_return_t (*StructCallFn)(io_connect_t, uint32_t, const void *, size_t, void *, size_t *);
         StructCallFn structCall = (StructCallFn)dlsym(sym.iokit, "IOConnectCallStructMethod");
         if (!structCall) {
@@ -22264,10 +22272,15 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 memset(outBuf, 0, sizeof(outBuf));
                 size_t outSize = sizeof(outBuf);
 
-                isr_checkpoint(@"ISR-StructMethod-last.json", (@{
-                    @"selector": @(sel), @"input": @(inputs[inp].name),
+                NSDictionary *ckpt = @{
+                    @"selector": @(sel), @"input": [NSString stringWithUTF8String:inputs[inp].name],
                     @"inputSize": @(inputs[inp].size), @"step": @1
-                }));
+                };
+                [[NSUserDefaults standardUserDefaults] setObject:ckpt forKey:@"ISR_StructMethod_LastCall"];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                isr_checkpoint(@"ISR-StructMethod-last.json", ckpt);
+                log([NSString stringWithFormat:@"STRUCTMETHOD: calling sel=%u input=%s size=%zu",
+                     sel, inputs[inp].name, inputs[inp].size]);
 
                 kern_return_t ret = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf, &outSize);
                 if (ret == KERN_SUCCESS) {
@@ -22306,10 +22319,13 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 memset(outBuf2, 0, sizeof(outBuf2));
                 size_t outSize2 = sizeof(outBuf2);
 
-                isr_checkpoint(@"ISR-StructMethod-last.json", (@{
-                    @"selector": @(sel), @"input": @(inputs[inp].name),
+                NSDictionary *ckpt2 = @{
+                    @"selector": @(sel), @"input": [NSString stringWithUTF8String:inputs[inp].name],
                     @"inputSize": @(inputs[inp].size), @"step": @2
-                }));
+                };
+                [[NSUserDefaults standardUserDefaults] setObject:ckpt2 forKey:@"ISR_StructMethod_LastCall"];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                log([NSString stringWithFormat:@"STRUCTMETHOD: calling sel=%u input=%s", sel, inputs[inp].name]);
                 kern_return_t ret2 = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf2, &outSize2);
                 if (ret2 == KERN_SUCCESS) {
                     acceptedSelectors++;
@@ -22340,10 +22356,10 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                     uint8_t outBuf3[4096];
                     memset(outBuf3, 0, sizeof(outBuf3));
                     size_t outSize3 = sizeof(outBuf3);
-                    isr_checkpoint(@"ISR-StructMethod-last.json", (@{
-                        @"selector": @(sel), @"input": @"huge64k",
-                        @"inputSize": @(65536), @"step": @3
-                    }));
+                    NSDictionary *ckpt3 = @{@"selector": @(sel), @"input": @"huge64k", @"inputSize": @(65536), @"step": @3};
+                    [[NSUserDefaults standardUserDefaults] setObject:ckpt3 forKey:@"ISR_StructMethod_LastCall"];
+                    [[NSUserDefaults standardUserDefaults] synchronize];
+                    log([NSString stringWithFormat:@"STRUCTMETHOD: calling sel=%u input=huge64k size=65536", sel]);
                     kern_return_t ret3 = structCall(connect, sel, hugeStruct, 65536, outBuf3, &outSize3);
                     if (ret3 == KERN_SUCCESS) {
                         anomalies++;
@@ -22355,6 +22371,8 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         }
 
         sym.close(connect);
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ISR_StructMethod_LastCall"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
 
         gettimeofday(&tv_end, NULL);
         double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
