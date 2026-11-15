@@ -22179,8 +22179,8 @@ static void isr_crash_log(const char *msg) {
 void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        #define BATCH_SIZE 5
-        #define MAX_SEL 99
+        #define BATCH_SIZE 1
+        #define MAX_SEL 4
 
         NSString *progressPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-structmethod-progress.txt"];
         NSString *prev = [NSString stringWithContentsOfFile:progressPath encoding:NSUTF8StringEncoding error:nil];
