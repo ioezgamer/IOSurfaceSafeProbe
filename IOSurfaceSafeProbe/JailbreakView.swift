@@ -28,9 +28,12 @@ struct JailbreakView: View {
         ("Mach OOL Heap Control", .notFound, "R30"),
         ("IOKit Method Exploit", .notFound, "R30"),
         ("Kernel Info Harvest", .confirmed, "R30"),
-        ("Race Condition UAF", .pending, "R31"),
-        ("Physical Memory Map", .pending, "R31"),
-        ("Full Exploit Chain", .pending, "R31"),
+        ("Race Condition UAF", .notFound, "R31"),
+        ("Physical Memory Map", .confirmed, "R31"),
+        ("Full Exploit Chain", .confirmed, "R31"),
+        ("Type Confusion on Property Store", .pending, "R32"),
+        ("Struct Method Kernel Leak", .pending, "R32"),
+        ("Surface Object UAF", .pending, "R32"),
     ]
 
     var body: some View {
@@ -160,7 +163,7 @@ struct JailbreakView: View {
             }
             .disabled(true)
 
-            Text("Requiere kernel R/W primitiva — Round 31 en progreso")
+            Text("Requiere kernel R/W primitiva — Round 32 en progreso")
                 .font(.caption2)
                 .foregroundStyle(.gray.opacity(0.5))
         }

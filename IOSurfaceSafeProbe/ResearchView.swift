@@ -327,6 +327,16 @@ struct ResearchView: View {
         ("exploitchain", "Full Exploit Chain", "lock.open.laptopcomputer",
          "Spray+OOB+AllocSize override+kernel scan+vm_remap — cadena completa de explotación",
          { log, done in iosurface_research_exploit_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 32
+        ("typeconfuse", "Type Confusion", "arrow.triangle.swap",
+         "Property store type coercion — CFData↔CFNumber↔CFDictionary type confusion attack",
+         { log, done in iosurface_research_type_confuse({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("structmethod", "Struct Method Call", "wrench.and.screwdriver.fill",
+         "IOConnectCallStructMethod — struct-based IOKit methods con inputs crafteados",
+         { log, done in iosurface_research_struct_method({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("lifecyclerace", "Lifecycle TOCTOU", "tornado",
+         "Race create/lookup/free/use — TOCTOU en el objeto IOSurface mismo",
+         { log, done in iosurface_research_lifecycle_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -736,7 +746,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 93), id: \.id) { probe in
+            ForEach(probes[93..<96], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 32 ---
+            Text("Round 32 — Bug Hunting")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 96), id: \.id) { probe in
                 probeCard(probe)
             }
 

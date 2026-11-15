@@ -22,6 +22,7 @@
 extern mach_port_t bootstrap_port;
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
 #include <math.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
 #import "IOSurfaceResearch.h"
@@ -21786,6 +21787,826 @@ void iosurface_research_exploit_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             @"expandedMappings": @(expandedMappings)
         };
         isr_checkpoint(@"ISR-ExploitChain-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Probe 97: Type Confusion on Property Store
+
+void iosurface_research_type_confuse(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            log(@"TYPECONFUSE: Failed to load symbols");
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+        typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+        SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+        GetValueFn getValue = (GetValueFn)dlsym(sym.iosurface, "IOSurfaceGetValue");
+        RemoveValueFn removeValue = (RemoveValueFn)dlsym(sym.iosurface, "IOSurfaceRemoveValue");
+
+        if (!setValue || !getValue || !removeValue) {
+            log(@"TYPECONFUSE: Failed to load value functions");
+            isr_unload(&sym);
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
+        NSDictionary *params = isr_default_surface_params(64, 64);
+        IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)params);
+        __block unsigned anomalies = 0;
+        unsigned staleReads = 0;
+        unsigned typeMismatches = 0;
+        unsigned corruptedData = 0;
+        unsigned largeAllocAnomalies = 0;
+
+        if (!surf) {
+            log(@"TYPECONFUSE: Failed to create surface");
+            isr_unload(&sym);
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+
+        log(@"TYPECONFUSE: Step 1 — CFData with fake pointer pattern");
+        if (!isr_stopped()) {
+            uint64_t fakePointers[8] = {
+                0xfffffff007004000ULL, 0xfffffff007008000ULL,
+                0xfffffff00700c000ULL, 0xfffffff007010000ULL,
+                0xdeadbeefcafebabeULL, 0x4141414141414141ULL,
+                0xfffffff007014000ULL, 0x0000000000000000ULL
+            };
+            CFDataRef fakeData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)fakePointers, sizeof(fakePointers));
+            CFStringRef key1 = CFSTR("ISRTypeConfuseData");
+            setValue(surf, key1, fakeData);
+            CFTypeRef readBack = getValue(surf, key1);
+            if (readBack) {
+                CFTypeID tid = CFGetTypeID(readBack);
+                CFTypeID dataTypeID = CFDataGetTypeID();
+                if (tid != dataTypeID) {
+                    anomalies++;
+                    typeMismatches++;
+                    log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — type changed! Expected CFData(%lu) got type %lu", (unsigned long)dataTypeID, (unsigned long)tid]);
+                } else {
+                    CFDataRef readData = (CFDataRef)readBack;
+                    CFIndex len = CFDataGetLength(readData);
+                    if (len != sizeof(fakePointers)) {
+                        anomalies++;
+                        corruptedData++;
+                        log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — size mismatch! Wrote %zu got %ld", sizeof(fakePointers), (long)len]);
+                    } else {
+                        const UInt8 *bytes = CFDataGetBytePtr(readData);
+                        if (memcmp(bytes, fakePointers, sizeof(fakePointers)) != 0) {
+                            anomalies++;
+                            corruptedData++;
+                            log(@"TYPECONFUSE: ANOMALY — data content mismatch after readback!");
+                        } else {
+                            log(@"TYPECONFUSE: CFData round-trip OK — 64 bytes intact");
+                        }
+                    }
+                }
+            } else {
+                log(@"TYPECONFUSE: readback returned NULL");
+            }
+            CFRelease(fakeData);
+        }
+
+        log(@"TYPECONFUSE: Step 2 — Type overwrite: set as CFNumber, read expecting CFData");
+        if (!isr_stopped()) {
+            CFStringRef key2 = CFSTR("ISRTypeConfuseOverwrite");
+            uint64_t fakeVal = 0xfffffff007004000ULL;
+            CFDataRef origData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)&fakeVal, 8);
+            setValue(surf, key2, origData);
+            CFRelease(origData);
+
+            int64_t numVal = 0x4242424242424242LL;
+            CFNumberRef numObj = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &numVal);
+            setValue(surf, key2, numObj);
+            CFRelease(numObj);
+
+            CFTypeRef overwritten = getValue(surf, key2);
+            if (overwritten) {
+                CFTypeID tid = CFGetTypeID(overwritten);
+                if (tid == CFDataGetTypeID()) {
+                    anomalies++;
+                    typeMismatches++;
+                    log(@"TYPECONFUSE: ANOMALY — set as CFNumber but read back as CFData! Type confusion!");
+                } else if (tid == CFNumberGetTypeID()) {
+                    int64_t readNum = 0;
+                    CFNumberGetValue((CFNumberRef)overwritten, kCFNumberSInt64Type, &readNum);
+                    log([NSString stringWithFormat:@"TYPECONFUSE: Overwrite OK — CFNumber value 0x%llx", (unsigned long long)readNum]);
+                    if (readNum != numVal) {
+                        anomalies++;
+                        corruptedData++;
+                        log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — value corruption! Expected 0x%llx got 0x%llx", (unsigned long long)numVal, (unsigned long long)readNum]);
+                    }
+                } else {
+                    anomalies++;
+                    typeMismatches++;
+                    log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — unexpected type %lu after overwrite", (unsigned long)tid]);
+                }
+            }
+        }
+
+        log(@"TYPECONFUSE: Step 3 — Large CFData stress (1MB allocation)");
+        if (!isr_stopped()) {
+            size_t bigSize = 1024 * 1024;
+            uint8_t *bigBuf = (uint8_t *)calloc(1, bigSize);
+            if (bigBuf) {
+                for (size_t i = 0; i < bigSize; i += 8) {
+                    uint64_t marker = 0xDEAD000000000000ULL | (uint64_t)(i / 8);
+                    memcpy(bigBuf + i, &marker, 8);
+                }
+                CFDataRef bigData = CFDataCreate(kCFAllocatorDefault, bigBuf, (CFIndex)bigSize);
+                CFStringRef key3 = CFSTR("ISRTypeConfuseBig");
+                setValue(surf, key3, bigData);
+                CFTypeRef bigBack = getValue(surf, key3);
+                if (bigBack && CFGetTypeID(bigBack) == CFDataGetTypeID()) {
+                    CFDataRef bigRead = (CFDataRef)bigBack;
+                    CFIndex readLen = CFDataGetLength(bigRead);
+                    if (readLen != (CFIndex)bigSize) {
+                        anomalies++;
+                        largeAllocAnomalies++;
+                        log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — 1MB data truncated to %ld bytes!", (long)readLen]);
+                    } else {
+                        const UInt8 *readBytes = CFDataGetBytePtr(bigRead);
+                        int corrupt = 0;
+                        for (size_t i = 0; i < bigSize && i < 4096; i += 8) {
+                            uint64_t expected = 0xDEAD000000000000ULL | (uint64_t)(i / 8);
+                            uint64_t actual;
+                            memcpy(&actual, readBytes + i, 8);
+                            if (actual != expected) { corrupt++; }
+                        }
+                        if (corrupt > 0) {
+                            anomalies += (unsigned)corrupt;
+                            corruptedData += (unsigned)corrupt;
+                            log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — %d corrupted qwords in 1MB readback!", corrupt]);
+                        } else {
+                            log(@"TYPECONFUSE: 1MB round-trip OK — first 4096 bytes verified");
+                        }
+                    }
+                } else {
+                    log(@"TYPECONFUSE: 1MB readback failed or wrong type");
+                }
+                removeValue(surf, key3);
+                CFRelease(bigData);
+                free(bigBuf);
+            }
+        }
+
+        log(@"TYPECONFUSE: Step 4 — Rapid 1000-key set/read checking for corruption");
+        if (!isr_stopped()) {
+            unsigned rapidCorrupt = 0;
+            for (int i = 0; i < 1000 && !isr_stopped(); i++) {
+                NSString *keyStr = [NSString stringWithFormat:@"ISR_rapid_%d", i];
+                CFStringRef key = (__bridge CFStringRef)keyStr;
+                uint64_t val = (uint64_t)i * 0x1111111111111111ULL;
+                CFDataRef data = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)&val, 8);
+                setValue(surf, key, data);
+                CFRelease(data);
+            }
+            for (int i = 0; i < 1000 && !isr_stopped(); i++) {
+                NSString *keyStr = [NSString stringWithFormat:@"ISR_rapid_%d", i];
+                CFStringRef key = (__bridge CFStringRef)keyStr;
+                uint64_t expected = (uint64_t)i * 0x1111111111111111ULL;
+                CFTypeRef val = getValue(surf, key);
+                if (val && CFGetTypeID(val) == CFDataGetTypeID()) {
+                    CFDataRef d = (CFDataRef)val;
+                    if (CFDataGetLength(d) == 8) {
+                        uint64_t actual;
+                        memcpy(&actual, CFDataGetBytePtr(d), 8);
+                        if (actual != expected) {
+                            rapidCorrupt++;
+                        }
+                    } else {
+                        rapidCorrupt++;
+                    }
+                } else if (!val) {
+                    rapidCorrupt++;
+                }
+                removeValue(surf, key);
+            }
+            if (rapidCorrupt > 0) {
+                anomalies += rapidCorrupt;
+                corruptedData += rapidCorrupt;
+                log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — %u of 1000 rapid keys corrupted!", rapidCorrupt]);
+            } else {
+                log(@"TYPECONFUSE: 1000 rapid keys — all verified OK");
+            }
+        }
+
+        log(@"TYPECONFUSE: Step 5 — Nested CFDictionary with fake pointer CFData");
+        if (!isr_stopped()) {
+            uint64_t nested_ptrs[4] = {
+                0xfffffff007100000ULL, 0xfffffff007200000ULL,
+                0xfffffff007300000ULL, 0xfffffff007400000ULL
+            };
+            CFDataRef innerData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)nested_ptrs, sizeof(nested_ptrs));
+            CFStringRef innerKey = CFSTR("inner");
+            CFStringRef outerKey = CFSTR("ISRTypeConfuseNested");
+            CFDictionaryRef innerDict = CFDictionaryCreate(kCFAllocatorDefault,
+                (const void **)&innerKey, (const void **)&innerData, 1,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            setValue(surf, outerKey, innerDict);
+            CFTypeRef nestedBack = getValue(surf, outerKey);
+            if (nestedBack && CFGetTypeID(nestedBack) == CFDictionaryGetTypeID()) {
+                CFDictionaryRef readDict = (CFDictionaryRef)nestedBack;
+                CFTypeRef innerVal = CFDictionaryGetValue(readDict, innerKey);
+                if (innerVal && CFGetTypeID(innerVal) == CFDataGetTypeID()) {
+                    CFDataRef readInner = (CFDataRef)innerVal;
+                    if (CFDataGetLength(readInner) == sizeof(nested_ptrs)) {
+                        const UInt8 *bytes = CFDataGetBytePtr(readInner);
+                        if (memcmp(bytes, nested_ptrs, sizeof(nested_ptrs)) != 0) {
+                            anomalies++;
+                            corruptedData++;
+                            log(@"TYPECONFUSE: ANOMALY — nested dict inner data corrupted!");
+                        } else {
+                            log(@"TYPECONFUSE: Nested dict round-trip OK");
+                        }
+                    } else {
+                        anomalies++;
+                        log(@"TYPECONFUSE: ANOMALY — inner data size mismatch in nested dict");
+                    }
+                } else {
+                    anomalies++;
+                    typeMismatches++;
+                    log(@"TYPECONFUSE: ANOMALY — inner value type changed in nested dict!");
+                }
+            } else if (nestedBack) {
+                anomalies++;
+                typeMismatches++;
+                log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — nested dict came back as type %lu!", (unsigned long)CFGetTypeID(nestedBack)]);
+            } else {
+                log(@"TYPECONFUSE: Nested dict readback NULL");
+            }
+            removeValue(surf, outerKey);
+            CFRelease(innerDict);
+            CFRelease(innerData);
+        }
+
+        log(@"TYPECONFUSE: Step 6 — Stale read after RemoveValue (dangling reference check)");
+        if (!isr_stopped()) {
+            CFStringRef staleKey = CFSTR("ISRTypeConfuseStale");
+            uint64_t staleVal = 0xCAFEBABEDEADBEEFULL;
+            CFDataRef staleData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)&staleVal, 8);
+            setValue(surf, staleKey, staleData);
+            CFRelease(staleData);
+
+            CFTypeRef beforeRemove = getValue(surf, staleKey);
+            if (!beforeRemove) {
+                log(@"TYPECONFUSE: pre-remove read NULL — unexpected");
+            }
+            removeValue(surf, staleKey);
+            for (int attempt = 0; attempt < 100 && !isr_stopped(); attempt++) {
+                CFTypeRef afterRemove = getValue(surf, staleKey);
+                if (afterRemove != NULL) {
+                    staleReads++;
+                    anomalies++;
+                    CFTypeID tid = CFGetTypeID(afterRemove);
+                    log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — stale read attempt %d returned type %lu after remove!", attempt, (unsigned long)tid]);
+                    if (tid == CFDataGetTypeID()) {
+                        CFDataRef staleRead = (CFDataRef)afterRemove;
+                        CFIndex slen = CFDataGetLength(staleRead);
+                        log([NSString stringWithFormat:@"TYPECONFUSE: stale data length: %ld", (long)slen]);
+                    }
+                    break;
+                }
+            }
+            if (staleReads == 0) {
+                log(@"TYPECONFUSE: No stale reads after remove (100 attempts) — clean");
+            }
+        }
+
+        log(@"TYPECONFUSE: Step 7 — Reserved key type confusion");
+        if (!isr_stopped()) {
+            CFStringRef reservedKeys[] = {
+                CFSTR("IOSurfaceAllocSize"),
+                CFSTR("IOSurfaceWidth"),
+                CFSTR("IOSurfaceHeight"),
+                CFSTR("IOSurfaceBytesPerRow"),
+                CFSTR("IOSurfacePixelFormat"),
+                CFSTR("IOSurfaceBytesPerElement"),
+                CFSTR("IOSurfacePlaneCount")
+            };
+            int numReserved = 7;
+            for (int r = 0; r < numReserved && !isr_stopped(); r++) {
+                uint64_t fakeVal2 = 0xfffffff007AABB00ULL | (uint64_t)r;
+                CFDataRef asData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)&fakeVal2, 8);
+                setValue(surf, reservedKeys[r], asData);
+                CFRelease(asData);
+
+                CFTypeRef reserved_back = getValue(surf, reservedKeys[r]);
+                if (reserved_back) {
+                    CFTypeID tid = CFGetTypeID(reserved_back);
+                    if (tid == CFDataGetTypeID()) {
+                        anomalies++;
+                        typeMismatches++;
+                        log([NSString stringWithFormat:@"TYPECONFUSE: ANOMALY — reserved key %@ stored as CFData! Type confusion on reserved key!", (__bridge NSString *)reservedKeys[r]]);
+                    } else if (tid == CFNumberGetTypeID()) {
+                        int64_t numBack = 0;
+                        CFNumberGetValue((CFNumberRef)reserved_back, kCFNumberSInt64Type, &numBack);
+                        if ((uint64_t)numBack == fakeVal2) {
+                            log([NSString stringWithFormat:@"TYPECONFUSE: Reserved key %@ accepted raw value 0x%llx — potential overflow!", (__bridge NSString *)reservedKeys[r], (unsigned long long)fakeVal2]);
+                            anomalies++;
+                        } else {
+                            log([NSString stringWithFormat:@"TYPECONFUSE: Reserved key %@ coerced to number 0x%llx", (__bridge NSString *)reservedKeys[r], (unsigned long long)numBack]);
+                        }
+                    }
+                }
+            }
+        }
+
+        CFRelease(surf);
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+        log([NSString stringWithFormat:@"TYPECONFUSE: Done — %u anomalies (stale:%u typeMismatch:%u corrupt:%u largeAlloc:%u) in %.2fs",
+             anomalies, staleReads, typeMismatches, corruptedData, largeAllocAnomalies, elapsed]);
+
+        NSDictionary *res = @{
+            @"anomalies": @(anomalies),
+            @"staleReads": @(staleReads),
+            @"typeMismatches": @(typeMismatches),
+            @"corruptedData": @(corruptedData),
+            @"largeAllocAnomalies": @(largeAllocAnomalies),
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"ISR-TypeConfuse-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Probe 98: IOConnectCallStructMethod
+
+void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            log(@"STRUCTMETHOD: Failed to load symbols");
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+
+        typedef kern_return_t (*StructCallFn)(io_connect_t, uint32_t, const void *, size_t, void *, size_t *);
+        StructCallFn structCall = (StructCallFn)dlsym(sym.iokit, "IOConnectCallStructMethod");
+        if (!structCall) {
+            log(@"STRUCTMETHOD: Failed to load IOConnectCallStructMethod");
+            isr_unload(&sym);
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+        unsigned anomalies = 0;
+        unsigned acceptedSelectors = 0;
+        unsigned kernelPtrsFound = 0;
+        unsigned outputDataSelectors = 0;
+
+        mach_port_t master = 0;
+        typedef kern_return_t (*HostGetFn)(mach_port_t *);
+        HostGetFn hostGet = (HostGetFn)dlsym(sym.iokit, "IOMainPort");
+        if (!hostGet) {
+            hostGet = (HostGetFn)dlsym(sym.iokit, "IOMasterPort");
+        }
+        if (!hostGet) {
+            log(@"STRUCTMETHOD: Failed to load IOMainPort/IOMasterPort");
+            isr_unload(&sym);
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+        hostGet(&master);
+
+        CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
+        io_service_t service = sym.getMatch(master, matching);
+        io_connect_t connect = 0;
+
+        if (!service) {
+            log(@"STRUCTMETHOD: IOSurfaceRoot service not found");
+            isr_unload(&sym);
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+
+        kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
+        sym.release(service);
+        if (kr != KERN_SUCCESS || !connect) {
+            log([NSString stringWithFormat:@"STRUCTMETHOD: IOServiceOpen failed — kr=%d", kr]);
+            isr_unload(&sym);
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+        log([NSString stringWithFormat:@"STRUCTMETHOD: IOSurfaceRoot opened — connect=%u", connect]);
+
+        uint8_t zeroStruct[8];
+        memset(zeroStruct, 0, sizeof(zeroStruct));
+        uint8_t deadbeefStruct[64];
+        for (int i = 0; i < 64; i += 4) {
+            deadbeefStruct[i] = 0xEF; deadbeefStruct[i+1] = 0xBE;
+            deadbeefStruct[i+2] = 0xAD; deadbeefStruct[i+3] = 0xDE;
+        }
+        uint8_t largeStruct[4096];
+        memset(largeStruct, 0x41, sizeof(largeStruct));
+        uint8_t ptrStruct[64];
+        uint64_t fakePtrs2[8] = {
+            0xfffffff007004000ULL, 0xfffffff007008000ULL,
+            0xfffffff00700c000ULL, 0xfffffff007010000ULL,
+            0x0000000000000000ULL, 0x4141414141414141ULL,
+            0xfffffff007014000ULL, 0xfffffff007018000ULL
+        };
+        memcpy(ptrStruct, fakePtrs2, sizeof(ptrStruct));
+
+        struct {
+            const char *name;
+            const void *data;
+            size_t size;
+        } inputs[] = {
+            {"empty",    NULL,          0},
+            {"zero8",    zeroStruct,    8},
+            {"deadbeef", deadbeefStruct, 64},
+            {"large4k",  largeStruct,   4096},
+            {"fakeptrs", ptrStruct,     64},
+        };
+        int numInputs = 5;
+
+        log(@"STRUCTMETHOD: Step 1 — Testing selectors 0-33 with 5 input variants");
+        for (uint32_t sel = 0; sel <= 33 && !isr_stopped(); sel++) {
+            for (int inp = 0; inp < numInputs && !isr_stopped(); inp++) {
+                uint8_t outBuf[4096];
+                memset(outBuf, 0, sizeof(outBuf));
+                size_t outSize = sizeof(outBuf);
+
+                kern_return_t ret = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf, &outSize);
+                if (ret == KERN_SUCCESS) {
+                    acceptedSelectors++;
+                    log([NSString stringWithFormat:@"STRUCTMETHOD: ACCEPTED sel=%u input=%s outSize=%zu",
+                         sel, inputs[inp].name, outSize]);
+
+                    if (outSize > 0) {
+                        outputDataSelectors++;
+                        int kptrs = 0;
+                        for (size_t off = 0; off + 8 <= outSize; off += 8) {
+                            uint64_t qw;
+                            memcpy(&qw, outBuf + off, 8);
+                            if (qw > 0xffff000000000000ULL && qw < 0xfffffffffffffffeULL) {
+                                kptrs++;
+                                kernelPtrsFound++;
+                                anomalies++;
+                                log([NSString stringWithFormat:@"STRUCTMETHOD: KERNEL PTR sel=%u input=%s offset=%zu ptr=0x%llx",
+                                     sel, inputs[inp].name, off, (unsigned long long)qw]);
+                            }
+                        }
+                        if (kptrs == 0 && outSize >= 8) {
+                            uint64_t first;
+                            memcpy(&first, outBuf, 8);
+                            log([NSString stringWithFormat:@"STRUCTMETHOD: sel=%u output first qword: 0x%llx", sel, (unsigned long long)first]);
+                        }
+                    }
+                }
+            }
+        }
+
+        log(@"STRUCTMETHOD: Step 2 — Testing selectors 34-99 with empty and zero8");
+        for (uint32_t sel = 34; sel <= 99 && !isr_stopped(); sel++) {
+            for (int inp = 0; inp < 2 && !isr_stopped(); inp++) {
+                uint8_t outBuf2[4096];
+                memset(outBuf2, 0, sizeof(outBuf2));
+                size_t outSize2 = sizeof(outBuf2);
+
+                kern_return_t ret2 = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf2, &outSize2);
+                if (ret2 == KERN_SUCCESS) {
+                    acceptedSelectors++;
+                    log([NSString stringWithFormat:@"STRUCTMETHOD: ACCEPTED sel=%u input=%s outSize=%zu", sel, inputs[inp].name, outSize2]);
+                    if (outSize2 > 0) {
+                        outputDataSelectors++;
+                        for (size_t off = 0; off + 8 <= outSize2; off += 8) {
+                            uint64_t qw2;
+                            memcpy(&qw2, outBuf2 + off, 8);
+                            if (qw2 > 0xffff000000000000ULL && qw2 < 0xfffffffffffffffeULL) {
+                                kernelPtrsFound++;
+                                anomalies++;
+                                log([NSString stringWithFormat:@"STRUCTMETHOD: KERNEL PTR sel=%u offset=%zu ptr=0x%llx",
+                                     sel, off, (unsigned long long)qw2]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        log(@"STRUCTMETHOD: Step 3 — Oversized struct input (64KB) on known selectors");
+        if (!isr_stopped()) {
+            uint8_t *hugeStruct = (uint8_t *)calloc(1, 65536);
+            if (hugeStruct) {
+                memset(hugeStruct, 0xBB, 65536);
+                for (uint32_t sel = 0; sel <= 10 && !isr_stopped(); sel++) {
+                    uint8_t outBuf3[4096];
+                    memset(outBuf3, 0, sizeof(outBuf3));
+                    size_t outSize3 = sizeof(outBuf3);
+                    kern_return_t ret3 = structCall(connect, sel, hugeStruct, 65536, outBuf3, &outSize3);
+                    if (ret3 == KERN_SUCCESS) {
+                        anomalies++;
+                        log([NSString stringWithFormat:@"STRUCTMETHOD: ANOMALY — 64KB input accepted on sel=%u! outSize=%zu", sel, outSize3]);
+                    }
+                }
+                free(hugeStruct);
+            }
+        }
+
+        sym.close(connect);
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+        log([NSString stringWithFormat:@"STRUCTMETHOD: Done — %u anomalies, %u accepted, %u with output, %u kernel ptrs in %.2fs",
+             anomalies, acceptedSelectors, outputDataSelectors, kernelPtrsFound, elapsed]);
+
+        NSDictionary *res = @{
+            @"anomalies": @(anomalies),
+            @"accepted_selectors": @(acceptedSelectors),
+            @"outputDataSelectors": @(outputDataSelectors),
+            @"kernelPtrsFound": @(kernelPtrsFound),
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"ISR-StructMethod-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+#pragma mark - Probe 99: Surface Lifecycle TOCTOU Race
+
+static volatile sig_atomic_t g_lifecycle_segv_count = 0;
+static volatile sig_atomic_t g_lifecycle_bus_count = 0;
+static struct sigaction g_old_segv_action;
+static struct sigaction g_old_bus_action;
+
+static void lifecycle_signal_handler(int sig, siginfo_t *info __unused, void *ctx __unused) {
+    if (sig == SIGSEGV) {
+        g_lifecycle_segv_count++;
+    } else if (sig == SIGBUS) {
+        g_lifecycle_bus_count++;
+    }
+}
+
+typedef struct {
+    ISRSymbols *sym;
+    atomic_uint *sharedIDWrite;
+    atomic_uint *sharedIDRead;
+    uint32_t *idBuffer;
+    unsigned maxIDs;
+    atomic_uint *totalCreated;
+    atomic_uint *anomalyCount;
+    atomic_uint *lockFailCount;
+    ISRLogBlock log;
+} ISRLifecycleCtx;
+
+static void *lifecycle_creator(void *arg) {
+    ISRLifecycleCtx *ctx = (ISRLifecycleCtx *)arg;
+    ISRSymbols *s = ctx->sym;
+    NSDictionary *params = isr_default_surface_params(32, 32);
+
+    for (unsigned i = 0; i < 5000 && !isr_stopped(); i++) {
+        @autoreleasepool {
+            IOSurfaceRef surf = s->create((__bridge CFDictionaryRef)params);
+            if (surf) {
+                IOSurfaceID sid = s->getID(surf);
+                unsigned idx = atomic_fetch_add(ctx->sharedIDWrite, 1) % ctx->maxIDs;
+                ctx->idBuffer[idx] = sid;
+                atomic_fetch_add(ctx->totalCreated, 1);
+                CFRelease(surf);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void *lifecycle_lookup_use(void *arg) {
+    ISRLifecycleCtx *ctx = (ISRLifecycleCtx *)arg;
+    ISRSymbols *s = ctx->sym;
+
+    for (unsigned i = 0; i < 5000 && !isr_stopped(); i++) {
+        @autoreleasepool {
+            unsigned idx = atomic_load(ctx->sharedIDWrite);
+            if (idx == 0) continue;
+            unsigned readIdx = (idx - 1 - (arc4random() % MIN(idx, 10))) % ctx->maxIDs;
+            uint32_t sid = ctx->idBuffer[readIdx];
+            if (sid == 0) continue;
+
+            IOSurfaceRef looked = s->lookup(sid);
+            if (looked) {
+                uint32_t seed = 0;
+                kern_return_t lockRet = s->lock(looked, 0, &seed);
+                if (lockRet != KERN_SUCCESS) {
+                    atomic_fetch_add(ctx->lockFailCount, 1);
+                }
+                void *base = s->getBase(looked);
+                if (base) {
+                    volatile uint8_t probe = *(volatile uint8_t *)base;
+                    (void)probe;
+                    if (lockRet == KERN_SUCCESS) {
+                        uint8_t *bptr = (uint8_t *)base;
+                        bptr[0] = 0xAA;
+                        bptr[1] = 0xBB;
+                    }
+                }
+                if (lockRet == KERN_SUCCESS) {
+                    s->unlock(looked, 0, &seed);
+                }
+                CFRelease(looked);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void *lifecycle_releaser(void *arg) {
+    ISRLifecycleCtx *ctx = (ISRLifecycleCtx *)arg;
+    ISRSymbols *s = ctx->sym;
+
+    for (unsigned i = 0; i < 5000 && !isr_stopped(); i++) {
+        @autoreleasepool {
+            unsigned idx = atomic_load(ctx->sharedIDWrite);
+            if (idx == 0) continue;
+            unsigned readIdx = (idx - 1 - (arc4random() % MIN(idx, 10))) % ctx->maxIDs;
+            uint32_t sid = ctx->idBuffer[readIdx];
+            if (sid == 0) continue;
+
+            IOSurfaceRef looked = s->lookup(sid);
+            if (looked) {
+                CFRelease(looked);
+                CFRelease(looked);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void *lifecycle_setter(void *arg) {
+    ISRLifecycleCtx *ctx = (ISRLifecycleCtx *)arg;
+    ISRSymbols *s = ctx->sym;
+
+    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+    SetValueFn setValue = (SetValueFn)dlsym(s->iosurface, "IOSurfaceSetValue");
+    if (!setValue) return NULL;
+
+    uint64_t payload = 0xDEADFACECAFEBABEULL;
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)&payload, 8);
+
+    for (unsigned i = 0; i < 5000 && !isr_stopped(); i++) {
+        @autoreleasepool {
+            unsigned idx = atomic_load(ctx->sharedIDWrite);
+            if (idx == 0) { continue; }
+            unsigned readIdx = (idx - 1 - (arc4random() % MIN(idx, 10))) % ctx->maxIDs;
+            uint32_t sid = ctx->idBuffer[readIdx];
+            if (sid == 0) continue;
+
+            IOSurfaceRef looked = s->lookup(sid);
+            if (looked) {
+                CFStringRef key = (__bridge CFStringRef)[NSString stringWithFormat:@"ISR_race_%u", i];
+                setValue(looked, key, data);
+                CFRelease(looked);
+            }
+        }
+    }
+
+    CFRelease(data);
+    return NULL;
+}
+
+void iosurface_research_lifecycle_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            log(@"LIFECYCLERACE: Failed to load symbols");
+            done(@{@"anomalies": @(-1)});
+            return;
+        }
+
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
+        g_lifecycle_segv_count = 0;
+        g_lifecycle_bus_count = 0;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = lifecycle_signal_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &g_old_segv_action);
+        sigaction(SIGBUS, &sa, &g_old_bus_action);
+
+        log(@"LIFECYCLERACE: Signal handlers installed for SIGSEGV/SIGBUS");
+
+        unsigned maxIDs = 1024;
+        uint32_t *idBuffer = (uint32_t *)calloc(maxIDs, sizeof(uint32_t));
+        atomic_uint sharedIDWrite = 0;
+        atomic_uint sharedIDRead = 0;
+        atomic_uint totalCreated = 0;
+        atomic_uint anomalyCount = 0;
+        atomic_uint lockFailCount = 0;
+
+        ISRLifecycleCtx ctx = {
+            .sym = &sym,
+            .sharedIDWrite = &sharedIDWrite,
+            .sharedIDRead = &sharedIDRead,
+            .idBuffer = idBuffer,
+            .maxIDs = maxIDs,
+            .totalCreated = &totalCreated,
+            .anomalyCount = &anomalyCount,
+            .lockFailCount = &lockFailCount,
+            .log = log
+        };
+
+        log(@"LIFECYCLERACE: Step 1 — Launching 4 threads (create/lookup/release/setValue)");
+        log(@"LIFECYCLERACE: 5000 iterations per thread, racing on surface lifecycle");
+
+        pthread_t t_creator, t_lookup, t_releaser, t_setter;
+        pthread_create(&t_creator,  NULL, lifecycle_creator,    &ctx);
+        pthread_create(&t_lookup,   NULL, lifecycle_lookup_use, &ctx);
+        pthread_create(&t_releaser, NULL, lifecycle_releaser,   &ctx);
+        pthread_create(&t_setter,   NULL, lifecycle_setter,     &ctx);
+
+        pthread_join(t_creator, NULL);
+        pthread_join(t_lookup, NULL);
+        pthread_join(t_releaser, NULL);
+        pthread_join(t_setter, NULL);
+
+        unsigned totalAnomalies = atomic_load(&anomalyCount);
+        unsigned totalLockFails = atomic_load(&lockFailCount);
+        unsigned totalSurfaces = atomic_load(&totalCreated);
+        int segvs = g_lifecycle_segv_count;
+        int buses = g_lifecycle_bus_count;
+
+        sigaction(SIGSEGV, &g_old_segv_action, NULL);
+        sigaction(SIGBUS, &g_old_bus_action, NULL);
+
+        totalAnomalies += (unsigned)segvs + (unsigned)buses + totalLockFails;
+
+        log([NSString stringWithFormat:@"LIFECYCLERACE: Threads completed — %u surfaces created", totalSurfaces]);
+        log([NSString stringWithFormat:@"LIFECYCLERACE: SIGSEGV count: %d", segvs]);
+        log([NSString stringWithFormat:@"LIFECYCLERACE: SIGBUS count: %d", buses]);
+        log([NSString stringWithFormat:@"LIFECYCLERACE: Lock failures: %u", totalLockFails]);
+
+        if (segvs > 0 || buses > 0) {
+            log(@"LIFECYCLERACE: *** SIGNAL CAUGHT — potential UAF triggered! ***");
+        }
+        if (totalLockFails > 0) {
+            log([NSString stringWithFormat:@"LIFECYCLERACE: *** %u lock failures — potential freed surface access ***", totalLockFails]);
+        }
+
+        log(@"LIFECYCLERACE: Step 2 — Post-race stale ID scan");
+        if (!isr_stopped()) {
+            unsigned staleAccess = 0;
+            unsigned writeIdx = atomic_load(&sharedIDWrite);
+            unsigned scanCount = MIN(writeIdx, maxIDs);
+            for (unsigned i = 0; i < scanCount && !isr_stopped(); i++) {
+                uint32_t sid = idBuffer[i];
+                if (sid == 0) continue;
+                IOSurfaceRef stale = sym.lookup(sid);
+                if (stale) {
+                    size_t w = sym.getWidth(stale);
+                    size_t h = sym.getHeight(stale);
+                    if (w != 32 || h != 32) {
+                        staleAccess++;
+                        totalAnomalies++;
+                        log([NSString stringWithFormat:@"LIFECYCLERACE: ANOMALY — stale ID %u has dimensions %zux%zu (expected 32x32)!", sid, w, h]);
+                    }
+                    CFRelease(stale);
+                } else {
+                    staleAccess++;
+                }
+            }
+            log([NSString stringWithFormat:@"LIFECYCLERACE: Scanned %u IDs — %u stale/freed", scanCount, staleAccess]);
+        }
+
+        free(idBuffer);
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+
+        log([NSString stringWithFormat:@"LIFECYCLERACE: Done — %u total anomalies (segv:%d bus:%d lockFail:%u) in %.2fs",
+             totalAnomalies, segvs, buses, totalLockFails, elapsed]);
+
+        NSDictionary *res = @{
+            @"anomalies": @(totalAnomalies),
+            @"surfacesCreated": @(totalSurfaces),
+            @"segvCount": @(segvs),
+            @"busCount": @(buses),
+            @"lockFailures": @(totalLockFails),
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"ISR-LifecycleRace-checkpoint.json", res);
         isr_unload(&sym);
         done(res);
     });
