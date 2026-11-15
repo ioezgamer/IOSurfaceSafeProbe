@@ -22179,94 +22179,37 @@ static void isr_crash_log(const char *msg) {
 void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        NSString *progressPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-structmethod-progress.txt"];
-        NSString *variantPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-structmethod-batch.txt"];
+        log(@"JAILBREAK: ========================================");
+        log(@"JAILBREAK: Fase 1 — Análisis de crash para explotación");
+        log(@"JAILBREAK: ========================================");
 
-        struct {
-            const char *desc;
-            int useCallMethod;
-            uint32_t nScalarIn;
-            uint64_t scalarIn[4];
-            int hasStructIn;
-            size_t structInSize;
-            uint8_t fillByte;
-            int hasStructOut;
-            size_t structOutSize;
-            uint32_t nScalarOut;
-        } tests[] = {
-            {"CallMethod sel0 scalar=0 structIn=NULL structOut=NULL",
-             1, 0, {0}, 0, 0, 0, 0, 0, 0},
-            {"CallMethod sel0 scalar=0 structIn=NULL structOut=4096",
-             1, 0, {0}, 0, 0, 0, 1, 4096, 0},
-            {"CallMethod sel0 scalar=0 structIn=zero(64) structOut=4096",
-             1, 0, {0}, 1, 64, 0x00, 1, 4096, 0},
-            {"CallMethod sel0 scalar=0 structIn=zero(4096) structOut=4096",
-             1, 0, {0}, 1, 4096, 0x00, 1, 4096, 0},
-            {"CallMethod sel0 scalar=1(0) structIn=NULL structOut=4096",
-             1, 1, {0}, 0, 0, 0, 1, 4096, 0},
-            {"CallMethod sel0 scalar=1(0) structIn=zero(64) structOut=4096",
-             1, 1, {0}, 1, 64, 0x00, 1, 4096, 0},
-            {"CallMethod sel0 scalar=2(0,0) structIn=zero(256) structOut=4096",
-             1, 2, {0,0}, 1, 256, 0x00, 1, 4096, 0},
-            {"ScalarMethod sel0 scalar=0 scalarOut=16",
-             0, 0, {0}, 0, 0, 0, 0, 0, 16},
-            {"ScalarMethod sel0 scalar=1(0) scalarOut=16",
-             0, 1, {0}, 0, 0, 0, 0, 0, 16},
-            {"CallMethod sel0 scalar=1(0) structIn=zero(4096) structOut=4096 scalarOut=4",
-             1, 1, {0}, 1, 4096, 0x00, 1, 4096, 4},
-        };
-        int numTests = sizeof(tests) / sizeof(tests[0]);
+        NSString *progressPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-jailbreak-progress.txt"];
+        NSString *resultPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-jailbreak-result.txt"];
 
         NSString *prev = [NSString stringWithContentsOfFile:progressPath encoding:NSUTF8StringEncoding error:nil];
-        int testIdx = 0;
         if (prev) {
             NSString *trimmed = [prev stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if ([trimmed hasPrefix:@"CRASH:"]) {
-                int crashedIdx = [[trimmed substringFromIndex:6] intValue];
-                NSString *crashInfo = [NSString stringWithContentsOfFile:variantPath encoding:NSUTF8StringEncoding error:nil];
-                log(@"SEL0METHOD: ========================================");
-                log(@"SEL0METHOD: *** CRASH DETECTADO ***");
-                log([NSString stringWithFormat:@"SEL0METHOD: Variante %d crasheó: %@", crashedIdx + 1, crashInfo ?: @"desconocida"]);
-                log(@"SEL0METHOD: ========================================");
-                int nextIdx = crashedIdx + 1;
-                if (nextIdx >= numTests) {
-                    log(@"SEL0METHOD: Todas las variantes probadas.");
-                    [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
-                    [[NSFileManager defaultManager] removeItemAtPath:variantPath error:nil];
-                } else {
-                    log([NSString stringWithFormat:@"SEL0METHOD: Tocá otra vez para variante %d/%d", nextIdx + 1, numTests]);
-                    [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            if ([trimmed isEqualToString:@"DONE"]) {
+                NSString *results = [NSString stringWithContentsOfFile:resultPath encoding:NSUTF8StringEncoding error:nil];
+                log(@"JAILBREAK: === RESULTADOS ANTERIORES ===");
+                if (results) {
+                    for (NSString *line in [results componentsSeparatedByString:@"\n"]) {
+                        if (line.length > 0) log([NSString stringWithFormat:@"JAILBREAK: %@", line]);
+                    }
                 }
-                done(@{@"crash_detected": @YES, @"crash_variant": crashInfo ?: @"unknown"});
-                return;
-            } else if ([trimmed isEqualToString:@"DONE"]) {
-                log(@"SEL0METHOD: Todas las variantes probadas!");
-                log(@"SEL0METHOD: Tocá otra vez para reiniciar.");
+                log(@"JAILBREAK: Tocá otra vez para re-ejecutar.");
                 [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
-                done(@{@"all_done": @YES});
+                [[NSFileManager defaultManager] removeItemAtPath:resultPath error:nil];
+                done(@{@"previous_results": results ?: @"none"});
                 return;
-            } else {
-                testIdx = [trimmed intValue];
             }
         }
 
-        if (testIdx >= numTests) {
-            [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log(@"SEL0METHOD: Todas las variantes completadas!");
-            done(@{@"all_done": @YES});
-            return;
-        }
-
-        NSString *variantDesc = [NSString stringWithUTF8String:tests[testIdx].desc];
-        [variantDesc writeToFile:variantPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [[NSString stringWithFormat:@"CRASH:%d", testIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        log([NSString stringWithFormat:@"SEL0METHOD: === Variante %d/%d ===", testIdx + 1, numTests]);
-        log([NSString stringWithFormat:@"SEL0METHOD: %@", variantDesc]);
+        [@"RUNNING" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
         ISRSymbols sym;
         if (!isr_load(&sym)) {
-            log(@"SEL0METHOD: Error cargando símbolos");
+            log(@"JAILBREAK: Error cargando símbolos");
             done(@{@"error": @"symbols"});
             return;
         }
@@ -22276,146 +22219,316 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             uint64_t *, uint32_t *, void *, size_t *);
         CallMethodFn callMethod = (CallMethodFn)dlsym(sym.iokit, "IOConnectCallMethod");
 
-        typedef kern_return_t (*ScalarMethodFn)(io_connect_t, uint32_t,
-            const uint64_t *, uint32_t, uint64_t *, uint32_t *);
-        ScalarMethodFn scalarMethod = (ScalarMethodFn)dlsym(sym.iokit, "IOConnectCallScalarMethod");
-
-        if (!callMethod || !scalarMethod) {
-            log(@"SEL0METHOD: No se pudieron cargar IOConnectCallMethod/ScalarMethod");
-            isr_unload(&sym);
-            done(@{@"error": @"dlsym"});
-            return;
-        }
+        typedef kern_return_t (*StructMethodFn)(io_connect_t, uint32_t,
+            const void *, size_t, void *, size_t *);
+        StructMethodFn structMethod = (StructMethodFn)dlsym(sym.iokit, "IOConnectCallStructMethod");
 
         mach_port_t master = 0;
         typedef kern_return_t (*HostGetFn)(mach_port_t *);
         HostGetFn hostGet = (HostGetFn)dlsym(sym.iokit, "IOMainPort");
         if (!hostGet) hostGet = (HostGetFn)dlsym(sym.iokit, "IOMasterPort");
-        if (!hostGet) {
-            log(@"SEL0METHOD: No se pudo cargar IOMainPort/IOMasterPort");
+
+        if (!callMethod || !structMethod || !hostGet) {
+            log(@"JAILBREAK: Error cargando funciones IOKit");
             isr_unload(&sym);
-            done(@{@"error": @"hostget"});
+            done(@{@"error": @"dlsym"});
             return;
         }
         hostGet(&master);
 
-        CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
-        io_service_t service = sym.getMatch(master, matching);
-        io_connect_t connect = 0;
-        if (!service) {
-            log(@"SEL0METHOD: IOSurfaceRoot service no encontrado");
-            isr_unload(&sym);
-            done(@{@"error": @"service"});
-            return;
-        }
+        NSMutableString *allResults = [NSMutableString string];
 
-        kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
-        sym.release(service);
-        if (kr != KERN_SUCCESS || !connect) {
-            log([NSString stringWithFormat:@"SEL0METHOD: IOServiceOpen falló — kr=%d", kr]);
-            isr_unload(&sym);
-            done(@{@"error": @"open"});
-            return;
-        }
-        log([NSString stringWithFormat:@"SEL0METHOD: connect=%u", connect]);
+        log(@"JAILBREAK: --- Paso 1: Probar tipos de conexión 0-4 ---");
+        log(@"JAILBREAK: El crash puede ser específico del tipo 0.");
+        log(@"JAILBREAK: Si tipo!=0 no crashea, tendríamos dispatch table diferente.");
 
-        uint8_t *structIn = NULL;
-        size_t structInSize = tests[testIdx].structInSize;
-        if (tests[testIdx].hasStructIn && structInSize > 0) {
-            structIn = (uint8_t *)calloc(1, structInSize);
-            if (structIn) memset(structIn, tests[testIdx].fillByte, structInSize);
-        }
+        for (uint32_t connType = 0; connType <= 4; connType++) {
+            if (isr_stopped()) break;
 
-        uint8_t *structOut = NULL;
-        size_t structOutSize = tests[testIdx].structOutSize;
-        if (tests[testIdx].hasStructOut && structOutSize > 0) {
-            structOut = (uint8_t *)calloc(1, structOutSize);
-        }
-
-        uint64_t scalarOut[16];
-        memset(scalarOut, 0, sizeof(scalarOut));
-        uint32_t scalarOutCnt = tests[testIdx].nScalarOut;
-
-        kern_return_t result;
-
-        if (tests[testIdx].useCallMethod) {
-            log([NSString stringWithFormat:@"SEL0METHOD: IOConnectCallMethod(sel=0, scalarIn=%u, structIn=%s(%zu), scalarOut=%u, structOut=%s(%zu))",
-                 tests[testIdx].nScalarIn,
-                 structIn ? "buf" : "NULL", structIn ? structInSize : (size_t)0,
-                 scalarOutCnt,
-                 structOut ? "buf" : "NULL", structOut ? structOutSize : (size_t)0]);
-
-            result = callMethod(connect, 0,
-                tests[testIdx].nScalarIn > 0 ? tests[testIdx].scalarIn : NULL,
-                tests[testIdx].nScalarIn,
-                structIn, structIn ? structInSize : 0,
-                scalarOutCnt > 0 ? scalarOut : NULL,
-                scalarOutCnt > 0 ? &scalarOutCnt : NULL,
-                structOut, structOut ? &structOutSize : NULL);
-        } else {
-            log([NSString stringWithFormat:@"SEL0METHOD: IOConnectCallScalarMethod(sel=0, scalarIn=%u, scalarOut=%u)",
-                 tests[testIdx].nScalarIn, scalarOutCnt]);
-
-            result = scalarMethod(connect, 0,
-                tests[testIdx].nScalarIn > 0 ? tests[testIdx].scalarIn : NULL,
-                tests[testIdx].nScalarIn,
-                scalarOutCnt > 0 ? scalarOut : NULL,
-                scalarOutCnt > 0 ? &scalarOutCnt : NULL);
-        }
-
-        log([NSString stringWithFormat:@"SEL0METHOD: *** RETORNÓ: kr=0x%x (%d) ***", result, result]);
-
-        if (result == KERN_SUCCESS) {
-            log(@"SEL0METHOD: ¡¡¡ÉXITO!!! El kernel aceptó esta llamada.");
-            if (scalarOutCnt > 0) {
-                for (uint32_t i = 0; i < scalarOutCnt; i++) {
-                    log([NSString stringWithFormat:@"SEL0METHOD: scalarOut[%u] = 0x%llx (%llu)", i, scalarOut[i], scalarOut[i]]);
-                }
+            CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
+            io_service_t service = sym.getMatch(master, matching);
+            if (!service) {
+                log([NSString stringWithFormat:@"JAILBREAK: tipo=%u — servicio no encontrado", connType]);
+                [allResults appendFormat:@"tipo=%u: NO_SERVICE\n", connType];
+                continue;
             }
-            if (structOut && structOutSize > 0) {
-                log([NSString stringWithFormat:@"SEL0METHOD: structOut size=%zu", structOutSize]);
-                size_t dumpLen = structOutSize > 128 ? 128 : structOutSize;
-                NSMutableString *hex = [NSMutableString string];
-                for (size_t i = 0; i < dumpLen; i++) {
-                    if (i > 0 && i % 16 == 0) [hex appendString:@"\n"];
-                    [hex appendFormat:@"%02x ", structOut[i]];
-                }
-                log([NSString stringWithFormat:@"SEL0METHOD: Hex dump:\n%@", hex]);
 
-                for (size_t i = 0; i + 7 < structOutSize; i += 4) {
-                    uint64_t val = 0;
-                    memcpy(&val, structOut + i, 8);
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
-                        (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
-                        log([NSString stringWithFormat:@"SEL0METHOD: *** PUNTERO KERNEL offset %zu: 0x%llx ***", i, val]);
+            io_connect_t connect = 0;
+            kern_return_t kr = sym.open(service, mach_task_self(), connType, &connect);
+            sym.release(service);
+
+            if (kr != KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JAILBREAK: tipo=%u — IOServiceOpen falló kr=0x%x", connType, kr]);
+                [allResults appendFormat:@"tipo=%u: OPEN_FAIL(0x%x)\n", connType, kr];
+                continue;
+            }
+
+            log([NSString stringWithFormat:@"JAILBREAK: tipo=%u — conexión=%u abierta OK", connType, connect]);
+
+            if (connType == 0) {
+                log(@"JAILBREAK: tipo=0 — SKIP selector 0 (crash conocido). Probando sel 1-5...");
+                [allResults appendFormat:@"tipo=%u: OPEN_OK connect=%u (sel0=SKIP_KNOWN_CRASH)\n", connType, connect];
+
+                for (uint32_t sel = 1; sel <= 5; sel++) {
+                    if (isr_stopped()) break;
+                    uint8_t outBuf[4096];
+                    size_t outSize = sizeof(outBuf);
+                    memset(outBuf, 0, sizeof(outBuf));
+
+                    uint8_t inBuf[256];
+                    memset(inBuf, 0, sizeof(inBuf));
+
+                    kern_return_t sr = structMethod(connect, sel, inBuf, sizeof(inBuf), outBuf, &outSize);
+                    log([NSString stringWithFormat:@"JAILBREAK: tipo=0 sel=%u — kr=0x%x", sel, sr]);
+                    [allResults appendFormat:@"  tipo=0 sel=%u: kr=0x%x\n", sel, sr];
+
+                    if (sr == KERN_SUCCESS && outSize > 0) {
+                        log([NSString stringWithFormat:@"JAILBREAK: *** sel=%u RETORNÓ DATOS! outSize=%zu ***", sel, outSize]);
+                        size_t dumpLen = outSize > 64 ? 64 : outSize;
+                        NSMutableString *hex = [NSMutableString string];
+                        for (size_t i = 0; i < dumpLen; i++) {
+                            [hex appendFormat:@"%02x", outBuf[i]];
+                            if (i % 16 == 15) [hex appendString:@"\n"];
+                            else [hex appendString:@" "];
+                        }
+                        log([NSString stringWithFormat:@"JAILBREAK: Hex:\n%@", hex]);
+
+                        for (size_t i = 0; i + 7 < outSize; i += 4) {
+                            uint64_t val = 0;
+                            memcpy(&val, outBuf + i, 8);
+                            if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                log([NSString stringWithFormat:@"JAILBREAK: *** PUNTERO KERNEL sel=%u offset=%zu: 0x%llx ***", sel, i, val]);
+                                [allResults appendFormat:@"  *** KPTR sel=%u off=%zu: 0x%llx ***\n", sel, i, val];
+                            }
+                        }
+                    }
+                }
+
+                sym.close(connect);
+                continue;
+            }
+
+            log([NSString stringWithFormat:@"JAILBREAK: tipo=%u — Probando selectores 0-5...", connType]);
+
+            for (uint32_t sel = 0; sel <= 5; sel++) {
+                if (isr_stopped()) break;
+
+                uint8_t outBuf[4096];
+                size_t outSize = sizeof(outBuf);
+                memset(outBuf, 0, sizeof(outBuf));
+
+                uint8_t inBuf[256];
+                memset(inBuf, 0, sizeof(inBuf));
+
+                log([NSString stringWithFormat:@"JAILBREAK: tipo=%u sel=%u — llamando StructMethod...", connType, sel]);
+
+                kern_return_t sr = structMethod(connect, sel, inBuf, sizeof(inBuf), outBuf, &outSize);
+                log([NSString stringWithFormat:@"JAILBREAK: tipo=%u sel=%u — kr=0x%x", connType, sel, sr]);
+                [allResults appendFormat:@"tipo=%u sel=%u: kr=0x%x\n", connType, sel, sr];
+
+                if (sr == KERN_SUCCESS && outSize > 0) {
+                    log([NSString stringWithFormat:@"JAILBREAK: *** tipo=%u sel=%u RETORNÓ DATOS! outSize=%zu ***", connType, sel, outSize]);
+                    size_t dumpLen = outSize > 64 ? 64 : outSize;
+                    NSMutableString *hex = [NSMutableString string];
+                    for (size_t i = 0; i < dumpLen; i++) {
+                        [hex appendFormat:@"%02x", outBuf[i]];
+                        if (i % 16 == 15) [hex appendString:@"\n"];
+                        else [hex appendString:@" "];
+                    }
+                    log([NSString stringWithFormat:@"JAILBREAK: Hex:\n%@", hex]);
+
+                    for (size_t i = 0; i + 7 < outSize; i += 4) {
+                        uint64_t val = 0;
+                        memcpy(&val, outBuf + i, 8);
+                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                            (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            log([NSString stringWithFormat:@"JAILBREAK: *** PUNTERO KERNEL tipo=%u sel=%u offset=%zu: 0x%llx ***", connType, sel, i, val]);
+                            [allResults appendFormat:@"  *** KPTR tipo=%u sel=%u off=%zu: 0x%llx ***\n", connType, sel, i, val];
+                        }
                     }
                 }
             }
-        } else {
-            log([NSString stringWithFormat:@"SEL0METHOD: Rechazado con 0x%x — no crasheó", result]);
-            if (result == 0xe00002bc) log(@"SEL0METHOD: (kIOReturnBadArgument)");
-            else if (result == 0xe00002c2) log(@"SEL0METHOD: (kIOReturnExclusiveAccess)");
-            else if (result == 0xe0000001) log(@"SEL0METHOD: (kIOReturnError)");
-            else if (result == 0xe00002be) log(@"SEL0METHOD: (kIOReturnNoMemory)");
-            else if (result == 0xe00002ed) log(@"SEL0METHOD: (kIOReturnUnsupported)");
+
+            sym.close(connect);
         }
 
-        if (structIn) free(structIn);
-        if (structOut) free(structOut);
-        sym.close(connect);
+        if (!isr_stopped()) {
+            log(@"JAILBREAK: --- Paso 2: IOSurfaceCreate + selectores ---");
+            log(@"JAILBREAK: Crear superficie normal y luego probar selectores sobre esa conexión.");
 
-        int nextIdx = testIdx + 1;
-        [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            void *ioSurfaceHandle = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+            if (ioSurfaceHandle) {
+                typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
+                CreateFn createSurf = (CreateFn)dlsym(ioSurfaceHandle, "IOSurfaceCreate");
 
-        if (nextIdx >= numTests) {
-            [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log(@"SEL0METHOD: === Todas las variantes probadas ===");
-        } else {
-            log([NSString stringWithFormat:@"SEL0METHOD: Siguiente: variante %d/%d — tocá otra vez", nextIdx + 1, numTests]);
+                typedef uint32_t (*GetIDFn)(IOSurfaceRef);
+                GetIDFn getID = (GetIDFn)dlsym(ioSurfaceHandle, "IOSurfaceGetID");
+
+                typedef IOSurfaceRef (*LookupFn)(uint32_t);
+                LookupFn lookupSurf = (LookupFn)dlsym(ioSurfaceHandle, "IOSurfaceLookup");
+
+                if (createSurf) {
+                    NSDictionary *props = @{
+                        @"IOSurfaceWidth": @32,
+                        @"IOSurfaceHeight": @32,
+                        @"IOSurfaceBytesPerElement": @4,
+                        @"IOSurfacePixelFormat": @(0x42475241),
+                    };
+                    IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
+                    if (surf) {
+                        uint32_t surfID = getID ? getID(surf) : 0;
+                        log([NSString stringWithFormat:@"JAILBREAK: Superficie creada, ID=%u", surfID]);
+                        [allResults appendFormat:@"IOSurfaceCreate: OK id=%u\n", surfID];
+
+                        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                        SetValueFn setValue = (SetValueFn)dlsym(ioSurfaceHandle, "IOSurfaceSetValue");
+                        typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+                        GetValueFn getValue = (GetValueFn)dlsym(ioSurfaceHandle, "IOSurfaceGetValue");
+
+                        if (setValue && getValue) {
+                            uint8_t bigBuf[8192];
+                            memset(bigBuf, 0x41, sizeof(bigBuf));
+                            NSData *bigData = [NSData dataWithBytes:bigBuf length:sizeof(bigBuf)];
+                            setValue(surf, CFSTR("exploit_spray"), (__bridge CFTypeRef)bigData);
+
+                            CFTypeRef readBack = getValue(surf, CFSTR("exploit_spray"));
+                            if (readBack && CFGetTypeID(readBack) == CFDataGetTypeID()) {
+                                CFDataRef dataRef = (CFDataRef)readBack;
+                                CFIndex len = CFDataGetLength(dataRef);
+                                log([NSString stringWithFormat:@"JAILBREAK: SetValue/GetValue funciona. Tamaño=%ld", (long)len]);
+                                [allResults appendFormat:@"SetValue/GetValue: OK size=%ld\n", (long)len];
+                            }
+
+                            for (int i = 0; i < 5; i++) {
+                                NSString *key = [NSString stringWithFormat:@"spray_%d", i];
+                                setValue(surf, (__bridge CFStringRef)key, (__bridge CFTypeRef)bigData);
+                            }
+                            log(@"JAILBREAK: 5 spray values escritos en la superficie");
+                        }
+
+                        if (lookupSurf && surfID > 0) {
+                            IOSurfaceRef looked = lookupSurf(surfID);
+                            if (looked) {
+                                log([NSString stringWithFormat:@"JAILBREAK: IOSurfaceLookup(%u) OK", surfID]);
+                                [allResults appendFormat:@"IOSurfaceLookup(%u): OK\n", surfID];
+                                CFRelease(looked);
+                            } else {
+                                log([NSString stringWithFormat:@"JAILBREAK: IOSurfaceLookup(%u) falló", surfID]);
+                                [allResults appendFormat:@"IOSurfaceLookup(%u): FAIL\n", surfID];
+                            }
+                        }
+
+                        log(@"JAILBREAK: Probando selectores 1-10 con superficie existente (tipo=0)...");
+                        CFMutableDictionaryRef matching2 = sym.matching("IOSurfaceRoot");
+                        io_service_t svc2 = sym.getMatch(master, matching2);
+                        if (svc2) {
+                            io_connect_t conn2 = 0;
+                            kern_return_t kr2 = sym.open(svc2, mach_task_self(), 0, &conn2);
+                            sym.release(svc2);
+                            if (kr2 == KERN_SUCCESS && conn2) {
+                                for (uint32_t sel = 1; sel <= 10; sel++) {
+                                    if (isr_stopped()) break;
+
+                                    uint64_t scIn[4] = {surfID, 0, 0, 0};
+                                    uint8_t sOut[4096];
+                                    size_t sOutSz = sizeof(sOut);
+                                    memset(sOut, 0, sizeof(sOut));
+                                    uint64_t scOut[16];
+                                    uint32_t scOutCnt = 16;
+
+                                    kern_return_t r = callMethod(conn2, sel,
+                                        scIn, 1,
+                                        NULL, 0,
+                                        scOut, &scOutCnt,
+                                        sOut, &sOutSz);
+
+                                    log([NSString stringWithFormat:@"JAILBREAK: sel=%u scIn={surfID=%u} — kr=0x%x scOutCnt=%u sOutSz=%zu",
+                                         sel, surfID, r, scOutCnt, sOutSz]);
+                                    [allResults appendFormat:@"sel=%u(surfID): kr=0x%x scOut=%u sOut=%zu\n", sel, r, scOutCnt, sOutSz];
+
+                                    if (r == KERN_SUCCESS) {
+                                        if (scOutCnt > 0) {
+                                            for (uint32_t si = 0; si < scOutCnt && si < 4; si++) {
+                                                log([NSString stringWithFormat:@"JAILBREAK: scalarOut[%u]=0x%llx", si, scOut[si]]);
+                                            }
+                                        }
+                                        if (sOutSz > 0) {
+                                            size_t dLen = sOutSz > 64 ? 64 : sOutSz;
+                                            NSMutableString *hex = [NSMutableString string];
+                                            for (size_t i = 0; i < dLen; i++) {
+                                                [hex appendFormat:@"%02x", sOut[i]];
+                                                if (i % 16 == 15) [hex appendString:@"\n"];
+                                                else [hex appendString:@" "];
+                                            }
+                                            log([NSString stringWithFormat:@"JAILBREAK: Hex sel=%u:\n%@", sel, hex]);
+
+                                            for (size_t i = 0; i + 7 < sOutSz; i += 4) {
+                                                uint64_t val = 0;
+                                                memcpy(&val, sOut + i, 8);
+                                                if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                                    (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                                    log([NSString stringWithFormat:@"JAILBREAK: *** KPTR sel=%u off=%zu: 0x%llx ***", sel, i, val]);
+                                                    [allResults appendFormat:@"  *** KPTR sel=%u off=%zu: 0x%llx ***\n", sel, i, val];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                sym.close(conn2);
+                            }
+                        }
+
+                        CFRelease(surf);
+                    } else {
+                        log(@"JAILBREAK: IOSurfaceCreate falló");
+                        [allResults appendString:@"IOSurfaceCreate: FAIL\n"];
+                    }
+                } else {
+                    log(@"JAILBREAK: IOSurfaceCreate no encontrado");
+                }
+                dlclose(ioSurfaceHandle);
+            } else {
+                log(@"JAILBREAK: No se pudo abrir IOSurface.framework");
+            }
         }
+
+        if (!isr_stopped()) {
+            log(@"JAILBREAK: --- Paso 3: Mach trap info ---");
+            log(@"JAILBREAK: Verificando task_info para direcciones del kernel...");
+
+            task_dyld_info_data_t dyldInfo;
+            mach_msg_type_number_t dyldCount = TASK_DYLD_INFO_COUNT;
+            kern_return_t tkr = task_info(mach_task_self(), TASK_DYLD_INFO,
+                                          (task_info_t)&dyldInfo, &dyldCount);
+            if (tkr == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JAILBREAK: TASK_DYLD_INFO: all_image_info_addr=0x%llx size=%llu",
+                     dyldInfo.all_image_info_addr, dyldInfo.all_image_info_size]);
+                [allResults appendFormat:@"DYLD_INFO: addr=0x%llx size=%llu\n",
+                 dyldInfo.all_image_info_addr, dyldInfo.all_image_info_size];
+            }
+
+            struct task_vm_info vmInfo;
+            mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+            kern_return_t vkr = task_info(mach_task_self(), TASK_VM_INFO,
+                                          (task_info_t)&vmInfo, &vmCount);
+            if (vkr == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JAILBREAK: VM_INFO: vsize=%llu rsize=%llu page_size=%d",
+                     vmInfo.virtual_size, vmInfo.resident_size, vmInfo.page_size]);
+                [allResults appendFormat:@"VM_INFO: vsize=%llu rsize=%llu pgsz=%d\n",
+                 vmInfo.virtual_size, vmInfo.resident_size, vmInfo.page_size];
+            }
+        }
+
+        [allResults writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        log(@"JAILBREAK: ========================================");
+        log(@"JAILBREAK: Fase 1 completada. Resultados guardados.");
+        log(@"JAILBREAK: ========================================");
 
         isr_unload(&sym);
-        done(@{@"variant": variantDesc, @"result": @(result)});
+        done(@{@"phase1": @"complete", @"results": allResults});
     });
 }
 
