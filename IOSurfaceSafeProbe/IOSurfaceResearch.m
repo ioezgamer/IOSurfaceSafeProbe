@@ -22184,22 +22184,36 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 
         struct {
             const char *desc;
-            int hasInput;
-            size_t inputSize;
+            int useCallMethod;
+            uint32_t nScalarIn;
+            uint64_t scalarIn[4];
+            int hasStructIn;
+            size_t structInSize;
             uint8_t fillByte;
-            int hasOutput;
-            size_t outBufSize;
+            int hasStructOut;
+            size_t structOutSize;
+            uint32_t nScalarOut;
         } tests[] = {
-            {"sel0 input=NULL,0 output=NULL,0",        0, 0,    0,    0, 0},
-            {"sel0 input=NULL,0 output=buf,4096",      0, 0,    0,    1, 4096},
-            {"sel0 input=zero,8 output=NULL,0",        1, 8,    0x00, 0, 0},
-            {"sel0 input=zero,8 output=buf,4096",      1, 8,    0x00, 1, 4096},
-            {"sel0 input=zero,64 output=buf,4096",     1, 64,   0x00, 1, 4096},
-            {"sel0 input=zero,256 output=buf,4096",    1, 256,  0x00, 1, 4096},
-            {"sel0 input=zero,4096 output=buf,4096",   1, 4096, 0x00, 1, 4096},
-            {"sel0 input=0xAA,8 output=buf,4096",      1, 8,    0xAA, 1, 4096},
-            {"sel0 input=0xFF,64 output=buf,4096",     1, 64,   0xFF, 1, 4096},
-            {"sel0 input=0x41,4096 output=buf,4096",   1, 4096, 0x41, 1, 4096},
+            {"CallMethod sel0 scalar=0 structIn=NULL structOut=NULL",
+             1, 0, {0}, 0, 0, 0, 0, 0, 0},
+            {"CallMethod sel0 scalar=0 structIn=NULL structOut=4096",
+             1, 0, {0}, 0, 0, 0, 1, 4096, 0},
+            {"CallMethod sel0 scalar=0 structIn=zero(64) structOut=4096",
+             1, 0, {0}, 1, 64, 0x00, 1, 4096, 0},
+            {"CallMethod sel0 scalar=0 structIn=zero(4096) structOut=4096",
+             1, 0, {0}, 1, 4096, 0x00, 1, 4096, 0},
+            {"CallMethod sel0 scalar=1(0) structIn=NULL structOut=4096",
+             1, 1, {0}, 0, 0, 0, 1, 4096, 0},
+            {"CallMethod sel0 scalar=1(0) structIn=zero(64) structOut=4096",
+             1, 1, {0}, 1, 64, 0x00, 1, 4096, 0},
+            {"CallMethod sel0 scalar=2(0,0) structIn=zero(256) structOut=4096",
+             1, 2, {0,0}, 1, 256, 0x00, 1, 4096, 0},
+            {"ScalarMethod sel0 scalar=0 scalarOut=16",
+             0, 0, {0}, 0, 0, 0, 0, 0, 16},
+            {"ScalarMethod sel0 scalar=1(0) scalarOut=16",
+             0, 1, {0}, 0, 0, 0, 0, 0, 16},
+            {"CallMethod sel0 scalar=1(0) structIn=zero(4096) structOut=4096 scalarOut=4",
+             1, 1, {0}, 1, 4096, 0x00, 1, 4096, 4},
         };
         int numTests = sizeof(tests) / sizeof(tests[0]);
 
@@ -22210,27 +22224,24 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             if ([trimmed hasPrefix:@"CRASH:"]) {
                 int crashedIdx = [[trimmed substringFromIndex:6] intValue];
                 NSString *crashInfo = [NSString stringWithContentsOfFile:variantPath encoding:NSUTF8StringEncoding error:nil];
-                log(@"SEL0DEEP: ========================================");
-                log(@"SEL0DEEP: *** CRASH DETECTADO en selector 0 ***");
-                log([NSString stringWithFormat:@"SEL0DEEP: Variante %d crasheó: %@", crashedIdx + 1, crashInfo ?: @"desconocida"]);
-                log(@"SEL0DEEP: ========================================");
-                log(@"SEL0DEEP: Esto confirma un BUG en el kernel.");
-                log(@"SEL0DEEP: s_create_surface no valida este input.");
+                log(@"SEL0METHOD: ========================================");
+                log(@"SEL0METHOD: *** CRASH DETECTADO ***");
+                log([NSString stringWithFormat:@"SEL0METHOD: Variante %d crasheó: %@", crashedIdx + 1, crashInfo ?: @"desconocida"]);
+                log(@"SEL0METHOD: ========================================");
                 int nextIdx = crashedIdx + 1;
                 if (nextIdx >= numTests) {
-                    log(@"SEL0DEEP: Todas las variantes probadas.");
+                    log(@"SEL0METHOD: Todas las variantes probadas.");
                     [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
                     [[NSFileManager defaultManager] removeItemAtPath:variantPath error:nil];
                 } else {
-                    log([NSString stringWithFormat:@"SEL0DEEP: Tocá otra vez para variante %d/%d", nextIdx + 1, numTests]);
+                    log([NSString stringWithFormat:@"SEL0METHOD: Tocá otra vez para variante %d/%d", nextIdx + 1, numTests]);
                     [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
                 }
-                log(@"SEL0DEEP: ========================================");
                 done(@{@"crash_detected": @YES, @"crash_variant": crashInfo ?: @"unknown"});
                 return;
             } else if ([trimmed isEqualToString:@"DONE"]) {
-                log(@"SEL0DEEP: Todas las 10 variantes probadas sin crash!");
-                log(@"SEL0DEEP: Tocá otra vez para reiniciar.");
+                log(@"SEL0METHOD: Todas las variantes probadas!");
+                log(@"SEL0METHOD: Tocá otra vez para reiniciar.");
                 [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
                 done(@{@"all_done": @YES});
                 return;
@@ -22241,7 +22252,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 
         if (testIdx >= numTests) {
             [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log(@"SEL0DEEP: Todas las 10 variantes completadas sin crash!");
+            log(@"SEL0METHOD: Todas las variantes completadas!");
             done(@{@"all_done": @YES});
             return;
         }
@@ -22250,19 +22261,27 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         [variantDesc writeToFile:variantPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [[NSString stringWithFormat:@"CRASH:%d", testIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        log([NSString stringWithFormat:@"SEL0DEEP: === Variante %d/%d: %@ ===", testIdx + 1, numTests, variantDesc]);
+        log([NSString stringWithFormat:@"SEL0METHOD: === Variante %d/%d ===", testIdx + 1, numTests]);
+        log([NSString stringWithFormat:@"SEL0METHOD: %@", variantDesc]);
 
         ISRSymbols sym;
         if (!isr_load(&sym)) {
-            log(@"SEL0DEEP: Error cargando símbolos");
+            log(@"SEL0METHOD: Error cargando símbolos");
             done(@{@"error": @"symbols"});
             return;
         }
 
-        typedef kern_return_t (*StructCallFn)(io_connect_t, uint32_t, const void *, size_t, void *, size_t *);
-        StructCallFn structCall = (StructCallFn)dlsym(sym.iokit, "IOConnectCallStructMethod");
-        if (!structCall) {
-            log(@"SEL0DEEP: No se pudo cargar IOConnectCallStructMethod");
+        typedef kern_return_t (*CallMethodFn)(io_connect_t, uint32_t,
+            const uint64_t *, uint32_t, const void *, size_t,
+            uint64_t *, uint32_t *, void *, size_t *);
+        CallMethodFn callMethod = (CallMethodFn)dlsym(sym.iokit, "IOConnectCallMethod");
+
+        typedef kern_return_t (*ScalarMethodFn)(io_connect_t, uint32_t,
+            const uint64_t *, uint32_t, uint64_t *, uint32_t *);
+        ScalarMethodFn scalarMethod = (ScalarMethodFn)dlsym(sym.iokit, "IOConnectCallScalarMethod");
+
+        if (!callMethod || !scalarMethod) {
+            log(@"SEL0METHOD: No se pudieron cargar IOConnectCallMethod/ScalarMethod");
             isr_unload(&sym);
             done(@{@"error": @"dlsym"});
             return;
@@ -22273,7 +22292,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         HostGetFn hostGet = (HostGetFn)dlsym(sym.iokit, "IOMainPort");
         if (!hostGet) hostGet = (HostGetFn)dlsym(sym.iokit, "IOMasterPort");
         if (!hostGet) {
-            log(@"SEL0DEEP: No se pudo cargar IOMainPort/IOMasterPort");
+            log(@"SEL0METHOD: No se pudo cargar IOMainPort/IOMasterPort");
             isr_unload(&sym);
             done(@{@"error": @"hostget"});
             return;
@@ -22284,7 +22303,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         io_service_t service = sym.getMatch(master, matching);
         io_connect_t connect = 0;
         if (!service) {
-            log(@"SEL0DEEP: IOSurfaceRoot service no encontrado");
+            log(@"SEL0METHOD: IOSurfaceRoot service no encontrado");
             isr_unload(&sym);
             done(@{@"error": @"service"});
             return;
@@ -22293,72 +22312,96 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
         sym.release(service);
         if (kr != KERN_SUCCESS || !connect) {
-            log([NSString stringWithFormat:@"SEL0DEEP: IOServiceOpen falló — kr=%d", kr]);
+            log([NSString stringWithFormat:@"SEL0METHOD: IOServiceOpen falló — kr=%d", kr]);
             isr_unload(&sym);
             done(@{@"error": @"open"});
             return;
         }
-        log([NSString stringWithFormat:@"SEL0DEEP: IOSurfaceRoot connect=%u", connect]);
+        log([NSString stringWithFormat:@"SEL0METHOD: connect=%u", connect]);
 
-        uint8_t *inputBuf = NULL;
-        size_t inputSize = tests[testIdx].inputSize;
-        if (tests[testIdx].hasInput && inputSize > 0) {
-            inputBuf = (uint8_t *)calloc(1, inputSize);
-            if (inputBuf) memset(inputBuf, tests[testIdx].fillByte, inputSize);
+        uint8_t *structIn = NULL;
+        size_t structInSize = tests[testIdx].structInSize;
+        if (tests[testIdx].hasStructIn && structInSize > 0) {
+            structIn = (uint8_t *)calloc(1, structInSize);
+            if (structIn) memset(structIn, tests[testIdx].fillByte, structInSize);
         }
 
-        uint8_t *outputBuf = NULL;
-        size_t outBufSize = tests[testIdx].outBufSize;
-        size_t outSize = outBufSize;
-        if (tests[testIdx].hasOutput && outBufSize > 0) {
-            outputBuf = (uint8_t *)calloc(1, outBufSize);
+        uint8_t *structOut = NULL;
+        size_t structOutSize = tests[testIdx].structOutSize;
+        if (tests[testIdx].hasStructOut && structOutSize > 0) {
+            structOut = (uint8_t *)calloc(1, structOutSize);
         }
 
-        log([NSString stringWithFormat:@"SEL0DEEP: Llamando IOConnectCallStructMethod(connect, 0, %s, %zu, %s, %zu)...",
-             inputBuf ? "buf" : "NULL", inputBuf ? inputSize : (size_t)0,
-             outputBuf ? "buf" : "NULL", outSize]);
+        uint64_t scalarOut[16];
+        memset(scalarOut, 0, sizeof(scalarOut));
+        uint32_t scalarOutCnt = tests[testIdx].nScalarOut;
 
-        kern_return_t result = structCall(connect,
-                                          0,
-                                          inputBuf, inputBuf ? inputSize : 0,
-                                          outputBuf, outputBuf ? &outSize : NULL);
+        kern_return_t result;
 
-        log([NSString stringWithFormat:@"SEL0DEEP: *** RETORNÓ: kr=0x%x (%d) ***", result, result]);
+        if (tests[testIdx].useCallMethod) {
+            log([NSString stringWithFormat:@"SEL0METHOD: IOConnectCallMethod(sel=0, scalarIn=%u, structIn=%s(%zu), scalarOut=%u, structOut=%s(%zu))",
+                 tests[testIdx].nScalarIn,
+                 structIn ? "buf" : "NULL", structIn ? structInSize : (size_t)0,
+                 scalarOutCnt,
+                 structOut ? "buf" : "NULL", structOut ? structOutSize : (size_t)0]);
+
+            result = callMethod(connect, 0,
+                tests[testIdx].nScalarIn > 0 ? tests[testIdx].scalarIn : NULL,
+                tests[testIdx].nScalarIn,
+                structIn, structIn ? structInSize : 0,
+                scalarOutCnt > 0 ? scalarOut : NULL,
+                scalarOutCnt > 0 ? &scalarOutCnt : NULL,
+                structOut, structOut ? &structOutSize : NULL);
+        } else {
+            log([NSString stringWithFormat:@"SEL0METHOD: IOConnectCallScalarMethod(sel=0, scalarIn=%u, scalarOut=%u)",
+                 tests[testIdx].nScalarIn, scalarOutCnt]);
+
+            result = scalarMethod(connect, 0,
+                tests[testIdx].nScalarIn > 0 ? tests[testIdx].scalarIn : NULL,
+                tests[testIdx].nScalarIn,
+                scalarOutCnt > 0 ? scalarOut : NULL,
+                scalarOutCnt > 0 ? &scalarOutCnt : NULL);
+        }
+
+        log([NSString stringWithFormat:@"SEL0METHOD: *** RETORNÓ: kr=0x%x (%d) ***", result, result]);
 
         if (result == KERN_SUCCESS) {
-            log(@"SEL0DEEP: ¡¡¡ÉXITO!!! El kernel aceptó esta variante.");
-            if (outputBuf && outSize > 0) {
-                log([NSString stringWithFormat:@"SEL0DEEP: Output size=%zu bytes", outSize]);
-                size_t dumpLen = outSize > 128 ? 128 : outSize;
+            log(@"SEL0METHOD: ¡¡¡ÉXITO!!! El kernel aceptó esta llamada.");
+            if (scalarOutCnt > 0) {
+                for (uint32_t i = 0; i < scalarOutCnt; i++) {
+                    log([NSString stringWithFormat:@"SEL0METHOD: scalarOut[%u] = 0x%llx (%llu)", i, scalarOut[i], scalarOut[i]]);
+                }
+            }
+            if (structOut && structOutSize > 0) {
+                log([NSString stringWithFormat:@"SEL0METHOD: structOut size=%zu", structOutSize]);
+                size_t dumpLen = structOutSize > 128 ? 128 : structOutSize;
                 NSMutableString *hex = [NSMutableString string];
                 for (size_t i = 0; i < dumpLen; i++) {
                     if (i > 0 && i % 16 == 0) [hex appendString:@"\n"];
-                    [hex appendFormat:@"%02x ", outputBuf[i]];
+                    [hex appendFormat:@"%02x ", structOut[i]];
                 }
-                log([NSString stringWithFormat:@"SEL0DEEP: Hex dump (primeros %zu bytes):\n%@", dumpLen, hex]);
+                log([NSString stringWithFormat:@"SEL0METHOD: Hex dump:\n%@", hex]);
 
-                int hasKernPtr = 0;
-                for (size_t i = 0; i + 7 < outSize; i += 4) {
+                for (size_t i = 0; i + 7 < structOutSize; i += 4) {
                     uint64_t val = 0;
-                    memcpy(&val, outputBuf + i, 8);
+                    memcpy(&val, structOut + i, 8);
                     if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
                         (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
-                        log([NSString stringWithFormat:@"SEL0DEEP: *** POSIBLE PUNTERO KERNEL en offset %zu: 0x%llx ***", i, val]);
-                        hasKernPtr = 1;
+                        log([NSString stringWithFormat:@"SEL0METHOD: *** PUNTERO KERNEL offset %zu: 0x%llx ***", i, val]);
                     }
                 }
-                if (!hasKernPtr) log(@"SEL0DEEP: No se detectaron punteros kernel en output.");
             }
         } else {
-            log([NSString stringWithFormat:@"SEL0DEEP: Rechazado con código 0x%x — no crasheó", result]);
-            if (result == 0xe00002bc) log(@"SEL0DEEP: (KERN_INVALID_ARGUMENT — argumento inválido)");
-            else if (result == 0xe00002c2) log(@"SEL0DEEP: (kIOReturnBadArgument)");
-            else if (result == 0xe0000001) log(@"SEL0DEEP: (kIOReturnError — error genérico)");
-            else if (result == 0xe00002be) log(@"SEL0DEEP: (kIOReturnNoMemory)");
+            log([NSString stringWithFormat:@"SEL0METHOD: Rechazado con 0x%x — no crasheó", result]);
+            if (result == 0xe00002bc) log(@"SEL0METHOD: (kIOReturnBadArgument)");
+            else if (result == 0xe00002c2) log(@"SEL0METHOD: (kIOReturnExclusiveAccess)");
+            else if (result == 0xe0000001) log(@"SEL0METHOD: (kIOReturnError)");
+            else if (result == 0xe00002be) log(@"SEL0METHOD: (kIOReturnNoMemory)");
+            else if (result == 0xe00002ed) log(@"SEL0METHOD: (kIOReturnUnsupported)");
         }
 
-        if (inputBuf) free(inputBuf);
-        if (outputBuf) free(outputBuf);
+        if (structIn) free(structIn);
+        if (structOut) free(structOut);
         sym.close(connect);
 
         int nextIdx = testIdx + 1;
@@ -22366,9 +22409,9 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 
         if (nextIdx >= numTests) {
             [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log(@"SEL0DEEP: === Todas las variantes probadas ===");
+            log(@"SEL0METHOD: === Todas las variantes probadas ===");
         } else {
-            log([NSString stringWithFormat:@"SEL0DEEP: Siguiente: variante %d/%d — tocá el botón otra vez", nextIdx + 1, numTests]);
+            log([NSString stringWithFormat:@"SEL0METHOD: Siguiente: variante %d/%d — tocá otra vez", nextIdx + 1, numTests]);
         }
 
         isr_unload(&sym);
