@@ -26889,7 +26889,7 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
 
             jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
 
-            volatile int spamRun = 1;
+            __block volatile int spamRun = 1;
             __block volatile uint64_t okCount = 0;
             __block volatile uint64_t tryCount = 0;
             __block volatile uint32_t lastRc = 0;
@@ -26911,7 +26911,7 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             uint64_t okPre = okCount;
             sym.close(c);
             usleep(2000);
-            *((volatile int *)&spamRun) = 0;
+            spamRun = 0;
             dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
 
             uint64_t okPost = okCount - okPre;
