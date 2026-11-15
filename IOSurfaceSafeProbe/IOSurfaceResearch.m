@@ -21812,10 +21812,28 @@ void iosurface_research_type_confuse(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
         RemoveValueFn removeValue = (RemoveValueFn)dlsym(sym.iosurface, "IOSurfaceRemoveValue");
 
         if (!setValue || !getValue || !removeValue) {
-            log(@"TYPECONFUSE: Failed to load value functions");
-            isr_unload(&sym);
-            done(@{@"anomalies": @(-1)});
-            return;
+            void *alt = dlopen("/System/Library/PrivateFrameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+            if (alt) {
+                if (!setValue) setValue = (SetValueFn)dlsym(alt, "IOSurfaceSetValue");
+                if (!getValue) getValue = (GetValueFn)dlsym(alt, "IOSurfaceGetValue");
+                if (!removeValue) removeValue = (RemoveValueFn)dlsym(alt, "IOSurfaceRemoveValue");
+            }
+            if (!setValue || !getValue || !removeValue) {
+                void *alt2 = dlopen(NULL, RTLD_LAZY);
+                if (alt2) {
+                    if (!setValue) setValue = (SetValueFn)dlsym(alt2, "IOSurfaceSetValue");
+                    if (!getValue) getValue = (GetValueFn)dlsym(alt2, "IOSurfaceGetValue");
+                    if (!removeValue) removeValue = (RemoveValueFn)dlsym(alt2, "IOSurfaceRemoveValue");
+                }
+            }
+            if (!setValue || !getValue || !removeValue) {
+                log([NSString stringWithFormat:@"TYPECONFUSE: Failed to load value functions — set=%p get=%p remove=%p",
+                     (void*)setValue, (void*)getValue, (void*)removeValue]);
+                isr_unload(&sym);
+                done(@{@"anomalies": @(-1)});
+                return;
+            }
+            log(@"TYPECONFUSE: Loaded value functions from alternate handle");
         }
 
         struct timeval tv_start, tv_end;
@@ -22246,6 +22264,11 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 memset(outBuf, 0, sizeof(outBuf));
                 size_t outSize = sizeof(outBuf);
 
+                isr_checkpoint(@"ISR-StructMethod-last.json", (@{
+                    @"selector": @(sel), @"input": @(inputs[inp].name),
+                    @"inputSize": @(inputs[inp].size), @"step": @1
+                }));
+
                 kern_return_t ret = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf, &outSize);
                 if (ret == KERN_SUCCESS) {
                     acceptedSelectors++;
@@ -22283,6 +22306,10 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 memset(outBuf2, 0, sizeof(outBuf2));
                 size_t outSize2 = sizeof(outBuf2);
 
+                isr_checkpoint(@"ISR-StructMethod-last.json", (@{
+                    @"selector": @(sel), @"input": @(inputs[inp].name),
+                    @"inputSize": @(inputs[inp].size), @"step": @2
+                }));
                 kern_return_t ret2 = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf2, &outSize2);
                 if (ret2 == KERN_SUCCESS) {
                     acceptedSelectors++;
@@ -22313,6 +22340,10 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                     uint8_t outBuf3[4096];
                     memset(outBuf3, 0, sizeof(outBuf3));
                     size_t outSize3 = sizeof(outBuf3);
+                    isr_checkpoint(@"ISR-StructMethod-last.json", (@{
+                        @"selector": @(sel), @"input": @"huge64k",
+                        @"inputSize": @(65536), @"step": @3
+                    }));
                     kern_return_t ret3 = structCall(connect, sel, hugeStruct, 65536, outBuf3, &outSize3);
                     if (ret3 == KERN_SUCCESS) {
                         anomalies++;
