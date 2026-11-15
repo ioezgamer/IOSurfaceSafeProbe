@@ -22193,13 +22193,16 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 NSString *crashInfo = [NSString stringWithContentsOfFile:crashInfoPath encoding:NSUTF8StringEncoding error:nil];
                 log(@"STRUCTMETHOD: ========== CRASH DETECTADO ==========");
                 log([NSString stringWithFormat:@"STRUCTMETHOD: *** La app crasheó en el lote: %@ ***", crashInfo ?: @"desconocido"]);
-                log(@"STRUCTMETHOD: Borrá el archivo ISR-structmethod-progress.txt en Files para reiniciar");
+                log(@"STRUCTMETHOD: Tocá otra vez para reiniciar las pruebas");
                 log(@"STRUCTMETHOD: ====================================");
+                [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
+                [[NSFileManager defaultManager] removeItemAtPath:crashInfoPath error:nil];
                 done(@{@"crash_detected": @YES, @"crash_batch": crashInfo ?: @"unknown"});
                 return;
             } else if ([trimmed isEqualToString:@"DONE"]) {
                 log(@"STRUCTMETHOD: Todas las pruebas completadas sin crash!");
-                log(@"STRUCTMETHOD: Borrá ISR-structmethod-progress.txt en Files para reiniciar");
+                log(@"STRUCTMETHOD: Tocá otra vez para reiniciar");
+                [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
                 done(@{@"all_done": @YES});
                 return;
             } else {
