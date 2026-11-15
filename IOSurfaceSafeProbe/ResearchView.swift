@@ -317,6 +317,16 @@ struct ResearchView: View {
         ("taskintro", "Task Introspection", "brain.filled.head.profile",
          "Harvest kernel info via task_info, vm_region, commpage, host_info, thread state",
          { log, done in iosurface_research_task_intro({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Round 31
+        ("raceuaf", "Race Condition UAF", "bolt.trianglebadge.exclamationmark.fill",
+         "4 threads racing SetValue/GetValue/RemoveValue — CVE-2023-32434 style UAF/type confusion",
+         { log, done in iosurface_research_race_uaf({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("physmap", "Physical Memory Map", "cpu.fill",
+         "100 single-page surfaces, sentinel cross-scan, vm_remap overlap para R/W físico",
+         { log, done in iosurface_research_phys_map({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("exploitchain", "Full Exploit Chain", "lock.open.laptopcomputer",
+         "Spray+OOB+AllocSize override+kernel scan+vm_remap — cadena completa de explotación",
+         { log, done in iosurface_research_exploit_chain({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -714,7 +724,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 90), id: \.id) { probe in
+            ForEach(probes[90..<93], id: \.id) { probe in
+                probeCard(probe)
+            }
+
+            // --- ROUND 31 ---
+            Text("Round 31 — Exploit Chain")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            ForEach(probes.suffix(from: 93), id: \.id) { probe in
                 probeCard(probe)
             }
 
