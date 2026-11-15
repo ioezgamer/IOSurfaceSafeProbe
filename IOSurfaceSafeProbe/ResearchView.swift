@@ -351,6 +351,16 @@ struct ResearchView: View {
         ("ctrlcorrupt", "Controlled Corruption", "hammer.circle.fill",
          "Corrupcion controlada via alias stale — intenta OOB en propiedades IOSurface",
          { log, done in iosurface_controlled_corruption({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Kernel object spray vectors
+        ("oolspray", "OOL Spray Alias", "envelope.fill",
+         "Spray mensajes Mach OOL en paginas recicladas — busca objetos kalloc kernel",
+         { log, done in iosurface_ool_spray_alias({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("notifyuaf2", "Notify UAF+Alias", "bolt.shield.fill",
+         "Combina notify UAF con alias stale — lee objeto kernel liberado",
+         { log, done in iosurface_notify_uaf_alias({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("pipespray", "Pipe Spray Alias", "pipe.and.drop.fill",
+         "Spray pipe buffers 16KB en paginas recicladas — busca datos kernel",
+         { log, done in iosurface_pipe_spray_alias({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
