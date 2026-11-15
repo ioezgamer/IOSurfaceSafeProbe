@@ -344,6 +344,13 @@ struct ResearchView: View {
         ("notifyuaf", "Notify UAF Race", "bolt.trianglebadge.exclamationmark",
          "CVE-2026-112477 — SetSurfaceNotify + Create/Release race condition",
          { log, done in iosurface_notify_uaf_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Jailbreak exploitation phase
+        ("kernspray", "Kernel Spray Alias", "cpu.fill",
+         "Spray kernel objects en paginas recicladas — lee datos kernel via alias stale",
+         { log, done in iosurface_kernel_spray_alias({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("ctrlcorrupt", "Controlled Corruption", "hammer.circle.fill",
+         "Corrupcion controlada via alias stale — intenta OOB en propiedades IOSurface",
+         { log, done in iosurface_controlled_corruption({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {

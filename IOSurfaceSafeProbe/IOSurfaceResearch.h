@@ -373,5 +373,11 @@ void iosurface_stale_page_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull 
 /// Probe JB4: IOSurface notify UAF race (CVE-2026-112477) — SetSurfaceNotify + Create/Release race.
 void iosurface_notify_uaf_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB5: Kernel object spray via stale-page alias — read kernel data through recycled pages.
+void iosurface_kernel_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB6: Controlled corruption via stale-page write — corrupt IOSurface properties for OOB.
+void iosurface_controlled_corruption(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
