@@ -383,6 +383,15 @@ struct ResearchView: View {
         ("pacharvest", "PAC Harvest", "wand.and.stars",
          "16 threads + 10 scans + PAC strip masivo — mapa de direcciones kernel",
          { log, done in iosurface_pac_harvest({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kallocoverflow", "Kalloc Overflow", "flame.fill",
+         "Property overflow en boundaries de kalloc zones — busca leaks de datos kernel",
+         { log, done in iosurface_kalloc_overflow({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("heapfengshui", "Heap Feng Shui", "square.grid.3x3.fill",
+         "Grooming preciso heap kernel — IOSurface+voucher cross-zone type confusion",
+         { log, done in iosurface_heap_fengshui({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kptroracle", "KPtr Oracle", "target",
+         "Correlacion kernel ptr leaked + IOSurface IDs — calcula offsets kernel",
+         { log, done in iosurface_kptr_oracle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {

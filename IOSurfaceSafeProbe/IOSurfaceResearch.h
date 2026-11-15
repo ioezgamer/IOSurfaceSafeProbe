@@ -409,5 +409,14 @@ void iosurface_thread_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull 
 /// Probe JB16: PAC pointer harvest — mass thread scan + diverse syscalls + kernel address map.
 void iosurface_pac_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB17: Kalloc overflow oracle — IOSurface property sizes at kalloc zone boundaries.
+void iosurface_kalloc_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB18: Heap feng shui + type confusion via IOSurface/voucher cross-zone spray.
+void iosurface_heap_fengshui(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB19: Kernel pointer oracle — use leaked PAC ptr + IOSurface ID correlation.
+void iosurface_kptr_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

