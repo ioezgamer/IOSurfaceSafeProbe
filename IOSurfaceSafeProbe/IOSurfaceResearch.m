@@ -23070,7 +23070,7 @@ void iosurface_kernel_info_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 
             // KERNEL_BOOT_INFO (7)
             kernel_boot_info_t bootInfo;
-            mach_msg_type_number_t bootCnt = KERNEL_BOOT_INFO_MAX_SIZE;
+            mach_msg_type_number_t bootCnt = 4096;
             if (host_get_boot_info(mach_host_self(), bootInfo) == KERN_SUCCESS) {
                 NSString *bi = [NSString stringWithUTF8String:bootInfo];
                 log([NSString stringWithFormat:@"JB12: BOOT_INFO: %@", bi]);
