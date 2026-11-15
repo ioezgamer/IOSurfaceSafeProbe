@@ -22179,67 +22179,85 @@ static void isr_crash_log(const char *msg) {
 void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        #define BATCH_SIZE 1
-        #define MAX_SEL 4
-
         NSString *progressPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-structmethod-progress.txt"];
-        NSString *prev = [NSString stringWithContentsOfFile:progressPath encoding:NSUTF8StringEncoding error:nil];
+        NSString *variantPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-structmethod-batch.txt"];
 
-        int batchStart = 0;
+        struct {
+            const char *desc;
+            int hasInput;
+            size_t inputSize;
+            uint8_t fillByte;
+            int hasOutput;
+            size_t outBufSize;
+        } tests[] = {
+            {"sel0 input=NULL,0 output=NULL,0",        0, 0,    0,    0, 0},
+            {"sel0 input=NULL,0 output=buf,4096",      0, 0,    0,    1, 4096},
+            {"sel0 input=zero,8 output=NULL,0",        1, 8,    0x00, 0, 0},
+            {"sel0 input=zero,8 output=buf,4096",      1, 8,    0x00, 1, 4096},
+            {"sel0 input=zero,64 output=buf,4096",     1, 64,   0x00, 1, 4096},
+            {"sel0 input=zero,256 output=buf,4096",    1, 256,  0x00, 1, 4096},
+            {"sel0 input=zero,4096 output=buf,4096",   1, 4096, 0x00, 1, 4096},
+            {"sel0 input=0xAA,8 output=buf,4096",      1, 8,    0xAA, 1, 4096},
+            {"sel0 input=0xFF,64 output=buf,4096",     1, 64,   0xFF, 1, 4096},
+            {"sel0 input=0x41,4096 output=buf,4096",   1, 4096, 0x41, 1, 4096},
+        };
+        int numTests = sizeof(tests) / sizeof(tests[0]);
+
+        NSString *prev = [NSString stringWithContentsOfFile:progressPath encoding:NSUTF8StringEncoding error:nil];
+        int testIdx = 0;
         if (prev) {
             NSString *trimmed = [prev stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if ([trimmed isEqualToString:@"CRASH"]) {
-                NSString *crashInfoPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-structmethod-batch.txt"];
-                NSString *crashInfo = [NSString stringWithContentsOfFile:crashInfoPath encoding:NSUTF8StringEncoding error:nil];
-                log(@"STRUCTMETHOD: ========== CRASH DETECTADO ==========");
-                log([NSString stringWithFormat:@"STRUCTMETHOD: *** La app crasheó en el lote: %@ ***", crashInfo ?: @"desconocido"]);
-                log(@"STRUCTMETHOD: Tocá otra vez para reiniciar las pruebas");
-                log(@"STRUCTMETHOD: ====================================");
+                NSString *crashInfo = [NSString stringWithContentsOfFile:variantPath encoding:NSUTF8StringEncoding error:nil];
+                log(@"SEL0DEEP: ========================================");
+                log(@"SEL0DEEP: *** CRASH DETECTADO en selector 0 ***");
+                log([NSString stringWithFormat:@"SEL0DEEP: Variante que crasheó: %@", crashInfo ?: @"desconocida"]);
+                log(@"SEL0DEEP: ========================================");
+                log(@"SEL0DEEP: Esto confirma un BUG en el kernel.");
+                log(@"SEL0DEEP: s_create_surface no valida este input.");
+                log(@"SEL0DEEP: Tocá otra vez para probar la siguiente variante.");
+                log(@"SEL0DEEP: ========================================");
                 [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
-                [[NSFileManager defaultManager] removeItemAtPath:crashInfoPath error:nil];
-                done(@{@"crash_detected": @YES, @"crash_batch": crashInfo ?: @"unknown"});
+                [[NSFileManager defaultManager] removeItemAtPath:variantPath error:nil];
+                done(@{@"crash_detected": @YES, @"crash_variant": crashInfo ?: @"unknown"});
                 return;
             } else if ([trimmed isEqualToString:@"DONE"]) {
-                log(@"STRUCTMETHOD: Todas las pruebas completadas sin crash!");
-                log(@"STRUCTMETHOD: Tocá otra vez para reiniciar");
+                log(@"SEL0DEEP: Todas las 10 variantes probadas sin crash!");
+                log(@"SEL0DEEP: Tocá otra vez para reiniciar.");
                 [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
                 done(@{@"all_done": @YES});
                 return;
             } else {
-                batchStart = [trimmed intValue];
+                testIdx = [trimmed intValue];
             }
         }
 
-        if (batchStart > MAX_SEL) {
-            [[NSString stringWithFormat:@"DONE"] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log(@"STRUCTMETHOD: Todas las pruebas completadas sin crash!");
+        if (testIdx >= numTests) {
+            [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            log(@"SEL0DEEP: Todas las 10 variantes completadas sin crash!");
             done(@{@"all_done": @YES});
             return;
         }
 
-        int batchEnd = batchStart + BATCH_SIZE - 1;
-        if (batchEnd > MAX_SEL) batchEnd = MAX_SEL;
-
-        NSString *batchInfo = [NSString stringWithFormat:@"selectores %d-%d", batchStart, batchEnd];
-        NSString *batchInfoPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-structmethod-batch.txt"];
-        [batchInfo writeToFile:batchInfoPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSString *variantDesc = [NSString stringWithUTF8String:tests[testIdx].desc];
+        [variantDesc writeToFile:variantPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [@"CRASH" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        log([NSString stringWithFormat:@"STRUCTMETHOD: === Probando lote: selectores %d a %d (de 0-%d) ===", batchStart, batchEnd, MAX_SEL]);
+        log([NSString stringWithFormat:@"SEL0DEEP: === Variante %d/%d: %@ ===", testIdx + 1, numTests, variantDesc]);
 
         ISRSymbols sym;
         if (!isr_load(&sym)) {
-            log(@"STRUCTMETHOD: Failed to load symbols");
-            done(@{@"anomalies": @(-1)});
+            log(@"SEL0DEEP: Error cargando símbolos");
+            done(@{@"error": @"symbols"});
             return;
         }
 
         typedef kern_return_t (*StructCallFn)(io_connect_t, uint32_t, const void *, size_t, void *, size_t *);
         StructCallFn structCall = (StructCallFn)dlsym(sym.iokit, "IOConnectCallStructMethod");
         if (!structCall) {
-            log(@"STRUCTMETHOD: Failed to load IOConnectCallStructMethod");
+            log(@"SEL0DEEP: No se pudo cargar IOConnectCallStructMethod");
             isr_unload(&sym);
-            done(@{@"anomalies": @(-1)});
+            done(@{@"error": @"dlsym"});
             return;
         }
 
@@ -22248,9 +22266,9 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         HostGetFn hostGet = (HostGetFn)dlsym(sym.iokit, "IOMainPort");
         if (!hostGet) hostGet = (HostGetFn)dlsym(sym.iokit, "IOMasterPort");
         if (!hostGet) {
-            log(@"STRUCTMETHOD: Failed to load IOMainPort/IOMasterPort");
+            log(@"SEL0DEEP: No se pudo cargar IOMainPort/IOMasterPort");
             isr_unload(&sym);
-            done(@{@"anomalies": @(-1)});
+            done(@{@"error": @"hostget"});
             return;
         }
         hostGet(&master);
@@ -22259,72 +22277,95 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         io_service_t service = sym.getMatch(master, matching);
         io_connect_t connect = 0;
         if (!service) {
-            log(@"STRUCTMETHOD: IOSurfaceRoot service not found");
+            log(@"SEL0DEEP: IOSurfaceRoot service no encontrado");
             isr_unload(&sym);
-            done(@{@"anomalies": @(-1)});
+            done(@{@"error": @"service"});
             return;
         }
 
         kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
         sym.release(service);
         if (kr != KERN_SUCCESS || !connect) {
-            log([NSString stringWithFormat:@"STRUCTMETHOD: IOServiceOpen failed — kr=%d", kr]);
+            log([NSString stringWithFormat:@"SEL0DEEP: IOServiceOpen falló — kr=%d", kr]);
             isr_unload(&sym);
-            done(@{@"anomalies": @(-1)});
+            done(@{@"error": @"open"});
             return;
         }
-        log([NSString stringWithFormat:@"STRUCTMETHOD: IOSurfaceRoot connect=%u — probando selectores...", connect]);
+        log([NSString stringWithFormat:@"SEL0DEEP: IOSurfaceRoot connect=%u", connect]);
 
-        uint8_t zeroStruct[8];
-        memset(zeroStruct, 0, sizeof(zeroStruct));
-
-        unsigned anomalies = 0;
-        unsigned accepted = 0;
-
-        for (uint32_t sel = (uint32_t)batchStart; sel <= (uint32_t)batchEnd && !isr_stopped(); sel++) {
-            uint8_t outBuf[4096];
-            size_t outSize;
-
-            outSize = sizeof(outBuf);
-            memset(outBuf, 0, sizeof(outBuf));
-            log([NSString stringWithFormat:@"STRUCTMETHOD: sel=%u input=empty", sel]);
-            kern_return_t r1 = structCall(connect, sel, NULL, 0, outBuf, &outSize);
-            if (r1 == KERN_SUCCESS) {
-                accepted++;
-                log([NSString stringWithFormat:@"STRUCTMETHOD: ACCEPTED sel=%u input=empty outSize=%zu", sel, outSize]);
-            }
-
-            outSize = sizeof(outBuf);
-            memset(outBuf, 0, sizeof(outBuf));
-            log([NSString stringWithFormat:@"STRUCTMETHOD: sel=%u input=zero8", sel]);
-            kern_return_t r2 = structCall(connect, sel, zeroStruct, 8, outBuf, &outSize);
-            if (r2 == KERN_SUCCESS) {
-                accepted++;
-                log([NSString stringWithFormat:@"STRUCTMETHOD: ACCEPTED sel=%u input=zero8 outSize=%zu", sel, outSize]);
-            }
+        uint8_t *inputBuf = NULL;
+        size_t inputSize = tests[testIdx].inputSize;
+        if (tests[testIdx].hasInput && inputSize > 0) {
+            inputBuf = (uint8_t *)calloc(1, inputSize);
+            if (inputBuf) memset(inputBuf, tests[testIdx].fillByte, inputSize);
         }
 
+        uint8_t *outputBuf = NULL;
+        size_t outBufSize = tests[testIdx].outBufSize;
+        size_t outSize = outBufSize;
+        if (tests[testIdx].hasOutput && outBufSize > 0) {
+            outputBuf = (uint8_t *)calloc(1, outBufSize);
+        }
+
+        log([NSString stringWithFormat:@"SEL0DEEP: Llamando IOConnectCallStructMethod(connect, 0, %s, %zu, %s, %zu)...",
+             inputBuf ? "buf" : "NULL", inputBuf ? inputSize : (size_t)0,
+             outputBuf ? "buf" : "NULL", outSize]);
+
+        kern_return_t result = structCall(connect,
+                                          0,
+                                          inputBuf, inputBuf ? inputSize : 0,
+                                          outputBuf, outputBuf ? &outSize : NULL);
+
+        log([NSString stringWithFormat:@"SEL0DEEP: *** RETORNÓ: kr=0x%x (%d) ***", result, result]);
+
+        if (result == KERN_SUCCESS) {
+            log(@"SEL0DEEP: ¡¡¡ÉXITO!!! El kernel aceptó esta variante.");
+            if (outputBuf && outSize > 0) {
+                log([NSString stringWithFormat:@"SEL0DEEP: Output size=%zu bytes", outSize]);
+                size_t dumpLen = outSize > 128 ? 128 : outSize;
+                NSMutableString *hex = [NSMutableString string];
+                for (size_t i = 0; i < dumpLen; i++) {
+                    if (i > 0 && i % 16 == 0) [hex appendString:@"\n"];
+                    [hex appendFormat:@"%02x ", outputBuf[i]];
+                }
+                log([NSString stringWithFormat:@"SEL0DEEP: Hex dump (primeros %zu bytes):\n%@", dumpLen, hex]);
+
+                int hasKernPtr = 0;
+                for (size_t i = 0; i + 7 < outSize; i += 4) {
+                    uint64_t val = 0;
+                    memcpy(&val, outputBuf + i, 8);
+                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                        (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                        log([NSString stringWithFormat:@"SEL0DEEP: *** POSIBLE PUNTERO KERNEL en offset %zu: 0x%llx ***", i, val]);
+                        hasKernPtr = 1;
+                    }
+                }
+                if (!hasKernPtr) log(@"SEL0DEEP: No se detectaron punteros kernel en output.");
+            }
+        } else {
+            log([NSString stringWithFormat:@"SEL0DEEP: Rechazado con código 0x%x — no crasheó", result]);
+            if (result == 0xe00002bc) log(@"SEL0DEEP: (KERN_INVALID_ARGUMENT — argumento inválido)");
+            else if (result == 0xe00002c2) log(@"SEL0DEEP: (kIOReturnBadArgument)");
+            else if (result == 0xe0000001) log(@"SEL0DEEP: (kIOReturnError — error genérico)");
+            else if (result == 0xe00002be) log(@"SEL0DEEP: (kIOReturnNoMemory)");
+        }
+
+        if (inputBuf) free(inputBuf);
+        if (outputBuf) free(outputBuf);
         sym.close(connect);
 
-        int nextBatch = batchEnd + 1;
-        [[NSString stringWithFormat:@"%d", nextBatch] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        int nextIdx = testIdx + 1;
+        [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        log([NSString stringWithFormat:@"STRUCTMETHOD: Lote %d-%d OK — %u aceptados, %u anomalías", batchStart, batchEnd, accepted, anomalies]);
-        if (nextBatch > MAX_SEL) {
-            log(@"STRUCTMETHOD: TODOS los selectores probados sin crash!");
-            [[NSString stringWithFormat:@"DONE"] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        if (nextIdx >= numTests) {
+            [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            log(@"SEL0DEEP: === Todas las variantes probadas ===");
         } else {
-            log([NSString stringWithFormat:@"STRUCTMETHOD: Siguiente lote: %d-%d — toca el botón otra vez", nextBatch, MIN(nextBatch + BATCH_SIZE - 1, MAX_SEL)]);
+            log([NSString stringWithFormat:@"SEL0DEEP: Siguiente: variante %d/%d — tocá el botón otra vez", nextIdx + 1, numTests]);
         }
 
-        NSDictionary *res = @{
-            @"anomalies": @(anomalies),
-            @"accepted": @(accepted),
-            @"batch_start": @(batchStart),
-            @"batch_end": @(batchEnd)
-        };
         isr_unload(&sym);
-        done(res);
+        done(@{@"variant": variantDesc, @"result": @(result)});
     });
 }
 
