@@ -356,5 +356,16 @@ void iosurface_research_phys_map(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull
 /// Probe 96: Full exploit chain — spray+OOB+AllocSize override+kernel scan+vm_remap R/W.
 void iosurface_research_exploit_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 32: Bug Hunting ---
+
+/// Probe 97: Property type confusion — set CFData, read as different types, check kernel type coercion bugs.
+void iosurface_research_type_confuse(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 98: IOConnectCallStructMethod — struct-based IOKit methods with crafted struct inputs.
+void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 99: Surface lifecycle TOCTOU — race destroy vs lookup to trigger use-after-free on IOSurface object.
+void iosurface_research_lifecycle_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
