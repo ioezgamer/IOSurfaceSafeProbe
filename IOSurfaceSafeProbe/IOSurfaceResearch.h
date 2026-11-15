@@ -345,5 +345,16 @@ void iosurface_research_ioconn_call(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
 /// Probe 93: Task port self-inspection — harvest kernel info via task_info, vm_region, host_info, commpage.
 void iosurface_research_task_intro(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+// --- Round 31: Exploit Chain ---
+
+/// Probe 94: Race condition UAF — 4 threads hammering SetValue/GetValue/RemoveValue for kernel UAF.
+void iosurface_research_race_uaf(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 95: Physical memory mapping — 100 single-page surfaces, sentinel cross-scan, vm_remap overlap.
+void iosurface_research_phys_map(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe 96: Full exploit chain — spray+OOB+AllocSize override+kernel scan+vm_remap R/W.
+void iosurface_research_exploit_chain(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
