@@ -22184,13 +22184,25 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         NSString *crashLogPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-crash-log.txt"];
         NSString *prevLog = [NSString stringWithContentsOfFile:crashLogPath encoding:NSUTF8StringEncoding error:nil];
         if (prevLog && [prevLog containsString:@"ABOUT_TO_CALL"]) {
+            log(@"STRUCTMETHOD: ========== CRASH REPORT ==========");
             NSArray *lines = [prevLog componentsSeparatedByString:@"\n"];
-            for (NSString *line in [lines reverseObjectEnumerator]) {
+            NSString *lastCall = nil;
+            int crashCount = 0;
+            for (NSString *line in lines) {
                 if ([line containsString:@"ABOUT_TO_CALL"]) {
-                    log([NSString stringWithFormat:@"STRUCTMETHOD: *** PREVIOUS CRASH: %@ ***", line]);
-                    break;
+                    lastCall = line;
+                    crashCount++;
                 }
             }
+            log([NSString stringWithFormat:@"STRUCTMETHOD: Total calls before crash: %d", crashCount]);
+            log([NSString stringWithFormat:@"STRUCTMETHOD: *** CRASHED ON: %@ ***", lastCall]);
+            log(@"STRUCTMETHOD: The selector above KILLED the app");
+            log(@"STRUCTMETHOD: ================================");
+            done(@{@"crash_detected": @YES, @"crashed_on": lastCall ?: @"unknown", @"total_calls_before_crash": @(crashCount)});
+            return;
+        }
+        if (prevLog && [prevLog containsString:@"DONE"]) {
+            log(@"STRUCTMETHOD: Previous run completed OK — clearing log for fresh run");
         }
         [@"" writeToFile:crashLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         isr_crash_log("phase=loading_symbols");
