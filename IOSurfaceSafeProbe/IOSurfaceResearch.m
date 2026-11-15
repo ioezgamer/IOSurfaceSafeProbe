@@ -22207,18 +22207,25 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         int testIdx = 0;
         if (prev) {
             NSString *trimmed = [prev stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if ([trimmed isEqualToString:@"CRASH"]) {
+            if ([trimmed hasPrefix:@"CRASH:"]) {
+                int crashedIdx = [[trimmed substringFromIndex:6] intValue];
                 NSString *crashInfo = [NSString stringWithContentsOfFile:variantPath encoding:NSUTF8StringEncoding error:nil];
                 log(@"SEL0DEEP: ========================================");
                 log(@"SEL0DEEP: *** CRASH DETECTADO en selector 0 ***");
-                log([NSString stringWithFormat:@"SEL0DEEP: Variante que crasheó: %@", crashInfo ?: @"desconocida"]);
+                log([NSString stringWithFormat:@"SEL0DEEP: Variante %d crasheó: %@", crashedIdx + 1, crashInfo ?: @"desconocida"]);
                 log(@"SEL0DEEP: ========================================");
                 log(@"SEL0DEEP: Esto confirma un BUG en el kernel.");
                 log(@"SEL0DEEP: s_create_surface no valida este input.");
-                log(@"SEL0DEEP: Tocá otra vez para probar la siguiente variante.");
+                int nextIdx = crashedIdx + 1;
+                if (nextIdx >= numTests) {
+                    log(@"SEL0DEEP: Todas las variantes probadas.");
+                    [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
+                    [[NSFileManager defaultManager] removeItemAtPath:variantPath error:nil];
+                } else {
+                    log([NSString stringWithFormat:@"SEL0DEEP: Tocá otra vez para variante %d/%d", nextIdx + 1, numTests]);
+                    [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
                 log(@"SEL0DEEP: ========================================");
-                [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
-                [[NSFileManager defaultManager] removeItemAtPath:variantPath error:nil];
                 done(@{@"crash_detected": @YES, @"crash_variant": crashInfo ?: @"unknown"});
                 return;
             } else if ([trimmed isEqualToString:@"DONE"]) {
@@ -22241,7 +22248,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 
         NSString *variantDesc = [NSString stringWithUTF8String:tests[testIdx].desc];
         [variantDesc writeToFile:variantPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [@"CRASH" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [[NSString stringWithFormat:@"CRASH:%d", testIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
         log([NSString stringWithFormat:@"SEL0DEEP: === Variante %d/%d: %@ ===", testIdx + 1, numTests, variantDesc]);
 
