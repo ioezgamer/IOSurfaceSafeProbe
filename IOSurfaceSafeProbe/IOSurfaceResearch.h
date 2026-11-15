@@ -397,5 +397,14 @@ void iosurface_property_kalloc_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 /// Probe JB12: Exhaustive kernel info harvest — commpage, task_info, host_info, vm_region.
 void iosurface_kernel_info_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB13: Exception port kernel pointer leak — controlled crash + inspect Mach exception message.
+void iosurface_exc_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB14: Kernel zone info + voucher spray — direct kernel heap layout via host_zone_info.
+void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB15: Thread state residue + port space enumeration — kernel pointer residue in registers.
+void iosurface_thread_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
