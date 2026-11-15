@@ -406,5 +406,8 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
 /// Probe JB15: Thread state residue + port space enumeration — kernel pointer residue in registers.
 void iosurface_thread_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB16: PAC pointer harvest — mass thread scan + diverse syscalls + kernel address map.
+void iosurface_pac_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

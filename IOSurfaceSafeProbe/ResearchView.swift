@@ -380,6 +380,9 @@ struct ResearchView: View {
         ("threadportleak", "Thread+Port Leak", "cpu.fill",
          "thread_get_state residuo kernel + mach_port_space_info enumeracion",
          { log, done in iosurface_thread_port_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("pacharvest", "PAC Harvest", "wand.and.stars",
+         "16 threads + 10 scans + PAC strip masivo — mapa de direcciones kernel",
+         { log, done in iosurface_pac_harvest({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
