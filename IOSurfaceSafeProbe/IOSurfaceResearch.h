@@ -388,5 +388,14 @@ void iosurface_notify_uaf_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull 
 /// Probe JB9: Pipe buffer spray into stale alias — kernel pipe buffers in recycled pages.
 void iosurface_pipe_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB10: Normal surface stale alias — vm_allocate pages may share allocator with kernel objects.
+void iosurface_normal_alias_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB11: IOSurface property kalloc oracle — spray/free/reclaim kernel heap via SetValue.
+void iosurface_property_kalloc_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB12: Exhaustive kernel info harvest — commpage, task_info, host_info, vm_region.
+void iosurface_kernel_info_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

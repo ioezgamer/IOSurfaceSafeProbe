@@ -361,6 +361,15 @@ struct ResearchView: View {
         ("pipespray", "Pipe Spray Alias", "pipe.and.drop.fill",
          "Spray pipe buffers 16KB en paginas recicladas — busca datos kernel",
          { log, done in iosurface_pipe_spray_alias({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("normalias", "Normal Alias Spray", "rectangle.on.rectangle.angled",
+         "Alias stale SIN PurpleGfxMem — paginas vm_allocate pueden compartir con kernel",
+         { log, done in iosurface_normal_alias_spray({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kallocoracle", "Kalloc Oracle", "wand.and.rays",
+         "Spray propiedades IOSurface para forzar kalloc kernel — detecta heap layout",
+         { log, done in iosurface_property_kalloc_oracle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kernharvest", "Kernel Info Harvest", "brain.head.profile.fill",
+         "Recoleccion exhaustiva: commpage, task_info, host_info, vm_region scan",
+         { log, done in iosurface_kernel_info_harvest({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
