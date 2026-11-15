@@ -25247,11 +25247,7 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
             HostZoneInfoFn zoneInfoFn = (HostZoneInfoFn)dlsym(RTLD_DEFAULT, "host_zone_info");
 
             if (!zoneInfoFn) {
-                log(@"[JB14] host_zone_info not available via dlsym — trying mach_host_self direct");
-                // Fallback: declare extern
-                extern kern_return_t host_zone_info(host_t host, jb14_zone_name_t **names,
-                    mach_msg_type_number_t *namesCnt, jb14_zone_info_t **info, mach_msg_type_number_t *infoCnt);
-                zoneInfoFn = (HostZoneInfoFn)host_zone_info;
+                log(@"[JB14] host_zone_info not available via dlsym — skipping zone info");
             }
 
             jb14_zone_name_t *names1 = NULL;
