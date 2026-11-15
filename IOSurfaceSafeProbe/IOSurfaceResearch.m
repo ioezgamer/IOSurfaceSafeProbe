@@ -19326,11 +19326,6 @@ void iosurface_research_arb_read(ISRLogBlock log, ISRDoneBlock done) {
         done(res);
     });
 }
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
 
 #pragma mark - Round 29: Kernel Takeover
 
@@ -22184,7 +22179,6 @@ static void isr_crash_log(const char *msg) {
 void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-<<<<<<< Updated upstream
         #define BATCH_SIZE 1
         #define MAX_SEL 4
 
@@ -22229,101 +22223,38 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         [@"CRASH" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
         log([NSString stringWithFormat:@"STRUCTMETHOD: === Probando lote: selectores %d a %d (de 0-%d) ===", batchStart, batchEnd, MAX_SEL]);
-=======
-        isr_crash_log("=== STRUCTMETHOD START ===");
-
-        NSString *crashLogPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-crash-log.txt"];
-        NSString *prevLog = [NSString stringWithContentsOfFile:crashLogPath encoding:NSUTF8StringEncoding error:nil];
-        if (prevLog && [prevLog containsString:@"ABOUT_TO_CALL"]) {
-            NSArray *lines = [prevLog componentsSeparatedByString:@"\n"];
-            for (NSString *line in [lines reverseObjectEnumerator]) {
-                if ([line containsString:@"ABOUT_TO_CALL"]) {
-                    log([NSString stringWithFormat:@"STRUCTMETHOD: *** PREVIOUS CRASH: %@ ***", line]);
-                    break;
-                }
-            }
-        }
-        [@"" writeToFile:crashLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        isr_crash_log("phase=loading_symbols");
->>>>>>> Stashed changes
 
         ISRSymbols sym;
         if (!isr_load(&sym)) {
             log(@"STRUCTMETHOD: Failed to load symbols");
-<<<<<<< Updated upstream
-=======
-            isr_crash_log("FAILED=load_symbols");
->>>>>>> Stashed changes
             done(@{@"anomalies": @(-1)});
             return;
         }
 
-<<<<<<< Updated upstream
-=======
-        isr_crash_log("phase=loading_structcall");
-        log(@"STRUCTMETHOD: Symbols loaded OK");
-
->>>>>>> Stashed changes
         typedef kern_return_t (*StructCallFn)(io_connect_t, uint32_t, const void *, size_t, void *, size_t *);
         StructCallFn structCall = (StructCallFn)dlsym(sym.iokit, "IOConnectCallStructMethod");
         if (!structCall) {
             log(@"STRUCTMETHOD: Failed to load IOConnectCallStructMethod");
-<<<<<<< Updated upstream
-=======
-            isr_crash_log("FAILED=load_structcall");
->>>>>>> Stashed changes
             isr_unload(&sym);
             done(@{@"anomalies": @(-1)});
             return;
         }
-<<<<<<< Updated upstream
-=======
-        log(@"STRUCTMETHOD: IOConnectCallStructMethod loaded OK");
-
-        struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
-        unsigned anomalies = 0;
-        unsigned acceptedSelectors = 0;
-        unsigned kernelPtrsFound = 0;
-        unsigned outputDataSelectors = 0;
-
-        isr_crash_log("phase=opening_iokit");
-        log(@"STRUCTMETHOD: Opening IOSurfaceRoot...");
->>>>>>> Stashed changes
 
         mach_port_t master = 0;
         typedef kern_return_t (*HostGetFn)(mach_port_t *);
         HostGetFn hostGet = (HostGetFn)dlsym(sym.iokit, "IOMainPort");
-<<<<<<< Updated upstream
         if (!hostGet) hostGet = (HostGetFn)dlsym(sym.iokit, "IOMasterPort");
         if (!hostGet) {
             log(@"STRUCTMETHOD: Failed to load IOMainPort/IOMasterPort");
-=======
-        if (!hostGet) {
-            hostGet = (HostGetFn)dlsym(sym.iokit, "IOMasterPort");
-        }
-        if (!hostGet) {
-            log(@"STRUCTMETHOD: Failed to load IOMainPort/IOMasterPort");
-            isr_crash_log("FAILED=load_mainport");
->>>>>>> Stashed changes
             isr_unload(&sym);
             done(@{@"anomalies": @(-1)});
             return;
         }
         hostGet(&master);
-<<<<<<< Updated upstream
-=======
-        log([NSString stringWithFormat:@"STRUCTMETHOD: master port=%u", master]);
->>>>>>> Stashed changes
 
         CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
         io_service_t service = sym.getMatch(master, matching);
         io_connect_t connect = 0;
-<<<<<<< Updated upstream
-=======
-        log([NSString stringWithFormat:@"STRUCTMETHOD: service=%u", service]);
-
->>>>>>> Stashed changes
         if (!service) {
             log(@"STRUCTMETHOD: IOSurfaceRoot service not found");
             isr_unload(&sym);
@@ -22331,23 +22262,14 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             return;
         }
 
-<<<<<<< Updated upstream
-=======
-        isr_crash_log("phase=calling_IOServiceOpen");
->>>>>>> Stashed changes
         kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
         sym.release(service);
         if (kr != KERN_SUCCESS || !connect) {
             log([NSString stringWithFormat:@"STRUCTMETHOD: IOServiceOpen failed — kr=%d", kr]);
-<<<<<<< Updated upstream
-=======
-            isr_crash_log("FAILED=IOServiceOpen");
->>>>>>> Stashed changes
             isr_unload(&sym);
             done(@{@"anomalies": @(-1)});
             return;
         }
-<<<<<<< Updated upstream
         log([NSString stringWithFormat:@"STRUCTMETHOD: IOSurfaceRoot connect=%u — probando selectores...", connect]);
 
         uint8_t zeroStruct[8];
@@ -22376,141 +22298,10 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             if (r2 == KERN_SUCCESS) {
                 accepted++;
                 log([NSString stringWithFormat:@"STRUCTMETHOD: ACCEPTED sel=%u input=zero8 outSize=%zu", sel, outSize]);
-=======
-        log([NSString stringWithFormat:@"STRUCTMETHOD: IOSurfaceRoot opened — connect=%u", connect]);
-        isr_crash_log("phase=testing_selectors");
-
-        uint8_t zeroStruct[8];
-        memset(zeroStruct, 0, sizeof(zeroStruct));
-        uint8_t deadbeefStruct[64];
-        for (int i = 0; i < 64; i += 4) {
-            deadbeefStruct[i] = 0xEF; deadbeefStruct[i+1] = 0xBE;
-            deadbeefStruct[i+2] = 0xAD; deadbeefStruct[i+3] = 0xDE;
-        }
-        uint8_t largeStruct[4096];
-        memset(largeStruct, 0x41, sizeof(largeStruct));
-        uint8_t ptrStruct[64];
-        uint64_t fakePtrs2[8] = {
-            0xfffffff007004000ULL, 0xfffffff007008000ULL,
-            0xfffffff00700c000ULL, 0xfffffff007010000ULL,
-            0x0000000000000000ULL, 0x4141414141414141ULL,
-            0xfffffff007014000ULL, 0xfffffff007018000ULL
-        };
-        memcpy(ptrStruct, fakePtrs2, sizeof(ptrStruct));
-
-        struct {
-            const char *name;
-            const void *data;
-            size_t size;
-        } inputs[] = {
-            {"empty",    NULL,          0},
-            {"zero8",    zeroStruct,    8},
-            {"deadbeef", deadbeefStruct, 64},
-            {"large4k",  largeStruct,   4096},
-            {"fakeptrs", ptrStruct,     64},
-        };
-        int numInputs = 5;
-
-        log(@"STRUCTMETHOD: Step 1 — Testing selectors 0-33 with 5 input variants");
-        for (uint32_t sel = 0; sel <= 33 && !isr_stopped(); sel++) {
-            for (int inp = 0; inp < numInputs && !isr_stopped(); inp++) {
-                uint8_t outBuf[4096];
-                memset(outBuf, 0, sizeof(outBuf));
-                size_t outSize = sizeof(outBuf);
-
-                char crashMsg[256];
-                snprintf(crashMsg, sizeof(crashMsg), "ABOUT_TO_CALL sel=%u input=%s size=%zu step=1",
-                         sel, inputs[inp].name, inputs[inp].size);
-                isr_crash_log(crashMsg);
-                log([NSString stringWithFormat:@"STRUCTMETHOD: %s", crashMsg]);
-
-                kern_return_t ret = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf, &outSize);
-                if (ret == KERN_SUCCESS) {
-                    acceptedSelectors++;
-                    log([NSString stringWithFormat:@"STRUCTMETHOD: ACCEPTED sel=%u input=%s outSize=%zu",
-                         sel, inputs[inp].name, outSize]);
-
-                    if (outSize > 0) {
-                        outputDataSelectors++;
-                        int kptrs = 0;
-                        for (size_t off = 0; off + 8 <= outSize; off += 8) {
-                            uint64_t qw;
-                            memcpy(&qw, outBuf + off, 8);
-                            if (qw > 0xffff000000000000ULL && qw < 0xfffffffffffffffeULL) {
-                                kptrs++;
-                                kernelPtrsFound++;
-                                anomalies++;
-                                log([NSString stringWithFormat:@"STRUCTMETHOD: KERNEL PTR sel=%u input=%s offset=%zu ptr=0x%llx",
-                                     sel, inputs[inp].name, off, (unsigned long long)qw]);
-                            }
-                        }
-                        if (kptrs == 0 && outSize >= 8) {
-                            uint64_t first;
-                            memcpy(&first, outBuf, 8);
-                            log([NSString stringWithFormat:@"STRUCTMETHOD: sel=%u output first qword: 0x%llx", sel, (unsigned long long)first]);
-                        }
-                    }
-                }
-            }
-        }
-
-        log(@"STRUCTMETHOD: Step 2 — Testing selectors 34-99 with empty and zero8");
-        for (uint32_t sel = 34; sel <= 99 && !isr_stopped(); sel++) {
-            for (int inp = 0; inp < 2 && !isr_stopped(); inp++) {
-                uint8_t outBuf2[4096];
-                memset(outBuf2, 0, sizeof(outBuf2));
-                size_t outSize2 = sizeof(outBuf2);
-
-                char crashMsg2[256];
-                snprintf(crashMsg2, sizeof(crashMsg2), "ABOUT_TO_CALL sel=%u input=%s size=%zu step=2",
-                         sel, inputs[inp].name, inputs[inp].size);
-                isr_crash_log(crashMsg2);
-                kern_return_t ret2 = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf2, &outSize2);
-                if (ret2 == KERN_SUCCESS) {
-                    acceptedSelectors++;
-                    log([NSString stringWithFormat:@"STRUCTMETHOD: ACCEPTED sel=%u input=%s outSize=%zu", sel, inputs[inp].name, outSize2]);
-                    if (outSize2 > 0) {
-                        outputDataSelectors++;
-                        for (size_t off = 0; off + 8 <= outSize2; off += 8) {
-                            uint64_t qw2;
-                            memcpy(&qw2, outBuf2 + off, 8);
-                            if (qw2 > 0xffff000000000000ULL && qw2 < 0xfffffffffffffffeULL) {
-                                kernelPtrsFound++;
-                                anomalies++;
-                                log([NSString stringWithFormat:@"STRUCTMETHOD: KERNEL PTR sel=%u offset=%zu ptr=0x%llx",
-                                     sel, off, (unsigned long long)qw2]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        log(@"STRUCTMETHOD: Step 3 — Oversized struct input (64KB) on known selectors");
-        if (!isr_stopped()) {
-            uint8_t *hugeStruct = (uint8_t *)calloc(1, 65536);
-            if (hugeStruct) {
-                memset(hugeStruct, 0xBB, 65536);
-                for (uint32_t sel = 0; sel <= 10 && !isr_stopped(); sel++) {
-                    uint8_t outBuf3[4096];
-                    memset(outBuf3, 0, sizeof(outBuf3));
-                    size_t outSize3 = sizeof(outBuf3);
-                    char crashMsg3[256];
-                    snprintf(crashMsg3, sizeof(crashMsg3), "ABOUT_TO_CALL sel=%u input=huge64k size=65536 step=3", sel);
-                    isr_crash_log(crashMsg3);
-                    kern_return_t ret3 = structCall(connect, sel, hugeStruct, 65536, outBuf3, &outSize3);
-                    if (ret3 == KERN_SUCCESS) {
-                        anomalies++;
-                        log([NSString stringWithFormat:@"STRUCTMETHOD: ANOMALY — 64KB input accepted on sel=%u! outSize=%zu", sel, outSize3]);
-                    }
-                }
-                free(hugeStruct);
->>>>>>> Stashed changes
             }
         }
 
         sym.close(connect);
-<<<<<<< Updated upstream
 
         int nextBatch = batchEnd + 1;
         [[NSString stringWithFormat:@"%d", nextBatch] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -22529,23 +22320,6 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             @"batch_start": @(batchStart),
             @"batch_end": @(batchEnd)
         };
-=======
-        isr_crash_log("DONE all_selectors_completed");
-
-        gettimeofday(&tv_end, NULL);
-        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
-        log([NSString stringWithFormat:@"STRUCTMETHOD: Done — %u anomalies, %u accepted, %u with output, %u kernel ptrs in %.2fs",
-             anomalies, acceptedSelectors, outputDataSelectors, kernelPtrsFound, elapsed]);
-
-        NSDictionary *res = @{
-            @"anomalies": @(anomalies),
-            @"accepted_selectors": @(acceptedSelectors),
-            @"outputDataSelectors": @(outputDataSelectors),
-            @"kernelPtrsFound": @(kernelPtrsFound),
-            @"elapsed": @(elapsed)
-        };
-        isr_checkpoint(@"ISR-StructMethod-checkpoint.json", res);
->>>>>>> Stashed changes
         isr_unload(&sym);
         done(res);
     });
@@ -22819,7 +22593,3 @@ void iosurface_research_lifecycle_race(ISRLogBlock _Nonnull log, ISRDoneBlock _N
         done(res);
     });
 }
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
->>>>>>> Stashed changes
