@@ -392,6 +392,15 @@ struct ResearchView: View {
         ("kptroracle", "KPtr Oracle", "target",
          "Correlacion kernel ptr leaked + IOSurface IDs — calcula offsets kernel",
          { log, done in iosurface_kptr_oracle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("uafcalib", "UAF Calibrate", "antenna.radiowaves.left.and.right",
+         "Calibra IOConnectCallAsyncMethod sel17/18 — encuentra forma de llamada correcta",
+         { log, done in iosurface_sysctl_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("uaftrigger", "UAF Trigger", "bolt.fill",
+         "Registro→Desregistro→Re-registro: crea puntero colgante en IOSurfaceRoot",
+         { log, done in iosurface_pixelbuf_scan({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("uafexploit", "UAF Exploit", "flame.fill",
+         "Heap spray + UAF dereference — intenta controlar memoria kernel liberada",
+         { log, done in iosurface_pipe_primitive({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
