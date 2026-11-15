@@ -367,5 +367,11 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 /// Probe 99: Surface lifecycle TOCTOU — race destroy vs lookup to trigger use-after-free on IOSurface object.
 void iosurface_research_lifecycle_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB3: Stale-page physical alias — memory entry survives CFRelease, R/W recycled pages.
+void iosurface_stale_page_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB4: IOSurface notify UAF race (CVE-2026-112477) — SetSurfaceNotify + Create/Release race.
+void iosurface_notify_uaf_race(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

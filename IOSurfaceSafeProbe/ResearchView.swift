@@ -337,6 +337,13 @@ struct ResearchView: View {
         ("lifecyclerace", "Lifecycle TOCTOU", "tornado",
          "Race create/lookup/free/use — TOCTOU en el objeto IOSurface mismo",
          { log, done in iosurface_research_lifecycle_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // Tims-Cooked techniques
+        ("stalepage", "Stale-Page Alias", "doc.on.doc",
+         "Memory entry survives CFRelease — R/W en páginas recicladas (NO parcheado en 27.2)",
+         { log, done in iosurface_stale_page_alias({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("notifyuaf", "Notify UAF Race", "bolt.trianglebadge.exclamationmark",
+         "CVE-2026-112477 — SetSurfaceNotify + Create/Release race condition",
+         { log, done in iosurface_notify_uaf_race({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
