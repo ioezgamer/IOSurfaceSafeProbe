@@ -26548,10 +26548,10 @@ void iosurface_sysctl_leak(ISRLogBlock log, ISRDoneBlock done) {
 
         CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
         io_service_t svc = 0;
-        if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        if (matching) svc = sym.getMatch(0, matching);
         if (!svc) {
             matching = sym.matching("IOCoreSurfaceRoot");
-            if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+            if (matching) svc = sym.getMatch(0, matching);
         }
         serviceFound = (svc != 0);
         log([NSString stringWithFormat:@"[JB20] IOSurfaceRoot service: %s (0x%x)",
@@ -26681,10 +26681,10 @@ void iosurface_pixelbuf_scan(ISRLogBlock log, ISRDoneBlock done) {
 
         CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
         io_service_t svc = 0;
-        if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        if (matching) svc = sym.getMatch(0, matching);
         if (!svc) {
             matching = sym.matching("IOCoreSurfaceRoot");
-            if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+            if (matching) svc = sym.getMatch(0, matching);
         }
         if (!svc) {
             log(@"[JB21] ERROR: IOSurfaceRoot no encontrado");
@@ -26845,10 +26845,10 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
 
         CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
         io_service_t svc = 0;
-        if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        if (matching) svc = sym.getMatch(0, matching);
         if (!svc) {
             matching = sym.matching("IOCoreSurfaceRoot");
-            if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+            if (matching) svc = sym.getMatch(0, matching);
         }
         if (!svc) {
             log(@"[JB22] ERROR: IOSurfaceRoot no encontrado");
@@ -27015,7 +27015,7 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                     }
 
                     for (int i = 0; i < 256; i++) {
-                        if (vouchers[i]) mach_voucher_attr_discard(vouchers[i]);
+                        if (vouchers[i]) mach_port_deallocate(mach_task_self(), vouchers[i]);
                     }
                     free(vouchers);
                 }
