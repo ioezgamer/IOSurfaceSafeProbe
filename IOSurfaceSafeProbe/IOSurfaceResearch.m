@@ -22165,34 +22165,45 @@ void iosurface_research_type_confuse(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 
 #pragma mark - Probe 98: IOConnectCallStructMethod
 
+static void isr_crash_log(const char *msg) {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-crash-log.txt"];
+    int fd = open([path UTF8String], O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        write(fd, msg, strlen(msg));
+        write(fd, "\n", 1);
+        fsync(fd);
+        close(fd);
+    }
+}
+
 void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        [[NSUserDefaults standardUserDefaults] setObject:@"loading_symbols" forKey:@"ISR_StructMethod_Phase"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        isr_crash_log("=== STRUCTMETHOD START ===");
 
-        NSDictionary *prevCrash = [[NSUserDefaults standardUserDefaults] objectForKey:@"ISR_StructMethod_LastCall"];
-        NSString *prevPhase = [[NSUserDefaults standardUserDefaults] objectForKey:@"ISR_StructMethod_Phase"];
-        if (prevCrash) {
-            log([NSString stringWithFormat:@"STRUCTMETHOD: *** PREVIOUS CRASH at selector=%@, input=%@, size=%@, step=%@ ***",
-                 prevCrash[@"selector"], prevCrash[@"input"], prevCrash[@"inputSize"], prevCrash[@"step"]]);
-            [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ISR_StructMethod_LastCall"];
-        } else if (prevPhase && ![prevPhase isEqualToString:@"done"]) {
-            log([NSString stringWithFormat:@"STRUCTMETHOD: *** PREVIOUS CRASH during phase: %@ ***", prevPhase]);
+        NSString *crashLogPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-crash-log.txt"];
+        NSString *prevLog = [NSString stringWithContentsOfFile:crashLogPath encoding:NSUTF8StringEncoding error:nil];
+        if (prevLog && [prevLog containsString:@"ABOUT_TO_CALL"]) {
+            NSArray *lines = [prevLog componentsSeparatedByString:@"\n"];
+            for (NSString *line in [lines reverseObjectEnumerator]) {
+                if ([line containsString:@"ABOUT_TO_CALL"]) {
+                    log([NSString stringWithFormat:@"STRUCTMETHOD: *** PREVIOUS CRASH: %@ ***", line]);
+                    break;
+                }
+            }
         }
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        [@"" writeToFile:crashLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        isr_crash_log("phase=loading_symbols");
 
         ISRSymbols sym;
         if (!isr_load(&sym)) {
             log(@"STRUCTMETHOD: Failed to load symbols");
-            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
+            isr_crash_log("FAILED=load_symbols");
             done(@{@"anomalies": @(-1)});
             return;
         }
 
-        [[NSUserDefaults standardUserDefaults] setObject:@"loading_structcall" forKey:@"ISR_StructMethod_Phase"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        isr_crash_log("phase=loading_structcall");
         log(@"STRUCTMETHOD: Symbols loaded OK");
 
         typedef kern_return_t (*StructCallFn)(io_connect_t, uint32_t, const void *, size_t, void *, size_t *);
@@ -22200,8 +22211,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         if (!structCall) {
             log(@"STRUCTMETHOD: Failed to load IOConnectCallStructMethod");
             isr_unload(&sym);
-            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
+            isr_crash_log("FAILED=load_structcall");
             done(@{@"anomalies": @(-1)});
             return;
         }
@@ -22214,8 +22224,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         unsigned kernelPtrsFound = 0;
         unsigned outputDataSelectors = 0;
 
-        [[NSUserDefaults standardUserDefaults] setObject:@"opening_iokit" forKey:@"ISR_StructMethod_Phase"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        isr_crash_log("phase=opening_iokit");
         log(@"STRUCTMETHOD: Opening IOSurfaceRoot...");
 
         mach_port_t master = 0;
@@ -22227,8 +22236,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         if (!hostGet) {
             log(@"STRUCTMETHOD: Failed to load IOMainPort/IOMasterPort");
             isr_unload(&sym);
-            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
+            isr_crash_log("FAILED=load_mainport");
             done(@{@"anomalies": @(-1)});
             return;
         }
@@ -22247,21 +22255,18 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             return;
         }
 
-        [[NSUserDefaults standardUserDefaults] setObject:@"calling_IOServiceOpen" forKey:@"ISR_StructMethod_Phase"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        isr_crash_log("phase=calling_IOServiceOpen");
         kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
         sym.release(service);
         if (kr != KERN_SUCCESS || !connect) {
             log([NSString stringWithFormat:@"STRUCTMETHOD: IOServiceOpen failed — kr=%d", kr]);
             isr_unload(&sym);
-            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
+            isr_crash_log("FAILED=IOServiceOpen");
             done(@{@"anomalies": @(-1)});
             return;
         }
         log([NSString stringWithFormat:@"STRUCTMETHOD: IOSurfaceRoot opened — connect=%u", connect]);
-        [[NSUserDefaults standardUserDefaults] setObject:@"testing_selectors" forKey:@"ISR_StructMethod_Phase"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        isr_crash_log("phase=testing_selectors");
 
         uint8_t zeroStruct[8];
         memset(zeroStruct, 0, sizeof(zeroStruct));
@@ -22301,13 +22306,9 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 memset(outBuf, 0, sizeof(outBuf));
                 size_t outSize = sizeof(outBuf);
 
-                NSDictionary *ckpt = @{
-                    @"selector": @(sel), @"input": [NSString stringWithUTF8String:inputs[inp].name],
-                    @"inputSize": @(inputs[inp].size), @"step": @1
-                };
-                [[NSUserDefaults standardUserDefaults] setObject:ckpt forKey:@"ISR_StructMethod_LastCall"];
-                [[NSUserDefaults standardUserDefaults] synchronize];
-                isr_checkpoint(@"ISR-StructMethod-last.json", ckpt);
+                char crashMsg[256];
+                snprintf(crashMsg, sizeof(crashMsg), "ABOUT_TO_CALL sel=%u input=%s size=%zu step=1", sel, inputs[inp].name, inputs[inp].size);
+                isr_crash_log(crashMsg);
                 log([NSString stringWithFormat:@"STRUCTMETHOD: calling sel=%u input=%s size=%zu",
                      sel, inputs[inp].name, inputs[inp].size]);
 
@@ -22348,12 +22349,9 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                 memset(outBuf2, 0, sizeof(outBuf2));
                 size_t outSize2 = sizeof(outBuf2);
 
-                NSDictionary *ckpt2 = @{
-                    @"selector": @(sel), @"input": [NSString stringWithUTF8String:inputs[inp].name],
-                    @"inputSize": @(inputs[inp].size), @"step": @2
-                };
-                [[NSUserDefaults standardUserDefaults] setObject:ckpt2 forKey:@"ISR_StructMethod_LastCall"];
-                [[NSUserDefaults standardUserDefaults] synchronize];
+                char crashMsg2[256];
+                snprintf(crashMsg2, sizeof(crashMsg2), "ABOUT_TO_CALL sel=%u input=%s size=%zu step=2", sel, inputs[inp].name, inputs[inp].size);
+                isr_crash_log(crashMsg2);
                 log([NSString stringWithFormat:@"STRUCTMETHOD: calling sel=%u input=%s", sel, inputs[inp].name]);
                 kern_return_t ret2 = structCall(connect, sel, inputs[inp].data, inputs[inp].size, outBuf2, &outSize2);
                 if (ret2 == KERN_SUCCESS) {
@@ -22385,9 +22383,9 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
                     uint8_t outBuf3[4096];
                     memset(outBuf3, 0, sizeof(outBuf3));
                     size_t outSize3 = sizeof(outBuf3);
-                    NSDictionary *ckpt3 = @{@"selector": @(sel), @"input": @"huge64k", @"inputSize": @(65536), @"step": @3};
-                    [[NSUserDefaults standardUserDefaults] setObject:ckpt3 forKey:@"ISR_StructMethod_LastCall"];
-                    [[NSUserDefaults standardUserDefaults] synchronize];
+                    char crashMsg3[256];
+                    snprintf(crashMsg3, sizeof(crashMsg3), "ABOUT_TO_CALL sel=%u input=huge64k size=65536 step=3", sel);
+                    isr_crash_log(crashMsg3);
                     log([NSString stringWithFormat:@"STRUCTMETHOD: calling sel=%u input=huge64k size=65536", sel]);
                     kern_return_t ret3 = structCall(connect, sel, hugeStruct, 65536, outBuf3, &outSize3);
                     if (ret3 == KERN_SUCCESS) {
@@ -22400,9 +22398,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         }
 
         sym.close(connect);
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ISR_StructMethod_LastCall"];
-        [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        isr_crash_log("DONE all_selectors_completed");
 
         gettimeofday(&tv_end, NULL);
         double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
