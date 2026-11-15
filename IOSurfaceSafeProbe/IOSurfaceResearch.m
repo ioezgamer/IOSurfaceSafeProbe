@@ -22168,29 +22168,44 @@ void iosurface_research_type_confuse(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        [[NSUserDefaults standardUserDefaults] setObject:@"loading_symbols" forKey:@"ISR_StructMethod_Phase"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+
+        NSDictionary *prevCrash = [[NSUserDefaults standardUserDefaults] objectForKey:@"ISR_StructMethod_LastCall"];
+        NSString *prevPhase = [[NSUserDefaults standardUserDefaults] objectForKey:@"ISR_StructMethod_Phase"];
+        if (prevCrash) {
+            log([NSString stringWithFormat:@"STRUCTMETHOD: *** PREVIOUS CRASH at selector=%@, input=%@, size=%@, step=%@ ***",
+                 prevCrash[@"selector"], prevCrash[@"input"], prevCrash[@"inputSize"], prevCrash[@"step"]]);
+            [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ISR_StructMethod_LastCall"];
+        } else if (prevPhase && ![prevPhase isEqualToString:@"done"]) {
+            log([NSString stringWithFormat:@"STRUCTMETHOD: *** PREVIOUS CRASH during phase: %@ ***", prevPhase]);
+        }
+        [[NSUserDefaults standardUserDefaults] synchronize];
+
         ISRSymbols sym;
         if (!isr_load(&sym)) {
             log(@"STRUCTMETHOD: Failed to load symbols");
+            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
             done(@{@"anomalies": @(-1)});
             return;
         }
 
-        NSDictionary *prevCrash = [[NSUserDefaults standardUserDefaults] objectForKey:@"ISR_StructMethod_LastCall"];
-        if (prevCrash) {
-            log([NSString stringWithFormat:@"STRUCTMETHOD: PREVIOUS CRASH detected at — selector=%@, input=%@, inputSize=%@, step=%@",
-                 prevCrash[@"selector"], prevCrash[@"input"], prevCrash[@"inputSize"], prevCrash[@"step"]]);
-            [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ISR_StructMethod_LastCall"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }
+        [[NSUserDefaults standardUserDefaults] setObject:@"loading_structcall" forKey:@"ISR_StructMethod_Phase"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        log(@"STRUCTMETHOD: Symbols loaded OK");
 
         typedef kern_return_t (*StructCallFn)(io_connect_t, uint32_t, const void *, size_t, void *, size_t *);
         StructCallFn structCall = (StructCallFn)dlsym(sym.iokit, "IOConnectCallStructMethod");
         if (!structCall) {
             log(@"STRUCTMETHOD: Failed to load IOConnectCallStructMethod");
             isr_unload(&sym);
+            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
             done(@{@"anomalies": @(-1)});
             return;
         }
+        log(@"STRUCTMETHOD: IOConnectCallStructMethod loaded OK");
 
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
@@ -22198,6 +22213,10 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         unsigned acceptedSelectors = 0;
         unsigned kernelPtrsFound = 0;
         unsigned outputDataSelectors = 0;
+
+        [[NSUserDefaults standardUserDefaults] setObject:@"opening_iokit" forKey:@"ISR_StructMethod_Phase"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        log(@"STRUCTMETHOD: Opening IOSurfaceRoot...");
 
         mach_port_t master = 0;
         typedef kern_return_t (*HostGetFn)(mach_port_t *);
@@ -22208,14 +22227,18 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         if (!hostGet) {
             log(@"STRUCTMETHOD: Failed to load IOMainPort/IOMasterPort");
             isr_unload(&sym);
+            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
             done(@{@"anomalies": @(-1)});
             return;
         }
         hostGet(&master);
+        log([NSString stringWithFormat:@"STRUCTMETHOD: master port=%u", master]);
 
         CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
         io_service_t service = sym.getMatch(master, matching);
         io_connect_t connect = 0;
+        log([NSString stringWithFormat:@"STRUCTMETHOD: service=%u", service]);
 
         if (!service) {
             log(@"STRUCTMETHOD: IOSurfaceRoot service not found");
@@ -22224,15 +22247,21 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
             return;
         }
 
+        [[NSUserDefaults standardUserDefaults] setObject:@"calling_IOServiceOpen" forKey:@"ISR_StructMethod_Phase"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
         kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
         sym.release(service);
         if (kr != KERN_SUCCESS || !connect) {
             log([NSString stringWithFormat:@"STRUCTMETHOD: IOServiceOpen failed — kr=%d", kr]);
             isr_unload(&sym);
+            [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
             done(@{@"anomalies": @(-1)});
             return;
         }
         log([NSString stringWithFormat:@"STRUCTMETHOD: IOSurfaceRoot opened — connect=%u", connect]);
+        [[NSUserDefaults standardUserDefaults] setObject:@"testing_selectors" forKey:@"ISR_StructMethod_Phase"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
 
         uint8_t zeroStruct[8];
         memset(zeroStruct, 0, sizeof(zeroStruct));
@@ -22372,6 +22401,7 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 
         sym.close(connect);
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"ISR_StructMethod_LastCall"];
+        [[NSUserDefaults standardUserDefaults] setObject:@"done" forKey:@"ISR_StructMethod_Phase"];
         [[NSUserDefaults standardUserDefaults] synchronize];
 
         gettimeofday(&tv_end, NULL);
