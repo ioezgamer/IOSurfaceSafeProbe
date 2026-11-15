@@ -379,5 +379,14 @@ void iosurface_kernel_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
 /// Probe JB6: Controlled corruption via stale-page write — corrupt IOSurface properties for OOB.
 void iosurface_controlled_corruption(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB7: Mach OOL message spray into stale alias — kernel kalloc pages via OOL descriptors.
+void iosurface_ool_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB8: Notify UAF + stale alias combo — read freed kernel notification object via alias.
+void iosurface_notify_uaf_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB9: Pipe buffer spray into stale alias — kernel pipe buffers in recycled pages.
+void iosurface_pipe_spray_alias(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
