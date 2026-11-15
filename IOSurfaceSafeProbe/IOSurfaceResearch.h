@@ -418,5 +418,14 @@ void iosurface_heap_fengshui(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
 /// Probe JB19: Kernel pointer oracle — use leaked PAC ptr + IOSurface ID correlation.
 void iosurface_kptr_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB20: IOSurfaceRoot UAF calibration — test async selector 17/18 call shapes.
+void iosurface_sysctl_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB21: IOSurfaceRoot UAF trigger — register/deregister/re-register dangling pointer.
+void iosurface_pixelbuf_scan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB22: IOSurfaceRoot UAF exploit — heap spray + dangling pointer dereference.
+void iosurface_pipe_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
