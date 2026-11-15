@@ -22176,121 +22176,29 @@ static void isr_crash_log(const char *msg) {
     }
 }
 
+static sigjmp_buf g_jb2_jmpbuf;
+static volatile sig_atomic_t g_jb2_fault_sig = 0;
+static volatile uint64_t g_jb2_fault_addr = 0;
+
+static void jb2_signal_handler(int sig, siginfo_t *info, void *ucontext) {
+    g_jb2_fault_sig = sig;
+    g_jb2_fault_addr = (uint64_t)(uintptr_t)(info ? info->si_addr : 0);
+    siglongjmp(g_jb2_jmpbuf, 1);
+}
+
 void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        NSString *progressPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-jb1-progress.txt"];
-        NSString *variantPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-jb1-variant.txt"];
-        NSString *resultPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/ISR-jb1-results.txt"];
-
-        struct {
-            const char *desc;
-            uint32_t connType;
-            uint32_t selector;
-            int useCallMethod;
-            int skipOpen;
-        } tests[] = {
-            {"open tipo=0 sel=1 StructMethod",  0, 1, 0, 0},
-            {"open tipo=0 sel=2 StructMethod",  0, 2, 0, 0},
-            {"open tipo=0 sel=3 StructMethod",  0, 3, 0, 0},
-            {"open tipo=0 sel=4 StructMethod",  0, 4, 0, 0},
-            {"open tipo=0 sel=5 StructMethod",  0, 5, 0, 0},
-            {"open tipo=1 sel=0 StructMethod",  1, 0, 0, 0},
-            {"open tipo=1 sel=1 StructMethod",  1, 1, 0, 0},
-            {"open tipo=2 sel=0 StructMethod",  2, 0, 0, 0},
-            {"open tipo=2 sel=1 StructMethod",  2, 1, 0, 0},
-            {"open tipo=3 sel=0 StructMethod",  3, 0, 0, 0},
-            {"open tipo=3 sel=1 StructMethod",  3, 1, 0, 0},
-            {"open tipo=4 sel=0 StructMethod",  4, 0, 0, 0},
-            {"open tipo=0 sel=1 CallMethod+surfID", 0, 1, 1, 0},
-            {"open tipo=0 sel=2 CallMethod+surfID", 0, 2, 1, 0},
-            {"open tipo=0 sel=3 CallMethod+surfID", 0, 3, 1, 0},
-            {"open tipo=0 sel=4 CallMethod+surfID", 0, 4, 1, 0},
-            {"open tipo=0 sel=5 CallMethod+surfID", 0, 5, 1, 0},
-            {"open tipo=0 sel=6 CallMethod+surfID", 0, 6, 1, 0},
-            {"open tipo=0 sel=7 CallMethod+surfID", 0, 7, 1, 0},
-            {"open tipo=0 sel=8 CallMethod+surfID", 0, 8, 1, 0},
-            {"open tipo=0 sel=9 CallMethod+surfID", 0, 9, 1, 0},
-            {"open tipo=0 sel=10 CallMethod+surfID", 0, 10, 1, 0},
-        };
-        int numTests = sizeof(tests) / sizeof(tests[0]);
-
-        NSString *prev = [NSString stringWithContentsOfFile:progressPath encoding:NSUTF8StringEncoding error:nil];
-        int testIdx = 0;
-        if (prev) {
-            NSString *trimmed = [prev stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if ([trimmed hasPrefix:@"CRASH:"]) {
-                int crashedIdx = [[trimmed substringFromIndex:6] intValue];
-                NSString *crashInfo = [NSString stringWithContentsOfFile:variantPath encoding:NSUTF8StringEncoding error:nil];
-                log(@"JB1: ========================================");
-                log(@"JB1: *** CRASH DETECTADO ***");
-                log([NSString stringWithFormat:@"JB1: Test %d crasheó: %@", crashedIdx + 1, crashInfo ?: @"desconocido"]);
-                log(@"JB1: ========================================");
-
-                NSMutableString *prevResults = [NSMutableString stringWithContentsOfFile:resultPath encoding:NSUTF8StringEncoding error:nil];
-                if (!prevResults) prevResults = [NSMutableString string];
-                [prevResults appendFormat:@"test%d: CRASH (%@)\n", crashedIdx, crashInfo ?: @"?"];
-                [prevResults writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-                int nextIdx = crashedIdx + 1;
-                if (nextIdx >= numTests) {
-                    log(@"JB1: Todos los tests probados.");
-                    log(@"JB1: === RESULTADOS ACUMULADOS ===");
-                    for (NSString *line in [prevResults componentsSeparatedByString:@"\n"]) {
-                        if (line.length > 0) log([NSString stringWithFormat:@"JB1: %@", line]);
-                    }
-                    [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
-                    [[NSFileManager defaultManager] removeItemAtPath:variantPath error:nil];
-                } else {
-                    log([NSString stringWithFormat:@"JB1: Tocá otra vez para test %d/%d", nextIdx + 1, numTests]);
-                    [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                }
-                done(@{@"crash_detected": @YES, @"crash_test": crashInfo ?: @"unknown"});
-                return;
-            } else if ([trimmed isEqualToString:@"DONE"]) {
-                NSString *results = [NSString stringWithContentsOfFile:resultPath encoding:NSUTF8StringEncoding error:nil];
-                log(@"JB1: === TODOS LOS RESULTADOS ===");
-                if (results) {
-                    for (NSString *line in [results componentsSeparatedByString:@"\n"]) {
-                        if (line.length > 0) log([NSString stringWithFormat:@"JB1: %@", line]);
-                    }
-                }
-                log(@"JB1: Tocá otra vez para reiniciar.");
-                [[NSFileManager defaultManager] removeItemAtPath:progressPath error:nil];
-                [[NSFileManager defaultManager] removeItemAtPath:variantPath error:nil];
-                [[NSFileManager defaultManager] removeItemAtPath:resultPath error:nil];
-                done(@{@"all_done": @YES});
-                return;
-            } else {
-                testIdx = [trimmed intValue];
-            }
-        }
-
-        if (testIdx >= numTests) {
-            [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log(@"JB1: Todos los tests completados!");
-            done(@{@"all_done": @YES});
-            return;
-        }
-
-        NSString *variantDesc = [NSString stringWithUTF8String:tests[testIdx].desc];
-        [variantDesc writeToFile:variantPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [[NSString stringWithFormat:@"CRASH:%d", testIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        log([NSString stringWithFormat:@"JB1: === Test %d/%d ===", testIdx + 1, numTests]);
-        log([NSString stringWithFormat:@"JB1: %@", variantDesc]);
+        log(@"JB2: ========================================");
+        log(@"JB2: Fase 2 — Análisis de crash + IOSurface framework");
+        log(@"JB2: ========================================");
 
         ISRSymbols sym;
         if (!isr_load(&sym)) {
-            log(@"JB1: Error cargando símbolos");
+            log(@"JB2: Error cargando símbolos");
             done(@{@"error": @"symbols"});
             return;
         }
-
-        typedef kern_return_t (*CallMethodFn)(io_connect_t, uint32_t,
-            const uint64_t *, uint32_t, const void *, size_t,
-            uint64_t *, uint32_t *, void *, size_t *);
-        CallMethodFn callMethod = (CallMethodFn)dlsym(sym.iokit, "IOConnectCallMethod");
 
         typedef kern_return_t (*StructMethodFn)(io_connect_t, uint32_t,
             const void *, size_t, void *, size_t *);
@@ -22301,171 +22209,308 @@ void iosurface_research_struct_method(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         HostGetFn hostGet = (HostGetFn)dlsym(sym.iokit, "IOMainPort");
         if (!hostGet) hostGet = (HostGetFn)dlsym(sym.iokit, "IOMasterPort");
 
-        if (!callMethod || !structMethod || !hostGet) {
-            log(@"JB1: Error cargando funciones IOKit");
+        if (!structMethod || !hostGet) {
+            log(@"JB2: Error cargando funciones");
             isr_unload(&sym);
             done(@{@"error": @"dlsym"});
             return;
         }
         hostGet(&master);
 
+        log(@"JB2: --- Paso 1: Signal handler para atrapar crash ---");
+        log(@"JB2: Instalando SIGSEGV/SIGBUS handler con siglongjmp...");
+
+        struct sigaction sa, old_segv, old_bus;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = jb2_signal_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &old_segv);
+        sigaction(SIGBUS, &sa, &old_bus);
+
         CFMutableDictionaryRef matching = sym.matching("IOSurfaceRoot");
         io_service_t service = sym.getMatch(master, matching);
-        if (!service) {
-            log(@"JB1: IOSurfaceRoot no encontrado");
-            isr_unload(&sym);
-            done(@{@"error": @"service"});
-            return;
-        }
-
-        uint32_t connType = tests[testIdx].connType;
         io_connect_t connect = 0;
-        kern_return_t kr = sym.open(service, mach_task_self(), connType, &connect);
-        sym.release(service);
 
-        if (kr != KERN_SUCCESS) {
-            log([NSString stringWithFormat:@"JB1: IOServiceOpen tipo=%u falló kr=0x%x", connType, kr]);
+        if (service) {
+            kern_return_t kr = sym.open(service, mach_task_self(), 0, &connect);
+            sym.release(service);
 
-            NSMutableString *prevResults = [NSMutableString stringWithContentsOfFile:resultPath encoding:NSUTF8StringEncoding error:nil];
-            if (!prevResults) prevResults = [NSMutableString string];
-            [prevResults appendFormat:@"test%d: OPEN_FAIL(tipo=%u,kr=0x%x)\n", testIdx, connType, kr];
-            [prevResults writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            if (kr == KERN_SUCCESS && connect) {
+                log([NSString stringWithFormat:@"JB2: Conexión tipo=0 abierta: %u", connect]);
 
-            int nextIdx = testIdx + 1;
-            [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            if (nextIdx >= numTests) {
-                [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                g_jb2_fault_sig = 0;
+                g_jb2_fault_addr = 0;
+
+                if (sigsetjmp(g_jb2_jmpbuf, 1) == 0) {
+                    log(@"JB2: Llamando StructMethod sel=0 (va a crashear)...");
+                    uint8_t inBuf[64];
+                    memset(inBuf, 0, sizeof(inBuf));
+                    uint8_t outBuf[64];
+                    size_t outSize = sizeof(outBuf);
+
+                    structMethod(connect, 0, inBuf, sizeof(inBuf), outBuf, &outSize);
+                    log(@"JB2: *** NO CRASHEÓ! Esto sería inesperado ***");
+                } else {
+                    log(@"JB2: ========================================");
+                    log(@"JB2: *** CRASH ATRAPADO POR SIGNAL HANDLER ***");
+                    log([NSString stringWithFormat:@"JB2: Signal: %d (%s)",
+                         (int)g_jb2_fault_sig,
+                         g_jb2_fault_sig == SIGSEGV ? "SIGSEGV" :
+                         g_jb2_fault_sig == SIGBUS ? "SIGBUS" : "OTHER"]);
+                    log([NSString stringWithFormat:@"JB2: Fault address: 0x%llx", g_jb2_fault_addr]);
+
+                    if (g_jb2_fault_addr == 0) {
+                        log(@"JB2: *** NULL POINTER DEREFERENCE ***");
+                        log(@"JB2: El kernel desreferenció un puntero NULL");
+                    } else if (g_jb2_fault_addr < 0x100000) {
+                        log(@"JB2: *** LOW ADDRESS — posible NULL+offset ***");
+                        log([NSString stringWithFormat:@"JB2: Offset desde NULL: 0x%llx", g_jb2_fault_addr]);
+                    } else if ((g_jb2_fault_addr & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
+                               (g_jb2_fault_addr & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                        log(@"JB2: *** DIRECCIÓN KERNEL ***");
+                        log(@"JB2: El crash está en espacio kernel — NO atrapable desde userland");
+                    } else {
+                        log(@"JB2: *** DIRECCIÓN USERLAND ***");
+                        log([NSString stringWithFormat:@"JB2: Podría ser controlable: 0x%llx", g_jb2_fault_addr]);
+                    }
+                    log(@"JB2: ========================================");
+                }
+            } else {
+                log([NSString stringWithFormat:@"JB2: IOServiceOpen falló kr=0x%x", kr]);
             }
-
-            isr_unload(&sym);
-            done(@{@"open_fail": @(kr)});
-            return;
+        } else {
+            log(@"JB2: Servicio no encontrado");
         }
 
-        log([NSString stringWithFormat:@"JB1: tipo=%u connect=%u OK", connType, connect]);
+        sigaction(SIGSEGV, &old_segv, NULL);
+        sigaction(SIGBUS, &old_bus, NULL);
 
-        uint32_t sel = tests[testIdx].selector;
-        kern_return_t result;
-        NSString *resultStr = @"";
+        if (!isr_stopped()) {
+            log(@"JB2: --- Paso 2: IOSurface framework (no IOConnectCall) ---");
 
-        if (tests[testIdx].useCallMethod) {
-            uint32_t surfID = 0;
             void *ioSurfaceHandle = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
             if (ioSurfaceHandle) {
                 typedef IOSurfaceRef (*CreateFn)(CFDictionaryRef);
                 CreateFn createSurf = (CreateFn)dlsym(ioSurfaceHandle, "IOSurfaceCreate");
                 typedef uint32_t (*GetIDFn)(IOSurfaceRef);
                 GetIDFn getID = (GetIDFn)dlsym(ioSurfaceHandle, "IOSurfaceGetID");
+                typedef void* (*GetBaseAddrFn)(IOSurfaceRef);
+                GetBaseAddrFn getBase = (GetBaseAddrFn)dlsym(ioSurfaceHandle, "IOSurfaceGetBaseAddress");
+                typedef size_t (*GetAllocSizeFn)(IOSurfaceRef);
+                GetAllocSizeFn getAllocSize = (GetAllocSizeFn)dlsym(ioSurfaceHandle, "IOSurfaceGetAllocSize");
+                typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                SetValueFn setValue = (SetValueFn)dlsym(ioSurfaceHandle, "IOSurfaceSetValue");
+                typedef CFTypeRef (*GetValueFn)(IOSurfaceRef, CFStringRef);
+                GetValueFn getValue = (GetValueFn)dlsym(ioSurfaceHandle, "IOSurfaceGetValue");
+                typedef IOSurfaceRef (*LookupFn)(uint32_t);
+                LookupFn lookupSurf = (LookupFn)dlsym(ioSurfaceHandle, "IOSurfaceLookup");
+                typedef kern_return_t (*LockFn)(IOSurfaceRef, uint32_t, uint32_t *);
+                LockFn lockSurf = (LockFn)dlsym(ioSurfaceHandle, "IOSurfaceLock");
+                typedef kern_return_t (*UnlockFn)(IOSurfaceRef, uint32_t, uint32_t *);
+                UnlockFn unlockSurf = (UnlockFn)dlsym(ioSurfaceHandle, "IOSurfaceUnlock");
+                typedef void (*IncrementUseFn)(IOSurfaceRef);
+                IncrementUseFn incUse = (IncrementUseFn)dlsym(ioSurfaceHandle, "IOSurfaceIncrementUseCount");
+                typedef void (*DecrementUseFn)(IOSurfaceRef);
+                DecrementUseFn decUse = (DecrementUseFn)dlsym(ioSurfaceHandle, "IOSurfaceDecrementUseCount");
+                typedef int32_t (*GetUseCountFn)(IOSurfaceRef);
+                GetUseCountFn getUseCount = (GetUseCountFn)dlsym(ioSurfaceHandle, "IOSurfaceGetUseCount");
+                typedef Boolean (*IsInUseFn)(IOSurfaceRef);
+                IsInUseFn isInUse = (IsInUseFn)dlsym(ioSurfaceHandle, "IOSurfaceIsInUse");
+                typedef CFDictionaryRef (*CopyAllValuesFn)(IOSurfaceRef);
+                CopyAllValuesFn copyAllValues = (CopyAllValuesFn)dlsym(ioSurfaceHandle, "IOSurfaceCopyAllValues");
+                typedef void (*RemoveValueFn)(IOSurfaceRef, CFStringRef);
+                RemoveValueFn removeValue = (RemoveValueFn)dlsym(ioSurfaceHandle, "IOSurfaceRemoveValue");
+
+                log([NSString stringWithFormat:@"JB2: Funciones: create=%d getID=%d getBase=%d allocSz=%d set=%d get=%d lookup=%d lock=%d unlock=%d inc=%d dec=%d getUse=%d inUse=%d copyAll=%d remove=%d",
+                     createSurf!=NULL, getID!=NULL, getBase!=NULL, getAllocSize!=NULL,
+                     setValue!=NULL, getValue!=NULL, lookupSurf!=NULL,
+                     lockSurf!=NULL, unlockSurf!=NULL,
+                     incUse!=NULL, decUse!=NULL, getUseCount!=NULL, isInUse!=NULL,
+                     copyAllValues!=NULL, removeValue!=NULL]);
 
                 if (createSurf) {
                     NSDictionary *props = @{
-                        @"IOSurfaceWidth": @32,
-                        @"IOSurfaceHeight": @32,
+                        @"IOSurfaceWidth": @64,
+                        @"IOSurfaceHeight": @64,
                         @"IOSurfaceBytesPerElement": @4,
                         @"IOSurfacePixelFormat": @(0x42475241),
                     };
                     IOSurfaceRef surf = createSurf((__bridge CFDictionaryRef)props);
-                    if (surf && getID) {
-                        surfID = getID(surf);
-                        log([NSString stringWithFormat:@"JB1: Superficie creada, ID=%u", surfID]);
+                    if (surf) {
+                        uint32_t surfID = getID ? getID(surf) : 0;
+                        log([NSString stringWithFormat:@"JB2: *** IOSurfaceCreate OK! ID=%u ***", surfID]);
+                        log(@"JB2: IOSurfaceCreate funciona — usa un path diferente al IOConnectCall");
+
+                        if (getBase) {
+                            void *base = getBase(surf);
+                            log([NSString stringWithFormat:@"JB2: BaseAddress=%p", base]);
+                        }
+                        if (getAllocSize) {
+                            size_t sz = getAllocSize(surf);
+                            log([NSString stringWithFormat:@"JB2: AllocSize=%zu", sz]);
+                        }
+
+                        if (lockSurf) {
+                            uint32_t seed = 0;
+                            kern_return_t lkr = lockSurf(surf, 3, &seed);
+                            log([NSString stringWithFormat:@"JB2: Lock(kIOSurfaceLockReadWrite)=%d seed=%u", lkr, seed]);
+                            if (unlockSurf) {
+                                kern_return_t ukr = unlockSurf(surf, 3, &seed);
+                                log([NSString stringWithFormat:@"JB2: Unlock=%d seed=%u", ukr, seed]);
+                            }
+                        }
+
+                        if (setValue && getValue) {
+                            uint8_t testData[4096];
+                            for (int i = 0; i < 4096; i++) testData[i] = (uint8_t)(i & 0xFF);
+                            NSData *data = [NSData dataWithBytes:testData length:sizeof(testData)];
+                            setValue(surf, CFSTR("test_data"), (__bridge CFTypeRef)data);
+
+                            CFTypeRef readBack = getValue(surf, CFSTR("test_data"));
+                            if (readBack && CFGetTypeID(readBack) == CFDataGetTypeID()) {
+                                CFDataRef dRef = (CFDataRef)readBack;
+                                CFIndex len = CFDataGetLength(dRef);
+                                log([NSString stringWithFormat:@"JB2: SetValue/GetValue OK — size=%ld", (long)len]);
+
+                                const UInt8 *bytes = CFDataGetBytePtr(dRef);
+                                int match = 1;
+                                for (int i = 0; i < 4096 && i < (int)len; i++) {
+                                    if (bytes[i] != (uint8_t)(i & 0xFF)) { match = 0; break; }
+                                }
+                                log([NSString stringWithFormat:@"JB2: Data integrity: %s", match ? "OK" : "CORRUPTED"]);
+                            }
+
+                            setValue(surf, CFSTR("big_spray_1"), (__bridge CFTypeRef)[NSData dataWithBytes:testData length:4096]);
+                            setValue(surf, CFSTR("big_spray_2"), (__bridge CFTypeRef)[NSData dataWithBytes:testData length:4096]);
+                            setValue(surf, CFSTR("big_spray_3"), (__bridge CFTypeRef)[NSData dataWithBytes:testData length:4096]);
+                            log(@"JB2: 3 spray values escritos (4096 bytes cada uno)");
+                        }
+
+                        if (copyAllValues) {
+                            CFDictionaryRef allVals = copyAllValues(surf);
+                            if (allVals) {
+                                CFIndex count = CFDictionaryGetCount(allVals);
+                                log([NSString stringWithFormat:@"JB2: CopyAllValues: %ld keys", (long)count]);
+
+                                CFIndex cnt = CFDictionaryGetCount(allVals);
+                                if (cnt > 0 && cnt < 100) {
+                                    const void **keys = (const void **)malloc(sizeof(void*) * (size_t)cnt);
+                                    const void **vals = (const void **)malloc(sizeof(void*) * (size_t)cnt);
+                                    if (keys && vals) {
+                                        CFDictionaryGetKeysAndValues(allVals, keys, vals);
+                                        for (CFIndex i = 0; i < cnt && i < 10; i++) {
+                                            NSString *k = (__bridge NSString *)keys[i];
+                                            CFTypeID tid = CFGetTypeID(vals[i]);
+                                            NSString *typeName = @"unknown";
+                                            if (tid == CFDataGetTypeID()) typeName = [NSString stringWithFormat:@"Data(%ld)", (long)CFDataGetLength((CFDataRef)vals[i])];
+                                            else if (tid == CFStringGetTypeID()) typeName = @"String";
+                                            else if (tid == CFNumberGetTypeID()) typeName = @"Number";
+                                            else if (tid == CFDictionaryGetTypeID()) typeName = @"Dict";
+                                            log([NSString stringWithFormat:@"JB2: key=%@ type=%@", k, typeName]);
+                                        }
+                                    }
+                                    if (keys) free(keys);
+                                    if (vals) free(vals);
+                                }
+                                CFRelease(allVals);
+                            }
+                        }
+
+                        if (incUse && getUseCount) {
+                            int32_t uc0 = getUseCount(surf);
+                            incUse(surf);
+                            int32_t uc1 = getUseCount(surf);
+                            incUse(surf);
+                            int32_t uc2 = getUseCount(surf);
+                            log([NSString stringWithFormat:@"JB2: UseCount: %d -> %d -> %d", uc0, uc1, uc2]);
+                            if (decUse) { decUse(surf); decUse(surf); }
+                        }
+
+                        if (lookupSurf && surfID > 0) {
+                            IOSurfaceRef looked = lookupSurf(surfID);
+                            if (looked) {
+                                log([NSString stringWithFormat:@"JB2: Lookup(%u) OK — misma superficie accesible cross-process", surfID]);
+                                if (getBase) {
+                                    void *base2 = getBase(looked);
+                                    log([NSString stringWithFormat:@"JB2: Lookup BaseAddress=%p", base2]);
+                                }
+                                CFRelease(looked);
+                            }
+                        }
+
+                        log(@"JB2: --- Paso 3: Crear muchas superficies (heap spray) ---");
+                        IOSurfaceRef surfaces[50];
+                        int created = 0;
+                        for (int i = 0; i < 50; i++) {
+                            NSDictionary *p = @{
+                                @"IOSurfaceWidth": @16,
+                                @"IOSurfaceHeight": @16,
+                                @"IOSurfaceBytesPerElement": @4,
+                                @"IOSurfacePixelFormat": @(0x42475241),
+                            };
+                            surfaces[i] = createSurf((__bridge CFDictionaryRef)p);
+                            if (surfaces[i]) created++;
+                        }
+                        log([NSString stringWithFormat:@"JB2: Heap spray: %d/50 superficies creadas", created]);
+
+                        if (created >= 2 && getID) {
+                            uint32_t id0 = getID(surfaces[0]);
+                            uint32_t id1 = getID(surfaces[1]);
+                            uint32_t idLast = getID(surfaces[created-1]);
+                            log([NSString stringWithFormat:@"JB2: IDs: first=%u second=%u last=%u (secuenciales=%s)",
+                                 id0, id1, idLast, (id1 == id0+1) ? "SI" : "NO"]);
+                        }
+
+                        if (created >= 2 && getBase) {
+                            void *b0 = getBase(surfaces[0]);
+                            void *b1 = getBase(surfaces[1]);
+                            ptrdiff_t diff = (uint8_t*)b1 - (uint8_t*)b0;
+                            log([NSString stringWithFormat:@"JB2: Base diff entre superficie 0 y 1: %td bytes", diff]);
+                        }
+
+                        for (int i = 0; i < created; i++) {
+                            if (surfaces[i]) CFRelease(surfaces[i]);
+                        }
+
                         CFRelease(surf);
+                    } else {
+                        log(@"JB2: IOSurfaceCreate falló");
                     }
                 }
                 dlclose(ioSurfaceHandle);
-            }
-
-            uint64_t scIn[4] = {surfID, 0, 0, 0};
-            uint8_t sOut[4096];
-            size_t sOutSz = sizeof(sOut);
-            memset(sOut, 0, sizeof(sOut));
-            uint64_t scOut[16];
-            uint32_t scOutCnt = 16;
-
-            log([NSString stringWithFormat:@"JB1: CallMethod sel=%u scIn={%u}...", sel, surfID]);
-            result = callMethod(connect, sel, scIn, 1, NULL, 0, scOut, &scOutCnt, sOut, &sOutSz);
-            log([NSString stringWithFormat:@"JB1: kr=0x%x scOutCnt=%u sOutSz=%zu", result, scOutCnt, sOutSz]);
-            resultStr = [NSString stringWithFormat:@"kr=0x%x scOut=%u sOut=%zu", result, scOutCnt, sOutSz];
-
-            if (result == KERN_SUCCESS) {
-                if (scOutCnt > 0) {
-                    for (uint32_t si = 0; si < scOutCnt && si < 4; si++) {
-                        log([NSString stringWithFormat:@"JB1: scalarOut[%u]=0x%llx", si, scOut[si]]);
-                    }
-                }
-                if (sOutSz > 0) {
-                    size_t dLen = sOutSz > 64 ? 64 : sOutSz;
-                    NSMutableString *hex = [NSMutableString string];
-                    for (size_t i = 0; i < dLen; i++) {
-                        [hex appendFormat:@"%02x ", sOut[i]];
-                        if (i > 0 && i % 16 == 15) [hex appendString:@"\n"];
-                    }
-                    log([NSString stringWithFormat:@"JB1: Hex:\n%@", hex]);
-
-                    for (size_t i = 0; i + 7 < sOutSz; i += 4) {
-                        uint64_t val = 0;
-                        memcpy(&val, sOut + i, 8);
-                        if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
-                            (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
-                            log([NSString stringWithFormat:@"JB1: *** KPTR off=%zu: 0x%llx ***", i, val]);
-                        }
-                    }
-                }
-            }
-        } else {
-            uint8_t inBuf[256];
-            memset(inBuf, 0, sizeof(inBuf));
-            uint8_t outBuf[4096];
-            size_t outSize = sizeof(outBuf);
-            memset(outBuf, 0, sizeof(outBuf));
-
-            log([NSString stringWithFormat:@"JB1: StructMethod tipo=%u sel=%u...", connType, sel]);
-            result = structMethod(connect, sel, inBuf, sizeof(inBuf), outBuf, &outSize);
-            log([NSString stringWithFormat:@"JB1: kr=0x%x outSize=%zu", result, outSize]);
-            resultStr = [NSString stringWithFormat:@"kr=0x%x out=%zu", result, outSize];
-
-            if (result == KERN_SUCCESS && outSize > 0) {
-                log([NSString stringWithFormat:@"JB1: *** RETORNÓ DATOS! ***"]);
-                size_t dLen = outSize > 64 ? 64 : outSize;
-                NSMutableString *hex = [NSMutableString string];
-                for (size_t i = 0; i < dLen; i++) {
-                    [hex appendFormat:@"%02x ", outBuf[i]];
-                    if (i > 0 && i % 16 == 15) [hex appendString:@"\n"];
-                }
-                log([NSString stringWithFormat:@"JB1: Hex:\n%@", hex]);
-
-                for (size_t i = 0; i + 7 < outSize; i += 4) {
-                    uint64_t val = 0;
-                    memcpy(&val, outBuf + i, 8);
-                    if ((val & 0xFFFFFF0000000000ULL) == 0xFFFFFE0000000000ULL ||
-                        (val & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
-                        log([NSString stringWithFormat:@"JB1: *** KPTR off=%zu: 0x%llx ***", i, val]);
-                    }
-                }
+            } else {
+                log(@"JB2: No se pudo abrir IOSurface.framework");
             }
         }
 
-        sym.close(connect);
-
-        NSMutableString *prevResults = [NSMutableString stringWithContentsOfFile:resultPath encoding:NSUTF8StringEncoding error:nil];
-        if (!prevResults) prevResults = [NSMutableString string];
-        [prevResults appendFormat:@"test%d(%@): %@\n", testIdx, variantDesc, resultStr];
-        [prevResults writeToFile:resultPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        int nextIdx = testIdx + 1;
-        if (nextIdx >= numTests) {
-            [@"DONE" writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log(@"JB1: === Todos los tests completados ===");
-            log(@"JB1: === RESULTADOS ===");
-            for (NSString *line in [prevResults componentsSeparatedByString:@"\n"]) {
-                if (line.length > 0) log([NSString stringWithFormat:@"JB1: %@", line]);
+        if (!isr_stopped()) {
+            log(@"JB2: --- Paso 4: Task info ---");
+            task_dyld_info_data_t dyldInfo;
+            mach_msg_type_number_t dyldCount = TASK_DYLD_INFO_COUNT;
+            kern_return_t tkr = task_info(mach_task_self(), TASK_DYLD_INFO,
+                                          (task_info_t)&dyldInfo, &dyldCount);
+            if (tkr == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB2: DYLD all_image_info_addr=0x%llx size=%llu",
+                     dyldInfo.all_image_info_addr, dyldInfo.all_image_info_size]);
             }
-        } else {
-            [[NSString stringWithFormat:@"%d", nextIdx] writeToFile:progressPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            log([NSString stringWithFormat:@"JB1: Siguiente: test %d/%d — tocá otra vez", nextIdx + 1, numTests]);
+
+            struct task_vm_info vmInfo;
+            mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+            kern_return_t vkr = task_info(mach_task_self(), TASK_VM_INFO,
+                                          (task_info_t)&vmInfo, &vmCount);
+            if (vkr == KERN_SUCCESS) {
+                log([NSString stringWithFormat:@"JB2: VM vsize=%llu rsize=%llu pgsz=%d",
+                     vmInfo.virtual_size, vmInfo.resident_size, vmInfo.page_size]);
+            }
         }
+
+        log(@"JB2: ========================================");
+        log(@"JB2: Fase 2 completada.");
+        log(@"JB2: ========================================");
 
         isr_unload(&sym);
-        done(@{@"test": variantDesc, @"result": @(result)});
+        done(@{@"phase2": @"complete"});
     });
 }
 
