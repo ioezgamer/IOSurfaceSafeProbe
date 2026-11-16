@@ -430,5 +430,11 @@ void iosurface_pipe_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull do
 /// Probe JB23: IOKit driver enumerator — full sandbox attack surface mapping.
 void iosurface_iokit_enumerator(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB24: AppleM2ScalerCSCDriver deep fuzz — CVE-2026-43655 UAF variant hunt.
+void iosurface_m2scaler_fuzz(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
+/// Probe JB25: CVE-2026-112611 — CoreGraphics PDF ShadingType 5 OOB write primitive.
+void iosurface_cg_oob_write(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

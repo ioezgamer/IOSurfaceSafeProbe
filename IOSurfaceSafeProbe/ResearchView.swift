@@ -405,6 +405,14 @@ struct ResearchView: View {
         ("iokitenum", "IOKit Enumerator", "list.bullet.rectangle.portrait.fill",
          "Enumera TODOS los drivers IOKit accesibles desde sandbox — mapea superficie de ataque completa mas alla de IOSurface",
          { log, done in iosurface_iokit_enumerator({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB24 - M2Scaler deep fuzz
+        ("m2scalerfuzz", "M2Scaler Fuzz", "bolt.shield.fill",
+         "Deep fuzz AppleM2ScalerCSCDriver sel 12-19 — CVE-2026-43655 UAF race, memory map, cross-type confusion",
+         { log, done in iosurface_m2scaler_fuzz({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB25 - CoreGraphics OOB write
+        ("cgoobwrite", "CG OOB Write", "doc.richtext.fill",
+         "CVE-2026-112611: PDF ShadingType 5 genera write primitivo en CoreGraphics — 4 bytes zero-write a direccion elegida",
+         { log, done in iosurface_cg_oob_write({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
