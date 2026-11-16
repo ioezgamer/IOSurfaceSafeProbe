@@ -413,6 +413,10 @@ struct ResearchView: View {
         ("cgoobwrite", "CG OOB Write", "doc.richtext.fill",
          "CVE-2026-112611: PDF ShadingType 5 genera write primitivo en CoreGraphics — 4 bytes zero-write a direccion elegida",
          { log, done in iosurface_cg_oob_write({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB26 - CG exploit
+        ("cgexploit", "CG Exploit", "exclamationmark.shield.fill",
+         "CVE-2026-112611 exploit: heap spray + zero-write ISA corruption + multi-write + dyld cache targets",
+         { log, done in iosurface_cg_exploit({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
