@@ -27652,18 +27652,19 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
             return;
         }
 
-        typedef io_object_t (*IOIteratorNextFn)(io_iterator_t);
-        typedef kern_return_t (*IORegistryEntryGetNameFn)(io_object_t, io_name_t);
+        // All IOKit types are mach_port_t underneath; use raw types to avoid module issues
+        typedef mach_port_t (*IOIteratorNextFn)(mach_port_t);
+        typedef kern_return_t (*IORegistryEntryGetNameFn)(mach_port_t, char *);
         typedef CFMutableDictionaryRef (*IOServiceMatchingFn)(const char *);
-        typedef kern_return_t (*IOServiceGetMatchingServicesFn)(mach_port_t, CFDictionaryRef, io_iterator_t *);
-        typedef kern_return_t (*IOServiceOpenFn)(io_object_t, task_port_t, uint32_t, io_connect_t *);
-        typedef kern_return_t (*IOServiceCloseFn)(io_connect_t);
-        typedef kern_return_t (*IOObjectReleaseFn)(io_object_t);
-        typedef kern_return_t (*IORegistryEntryGetPropertyFn)(io_object_t, const io_name_t, CFTypeRef *);
-        typedef CFTypeRef (*IORegistryEntryCreateCFPropertyFn)(io_object_t, CFStringRef, CFAllocatorRef, IOOptionBits);
-        typedef kern_return_t (*IOConnectCallMethodFn)(io_connect_t, uint32_t,
+        typedef kern_return_t (*IOServiceGetMatchingServicesFn)(mach_port_t, CFDictionaryRef, mach_port_t *);
+        typedef kern_return_t (*IOServiceOpenFn)(mach_port_t, task_port_t, uint32_t, mach_port_t *);
+        typedef kern_return_t (*IOServiceCloseFn)(mach_port_t);
+        typedef kern_return_t (*IOObjectReleaseFn)(mach_port_t);
+        typedef CFTypeRef (*IORegistryEntryCreateCFPropertyFn)(mach_port_t, CFStringRef, CFAllocatorRef, uint32_t);
+        typedef kern_return_t (*IOConnectCallMethodFn)(mach_port_t, uint32_t,
             const uint64_t *, uint32_t, const void *, size_t,
             uint64_t *, uint32_t *, void *, size_t *);
+        typedef kern_return_t (*IORegistryCreateIteratorFn)(mach_port_t, const char *, uint32_t, mach_port_t *);
 
         IOIteratorNextFn ioNext = (IOIteratorNextFn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
         IORegistryEntryGetNameFn ioGetName = (IORegistryEntryGetNameFn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
@@ -27674,6 +27675,7 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
         IOObjectReleaseFn ioRelease = (IOObjectReleaseFn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
         IORegistryEntryCreateCFPropertyFn ioCreateProp = (IORegistryEntryCreateCFPropertyFn)dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
         IOConnectCallMethodFn ioCallMethod = (IOConnectCallMethodFn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        IORegistryCreateIteratorFn ioRegIter = (IORegistryCreateIteratorFn)dlsym(RTLD_DEFAULT, "IORegistryCreateIterator");
 
         if (!ioNext || !ioGetName || !ioMatching || !ioGetMatching || !ioOpen || !ioClose || !ioRelease || !ioCreateProp || !ioCallMethod) {
             log(@"JB23: [!] Faltan simbolos IOKit");
@@ -27682,91 +27684,31 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
             return;
         }
 
-        // Known IOKit service class names to try
         NSArray *serviceClasses = @[
-            // Core graphics/display
-            @"IOSurfaceRoot",
-            @"IOMobileFramebuffer",
-            @"IOSurfaceAccelerator",
+            @"IOSurfaceRoot", @"IOMobileFramebuffer", @"IOSurfaceAccelerator",
             @"IOMobileFramebufferShim",
-            // GPU
-            @"AGXAccelerator",
-            @"AGXAcceleratorG15P",
-            @"AGXAcceleratorG15G",
-            @"IOGPU",
-            @"IOGPUDevice",
-            @"AGXFamilyAccelerator",
-            @"AGXDeviceUserClient",
-            // Media
-            @"AppleJPEGDriver",
-            @"AppleAVE2Driver",
-            @"AppleAVE2UserClient",
-            @"AppleVXE380",
-            @"AppleVXD394",
-            @"AppleM2ScalerCSCDriver",
-            @"IOAVService",
-            // Audio
-            @"AppleHDAController",
-            @"IOAudioEngine",
-            @"AppleSPU",
-            // HID/Input
-            @"IOHIDSystem",
-            @"IOHIDUserDevice",
-            @"AppleMultitouchDevice",
-            @"IOHIDEventService",
-            @"AppleHIDTransportSPI",
-            // Crypto/Security
-            @"AppleKeyStore",
-            @"IOAESAccelerator",
-            @"AppleSEP",
-            @"AppleSEPManager",
-            @"AppleCredentialManager",
-            @"AppleSSE",
-            // Storage
-            @"IONVMeController",
-            @"AppleANS3NVMeController",
-            @"IOFlashController",
-            // Network
-            @"IONetworkInterface",
-            @"IOEthernetController",
-            @"IO80211Controller",
+            @"AGXAccelerator", @"AGXAcceleratorG15P", @"AGXAcceleratorG15G",
+            @"IOGPU", @"IOGPUDevice", @"AGXFamilyAccelerator", @"AGXDeviceUserClient",
+            @"AppleJPEGDriver", @"AppleAVE2Driver", @"AppleAVE2UserClient",
+            @"AppleVXE380", @"AppleVXD394", @"AppleM2ScalerCSCDriver", @"IOAVService",
+            @"AppleHDAController", @"IOAudioEngine", @"AppleSPU",
+            @"IOHIDSystem", @"IOHIDUserDevice", @"AppleMultitouchDevice",
+            @"IOHIDEventService", @"AppleHIDTransportSPI",
+            @"AppleKeyStore", @"IOAESAccelerator", @"AppleSEP", @"AppleSEPManager",
+            @"AppleCredentialManager", @"AppleSSE",
+            @"IONVMeController", @"AppleANS3NVMeController", @"IOFlashController",
+            @"IONetworkInterface", @"IOEthernetController", @"IO80211Controller",
             @"AppleBCMWLANCore",
-            // USB/Lightning
-            @"IOUSBHostDevice",
-            @"AppleSynapsesDriver",
-            @"IOAccessoryManager",
-            // Sensors
-            @"AppleOscarAccelerometer",
-            @"AppleSensorHub",
-            @"CoreMotion",
-            @"CLLocationManager",
-            // Power
-            @"AppleSmartBatteryManager",
-            @"IOPMrootDomain",
-            @"ApplePMGR",
-            // Misc kernel
-            @"IOUserEthernetController",
-            @"AppleImage4",
-            @"AppleEffaceableStorage",
-            @"AppleMobileFileIntegrity",
-            @"AppleARMPE",
-            @"AppleSMC",
-            @"AppleBiometricServices",
-            @"AppleFirmwareUpdateKext",
-            // DCP (Display Coprocessor)
-            @"IOMFBDevice",
-            @"AppleDCP",
-            @"DCPAVService",
-            // Neural Engine
-            @"AppleH11ANEIn",
-            @"H11ANEIn",
-            @"AppleNeuralEngine",
-            // Additional drivers
-            @"AppleSPIMC",
-            @"AppleT8020DART",
-            @"AppleDARTMapper",
-            @"AppleConvergedIPCOLYBTControl",
-            @"AppleBluetooth",
+            @"IOUSBHostDevice", @"AppleSynapsesDriver", @"IOAccessoryManager",
+            @"AppleOscarAccelerometer", @"AppleSensorHub",
+            @"AppleSmartBatteryManager", @"IOPMrootDomain", @"ApplePMGR",
+            @"IOUserEthernetController", @"AppleImage4", @"AppleEffaceableStorage",
+            @"AppleMobileFileIntegrity", @"AppleARMPE", @"AppleSMC",
+            @"AppleBiometricServices", @"AppleFirmwareUpdateKext",
+            @"IOMFBDevice", @"AppleDCP", @"DCPAVService",
+            @"AppleH11ANEIn", @"H11ANEIn", @"AppleNeuralEngine",
+            @"AppleSPIMC", @"AppleT8020DART", @"AppleDARTMapper",
+            @"AppleConvergedIPCOLYBTControl", @"AppleBluetooth",
             @"IOBluetoothHCIController",
         ];
 
@@ -27776,6 +27718,7 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
         int totalServices = 0;
         int totalAccessible = 0;
         int totalOpenable = 0;
+        kern_return_t kr;
 
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
@@ -27786,45 +27729,32 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
             CFMutableDictionaryRef matchDict = ioMatching([className UTF8String]);
             if (!matchDict) continue;
 
-            io_iterator_t iter = 0;
-            kern_return_t kr = ioGetMatching(0, matchDict, &iter);
-            if (kr != KERN_SUCCESS || !iter) continue;
+            mach_port_t svcIter = 0;
+            kr = ioGetMatching(0, matchDict, &svcIter);
+            if (kr != KERN_SUCCESS || !svcIter) continue;
 
-            io_object_t service;
+            mach_port_t service;
             int instanceCount = 0;
-            while ((service = ioNext(iter)) != 0 && !isr_stopped()) {
+            while ((service = ioNext(svcIter)) != 0 && !isr_stopped()) {
                 instanceCount++;
                 totalServices++;
 
-                io_name_t name;
-                ioGetName(service, name);
-
-                // Try to get IOClass property
-                NSString *ioClass = @"?";
-                CFTypeRef classProp = ioCreateProp(service, CFSTR("IOClass"), kCFAllocatorDefault, 0);
-                if (classProp) {
-                    if (CFGetTypeID(classProp) == CFStringGetTypeID()) {
-                        ioClass = (__bridge NSString *)classProp;
-                    }
-                    CFRelease(classProp);
-                }
+                char nameBuf[128] = {0};
+                ioGetName(service, nameBuf);
 
                 totalAccessible++;
-                [accessible addObject:[NSString stringWithFormat:@"%@ (name:%s)", className, name]];
+                [accessible addObject:[NSString stringWithFormat:@"%@ (name:%s)", className, nameBuf]];
 
-                // Try opening with connection types 0-7
                 BOOL didOpen = NO;
                 for (uint32_t connType = 0; connType <= 7 && !isr_stopped(); connType++) {
-                    io_connect_t conn = 0;
+                    mach_port_t conn = 0;
                     kr = ioOpen(service, mach_task_self(), connType, &conn);
                     if (kr == KERN_SUCCESS && conn) {
                         didOpen = YES;
-                        NSString *entry = [NSString stringWithFormat:@"%@:type%u", className, connType];
-                        [openable addObject:entry];
+                        [openable addObject:[NSString stringWithFormat:@"%@:type%u", className, connType]];
                         totalOpenable++;
                         log([NSString stringWithFormat:@"JB23: [OPEN] %@ tipo=%u conn=0x%x", className, connType, conn]);
 
-                        // Quick selector scan 0-19
                         int acceptedSels = 0;
                         NSMutableArray *workingSels = [NSMutableArray array];
                         for (uint32_t sel = 0; sel < 20 && !isr_stopped(); sel++) {
@@ -27832,7 +27762,6 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
                             uint32_t scalarOutCnt = 4;
                             char structOut[256] = {0};
                             size_t structOutSz = sizeof(structOut);
-
                             uint64_t scalarIn[2] = {0, 0};
                             char structIn[24] = {0};
 
@@ -27840,7 +27769,7 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
                                 scalarIn, 2, structIn, sizeof(structIn),
                                 scalarOut, &scalarOutCnt, structOut, &structOutSz);
 
-                            if (skr != 0xe00002c2 && skr != 0xe00002c9) {
+                            if (skr != (kern_return_t)0xe00002c2 && skr != (kern_return_t)0xe00002c9) {
                                 acceptedSels++;
                                 [workingSels addObject:@(sel)];
                             }
@@ -27867,52 +27796,43 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
 
                 ioRelease(service);
             }
-            if (iter) ioRelease(iter);
+            if (svcIter) ioRelease(svcIter);
         }
 
-        // === FASE 2: Enumeracion generica via IORegistryEntryCreateIterator ===
-        if (!isr_stopped()) {
+        // === FASE 2: Generic IORegistry walk ===
+        if (!isr_stopped() && ioRegIter) {
             log(@"JB23: === Fase 2: Enumeracion generica del IORegistry ===");
 
-            typedef kern_return_t (*IORegistryCreateIteratorFn)(mach_port_t, const io_name_t, IOOptionBits, io_iterator_t *);
-            typedef kern_return_t (*IORegistryEntryGetPathFn)(io_object_t, const io_name_t, io_string_t);
-            IORegistryCreateIteratorFn ioRegIter = (IORegistryCreateIteratorFn)dlsym(RTLD_DEFAULT, "IORegistryCreateIterator");
-            IORegistryEntryGetPathFn ioGetPath = (IORegistryEntryGetPathFn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetPath");
+            mach_port_t regIt = 0;
+            kr = ioRegIter(0, "IOService", 3, &regIt);
+            if (kr == KERN_SUCCESS && regIt) {
+                mach_port_t entry;
+                int regCount = 0;
+                NSMutableSet *seenClasses = [NSMutableSet set];
 
-            if (ioRegIter) {
-                io_iterator_t regIter = 0;
-                kr = ioRegIter(0, "IOService", 3, &regIter); // kIORegistryIterateRecursively | kIORegistryIterateParents
-                if (kr == KERN_SUCCESS && regIter) {
-                    io_object_t entry;
-                    int regCount = 0;
-                    NSMutableSet *seenClasses = [NSMutableSet set];
-
-                    while ((entry = ioNext(regIter)) != 0 && regCount < 500 && !isr_stopped()) {
-                        regCount++;
-                        CFTypeRef classProp = ioCreateProp(entry, CFSTR("IOClass"), kCFAllocatorDefault, 0);
-                        if (classProp && CFGetTypeID(classProp) == CFStringGetTypeID()) {
-                            NSString *cls = (__bridge NSString *)classProp;
-                            if (![seenClasses containsObject:cls]) {
-                                [seenClasses addObject:cls];
-
-                                // Try opening this class
-                                io_connect_t conn = 0;
-                                kern_return_t okr = ioOpen(entry, mach_task_self(), 0, &conn);
-                                if (okr == KERN_SUCCESS && conn) {
-                                    log([NSString stringWithFormat:@"JB23: [REGISTRY-OPEN] %@ tipo=0", cls]);
-                                    totalOpenable++;
-                                    [openable addObject:[NSString stringWithFormat:@"%@:registry", cls]];
-                                    ioClose(conn);
-                                }
+                while ((entry = ioNext(regIt)) != 0 && regCount < 500 && !isr_stopped()) {
+                    regCount++;
+                    CFTypeRef classProp = ioCreateProp(entry, CFSTR("IOClass"), kCFAllocatorDefault, 0);
+                    if (classProp && CFGetTypeID(classProp) == CFStringGetTypeID()) {
+                        NSString *cls = (__bridge NSString *)classProp;
+                        if (![seenClasses containsObject:cls]) {
+                            [seenClasses addObject:cls];
+                            mach_port_t conn = 0;
+                            kern_return_t okr = ioOpen(entry, mach_task_self(), 0, &conn);
+                            if (okr == KERN_SUCCESS && conn) {
+                                log([NSString stringWithFormat:@"JB23: [REGISTRY-OPEN] %@ tipo=0", cls]);
+                                totalOpenable++;
+                                [openable addObject:[NSString stringWithFormat:@"%@:registry", cls]];
+                                ioClose(conn);
                             }
                         }
-                        if (classProp) CFRelease(classProp);
-                        ioRelease(entry);
                     }
-                    ioRelease(regIter);
-                    log([NSString stringWithFormat:@"JB23: Registry scan: %d entries, %lu clases unicas",
-                         regCount, (unsigned long)[seenClasses count]]);
+                    if (classProp) CFRelease(classProp);
+                    ioRelease(entry);
                 }
+                ioRelease(regIt);
+                log([NSString stringWithFormat:@"JB23: Registry scan: %d entries, %lu clases unicas",
+                     regCount, (unsigned long)[seenClasses count]]);
             }
         }
 
@@ -27946,6 +27866,464 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
             @"elapsed": @(elapsed)
         };
         isr_checkpoint(@"JB23-iokit-enum-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
+
+// =============================================================================
+// PROBE JB24: AppleM2ScalerCSCDriver Deep Fuzz — CVE-2026-43655 variant hunt
+// =============================================================================
+#pragma mark - JB24: AppleM2ScalerCSCDriver Deep Fuzz
+
+void iosurface_m2scaler_fuzz(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB24: === AppleM2ScalerCSCDriver Deep Fuzz ===");
+        log(@"JB24: Target: selectores 12-19, 8 conn types, basado en CVE-2026-43655 UAF");
+
+        ISRSymbols sym = {0};
+        if (!isr_load(&sym)) {
+            log(@"JB24: [!] No se pudieron cargar simbolos");
+            done(@{@"error": @"symbols_failed"});
+            return;
+        }
+
+        typedef CFMutableDictionaryRef (*IOServiceMatchingFn)(const char *);
+        typedef kern_return_t (*IOServiceGetMatchingServicesFn)(mach_port_t, CFDictionaryRef, mach_port_t *);
+        typedef mach_port_t (*IOIteratorNextFn)(mach_port_t);
+        typedef kern_return_t (*IOServiceOpenFn)(mach_port_t, task_port_t, uint32_t, mach_port_t *);
+        typedef kern_return_t (*IOServiceCloseFn)(mach_port_t);
+        typedef kern_return_t (*IOObjectReleaseFn)(mach_port_t);
+        typedef kern_return_t (*IOConnectCallMethodFn)(mach_port_t, uint32_t,
+            const uint64_t *, uint32_t, const void *, size_t,
+            uint64_t *, uint32_t *, void *, size_t *);
+        typedef kern_return_t (*IOConnectCallAsyncMethodFn)(mach_port_t, uint32_t,
+            mach_port_t, uint64_t *, uint32_t,
+            const uint64_t *, uint32_t, const void *, size_t,
+            uint64_t *, uint32_t *, void *, size_t *);
+        typedef kern_return_t (*IOConnectMapMemoryFn)(mach_port_t, uint32_t, task_port_t,
+            mach_vm_address_t *, mach_vm_size_t *, uint32_t);
+        typedef kern_return_t (*IOConnectUnmapMemoryFn)(mach_port_t, uint32_t, task_port_t,
+            mach_vm_address_t);
+
+        IOServiceMatchingFn ioMatching = (IOServiceMatchingFn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        IOServiceGetMatchingServicesFn ioGetMatching = (IOServiceGetMatchingServicesFn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        IOIteratorNextFn ioNext = (IOIteratorNextFn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        IOServiceOpenFn ioOpen = (IOServiceOpenFn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        IOServiceCloseFn ioClose = (IOServiceCloseFn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        IOObjectReleaseFn ioRelease = (IOObjectReleaseFn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        IOConnectCallMethodFn ioCallMethod = (IOConnectCallMethodFn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        IOConnectCallAsyncMethodFn ioCallAsync = (IOConnectCallAsyncMethodFn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        IOConnectMapMemoryFn ioMapMem = (IOConnectMapMemoryFn)dlsym(RTLD_DEFAULT, "IOConnectMapMemory64");
+        IOConnectUnmapMemoryFn ioUnmapMem = (IOConnectUnmapMemoryFn)dlsym(RTLD_DEFAULT, "IOConnectUnmapMemory64");
+
+        if (!ioMatching || !ioGetMatching || !ioNext || !ioOpen || !ioClose || !ioRelease || !ioCallMethod) {
+            log(@"JB24: [!] Faltan simbolos");
+            isr_unload(&sym);
+            done(@{@"error": @"symbols_missing"});
+            return;
+        }
+
+        // Find AppleM2ScalerCSCDriver service
+        CFMutableDictionaryRef matchDict = ioMatching("AppleM2ScalerCSCDriver");
+        if (!matchDict) {
+            log(@"JB24: [!] No se encontro AppleM2ScalerCSCDriver");
+            isr_unload(&sym);
+            done(@{@"error": @"no_service"});
+            return;
+        }
+
+        mach_port_t svcIter = 0;
+        kern_return_t kr = ioGetMatching(0, matchDict, &svcIter);
+        if (kr != KERN_SUCCESS || !svcIter) {
+            log(@"JB24: [!] IOServiceGetMatchingServices fallo");
+            isr_unload(&sym);
+            done(@{@"error": @"matching_failed"});
+            return;
+        }
+
+        mach_port_t service = ioNext(svcIter);
+        ioRelease(svcIter);
+        if (!service) {
+            log(@"JB24: [!] No hay instancia del servicio");
+            isr_unload(&sym);
+            done(@{@"error": @"no_instance"});
+            return;
+        }
+
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
+        int totalCalls = 0;
+        int totalAccepted = 0;
+        int totalErrors = 0;
+        int mapSuccess = 0;
+        int asyncSuccess = 0;
+        NSMutableArray *anomalies = [NSMutableArray array];
+        NSMutableDictionary *selectorMap = [NSMutableDictionary dictionary];
+
+        // === FASE 1: Detailed selector profiling on type 0 ===
+        log(@"JB24: === Fase 1: Perfil detallado de selectores ===");
+        {
+            mach_port_t conn = 0;
+            kr = ioOpen(service, mach_task_self(), 0, &conn);
+            if (kr == KERN_SUCCESS && conn) {
+                for (uint32_t sel = 0; sel < 30 && !isr_stopped(); sel++) {
+                    // Test with different input sizes
+                    uint32_t sizes[] = {0, 8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 4096};
+                    NSMutableArray *acceptedSizes = [NSMutableArray array];
+
+                    for (int si = 0; si < 12 && !isr_stopped(); si++) {
+                        uint32_t sz = sizes[si];
+                        char *structIn = (char *)calloc(sz + 1, 1);
+                        uint64_t scalarOut[8] = {0};
+                        uint32_t scalarOutCnt = 8;
+                        char structOut[4096] = {0};
+                        size_t structOutSz = sizeof(structOut);
+
+                        kr = ioCallMethod(conn, sel,
+                            NULL, 0, structIn, sz,
+                            scalarOut, &scalarOutCnt, structOut, &structOutSz);
+                        totalCalls++;
+
+                        if (kr != (kern_return_t)0xe00002c2 && kr != (kern_return_t)0xe00002c9) {
+                            totalAccepted++;
+                            [acceptedSizes addObject:[NSString stringWithFormat:@"%u(0x%x)", sz, kr]];
+                        }
+                        free(structIn);
+                    }
+
+                    if ([acceptedSizes count] > 0) {
+                        log([NSString stringWithFormat:@"JB24:   sel%u: %lu sizes OK: %@",
+                             sel, (unsigned long)[acceptedSizes count], acceptedSizes]);
+                        selectorMap[[NSString stringWithFormat:@"sel%u", sel]] = acceptedSizes;
+                    }
+                }
+
+                // Test with scalar inputs too
+                log(@"JB24: --- Scalar input test ---");
+                for (uint32_t sel = 12; sel < 20 && !isr_stopped(); sel++) {
+                    for (uint32_t nScalar = 1; nScalar <= 8 && !isr_stopped(); nScalar++) {
+                        uint64_t scalars[8] = {0};
+                        uint64_t scalarOut[8] = {0};
+                        uint32_t scalarOutCnt = 8;
+
+                        kr = ioCallMethod(conn, sel,
+                            scalars, nScalar, NULL, 0,
+                            scalarOut, &scalarOutCnt, NULL, NULL);
+                        totalCalls++;
+
+                        if (kr != (kern_return_t)0xe00002c2 && kr != (kern_return_t)0xe00002c9) {
+                            totalAccepted++;
+                            log([NSString stringWithFormat:@"JB24:   sel%u scalar[%u]: kr=0x%x outCnt=%u out0=0x%llx",
+                                 sel, nScalar, kr, scalarOutCnt, scalarOut[0]]);
+                        }
+                    }
+                }
+
+                ioClose(conn);
+            } else {
+                log([NSString stringWithFormat:@"JB24: [!] No se pudo abrir tipo 0: 0x%x", kr]);
+            }
+        }
+
+        // === FASE 2: Memory mapping attempts ===
+        if (!isr_stopped() && ioMapMem) {
+            log(@"JB24: === Fase 2: Memory mapping ===");
+            mach_port_t conn = 0;
+            kr = ioOpen(service, mach_task_self(), 0, &conn);
+            if (kr == KERN_SUCCESS && conn) {
+                for (uint32_t memType = 0; memType < 10 && !isr_stopped(); memType++) {
+                    mach_vm_address_t addr = 0;
+                    mach_vm_size_t size = 0;
+                    kr = ioMapMem(conn, memType, mach_task_self(), &addr, &size, 1);
+                    if (kr == KERN_SUCCESS && addr) {
+                        mapSuccess++;
+                        log([NSString stringWithFormat:@"JB24: [MAP] tipo=%u addr=0x%llx size=0x%llx",
+                             memType, (uint64_t)addr, (uint64_t)size]);
+
+                        // Read first bytes
+                        uint64_t *ptr = (uint64_t *)addr;
+                        log([NSString stringWithFormat:@"JB24:   data: 0x%llx 0x%llx 0x%llx 0x%llx",
+                             ptr[0], ptr[1], ptr[2], ptr[3]]);
+
+                        // Check for kernel pointers
+                        for (int i = 0; i < 64 && i * 8 < (int)size; i++) {
+                            uint64_t val = ptr[i];
+                            if ((val & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
+                                log([NSString stringWithFormat:@"JB24: [KPTR!] offset=%d val=0x%llx", i*8, val]);
+                                [anomalies addObject:[NSString stringWithFormat:@"kptr_map_%u_off%d:0x%llx", memType, i*8, val]];
+                            }
+                        }
+
+                        if (ioUnmapMem) {
+                            ioUnmapMem(conn, memType, mach_task_self(), addr);
+                        }
+                    } else if (kr != (kern_return_t)0xe00002c2) {
+                        log([NSString stringWithFormat:@"JB24:   map tipo=%u: 0x%x", memType, kr]);
+                    }
+                }
+                ioClose(conn);
+            }
+        }
+
+        // === FASE 3: Async method calls (CVE-2026-43655 was UAF via async path) ===
+        if (!isr_stopped() && ioCallAsync) {
+            log(@"JB24: === Fase 3: Async method calls (vector UAF) ===");
+            mach_port_t conn = 0;
+            kr = ioOpen(service, mach_task_self(), 0, &conn);
+            if (kr == KERN_SUCCESS && conn) {
+                for (uint32_t sel = 12; sel < 20 && !isr_stopped(); sel++) {
+                    mach_port_t wp = MACH_PORT_NULL;
+                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &wp);
+                    if (!wp) continue;
+
+                    uint64_t ref = 0xDEAD000000000000ULL | sel;
+                    char structIn[64] = {0};
+                    uint64_t scalarOut[8] = {0};
+                    uint32_t scalarOutCnt = 8;
+                    char structOut[256] = {0};
+                    size_t structOutSz = sizeof(structOut);
+
+                    kr = ioCallAsync(conn, sel, wp, &ref, 1,
+                        NULL, 0, structIn, 24,
+                        scalarOut, &scalarOutCnt, structOut, &structOutSz);
+                    totalCalls++;
+
+                    if (kr == KERN_SUCCESS) {
+                        asyncSuccess++;
+                        log([NSString stringWithFormat:@"JB24: [ASYNC-OK] sel%u outCnt=%u out0=0x%llx structOutSz=%zu",
+                             sel, scalarOutCnt, scalarOut[0], structOutSz]);
+                    } else if (kr != (kern_return_t)0xe00002c2 && kr != (kern_return_t)0xe00002c9) {
+                        log([NSString stringWithFormat:@"JB24: [ASYNC] sel%u: 0x%x", sel, kr]);
+                    }
+
+                    mach_port_mod_refs(mach_task_self(), wp, MACH_PORT_RIGHT_RECEIVE, -1);
+                }
+                ioClose(conn);
+            }
+        }
+
+        // === FASE 4: Race condition — open/call/close concurrent ===
+        if (!isr_stopped()) {
+            log(@"JB24: === Fase 4: Race condition open/call/close ===");
+
+            __block int raceAnomalies = 0;
+            __block int raceSuccess = 0;
+            __block volatile int go = 0;
+
+            for (int attempt = 0; attempt < 200 && !isr_stopped(); attempt++) {
+                mach_port_t conn = 0;
+                kr = ioOpen(service, mach_task_self(), attempt % 8, &conn);
+                if (kr != KERN_SUCCESS || !conn) continue;
+
+                // Call sel 12 (first active selector) with crafted input
+                uint64_t scalarIn[2] = {0x41414141, attempt};
+                char structIn[64];
+                memset(structIn, 0x42, sizeof(structIn));
+                // Put IOSurface-like patterns
+                ((uint64_t *)structIn)[0] = 0x4141414141414141ULL;
+                ((uint64_t *)structIn)[1] = (uint64_t)attempt;
+                ((uint32_t *)structIn)[4] = 64;  // width-like
+                ((uint32_t *)structIn)[5] = 64;  // height-like
+
+                uint64_t scalarOut[8] = {0};
+                uint32_t scalarOutCnt = 8;
+                char structOut[4096] = {0};
+                size_t structOutSz = sizeof(structOut);
+
+                kr = ioCallMethod(conn, 12,
+                    scalarIn, 2, structIn, 64,
+                    scalarOut, &scalarOutCnt, structOut, &structOutSz);
+                totalCalls++;
+
+                if (kr == KERN_SUCCESS) {
+                    raceSuccess++;
+                    // Check output for interesting data
+                    if (scalarOut[0] != 0 || structOutSz > 0) {
+                        log([NSString stringWithFormat:@"JB24: [RACE] attempt=%d sel12 OK outCnt=%u out0=0x%llx structSz=%zu",
+                             attempt, scalarOutCnt, scalarOut[0], structOutSz]);
+
+                        // Scan output for kernel pointers
+                        uint64_t *outPtr = (uint64_t *)structOut;
+                        for (int i = 0; i < (int)(structOutSz / 8); i++) {
+                            if ((outPtr[i] & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
+                                raceAnomalies++;
+                                log([NSString stringWithFormat:@"JB24: [KPTR-OUT!] sel12 off=%d val=0x%llx", i*8, outPtr[i]]);
+                                [anomalies addObject:[NSString stringWithFormat:@"kptr_sel12_off%d:0x%llx", i*8, outPtr[i]]];
+                            }
+                        }
+                    }
+                }
+
+                // Now try all selectors 13-19 quickly before close
+                for (uint32_t sel = 13; sel < 20 && !isr_stopped(); sel++) {
+                    scalarOutCnt = 8;
+                    structOutSz = sizeof(structOut);
+                    memset(scalarOut, 0, sizeof(scalarOut));
+                    memset(structOut, 0, sizeof(structOut));
+
+                    kr = ioCallMethod(conn, sel,
+                        scalarIn, 2, structIn, 64,
+                        scalarOut, &scalarOutCnt, structOut, &structOutSz);
+                    totalCalls++;
+
+                    if (kr == KERN_SUCCESS && (scalarOut[0] != 0 || structOutSz != sizeof(structOut))) {
+                        log([NSString stringWithFormat:@"JB24: [DATA] sel%u out0=0x%llx outCnt=%u structSz=%zu",
+                             sel, scalarOut[0], scalarOutCnt, structOutSz]);
+                    }
+                }
+
+                ioClose(conn);
+            }
+
+            log([NSString stringWithFormat:@"JB24: Race: %d success, %d anomalias kernel ptr", raceSuccess, raceAnomalies]);
+        }
+
+        // === FASE 5: Cross-type confusion — call on type X, close, call on type Y ===
+        if (!isr_stopped()) {
+            log(@"JB24: === Fase 5: Cross-type confusion ===");
+            int crossAnomalies = 0;
+
+            for (uint32_t typeA = 0; typeA < 8 && !isr_stopped(); typeA++) {
+                for (uint32_t typeB = typeA + 1; typeB < 8 && !isr_stopped(); typeB++) {
+                    mach_port_t connA = 0, connB = 0;
+                    kr = ioOpen(service, mach_task_self(), typeA, &connA);
+                    if (kr != KERN_SUCCESS || !connA) continue;
+                    kr = ioOpen(service, mach_task_self(), typeB, &connB);
+                    if (kr != KERN_SUCCESS || !connB) { ioClose(connA); continue; }
+
+                    // Call sel 12 on A
+                    char structIn[64] = {0};
+                    ((uint64_t *)structIn)[0] = 0xAAAAAAAAAAAAAAAAULL;
+                    uint64_t outA[8] = {0};
+                    uint32_t outACnt = 8;
+                    kern_return_t krA = ioCallMethod(connA, 12, NULL, 0, structIn, 64, outA, &outACnt, NULL, NULL);
+
+                    // Close A
+                    ioClose(connA);
+
+                    // Immediately call sel 12 on B — does it see A's state?
+                    uint64_t outB[8] = {0};
+                    uint32_t outBCnt = 8;
+                    char structOutB[4096] = {0};
+                    size_t structOutBSz = sizeof(structOutB);
+                    kern_return_t krB = ioCallMethod(connB, 12, NULL, 0, structIn, 64, outB, &outBCnt, structOutB, &structOutBSz);
+
+                    if (krA == KERN_SUCCESS && krB == KERN_SUCCESS) {
+                        // Check if B got data from A's context
+                        if (outB[0] != 0) {
+                            crossAnomalies++;
+                            log([NSString stringWithFormat:@"JB24: [CROSS] type%u->%u outB0=0x%llx", typeA, typeB, outB[0]]);
+                            [anomalies addObject:[NSString stringWithFormat:@"cross_%u_%u:0x%llx", typeA, typeB, outB[0]]];
+                        }
+                    }
+                    totalCalls += 2;
+                    ioClose(connB);
+                }
+            }
+            log([NSString stringWithFormat:@"JB24: Cross-type: %d anomalias", crossAnomalies]);
+        }
+
+        // === FASE 6: Rapid open/close race (UAF trigger attempt) ===
+        if (!isr_stopped()) {
+            log(@"JB24: === Fase 6: Rapid open/close UAF race ===");
+
+            __block int uafSigns = 0;
+            dispatch_queue_t q1 = dispatch_queue_create("jb24.opener", DISPATCH_QUEUE_CONCURRENT);
+            dispatch_queue_t q2 = dispatch_queue_create("jb24.caller", DISPATCH_QUEUE_CONCURRENT);
+            dispatch_group_t grp = dispatch_group_create();
+
+            __block volatile mach_port_t sharedConn = 0;
+            __block volatile int phase = 0;
+
+            for (int round = 0; round < 100 && !isr_stopped(); round++) {
+                mach_port_t c = 0;
+                kr = ioOpen(service, mach_task_self(), round % 8, &c);
+                if (kr != KERN_SUCCESS || !c) continue;
+                sharedConn = c;
+                phase = 0;
+
+                // Thread 1: call sel 12 repeatedly
+                dispatch_group_async(grp, q1, ^{
+                    for (int i = 0; i < 50 && phase == 0; i++) {
+                        char si[64] = {0};
+                        ((uint64_t *)si)[0] = 0xBBBBBBBBBBBBBBBBULL;
+                        uint64_t so[4] = {0};
+                        uint32_t soCnt = 4;
+                        mach_port_t cc = sharedConn;
+                        if (cc) {
+                            kern_return_t kkr = ioCallMethod(cc, 12, NULL, 0, si, 64, so, &soCnt, NULL, NULL);
+                            if (kkr == KERN_SUCCESS && so[0] != 0) {
+                                uafSigns++;
+                            }
+                        }
+                    }
+                });
+
+                // Thread 2: close after small delay
+                dispatch_group_async(grp, q2, ^{
+                    usleep(50 + (round % 100));
+                    mach_port_t cc = sharedConn;
+                    if (cc) {
+                        ioClose(cc);
+                        sharedConn = 0;
+                        phase = 1;
+                    }
+                });
+
+                dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC));
+
+                if (sharedConn) {
+                    ioClose(sharedConn);
+                    sharedConn = 0;
+                }
+            }
+
+            log([NSString stringWithFormat:@"JB24: UAF race: %d signos post-close", uafSigns]);
+            if (uafSigns > 0) {
+                [anomalies addObject:[NSString stringWithFormat:@"uaf_race_signs:%d", uafSigns]];
+            }
+        }
+
+        ioRelease(service);
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+
+        log(@"JB24: =============================================");
+        log([NSString stringWithFormat:@"JB24: Total calls: %d", totalCalls]);
+        log([NSString stringWithFormat:@"JB24: Accepted: %d", totalAccepted]);
+        log([NSString stringWithFormat:@"JB24: Map success: %d", mapSuccess]);
+        log([NSString stringWithFormat:@"JB24: Async success: %d", asyncSuccess]);
+        log([NSString stringWithFormat:@"JB24: Anomalias: %lu", (unsigned long)[anomalies count]]);
+        for (NSString *a in anomalies) {
+            log([NSString stringWithFormat:@"JB24:   %@", a]);
+        }
+        log([NSString stringWithFormat:@"JB24: Tiempo: %.2fs", elapsed]);
+
+        NSString *verdict = @"NO_VULNERABILITY";
+        if ([anomalies count] > 10) verdict = @"UAF_CONFIRMED";
+        else if ([anomalies count] > 3) verdict = @"MEMORY_CORRUPTION_LIKELY";
+        else if ([anomalies count] > 0) verdict = @"ANOMALIES_DETECTED";
+        else if (mapSuccess > 0) verdict = @"SHARED_MEMORY_ACCESSIBLE";
+        else if (asyncSuccess > 0) verdict = @"ASYNC_PATH_OPEN";
+
+        log([NSString stringWithFormat:@"JB24: Veredicto: %@", verdict]);
+        log(@"JB24: =============================================");
+
+        NSDictionary *res = @{
+            @"totalCalls": @(totalCalls),
+            @"accepted": @(totalAccepted),
+            @"mapSuccess": @(mapSuccess),
+            @"asyncSuccess": @(asyncSuccess),
+            @"anomalies": @([anomalies count]),
+            @"anomalyList": anomalies,
+            @"selectorMap": selectorMap,
+            @"verdict": verdict,
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"JB24-m2scaler-fuzz-checkpoint.json", res);
         isr_unload(&sym);
         done(res);
     });
@@ -28492,5 +28870,6 @@ void iosurface_cg_oob_write(ISRLogBlock log, ISRDoneBlock done) {
 
         isr_checkpoint(@"JB25-cg-oob-write-checkpoint.json", results);
         done(results);
+
     });
 }
