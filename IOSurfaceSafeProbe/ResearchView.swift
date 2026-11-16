@@ -425,6 +425,10 @@ struct ResearchView: View {
         ("directstrike", "Direct Strike", "bolt.shield.fill",
          "Zero-write directo a sandbox strings + AMFI entitlements + csops flags",
          { log, done in iosurface_direct_strike({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB29 - ISA Swizzle
+        ("isaswizzle", "ISA Swizzle", "arrow.triangle.swap",
+         "ObjC ISA corruption -> fake class -> controlled objc_msgSend -> code exec",
+         { log, done in iosurface_isa_swizzle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
