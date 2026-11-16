@@ -27652,18 +27652,19 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
             return;
         }
 
-        typedef io_object_t (*IOIteratorNextFn)(io_iterator_t);
-        typedef kern_return_t (*IORegistryEntryGetNameFn)(io_object_t, io_name_t);
+        // All IOKit types are mach_port_t underneath; use raw types to avoid module issues
+        typedef mach_port_t (*IOIteratorNextFn)(mach_port_t);
+        typedef kern_return_t (*IORegistryEntryGetNameFn)(mach_port_t, char *);
         typedef CFMutableDictionaryRef (*IOServiceMatchingFn)(const char *);
-        typedef kern_return_t (*IOServiceGetMatchingServicesFn)(mach_port_t, CFDictionaryRef, io_iterator_t *);
-        typedef kern_return_t (*IOServiceOpenFn)(io_object_t, task_port_t, uint32_t, io_connect_t *);
-        typedef kern_return_t (*IOServiceCloseFn)(io_connect_t);
-        typedef kern_return_t (*IOObjectReleaseFn)(io_object_t);
-        typedef kern_return_t (*IORegistryEntryGetPropertyFn)(io_object_t, const io_name_t, CFTypeRef *);
-        typedef CFTypeRef (*IORegistryEntryCreateCFPropertyFn)(io_object_t, CFStringRef, CFAllocatorRef, IOOptionBits);
-        typedef kern_return_t (*IOConnectCallMethodFn)(io_connect_t, uint32_t,
+        typedef kern_return_t (*IOServiceGetMatchingServicesFn)(mach_port_t, CFDictionaryRef, mach_port_t *);
+        typedef kern_return_t (*IOServiceOpenFn)(mach_port_t, task_port_t, uint32_t, mach_port_t *);
+        typedef kern_return_t (*IOServiceCloseFn)(mach_port_t);
+        typedef kern_return_t (*IOObjectReleaseFn)(mach_port_t);
+        typedef CFTypeRef (*IORegistryEntryCreateCFPropertyFn)(mach_port_t, CFStringRef, CFAllocatorRef, uint32_t);
+        typedef kern_return_t (*IOConnectCallMethodFn)(mach_port_t, uint32_t,
             const uint64_t *, uint32_t, const void *, size_t,
             uint64_t *, uint32_t *, void *, size_t *);
+        typedef kern_return_t (*IORegistryCreateIteratorFn)(mach_port_t, const char *, uint32_t, mach_port_t *);
 
         IOIteratorNextFn ioNext = (IOIteratorNextFn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
         IORegistryEntryGetNameFn ioGetName = (IORegistryEntryGetNameFn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
@@ -27674,6 +27675,7 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
         IOObjectReleaseFn ioRelease = (IOObjectReleaseFn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
         IORegistryEntryCreateCFPropertyFn ioCreateProp = (IORegistryEntryCreateCFPropertyFn)dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
         IOConnectCallMethodFn ioCallMethod = (IOConnectCallMethodFn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        IORegistryCreateIteratorFn ioRegIter = (IORegistryCreateIteratorFn)dlsym(RTLD_DEFAULT, "IORegistryCreateIterator");
 
         if (!ioNext || !ioGetName || !ioMatching || !ioGetMatching || !ioOpen || !ioClose || !ioRelease || !ioCreateProp || !ioCallMethod) {
             log(@"JB23: [!] Faltan simbolos IOKit");
@@ -27682,91 +27684,31 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
             return;
         }
 
-        // Known IOKit service class names to try
         NSArray *serviceClasses = @[
-            // Core graphics/display
-            @"IOSurfaceRoot",
-            @"IOMobileFramebuffer",
-            @"IOSurfaceAccelerator",
+            @"IOSurfaceRoot", @"IOMobileFramebuffer", @"IOSurfaceAccelerator",
             @"IOMobileFramebufferShim",
-            // GPU
-            @"AGXAccelerator",
-            @"AGXAcceleratorG15P",
-            @"AGXAcceleratorG15G",
-            @"IOGPU",
-            @"IOGPUDevice",
-            @"AGXFamilyAccelerator",
-            @"AGXDeviceUserClient",
-            // Media
-            @"AppleJPEGDriver",
-            @"AppleAVE2Driver",
-            @"AppleAVE2UserClient",
-            @"AppleVXE380",
-            @"AppleVXD394",
-            @"AppleM2ScalerCSCDriver",
-            @"IOAVService",
-            // Audio
-            @"AppleHDAController",
-            @"IOAudioEngine",
-            @"AppleSPU",
-            // HID/Input
-            @"IOHIDSystem",
-            @"IOHIDUserDevice",
-            @"AppleMultitouchDevice",
-            @"IOHIDEventService",
-            @"AppleHIDTransportSPI",
-            // Crypto/Security
-            @"AppleKeyStore",
-            @"IOAESAccelerator",
-            @"AppleSEP",
-            @"AppleSEPManager",
-            @"AppleCredentialManager",
-            @"AppleSSE",
-            // Storage
-            @"IONVMeController",
-            @"AppleANS3NVMeController",
-            @"IOFlashController",
-            // Network
-            @"IONetworkInterface",
-            @"IOEthernetController",
-            @"IO80211Controller",
+            @"AGXAccelerator", @"AGXAcceleratorG15P", @"AGXAcceleratorG15G",
+            @"IOGPU", @"IOGPUDevice", @"AGXFamilyAccelerator", @"AGXDeviceUserClient",
+            @"AppleJPEGDriver", @"AppleAVE2Driver", @"AppleAVE2UserClient",
+            @"AppleVXE380", @"AppleVXD394", @"AppleM2ScalerCSCDriver", @"IOAVService",
+            @"AppleHDAController", @"IOAudioEngine", @"AppleSPU",
+            @"IOHIDSystem", @"IOHIDUserDevice", @"AppleMultitouchDevice",
+            @"IOHIDEventService", @"AppleHIDTransportSPI",
+            @"AppleKeyStore", @"IOAESAccelerator", @"AppleSEP", @"AppleSEPManager",
+            @"AppleCredentialManager", @"AppleSSE",
+            @"IONVMeController", @"AppleANS3NVMeController", @"IOFlashController",
+            @"IONetworkInterface", @"IOEthernetController", @"IO80211Controller",
             @"AppleBCMWLANCore",
-            // USB/Lightning
-            @"IOUSBHostDevice",
-            @"AppleSynapsesDriver",
-            @"IOAccessoryManager",
-            // Sensors
-            @"AppleOscarAccelerometer",
-            @"AppleSensorHub",
-            @"CoreMotion",
-            @"CLLocationManager",
-            // Power
-            @"AppleSmartBatteryManager",
-            @"IOPMrootDomain",
-            @"ApplePMGR",
-            // Misc kernel
-            @"IOUserEthernetController",
-            @"AppleImage4",
-            @"AppleEffaceableStorage",
-            @"AppleMobileFileIntegrity",
-            @"AppleARMPE",
-            @"AppleSMC",
-            @"AppleBiometricServices",
-            @"AppleFirmwareUpdateKext",
-            // DCP (Display Coprocessor)
-            @"IOMFBDevice",
-            @"AppleDCP",
-            @"DCPAVService",
-            // Neural Engine
-            @"AppleH11ANEIn",
-            @"H11ANEIn",
-            @"AppleNeuralEngine",
-            // Additional drivers
-            @"AppleSPIMC",
-            @"AppleT8020DART",
-            @"AppleDARTMapper",
-            @"AppleConvergedIPCOLYBTControl",
-            @"AppleBluetooth",
+            @"IOUSBHostDevice", @"AppleSynapsesDriver", @"IOAccessoryManager",
+            @"AppleOscarAccelerometer", @"AppleSensorHub",
+            @"AppleSmartBatteryManager", @"IOPMrootDomain", @"ApplePMGR",
+            @"IOUserEthernetController", @"AppleImage4", @"AppleEffaceableStorage",
+            @"AppleMobileFileIntegrity", @"AppleARMPE", @"AppleSMC",
+            @"AppleBiometricServices", @"AppleFirmwareUpdateKext",
+            @"IOMFBDevice", @"AppleDCP", @"DCPAVService",
+            @"AppleH11ANEIn", @"H11ANEIn", @"AppleNeuralEngine",
+            @"AppleSPIMC", @"AppleT8020DART", @"AppleDARTMapper",
+            @"AppleConvergedIPCOLYBTControl", @"AppleBluetooth",
             @"IOBluetoothHCIController",
         ];
 
@@ -27776,6 +27718,7 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
         int totalServices = 0;
         int totalAccessible = 0;
         int totalOpenable = 0;
+        kern_return_t kr;
 
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
@@ -27786,45 +27729,32 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
             CFMutableDictionaryRef matchDict = ioMatching([className UTF8String]);
             if (!matchDict) continue;
 
-            io_iterator_t iter = 0;
-            kern_return_t kr = ioGetMatching(0, matchDict, &iter);
-            if (kr != KERN_SUCCESS || !iter) continue;
+            mach_port_t svcIter = 0;
+            kr = ioGetMatching(0, matchDict, &svcIter);
+            if (kr != KERN_SUCCESS || !svcIter) continue;
 
-            io_object_t service;
+            mach_port_t service;
             int instanceCount = 0;
-            while ((service = ioNext(iter)) != 0 && !isr_stopped()) {
+            while ((service = ioNext(svcIter)) != 0 && !isr_stopped()) {
                 instanceCount++;
                 totalServices++;
 
-                io_name_t name;
-                ioGetName(service, name);
-
-                // Try to get IOClass property
-                NSString *ioClass = @"?";
-                CFTypeRef classProp = ioCreateProp(service, CFSTR("IOClass"), kCFAllocatorDefault, 0);
-                if (classProp) {
-                    if (CFGetTypeID(classProp) == CFStringGetTypeID()) {
-                        ioClass = (__bridge NSString *)classProp;
-                    }
-                    CFRelease(classProp);
-                }
+                char nameBuf[128] = {0};
+                ioGetName(service, nameBuf);
 
                 totalAccessible++;
-                [accessible addObject:[NSString stringWithFormat:@"%@ (name:%s)", className, name]];
+                [accessible addObject:[NSString stringWithFormat:@"%@ (name:%s)", className, nameBuf]];
 
-                // Try opening with connection types 0-7
                 BOOL didOpen = NO;
                 for (uint32_t connType = 0; connType <= 7 && !isr_stopped(); connType++) {
-                    io_connect_t conn = 0;
+                    mach_port_t conn = 0;
                     kr = ioOpen(service, mach_task_self(), connType, &conn);
                     if (kr == KERN_SUCCESS && conn) {
                         didOpen = YES;
-                        NSString *entry = [NSString stringWithFormat:@"%@:type%u", className, connType];
-                        [openable addObject:entry];
+                        [openable addObject:[NSString stringWithFormat:@"%@:type%u", className, connType]];
                         totalOpenable++;
                         log([NSString stringWithFormat:@"JB23: [OPEN] %@ tipo=%u conn=0x%x", className, connType, conn]);
 
-                        // Quick selector scan 0-19
                         int acceptedSels = 0;
                         NSMutableArray *workingSels = [NSMutableArray array];
                         for (uint32_t sel = 0; sel < 20 && !isr_stopped(); sel++) {
@@ -27832,7 +27762,6 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
                             uint32_t scalarOutCnt = 4;
                             char structOut[256] = {0};
                             size_t structOutSz = sizeof(structOut);
-
                             uint64_t scalarIn[2] = {0, 0};
                             char structIn[24] = {0};
 
@@ -27840,7 +27769,7 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
                                 scalarIn, 2, structIn, sizeof(structIn),
                                 scalarOut, &scalarOutCnt, structOut, &structOutSz);
 
-                            if (skr != 0xe00002c2 && skr != 0xe00002c9) {
+                            if (skr != (kern_return_t)0xe00002c2 && skr != (kern_return_t)0xe00002c9) {
                                 acceptedSels++;
                                 [workingSels addObject:@(sel)];
                             }
@@ -27867,52 +27796,43 @@ void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
 
                 ioRelease(service);
             }
-            if (iter) ioRelease(iter);
+            if (svcIter) ioRelease(svcIter);
         }
 
-        // === FASE 2: Enumeracion generica via IORegistryEntryCreateIterator ===
-        if (!isr_stopped()) {
+        // === FASE 2: Generic IORegistry walk ===
+        if (!isr_stopped() && ioRegIter) {
             log(@"JB23: === Fase 2: Enumeracion generica del IORegistry ===");
 
-            typedef kern_return_t (*IORegistryCreateIteratorFn)(mach_port_t, const io_name_t, IOOptionBits, io_iterator_t *);
-            typedef kern_return_t (*IORegistryEntryGetPathFn)(io_object_t, const io_name_t, io_string_t);
-            IORegistryCreateIteratorFn ioRegIter = (IORegistryCreateIteratorFn)dlsym(RTLD_DEFAULT, "IORegistryCreateIterator");
-            IORegistryEntryGetPathFn ioGetPath = (IORegistryEntryGetPathFn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetPath");
+            mach_port_t regIt = 0;
+            kr = ioRegIter(0, "IOService", 3, &regIt);
+            if (kr == KERN_SUCCESS && regIt) {
+                mach_port_t entry;
+                int regCount = 0;
+                NSMutableSet *seenClasses = [NSMutableSet set];
 
-            if (ioRegIter) {
-                io_iterator_t regIter = 0;
-                kr = ioRegIter(0, "IOService", 3, &regIter); // kIORegistryIterateRecursively | kIORegistryIterateParents
-                if (kr == KERN_SUCCESS && regIter) {
-                    io_object_t entry;
-                    int regCount = 0;
-                    NSMutableSet *seenClasses = [NSMutableSet set];
-
-                    while ((entry = ioNext(regIter)) != 0 && regCount < 500 && !isr_stopped()) {
-                        regCount++;
-                        CFTypeRef classProp = ioCreateProp(entry, CFSTR("IOClass"), kCFAllocatorDefault, 0);
-                        if (classProp && CFGetTypeID(classProp) == CFStringGetTypeID()) {
-                            NSString *cls = (__bridge NSString *)classProp;
-                            if (![seenClasses containsObject:cls]) {
-                                [seenClasses addObject:cls];
-
-                                // Try opening this class
-                                io_connect_t conn = 0;
-                                kern_return_t okr = ioOpen(entry, mach_task_self(), 0, &conn);
-                                if (okr == KERN_SUCCESS && conn) {
-                                    log([NSString stringWithFormat:@"JB23: [REGISTRY-OPEN] %@ tipo=0", cls]);
-                                    totalOpenable++;
-                                    [openable addObject:[NSString stringWithFormat:@"%@:registry", cls]];
-                                    ioClose(conn);
-                                }
+                while ((entry = ioNext(regIt)) != 0 && regCount < 500 && !isr_stopped()) {
+                    regCount++;
+                    CFTypeRef classProp = ioCreateProp(entry, CFSTR("IOClass"), kCFAllocatorDefault, 0);
+                    if (classProp && CFGetTypeID(classProp) == CFStringGetTypeID()) {
+                        NSString *cls = (__bridge NSString *)classProp;
+                        if (![seenClasses containsObject:cls]) {
+                            [seenClasses addObject:cls];
+                            mach_port_t conn = 0;
+                            kern_return_t okr = ioOpen(entry, mach_task_self(), 0, &conn);
+                            if (okr == KERN_SUCCESS && conn) {
+                                log([NSString stringWithFormat:@"JB23: [REGISTRY-OPEN] %@ tipo=0", cls]);
+                                totalOpenable++;
+                                [openable addObject:[NSString stringWithFormat:@"%@:registry", cls]];
+                                ioClose(conn);
                             }
                         }
-                        if (classProp) CFRelease(classProp);
-                        ioRelease(entry);
                     }
-                    ioRelease(regIter);
-                    log([NSString stringWithFormat:@"JB23: Registry scan: %d entries, %lu clases unicas",
-                         regCount, (unsigned long)[seenClasses count]]);
+                    if (classProp) CFRelease(classProp);
+                    ioRelease(entry);
                 }
+                ioRelease(regIt);
+                log([NSString stringWithFormat:@"JB23: Registry scan: %d entries, %lu clases unicas",
+                     regCount, (unsigned long)[seenClasses count]]);
             }
         }
 
