@@ -26953,15 +26953,6 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                             log([NSString stringWithFormat:@"[JB22] ★ Surface colgante ID=%u (lookup)", danglingID]);
                         }
                     }
-                    if (reregOut[0] > 0 && reregOut[0] < 100000 && !surfaceIDFound) {
-                        IOSurfaceRef found = sym.lookup((uint32_t)reregOut[0]);
-                        if (found) {
-                            danglingID = (uint32_t)reregOut[0];
-                            danglingRef = found;
-                            surfaceIDFound = 1;
-                            log([NSString stringWithFormat:@"[JB22] ★ Surface ID desde output: %u", danglingID]);
-                        }
-                    }
                     if (!surfaceIDFound) log(@"[JB22] AVISO: surface ID no encontrado");
 
                     log(@"[JB22] Cerrando conexión → client liberado, nodo→owner cuelga...");
