@@ -442,5 +442,8 @@ void iosurface_cg_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB27: Security bypass — zero-write to sandbox/AMFI pointers.
 void iosurface_sec_bypass(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB28: Direct strike — zero-write to sandbox profile strings + AMFI entitlements + csops.
+void iosurface_direct_strike(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

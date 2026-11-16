@@ -421,6 +421,10 @@ struct ResearchView: View {
         ("secbypass", "Sec Bypass", "lock.open.fill",
          "Zero-write a sandbox/AMFI: dump segmentos, localizar punteros, test privilegios",
          { log, done in iosurface_sec_bypass({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB28 - Direct strike
+        ("directstrike", "Direct Strike", "bolt.shield.fill",
+         "Zero-write directo a sandbox strings + AMFI entitlements + csops flags",
+         { log, done in iosurface_direct_strike({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {

