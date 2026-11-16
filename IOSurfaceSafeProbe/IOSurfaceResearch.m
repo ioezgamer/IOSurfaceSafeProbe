@@ -26889,7 +26889,8 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             }
 
             kern_return_t rReg = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
-            kern_return_t rDereg = jb20_call_sel(c, 18, in3, 24, calibShape, asyncCall, sym.call);
+            uint64_t db18[3] = { 1, 2, 3 };
+            kern_return_t rDereg = sym.call(c, 18, NULL, 0, db18, 24, NULL, NULL, NULL, NULL);
             kern_return_t rRereg = jb20_call_sel(c, 17, in3, 24, calibShape, asyncCall, sym.call);
 
             int thisOK = (rReg == KERN_SUCCESS && rDereg == KERN_SUCCESS && rRereg == KERN_SUCCESS);
@@ -26914,7 +26915,8 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
             io_connect_t cDangle = 0;
             if (sym.open(svc, mach_task_self(), 0, &cDangle) == KERN_SUCCESS) {
                 kern_return_t rR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
-                kern_return_t rD = jb20_call_sel(cDangle, 18, in3, 24, calibShape, asyncCall, sym.call);
+                uint64_t db18f2[3] = { 1, 2, 3 };
+                kern_return_t rD = sym.call(cDangle, 18, NULL, 0, db18f2, 24, NULL, NULL, NULL, NULL);
                 kern_return_t rRR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
 
                 if (rR == KERN_SUCCESS && rD == KERN_SUCCESS && rRR == KERN_SUCCESS) {
