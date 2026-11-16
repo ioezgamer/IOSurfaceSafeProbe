@@ -417,6 +417,10 @@ struct ResearchView: View {
         ("cgexploit", "CG Exploit", "exclamationmark.shield.fill",
          "CVE-2026-112611 exploit: heap spray + zero-write ISA corruption + multi-write + dyld cache targets",
          { log, done in iosurface_cg_exploit({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB27 - Security bypass
+        ("secbypass", "Sec Bypass", "lock.open.fill",
+         "Zero-write a sandbox/AMFI: dump segmentos, localizar punteros, test privilegios",
+         { log, done in iosurface_sec_bypass({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
