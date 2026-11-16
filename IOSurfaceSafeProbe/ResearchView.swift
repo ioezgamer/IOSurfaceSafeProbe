@@ -401,6 +401,10 @@ struct ResearchView: View {
         ("uafexploit", "UAF Exploit", "flame.fill",
          "Heap spray + UAF dereference — intenta controlar memoria kernel liberada",
          { log, done in iosurface_pipe_primitive({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB23 - Clean new probe
+        ("iokitenum", "IOKit Enumerator", "list.bullet.rectangle.portrait.fill",
+         "Enumera TODOS los drivers IOKit accesibles desde sandbox — mapea superficie de ataque completa mas alla de IOSurface",
+         { log, done in iosurface_iokit_enumerator({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
@@ -822,9 +826,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes.suffix(from: 96), id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 1], id: \.id) { probe in
                 probeCard(probe)
             }
+
+            // --- JB23: NUEVA SUPERFICIE DE ATAQUE ---
+            Text("NUEVO — Superficie de Ataque IOKit")
+                .font(.caption.bold())
+                .foregroundStyle(.green)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+                .padding(.top, 8)
+
+            probeCard(probes[probes.count - 1])
 
             if !log.isEmpty { logSection }
         }

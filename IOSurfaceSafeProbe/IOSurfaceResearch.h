@@ -427,5 +427,8 @@ void iosurface_pixelbuf_scan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
 /// Probe JB22: IOSurfaceRoot UAF exploit — heap spray + dangling pointer dereference.
 void iosurface_pipe_primitive(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB23: IOKit driver enumerator — full sandbox attack surface mapping.
+void iosurface_iokit_enumerator(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

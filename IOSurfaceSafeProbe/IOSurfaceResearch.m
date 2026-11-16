@@ -27634,3 +27634,319 @@ void iosurface_research_lifecycle_race(ISRLogBlock _Nonnull log, ISRDoneBlock _N
         done(res);
     });
 }
+
+// =============================================================================
+// PROBE JB23: IOKit Driver Enumerator — Full sandbox attack surface mapping
+// =============================================================================
+#pragma mark - JB23: IOKit Driver Enumerator
+
+void iosurface_iokit_enumerator(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB23: === IOKit Driver Enumerator — Superficie de Ataque Completa ===");
+        log(@"JB23: Objetivo: enumerar TODOS los servicios IOKit accesibles desde app sandbox");
+
+        ISRSymbols sym = {0};
+        if (!isr_load(&sym)) {
+            log(@"JB23: [!] No se pudieron cargar simbolos");
+            done(@{@"error": @"symbols_failed"});
+            return;
+        }
+
+        typedef io_object_t (*IOIteratorNextFn)(io_iterator_t);
+        typedef kern_return_t (*IORegistryEntryGetNameFn)(io_object_t, io_name_t);
+        typedef CFMutableDictionaryRef (*IOServiceMatchingFn)(const char *);
+        typedef kern_return_t (*IOServiceGetMatchingServicesFn)(mach_port_t, CFDictionaryRef, io_iterator_t *);
+        typedef kern_return_t (*IOServiceOpenFn)(io_object_t, task_port_t, uint32_t, io_connect_t *);
+        typedef kern_return_t (*IOServiceCloseFn)(io_connect_t);
+        typedef kern_return_t (*IOObjectReleaseFn)(io_object_t);
+        typedef kern_return_t (*IORegistryEntryGetPropertyFn)(io_object_t, const io_name_t, CFTypeRef *);
+        typedef CFTypeRef (*IORegistryEntryCreateCFPropertyFn)(io_object_t, CFStringRef, CFAllocatorRef, IOOptionBits);
+        typedef kern_return_t (*IOConnectCallMethodFn)(io_connect_t, uint32_t,
+            const uint64_t *, uint32_t, const void *, size_t,
+            uint64_t *, uint32_t *, void *, size_t *);
+
+        IOIteratorNextFn ioNext = (IOIteratorNextFn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        IORegistryEntryGetNameFn ioGetName = (IORegistryEntryGetNameFn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
+        IOServiceMatchingFn ioMatching = (IOServiceMatchingFn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        IOServiceGetMatchingServicesFn ioGetMatching = (IOServiceGetMatchingServicesFn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        IOServiceOpenFn ioOpen = (IOServiceOpenFn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        IOServiceCloseFn ioClose = (IOServiceCloseFn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        IOObjectReleaseFn ioRelease = (IOObjectReleaseFn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        IORegistryEntryCreateCFPropertyFn ioCreateProp = (IORegistryEntryCreateCFPropertyFn)dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
+        IOConnectCallMethodFn ioCallMethod = (IOConnectCallMethodFn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+
+        if (!ioNext || !ioGetName || !ioMatching || !ioGetMatching || !ioOpen || !ioClose || !ioRelease || !ioCreateProp || !ioCallMethod) {
+            log(@"JB23: [!] Faltan simbolos IOKit");
+            isr_unload(&sym);
+            done(@{@"error": @"iokit_symbols_missing"});
+            return;
+        }
+
+        // Known IOKit service class names to try
+        NSArray *serviceClasses = @[
+            // Core graphics/display
+            @"IOSurfaceRoot",
+            @"IOMobileFramebuffer",
+            @"IOSurfaceAccelerator",
+            @"IOMobileFramebufferShim",
+            // GPU
+            @"AGXAccelerator",
+            @"AGXAcceleratorG15P",
+            @"AGXAcceleratorG15G",
+            @"IOGPU",
+            @"IOGPUDevice",
+            @"AGXFamilyAccelerator",
+            @"AGXDeviceUserClient",
+            // Media
+            @"AppleJPEGDriver",
+            @"AppleAVE2Driver",
+            @"AppleAVE2UserClient",
+            @"AppleVXE380",
+            @"AppleVXD394",
+            @"AppleM2ScalerCSCDriver",
+            @"IOAVService",
+            // Audio
+            @"AppleHDAController",
+            @"IOAudioEngine",
+            @"AppleSPU",
+            // HID/Input
+            @"IOHIDSystem",
+            @"IOHIDUserDevice",
+            @"AppleMultitouchDevice",
+            @"IOHIDEventService",
+            @"AppleHIDTransportSPI",
+            // Crypto/Security
+            @"AppleKeyStore",
+            @"IOAESAccelerator",
+            @"AppleSEP",
+            @"AppleSEPManager",
+            @"AppleCredentialManager",
+            @"AppleSSE",
+            // Storage
+            @"IONVMeController",
+            @"AppleANS3NVMeController",
+            @"IOFlashController",
+            // Network
+            @"IONetworkInterface",
+            @"IOEthernetController",
+            @"IO80211Controller",
+            @"AppleBCMWLANCore",
+            // USB/Lightning
+            @"IOUSBHostDevice",
+            @"AppleSynapsesDriver",
+            @"IOAccessoryManager",
+            // Sensors
+            @"AppleOscarAccelerometer",
+            @"AppleSensorHub",
+            @"CoreMotion",
+            @"CLLocationManager",
+            // Power
+            @"AppleSmartBatteryManager",
+            @"IOPMrootDomain",
+            @"ApplePMGR",
+            // Misc kernel
+            @"IOUserEthernetController",
+            @"AppleImage4",
+            @"AppleEffaceableStorage",
+            @"AppleMobileFileIntegrity",
+            @"AppleARMPE",
+            @"AppleSMC",
+            @"AppleBiometricServices",
+            @"AppleFirmwareUpdateKext",
+            // DCP (Display Coprocessor)
+            @"IOMFBDevice",
+            @"AppleDCP",
+            @"DCPAVService",
+            // Neural Engine
+            @"AppleH11ANEIn",
+            @"H11ANEIn",
+            @"AppleNeuralEngine",
+            // Additional drivers
+            @"AppleSPIMC",
+            @"AppleT8020DART",
+            @"AppleDARTMapper",
+            @"AppleConvergedIPCOLYBTControl",
+            @"AppleBluetooth",
+            @"IOBluetoothHCIController",
+        ];
+
+        NSMutableArray *accessible = [NSMutableArray array];
+        NSMutableArray *openable = [NSMutableArray array];
+        NSMutableArray *selectorResults = [NSMutableArray array];
+        int totalServices = 0;
+        int totalAccessible = 0;
+        int totalOpenable = 0;
+
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
+        for (NSString *className in serviceClasses) {
+            if (isr_stopped()) break;
+
+            CFMutableDictionaryRef matchDict = ioMatching([className UTF8String]);
+            if (!matchDict) continue;
+
+            io_iterator_t iter = 0;
+            kern_return_t kr = ioGetMatching(0, matchDict, &iter);
+            if (kr != KERN_SUCCESS || !iter) continue;
+
+            io_object_t service;
+            int instanceCount = 0;
+            while ((service = ioNext(iter)) != 0 && !isr_stopped()) {
+                instanceCount++;
+                totalServices++;
+
+                io_name_t name;
+                ioGetName(service, name);
+
+                // Try to get IOClass property
+                NSString *ioClass = @"?";
+                CFTypeRef classProp = ioCreateProp(service, CFSTR("IOClass"), kCFAllocatorDefault, 0);
+                if (classProp) {
+                    if (CFGetTypeID(classProp) == CFStringGetTypeID()) {
+                        ioClass = (__bridge NSString *)classProp;
+                    }
+                    CFRelease(classProp);
+                }
+
+                totalAccessible++;
+                [accessible addObject:[NSString stringWithFormat:@"%@ (name:%s)", className, name]];
+
+                // Try opening with connection types 0-7
+                BOOL didOpen = NO;
+                for (uint32_t connType = 0; connType <= 7 && !isr_stopped(); connType++) {
+                    io_connect_t conn = 0;
+                    kr = ioOpen(service, mach_task_self(), connType, &conn);
+                    if (kr == KERN_SUCCESS && conn) {
+                        didOpen = YES;
+                        NSString *entry = [NSString stringWithFormat:@"%@:type%u", className, connType];
+                        [openable addObject:entry];
+                        totalOpenable++;
+                        log([NSString stringWithFormat:@"JB23: [OPEN] %@ tipo=%u conn=0x%x", className, connType, conn]);
+
+                        // Quick selector scan 0-19
+                        int acceptedSels = 0;
+                        NSMutableArray *workingSels = [NSMutableArray array];
+                        for (uint32_t sel = 0; sel < 20 && !isr_stopped(); sel++) {
+                            uint64_t scalarOut[4] = {0};
+                            uint32_t scalarOutCnt = 4;
+                            char structOut[256] = {0};
+                            size_t structOutSz = sizeof(structOut);
+
+                            uint64_t scalarIn[2] = {0, 0};
+                            char structIn[24] = {0};
+
+                            kern_return_t skr = ioCallMethod(conn, sel,
+                                scalarIn, 2, structIn, sizeof(structIn),
+                                scalarOut, &scalarOutCnt, structOut, &structOutSz);
+
+                            if (skr != 0xe00002c2 && skr != 0xe00002c9) {
+                                acceptedSels++;
+                                [workingSels addObject:@(sel)];
+                            }
+                        }
+
+                        if (acceptedSels > 0) {
+                            log([NSString stringWithFormat:@"JB23:   -> %d selectores aceptados: %@",
+                                 acceptedSels, workingSels]);
+                            [selectorResults addObject:@{
+                                @"service": className,
+                                @"connType": @(connType),
+                                @"selectors": workingSels,
+                                @"count": @(acceptedSels)
+                            }];
+                        }
+
+                        ioClose(conn);
+                    }
+                }
+
+                if (!didOpen && instanceCount == 1) {
+                    log([NSString stringWithFormat:@"JB23: [FOUND] %@ — no se puede abrir (sandbox)", className]);
+                }
+
+                ioRelease(service);
+            }
+            if (iter) ioRelease(iter);
+        }
+
+        // === FASE 2: Enumeracion generica via IORegistryEntryCreateIterator ===
+        if (!isr_stopped()) {
+            log(@"JB23: === Fase 2: Enumeracion generica del IORegistry ===");
+
+            typedef kern_return_t (*IORegistryCreateIteratorFn)(mach_port_t, const io_name_t, IOOptionBits, io_iterator_t *);
+            typedef kern_return_t (*IORegistryEntryGetPathFn)(io_object_t, const io_name_t, io_string_t);
+            IORegistryCreateIteratorFn ioRegIter = (IORegistryCreateIteratorFn)dlsym(RTLD_DEFAULT, "IORegistryCreateIterator");
+            IORegistryEntryGetPathFn ioGetPath = (IORegistryEntryGetPathFn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetPath");
+
+            if (ioRegIter) {
+                io_iterator_t regIter = 0;
+                kr = ioRegIter(0, "IOService", 3, &regIter); // kIORegistryIterateRecursively | kIORegistryIterateParents
+                if (kr == KERN_SUCCESS && regIter) {
+                    io_object_t entry;
+                    int regCount = 0;
+                    NSMutableSet *seenClasses = [NSMutableSet set];
+
+                    while ((entry = ioNext(regIter)) != 0 && regCount < 500 && !isr_stopped()) {
+                        regCount++;
+                        CFTypeRef classProp = ioCreateProp(entry, CFSTR("IOClass"), kCFAllocatorDefault, 0);
+                        if (classProp && CFGetTypeID(classProp) == CFStringGetTypeID()) {
+                            NSString *cls = (__bridge NSString *)classProp;
+                            if (![seenClasses containsObject:cls]) {
+                                [seenClasses addObject:cls];
+
+                                // Try opening this class
+                                io_connect_t conn = 0;
+                                kern_return_t okr = ioOpen(entry, mach_task_self(), 0, &conn);
+                                if (okr == KERN_SUCCESS && conn) {
+                                    log([NSString stringWithFormat:@"JB23: [REGISTRY-OPEN] %@ tipo=0", cls]);
+                                    totalOpenable++;
+                                    [openable addObject:[NSString stringWithFormat:@"%@:registry", cls]];
+                                    ioClose(conn);
+                                }
+                            }
+                        }
+                        if (classProp) CFRelease(classProp);
+                        ioRelease(entry);
+                    }
+                    ioRelease(regIter);
+                    log([NSString stringWithFormat:@"JB23: Registry scan: %d entries, %lu clases unicas",
+                         regCount, (unsigned long)[seenClasses count]]);
+                }
+            }
+        }
+
+        gettimeofday(&tv_end, NULL);
+        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+
+        log(@"JB23: =============================================");
+        log([NSString stringWithFormat:@"JB23: Servicios encontrados: %d", totalServices]);
+        log([NSString stringWithFormat:@"JB23: Accesibles (matching): %d", totalAccessible]);
+        log([NSString stringWithFormat:@"JB23: Abribles (IOServiceOpen OK): %d", totalOpenable]);
+        log([NSString stringWithFormat:@"JB23: Con selectores activos: %lu", (unsigned long)[selectorResults count]]);
+        for (NSDictionary *sr in selectorResults) {
+            log([NSString stringWithFormat:@"JB23:   %@:tipo%@ — %@ selectores: %@",
+                 sr[@"service"], sr[@"connType"], sr[@"count"], sr[@"selectors"]]);
+        }
+        log([NSString stringWithFormat:@"JB23: Tiempo: %.2fs", elapsed]);
+        log(@"JB23: =============================================");
+
+        NSString *verdict = @"SCAN_COMPLETE";
+        if (totalOpenable > 5) verdict = @"LARGE_ATTACK_SURFACE";
+        else if (totalOpenable > 1) verdict = @"MODERATE_ATTACK_SURFACE";
+        else verdict = @"MINIMAL_ATTACK_SURFACE";
+
+        NSDictionary *res = @{
+            @"totalServices": @(totalServices),
+            @"accessible": @(totalAccessible),
+            @"openable": @(totalOpenable),
+            @"selectorResults": selectorResults,
+            @"openableList": openable,
+            @"verdict": verdict,
+            @"elapsed": @(elapsed)
+        };
+        isr_checkpoint(@"JB23-iokit-enum-checkpoint.json", res);
+        isr_unload(&sym);
+        done(res);
+    });
+}
