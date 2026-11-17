@@ -31520,3 +31520,393 @@ void iosurface_got_redirect(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// ==========================================================================
+// JB31 — Shellcode Exec: mmap RW -> write arm64 code -> mprotect RX -> call
+// Exploits mprotect(RX) success confirmed in JB30
+// ==========================================================================
+
+void iosurface_shellcode_exec(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB31: === Shellcode Execution — mmap RW -> mprotect RX -> call ===");
+        log(@"JB31: mprotect(RX) confirmed working in JB30, testing code exec");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile unsigned long jb25_esr;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        // =====================================================================
+        // FASE 1: mmap RW page and write shellcode
+        // =====================================================================
+        log(@"JB31: === Fase 1: mmap RW + write shellcode ===");
+
+        size_t pageSize = 0x10000;
+        void *codePage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANON, -1, 0);
+
+        if (codePage == MAP_FAILED) {
+            log([NSString stringWithFormat:@"JB31: [!] mmap FAILED errno=%d", errno]);
+            done(results);
+            return;
+        }
+
+        log([NSString stringWithFormat:@"JB31:   mmap RW at %p", codePage]);
+        results[@"codePageAddr"] = [NSString stringWithFormat:@"%p", codePage];
+
+        uint32_t *code = (uint32_t *)codePage;
+
+        // --- Shellcode 1: return constant 0x41424344 ("ABCD") ---
+        // movz w0, #0x4344
+        // movk w0, #0x4142, lsl #16
+        // ret
+        code[0] = 0x52886880; // movz w0, #0x4344
+        code[1] = 0x72882840; // movk w0, #0x4142, lsl #16
+        code[2] = 0xD65F03C0; // ret
+
+        // --- Shellcode 2: getpid via syscall (offset +16 = code[4]) ---
+        // mov x16, #20
+        // svc #0x80
+        // ret
+        code[4] = 0xD2800290; // mov x16, #20 (SYS_getpid)
+        code[5] = 0xD4001001; // svc #0x80
+        code[6] = 0xD65F03C0; // ret
+
+        // --- Shellcode 3: add two args and return (offset +32 = code[8]) ---
+        // add w0, w0, w1
+        // ret
+        code[8] = 0x0B010000; // add w0, w0, w1
+        code[9] = 0xD65F03C0; // ret
+
+        // --- Shellcode 4: read from pointer arg (offset +48 = code[12]) ---
+        // ldr x0, [x0]
+        // ret
+        code[12] = 0xF9400000; // ldr x0, [x0]
+        code[13] = 0xD65F03C0; // ret
+
+        // --- Shellcode 5: write value to pointer (offset +64 = code[16]) ---
+        // str x1, [x0]
+        // mov x0, #1
+        // ret
+        code[16] = 0xF9000001; // str x1, [x0]
+        code[17] = 0xD2800020; // mov x0, #1
+        code[18] = 0xD65F03C0; // ret
+
+        log(@"JB31:   5 shellcodes written (const/syscall/add/read/write)");
+
+        if (isr_stopped()) { munmap(codePage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 2: mprotect RW -> RX
+        // =====================================================================
+        log(@"JB31: === Fase 2: mprotect RW -> RX ===");
+
+        int mpRet = mprotect(codePage, pageSize, PROT_READ | PROT_EXEC);
+        log([NSString stringWithFormat:@"JB31:   mprotect(RX) = %d (errno=%d)", mpRet, mpRet ? errno : 0]);
+        results[@"mprotectRX"] = @(mpRet == 0);
+
+        if (mpRet != 0) {
+            log(@"JB31: [!] mprotect(RX) FAILED — W^X enforced after all");
+            log([NSString stringWithFormat:@"JB31:   errno=%d (%s)", errno, strerror(errno)]);
+
+            // Try RWX as fallback
+            int mpRwx = mprotect(codePage, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC);
+            log([NSString stringWithFormat:@"JB31:   mprotect(RWX) = %d (errno=%d)", mpRwx, mpRwx ? errno : 0]);
+            results[@"mprotectRWX"] = @(mpRwx == 0);
+
+            if (mpRwx != 0) {
+                log(@"JB31: [!] Neither RX nor RWX available — cannot exec shellcode");
+                results[@"verdict"] = @"NO_EXEC_PERMISSION";
+                munmap(codePage, pageSize);
+                done(results);
+                return;
+            }
+        }
+
+        log(@"JB31: [+] Page is now executable!");
+
+        if (isr_stopped()) { munmap(codePage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 3: Execute shellcode 1 — return constant
+        // =====================================================================
+        log(@"JB31: === Fase 3: Exec shellcode 1 — return 0x41424344 ===");
+
+        typedef int (*int_fn)(void);
+        int_fn sc1 = (int_fn)codePage;
+
+        jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+        int sc1Result = 0;
+        int sc1OK = 0;
+
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            sc1Result = sc1();
+            jb25_in_probe = 0;
+            sc1OK = 1;
+        } else {
+            jb25_in_probe = 0;
+            log([NSString stringWithFormat:@"JB31:   FAULT: sig=%d far=%#lx esr=%#lx",
+                 jb25_sig, jb25_far, jb25_esr]);
+        }
+
+        if (sc1OK) {
+            int match = (sc1Result == 0x41424344) ? 1 : 0;
+            log([NSString stringWithFormat:@"JB31: [%@] sc1() = %#x (expected 0x41424344)",
+                 match ? @"!!!!" : @"?", (unsigned)sc1Result]);
+            results[@"sc1_result"] = [NSString stringWithFormat:@"%#x", (unsigned)sc1Result];
+            results[@"sc1_match"] = @(match);
+
+            if (match) {
+                log(@"JB31: [!!!!] ARBITRARY CODE EXECUTION CONFIRMED!");
+            }
+        } else {
+            results[@"sc1_fault"] = @(1);
+            results[@"sc1_sig"] = @(jb25_sig);
+            results[@"sc1_far"] = [NSString stringWithFormat:@"%#lx", jb25_far];
+        }
+
+        if (isr_stopped()) { munmap(codePage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Execute shellcode 2 — getpid syscall
+        // =====================================================================
+        log(@"JB31: === Fase 4: Exec shellcode 2 — getpid syscall ===");
+
+        int_fn sc2 = (int_fn)((uint8_t *)codePage + 16);
+        typedef int (*getpid_fn)(void);
+        getpid_fn realGetpid = dlsym(RTLD_DEFAULT, "getpid");
+        int realPid = realGetpid();
+
+        jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+        int sc2Result = 0;
+        int sc2OK = 0;
+
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            sc2Result = sc2();
+            jb25_in_probe = 0;
+            sc2OK = 1;
+        } else {
+            jb25_in_probe = 0;
+            log([NSString stringWithFormat:@"JB31:   FAULT: sig=%d far=%#lx esr=%#lx",
+                 jb25_sig, jb25_far, jb25_esr]);
+        }
+
+        if (sc2OK) {
+            int match = (sc2Result == realPid) ? 1 : 0;
+            log([NSString stringWithFormat:@"JB31: [%@] sc2() = %d (real pid = %d)",
+                 match ? @"!!!!" : @"?", sc2Result, realPid]);
+            results[@"sc2_result"] = @(sc2Result);
+            results[@"sc2_realPid"] = @(realPid);
+            results[@"sc2_match"] = @(match);
+
+            if (match) {
+                log(@"JB31: [!!!!] DIRECT SYSCALL FROM SHELLCODE WORKS!");
+            }
+        } else {
+            results[@"sc2_fault"] = @(1);
+        }
+
+        if (isr_stopped()) { munmap(codePage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Execute shellcode 3 — add(a, b)
+        // =====================================================================
+        log(@"JB31: === Fase 5: Exec shellcode 3 — add(1337, 7331) ===");
+
+        typedef int (*add_fn)(int, int);
+        add_fn sc3 = (add_fn)((uint8_t *)codePage + 32);
+
+        jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+        int sc3Result = 0;
+        int sc3OK = 0;
+
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            sc3Result = sc3(1337, 7331);
+            jb25_in_probe = 0;
+            sc3OK = 1;
+        } else {
+            jb25_in_probe = 0;
+            log([NSString stringWithFormat:@"JB31:   FAULT: sig=%d far=%#lx esr=%#lx",
+                 jb25_sig, jb25_far, jb25_esr]);
+        }
+
+        if (sc3OK) {
+            int match = (sc3Result == 8668) ? 1 : 0;
+            log([NSString stringWithFormat:@"JB31: [%@] sc3(1337,7331) = %d (expected 8668)",
+                 match ? @"!!!!" : @"?", sc3Result]);
+            results[@"sc3_result"] = @(sc3Result);
+            results[@"sc3_match"] = @(match);
+        } else {
+            results[@"sc3_fault"] = @(1);
+        }
+
+        if (isr_stopped()) { munmap(codePage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 6: Execute shellcode 4 — read from pointer
+        // =====================================================================
+        log(@"JB31: === Fase 6: Exec shellcode 4 — read from pointer ===");
+
+        typedef uint64_t (*read_fn)(void *);
+        read_fn sc4 = (read_fn)((uint8_t *)codePage + 48);
+
+        uint64_t testVal = 0xDEADBEEFCAFEBABEULL;
+        uint64_t *testPtr = (uint64_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                              MAP_PRIVATE | MAP_ANON, -1, 0);
+        int sc4OK = 0;
+        uint64_t sc4Result = 0;
+
+        if (testPtr != MAP_FAILED) {
+            *testPtr = testVal;
+
+            jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                sc4Result = sc4(testPtr);
+                jb25_in_probe = 0;
+                sc4OK = 1;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB31:   FAULT: sig=%d far=%#lx",
+                     jb25_sig, jb25_far]);
+            }
+
+            if (sc4OK) {
+                int match = (sc4Result == testVal) ? 1 : 0;
+                log([NSString stringWithFormat:@"JB31: [%@] sc4(ptr) = %#llx (expected %#llx)",
+                     match ? @"!!!!" : @"?", sc4Result, testVal]);
+                results[@"sc4_match"] = @(match);
+            } else {
+                results[@"sc4_fault"] = @(1);
+            }
+            munmap(testPtr, 4096);
+        }
+
+        if (isr_stopped()) { munmap(codePage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 7: Execute shellcode 5 — write to pointer
+        // =====================================================================
+        log(@"JB31: === Fase 7: Exec shellcode 5 — write to pointer ===");
+
+        typedef uint64_t (*write_fn)(void *, uint64_t);
+        write_fn sc5 = (write_fn)((uint8_t *)codePage + 64);
+
+        uint64_t *writeTarget = (uint64_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                                  MAP_PRIVATE | MAP_ANON, -1, 0);
+        int sc5OK = 0;
+
+        if (writeTarget != MAP_FAILED) {
+            *writeTarget = 0;
+            uint64_t writeVal = 0x4A42333143303045ULL; // "E00C1JB" marker
+
+            jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                sc5(writeTarget, writeVal);
+                jb25_in_probe = 0;
+                sc5OK = 1;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB31:   FAULT: sig=%d far=%#lx",
+                     jb25_sig, jb25_far]);
+            }
+
+            if (sc5OK) {
+                uint64_t readback = *writeTarget;
+                int match = (readback == writeVal) ? 1 : 0;
+                log([NSString stringWithFormat:@"JB31: [%@] write %#llx -> readback %#llx",
+                     match ? @"!!!!" : @"?", writeVal, readback]);
+                results[@"sc5_match"] = @(match);
+            } else {
+                results[@"sc5_fault"] = @(1);
+            }
+            munmap(writeTarget, 4096);
+        }
+
+        // =====================================================================
+        // FASE 8: CS flags & entitlements check
+        // =====================================================================
+        log(@"JB31: === Fase 8: Code signing analysis ===");
+
+        typedef int (*csops_fn)(int, unsigned int, void *, size_t);
+        csops_fn csops = dlsym(RTLD_DEFAULT, "csops");
+        if (csops) {
+            uint32_t csflags = 0;
+            int csret = csops(realGetpid(), 0, &csflags, sizeof(csflags));
+            log([NSString stringWithFormat:@"JB31:   csops(GET_FLAGS) = %d, flags = %#x", csret, csflags]);
+            results[@"csFlags"] = [NSString stringWithFormat:@"%#x", csflags];
+
+            int csValid = (csflags & 0x1) ? 1 : 0;
+            int csHard = (csflags & 0x100) ? 1 : 0;
+            int csKill = (csflags & 0x200) ? 1 : 0;
+            int csRestrict = (csflags & 0x800) ? 1 : 0;
+            int csRuntime = (csflags & 0x10000) ? 1 : 0;
+            int csPlatform = (csflags & 0x4000000) ? 1 : 0;
+
+            log([NSString stringWithFormat:@"JB31:   valid=%d hard=%d kill=%d restrict=%d runtime=%d platform=%d",
+                 csValid, csHard, csKill, csRestrict, csRuntime, csPlatform]);
+            results[@"csRuntime"] = @(csRuntime);
+            results[@"csPlatform"] = @(csPlatform);
+
+            if (!csRuntime) {
+                log(@"JB31:   CS_RUNTIME not set — explains why mprotect(RX) works!");
+                log(@"JB31:   Hardened runtime not enforced on this binary");
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB31: =============================================");
+
+        int totalOK = 0;
+        int totalTests = 5;
+        if ([results[@"sc1_match"] intValue]) totalOK++;
+        if ([results[@"sc2_match"] intValue]) totalOK++;
+        if ([results[@"sc3_match"] intValue]) totalOK++;
+        if ([results[@"sc4_match"] intValue]) totalOK++;
+        if ([results[@"sc5_match"] intValue]) totalOK++;
+
+        NSString *verdict = @"ANALYSIS_COMPLETE";
+
+        if (totalOK == totalTests) {
+            verdict = @"FULL_SHELLCODE_EXECUTION";
+            log(@"JB31: [!!!!!] ALL 5 SHELLCODES EXECUTED CORRECTLY!");
+            log(@"JB31: [!!!!!] ARBITRARY CODE EXECUTION ACHIEVED!");
+            log(@"JB31: [!!!!!] const + syscall + arithmetic + read + write = FULL CONTROL");
+            log(@"JB31: Siguiente paso: shellcode para escalar privilegios");
+            log(@"JB31:   - Modificar CS flags via kernel memory");
+            log(@"JB31:   - Parchear sandbox policy");
+            log(@"JB31:   - Instalar unsigned code");
+        } else if (totalOK > 0) {
+            verdict = [NSString stringWithFormat:@"PARTIAL_EXEC_%d_OF_%d", totalOK, totalTests];
+            log([NSString stringWithFormat:@"JB31: [!!!] %d/%d shellcodes executed", totalOK, totalTests]);
+        } else if ([results[@"sc1_fault"] intValue]) {
+            verdict = @"EXEC_FAULTED";
+            log(@"JB31: Shellcode faulted — page may not truly be executable");
+            log(@"JB31: mprotect returned 0 but kernel may enforce W^X lazily");
+        } else {
+            verdict = @"NO_EXEC";
+            log(@"JB31: No shellcode executed");
+        }
+
+        results[@"verdict"] = verdict;
+        results[@"totalOK"] = @(totalOK);
+        results[@"totalTests"] = @(totalTests);
+        log([NSString stringWithFormat:@"JB31: Verdict: %@", verdict]);
+        log(@"JB31: =============================================");
+
+        munmap(codePage, pageSize);
+        isr_checkpoint(@"JB31-shellcode-exec-checkpoint.json", results);
+        done(results);
+    });
+}

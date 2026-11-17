@@ -433,6 +433,10 @@ struct ResearchView: View {
         ("gotredirect", "GOT Redirect", "arrow.uturn.right.circle",
          "CVE-2026-112611 zero-write GOT entry -> redirect code flow to controlled page",
          { log, done in iosurface_got_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB31 - Shellcode Exec
+        ("shellcodeexec", "Shellcode Exec", "terminal.fill",
+         "mmap RW -> arm64 shellcode -> mprotect RX -> execute arbitrary code",
+         { log, done in iosurface_shellcode_exec({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
