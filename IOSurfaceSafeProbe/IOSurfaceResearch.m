@@ -32667,11 +32667,11 @@ void iosurface_rop_exec(ISRLogBlock log, ISRDoneBlock done) {
     });
 }
 
-// MARK: - JB34: IOSurface Kernel Memory + ObjC Swizzle Exec
+// MARK: - JB34: IOSurface Shared Memory + ObjC Swizzle Exec
 void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB34: === IOSurface Kernel Memory Map + Swizzle Exec ===");
-        log(@"JB34: IOConnectMapMemory64 available, method_setIMP available");
+        log(@"JB34: === IOSurface Shared Memory + ObjC Swizzle Exec ===");
+        log(@"JB34: v3 — safe APIs only, no IOServiceOpen");
 
         NSMutableDictionary *results = [NSMutableDictionary dictionary];
 
@@ -32683,138 +32683,17 @@ void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
         extern struct jb25_jb_holder *jb25_jb_ptr;
         jb25_setup();
 
-        typedef unsigned int mach_port_t_local;
-        typedef int kern_return_t_local;
-
         // =====================================================================
-        // FASE 1: Open IOSurface connection for memory mapping
+        // FASE 1: IOSurfaceCreate — shared memory with kernel
         // =====================================================================
-        log(@"JB34: === Fase 1: IOSurface connection + map memory ===");
+        log(@"JB34: === Fase 1: IOSurfaceCreate shared memory ===");
 
-        typedef mach_port_t_local (*mach_task_self_fn)(void);
-        mach_task_self_fn taskSelfFn = dlsym(RTLD_DEFAULT, "mach_task_self");
-        mach_port_t_local task = taskSelfFn ? taskSelfFn() : 0;
-
-        typedef kern_return_t_local (*IOServiceMatching_fn)(const char *);
-        typedef mach_port_t_local (*IOServiceGetMatchingService_fn)(mach_port_t_local, void *);
-        typedef kern_return_t_local (*IOServiceOpen_fn)(mach_port_t_local, mach_port_t_local, uint32_t, mach_port_t_local *);
-        typedef kern_return_t_local (*IOConnectMapMemory64_fn)(
-            mach_port_t_local connect, uint32_t memoryType,
-            mach_port_t_local intoTask, uint64_t *atAddress,
-            uint64_t *ofSize, uint32_t options);
-        typedef kern_return_t_local (*IOServiceClose_fn)(mach_port_t_local);
-
-        IOServiceMatching_fn matchFn = dlsym(RTLD_DEFAULT, "IOServiceMatching");
-        IOServiceGetMatchingService_fn getSvcFn = dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
-        IOServiceOpen_fn openFn = dlsym(RTLD_DEFAULT, "IOServiceOpen");
-        IOConnectMapMemory64_fn mapFn = dlsym(RTLD_DEFAULT, "IOConnectMapMemory64");
-        IOServiceClose_fn closeFn = dlsym(RTLD_DEFAULT, "IOServiceClose");
-
-        log([NSString stringWithFormat:@"JB34:   IOServiceMatching = %p", matchFn]);
-        log([NSString stringWithFormat:@"JB34:   IOServiceGetMatchingService = %p", getSvcFn]);
-        log([NSString stringWithFormat:@"JB34:   IOServiceOpen = %p", openFn]);
-        log([NSString stringWithFormat:@"JB34:   IOConnectMapMemory64 = %p", mapFn]);
-
-        if (!matchFn || !getSvcFn || !openFn || !mapFn) {
-            log(@"JB34:   Missing IOKit functions");
-            results[@"verdict"] = @"NO_IOKIT";
-            done(results);
-            return;
-        }
-
-        void *matching = (void *)(uintptr_t)matchFn("IOSurfaceRoot");
-        mach_port_t_local service = getSvcFn(0, matching);
-        log([NSString stringWithFormat:@"JB34:   IOSurfaceRoot service = %u", service]);
-
-        mach_port_t_local connect = 0;
-        kern_return_t_local openRet = -1;
-
-        if (service) {
-            jb25_far = 0; jb25_sig = 0;
-            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                jb25_in_probe = 1;
-                openRet = openFn(service, task, 0, &connect);
-                jb25_in_probe = 0;
-            } else {
-                jb25_in_probe = 0;
-                log([NSString stringWithFormat:@"JB34:   IOServiceOpen FAULT sig=%d", jb25_sig]);
-            }
-            log([NSString stringWithFormat:@"JB34:   IOServiceOpen(type=0) = %d connect=%u", openRet, connect]);
-            results[@"iosurfConnect"] = @(connect);
-        }
-
-        // Try mapping memory types 0-5
-        if (connect) {
-            for (uint32_t memType = 0; memType < 6; memType++) {
-                uint64_t addr = 0;
-                uint64_t size = 0;
-
-                jb25_far = 0; jb25_sig = 0;
-                kern_return_t_local mapRet = -999;
-                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                    jb25_in_probe = 1;
-                    mapRet = mapFn(connect, memType, task, &addr, &size, 0);
-                    jb25_in_probe = 0;
-                } else {
-                    jb25_in_probe = 0;
-                    log([NSString stringWithFormat:@"JB34:   MapMemory(type=%u) FAULT sig=%d", memType, jb25_sig]);
-                    continue;
-                }
-
-                log([NSString stringWithFormat:@"JB34:   MapMemory(type=%u) = %d addr=%#llx size=%#llx",
-                     memType, mapRet, addr, size]);
-
-                if (mapRet == 0 && addr != 0 && size > 0) {
-                    log([NSString stringWithFormat:@"JB34:   [+] MAPPED type=%u: %llu bytes at %#llx",
-                         memType, size, addr]);
-                    results[[NSString stringWithFormat:@"map%u_addr", memType]] =
-                        [NSString stringWithFormat:@"%#llx", addr];
-                    results[[NSString stringWithFormat:@"map%u_size", memType]] =
-                        [NSString stringWithFormat:@"%#llx", size];
-
-                    // Read first 64 bytes
-                    jb25_far = 0; jb25_sig = 0;
-                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                        jb25_in_probe = 1;
-                        uint64_t *mapped = (uint64_t *)(uintptr_t)addr;
-                        log([NSString stringWithFormat:@"JB34:     [0]=%#llx [1]=%#llx [2]=%#llx [3]=%#llx",
-                             mapped[0], mapped[1], mapped[2], mapped[3]]);
-                        log([NSString stringWithFormat:@"JB34:     [4]=%#llx [5]=%#llx [6]=%#llx [7]=%#llx",
-                             mapped[4], mapped[5], mapped[6], mapped[7]]);
-
-                        // Test write
-                        uint64_t origVal = mapped[0];
-                        mapped[0] = 0xDEADBEEF4A4234ULL;
-                        uint64_t readBack = mapped[0];
-                        mapped[0] = origVal;
-                        int writeOK = (readBack == 0xDEADBEEF4A4234ULL) ? 1 : 0;
-                        log([NSString stringWithFormat:@"JB34:     Write test: %s", writeOK ? "WRITABLE" : "READ-ONLY"]);
-                        results[[NSString stringWithFormat:@"map%u_writable", memType]] = @(writeOK);
-                        jb25_in_probe = 0;
-                    } else {
-                        jb25_in_probe = 0;
-                        log([NSString stringWithFormat:@"JB34:     Read FAULT sig=%d", jb25_sig]);
-                    }
-                }
-
-                if (isr_stopped()) { break; }
-            }
-        }
-
-        if (isr_stopped()) { done(results); return; }
-
-        // =====================================================================
-        // FASE 2: Create IOSurface and map its memory
-        // =====================================================================
-        log(@"JB34: === Fase 2: Create IOSurface + map ===");
-
-        // Use IOSurfaceCreate to make a surface, then map it
         typedef void *(*IOSurfaceCreate_fn)(void *);
         typedef uint32_t (*IOSurfaceGetID_fn)(void *);
         typedef void *(*IOSurfaceGetBaseAddress_fn)(void *);
         typedef size_t (*IOSurfaceGetAllocSize_fn)(void *);
-        typedef kern_return_t_local (*IOSurfaceLock_fn)(void *, uint32_t, uint32_t *);
-        typedef kern_return_t_local (*IOSurfaceUnlock_fn)(void *, uint32_t, uint32_t *);
+        typedef int (*IOSurfaceLock_fn)(void *, uint32_t, uint32_t *);
+        typedef int (*IOSurfaceUnlock_fn)(void *, uint32_t, uint32_t *);
 
         IOSurfaceCreate_fn surfCreate = dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
         IOSurfaceGetID_fn surfGetID = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
@@ -32825,25 +32704,19 @@ void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
 
         log([NSString stringWithFormat:@"JB34:   IOSurfaceCreate = %p", surfCreate]);
         log([NSString stringWithFormat:@"JB34:   IOSurfaceGetBaseAddress = %p", surfGetBase]);
+        log([NSString stringWithFormat:@"JB34:   IOSurfaceLock = %p", surfLock]);
+
+        void *surface = NULL;
 
         if (surfCreate) {
             NSDictionary *props = @{
                 @"IOSurfaceWidth": @(32),
                 @"IOSurfaceHeight": @(32),
                 @"IOSurfaceBytesPerElement": @(4),
-                @"IOSurfacePixelFormat": @(0x42475241), // BGRA
+                @"IOSurfacePixelFormat": @(0x42475241),
             };
 
-            jb25_far = 0; jb25_sig = 0;
-            void *surface = NULL;
-            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                jb25_in_probe = 1;
-                surface = surfCreate((__bridge void *)props);
-                jb25_in_probe = 0;
-            } else {
-                jb25_in_probe = 0;
-                log([NSString stringWithFormat:@"JB34:   IOSurfaceCreate FAULT sig=%d", jb25_sig]);
-            }
+            surface = surfCreate((__bridge void *)props);
 
             if (surface) {
                 uint32_t surfID = surfGetID ? surfGetID(surface) : 0;
@@ -32853,10 +32726,9 @@ void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
                 results[@"surfaceID"] = @(surfID);
                 results[@"allocSize"] = @(allocSize);
 
-                // Lock and get base address
                 if (surfLock) {
                     uint32_t seed = 0;
-                    kern_return_t_local lockRet = surfLock(surface, 0, &seed);
+                    int lockRet = surfLock(surface, 0, &seed);
                     log([NSString stringWithFormat:@"JB34:   IOSurfaceLock = %d seed=%u", lockRet, seed]);
 
                     if (surfGetBase) {
@@ -32865,26 +32737,20 @@ void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
                         results[@"baseAddr"] = [NSString stringWithFormat:@"%p", base];
 
                         if (base) {
-                            // Write pattern and read back
                             uint32_t *pixels = (uint32_t *)base;
                             pixels[0] = 0xDEADBEEF;
                             pixels[1] = 0xCAFEBABE;
-                            log([NSString stringWithFormat:@"JB34:   Write: [0]=%#x [1]=%#x",
-                                 pixels[0], pixels[1]]);
-                            log([NSString stringWithFormat:@"JB34:   Read:  [0]=%#x [1]=%#x",
+                            log([NSString stringWithFormat:@"JB34:   Write+Read: [0]=%#x [1]=%#x",
                                  pixels[0], pixels[1]]);
                             results[@"surfaceWritable"] = @(pixels[0] == 0xDEADBEEF ? 1 : 0);
-
-                            // This is shared memory with the kernel!
-                            // The kernel sees the same backing store
-                            log(@"JB34:   [+] IOSurface shared memory — kernel sees this too");
+                            log(@"JB34:   [+] IOSurface shared memory — kernel sees same backing store");
                         }
                     }
 
                     if (surfUnlock) surfUnlock(surface, 0, NULL);
                 }
 
-                // Get the mach port for this surface
+                typedef unsigned int mach_port_t_local;
                 typedef mach_port_t_local (*IOSurfaceCreateMachPort_fn)(void *);
                 IOSurfaceCreateMachPort_fn createPort = dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
                 if (createPort) {
@@ -32892,6 +32758,46 @@ void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
                     log([NSString stringWithFormat:@"JB34:   Surface mach port = %u", surfPort]);
                     results[@"surfacePort"] = @(surfPort);
                 }
+            } else {
+                log(@"JB34:   IOSurfaceCreate returned NULL");
+            }
+        }
+
+        // =====================================================================
+        // FASE 2: Multiple surfaces — test cross-surface memory layout
+        // =====================================================================
+        log(@"JB34: === Fase 2: Multi-surface layout ===");
+
+        if (surfCreate && surfGetBase && surfLock && surfUnlock) {
+            void *surfaces[4] = {NULL};
+            void *bases[4] = {NULL};
+
+            for (int i = 0; i < 4; i++) {
+                NSDictionary *p = @{
+                    @"IOSurfaceWidth": @(64),
+                    @"IOSurfaceHeight": @(64),
+                    @"IOSurfaceBytesPerElement": @(4),
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                };
+                surfaces[i] = surfCreate((__bridge void *)p);
+                if (surfaces[i]) {
+                    surfLock(surfaces[i], 0, NULL);
+                    bases[i] = surfGetBase(surfaces[i]);
+                    log([NSString stringWithFormat:@"JB34:   Surface[%d] base = %p", i, bases[i]]);
+                }
+            }
+
+            if (bases[0] && bases[1]) {
+                int64_t delta01 = (int64_t)((uintptr_t)bases[1] - (uintptr_t)bases[0]);
+                int64_t delta12 = bases[2] ? (int64_t)((uintptr_t)bases[2] - (uintptr_t)bases[1]) : 0;
+                log([NSString stringWithFormat:@"JB34:   Delta[0→1] = %lld (0x%llx)", delta01, (uint64_t)delta01]);
+                log([NSString stringWithFormat:@"JB34:   Delta[1→2] = %lld (0x%llx)", delta12, (uint64_t)delta12]);
+                results[@"surfDelta01"] = [NSString stringWithFormat:@"%#llx", (uint64_t)delta01];
+                results[@"surfDelta12"] = [NSString stringWithFormat:@"%#llx", (uint64_t)delta12];
+            }
+
+            for (int i = 0; i < 4; i++) {
+                if (surfaces[i]) surfUnlock(surfaces[i], 0, NULL);
             }
         }
 
