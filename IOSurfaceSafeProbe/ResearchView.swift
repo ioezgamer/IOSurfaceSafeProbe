@@ -453,6 +453,9 @@ struct ResearchView: View {
         ("kernrw", "Kernel R/W", "lock.open.rotation",
          "IOConnectMapMemory64 + struct plist input + property leak + heap spray",
          { log, done in iosurface_kernel_rw({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("objscan", "Obj Scan", "viewfinder",
+         "IOSurfaceRef deep object scan + kernel ptr harvest + undoc properties",
+         { log, done in iosurface_obj_scan({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
