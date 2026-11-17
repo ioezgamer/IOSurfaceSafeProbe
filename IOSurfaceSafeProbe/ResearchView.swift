@@ -450,6 +450,9 @@ struct ResearchView: View {
         ("syscallrd", "Syscall Redir", "arrow.triangle.turn.up.right.circle",
          "Syscall redirect via swizzle + IOKit probe + csops manipulation",
          { log, done in iosurface_syscall_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kernrw", "Kernel R/W", "lock.open.rotation",
+         "IOConnectMapMemory64 + struct plist input + property leak + heap spray",
+         { log, done in iosurface_kernel_rw({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {

@@ -466,5 +466,8 @@ void iosurface_kernel_map(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB35: Syscall redirect via ObjC swizzle + IOSurface kernel probe.
 void iosurface_syscall_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB36: IOSurface kernel R/W primitives — MapMemory64, struct input, property leaks.
+void iosurface_kernel_rw(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
