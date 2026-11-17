@@ -463,5 +463,8 @@ void iosurface_rop_exec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB34: IOSurface kernel memory map + ObjC swizzle exec.
 void iosurface_kernel_map(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB35: Syscall redirect via ObjC swizzle + IOSurface kernel probe.
+void iosurface_syscall_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
