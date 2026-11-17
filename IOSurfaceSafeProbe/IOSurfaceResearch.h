@@ -475,5 +475,8 @@ void iosurface_obj_scan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB38: Kernel info leak vectors + OSSerialize format.
 void iosurface_kleak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB39: Exception ports + task_info + mach kobject leak.
+void iosurface_exc_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

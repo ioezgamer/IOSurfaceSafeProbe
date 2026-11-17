@@ -459,6 +459,9 @@ struct ResearchView: View {
         ("kleak", "K-Leak", "eye.trianglebadge.exclamationmark",
          "sysctl + proc_pidinfo + vm_region + OSSerialize + pipe/port spray",
          { log, done in iosurface_kleak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("excleak", "Exc Leak", "exclamationmark.shield",
+         "task_info + thread_info + exception ports + host_stats + mach_port_kobject",
+         { log, done in iosurface_exc_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
