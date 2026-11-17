@@ -441,8 +441,8 @@ struct ResearchView: View {
         ("jitexec", "ROP Infra", "cpu",
          "ROP chain infrastructure: gadgets + PAC + thread_create + fake stack",
          { log, done in iosurface_jit_exec({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
-        ("ropexec", "ROP Exec", "bolt.circle",
-         "Execute signed functions via thread_create_running — bypass CS_KILL",
+        ("ropexec", "Exec Paths", "bolt.circle",
+         "Safe exec paths: C fptr, ObjC IMP, swizzle, kernel ports, IOKit",
          { log, done in iosurface_rop_exec({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
