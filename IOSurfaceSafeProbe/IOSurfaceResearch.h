@@ -451,5 +451,8 @@ void iosurface_isa_swizzle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done)
 /// Probe JB30: GOT redirect — CVE-2026-112611 zero-write GOT entry -> redirect to controlled page.
 void iosurface_got_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB31: Shellcode exec — mmap RW -> write arm64 shellcode -> mprotect RX -> execute.
+void iosurface_shellcode_exec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
