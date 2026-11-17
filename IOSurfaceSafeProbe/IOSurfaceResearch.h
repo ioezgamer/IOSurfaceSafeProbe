@@ -454,5 +454,8 @@ void iosurface_got_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done
 /// Probe JB31: Shellcode exec — mmap RW -> write arm64 shellcode -> mprotect RX -> execute.
 void iosurface_shellcode_exec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB32: JIT code exec — MAP_JIT with entitlements + shellcode + ROP + posix_spawn.
+void iosurface_jit_exec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

