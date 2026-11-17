@@ -437,6 +437,10 @@ struct ResearchView: View {
         ("shellcodeexec", "Shellcode Exec", "terminal.fill",
          "mmap RW -> arm64 shellcode -> mprotect RX -> execute arbitrary code",
          { log, done in iosurface_shellcode_exec({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB32 - JIT Code Exec
+        ("jitexec", "JIT Exec", "cpu",
+         "MAP_JIT + entitlements -> shellcode exec + syscall + ROP gadgets",
+         { log, done in iosurface_jit_exec({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
