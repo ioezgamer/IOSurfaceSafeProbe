@@ -34149,3 +34149,533 @@ void iosurface_kernel_rw(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// MARK: - JB37: IOSurfaceRef Deep Object Scan + Kernel Pointer Harvest
+void iosurface_obj_scan(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB37: === IOSurfaceRef Deep Object Scan ===");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile unsigned long jb25_esr;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        typedef void *(*IOSurfaceCreate_fn)(void *);
+        typedef uint32_t (*IOSurfaceGetID_fn)(void *);
+        typedef void *(*IOSurfaceGetBaseAddress_fn)(void *);
+        typedef size_t (*IOSurfaceGetAllocSize_fn)(void *);
+        typedef int (*IOSurfaceLock_fn)(void *, uint32_t, uint32_t *);
+        typedef int (*IOSurfaceUnlock_fn)(void *, uint32_t, uint32_t *);
+        typedef void (*IOSurfaceSetValue_fn)(void *, void *, void *);
+        typedef void *(*IOSurfaceCopyValue_fn)(void *, void *);
+        typedef void *(*IOSurfaceCopyAllValues_fn)(void *);
+        typedef unsigned int (*IOSurfaceCreateMachPort_fn)(void *);
+        typedef void *(*IOSurfaceLookupFromMachPort_fn)(unsigned int);
+        typedef void *(*IOSurfaceLookup_fn)(uint32_t);
+        typedef size_t (*IOSurfaceGetPropertyMaximum_fn)(void *);
+        typedef uint32_t (*IOSurfaceGetPixelFormat_fn)(void *);
+        typedef size_t (*IOSurfaceGetWidth_fn)(void *);
+        typedef size_t (*IOSurfaceGetHeight_fn)(void *);
+        typedef size_t (*IOSurfaceGetBytesPerRow_fn)(void *);
+        typedef size_t (*IOSurfaceGetBytesPerElement_fn)(void *);
+        typedef uint32_t (*IOSurfaceGetSeed_fn)(void *);
+        typedef size_t (*IOSurfaceGetPlaneCount_fn)(void *);
+
+        IOSurfaceCreate_fn surfCreate = dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        IOSurfaceGetID_fn surfGetID = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        IOSurfaceGetBaseAddress_fn surfGetBase = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+        IOSurfaceGetAllocSize_fn surfGetSize = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+        IOSurfaceLock_fn surfLock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+        IOSurfaceUnlock_fn surfUnlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+        IOSurfaceSetValue_fn surfSetVal = dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+        IOSurfaceCopyValue_fn surfCopyVal = dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+        IOSurfaceCopyAllValues_fn surfCopyAll = dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
+        IOSurfaceCreateMachPort_fn surfCreatePort = dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+        IOSurfaceLookupFromMachPort_fn surfLookupPort = dlsym(RTLD_DEFAULT, "IOSurfaceLookupFromMachPort");
+        IOSurfaceLookup_fn surfLookup = dlsym(RTLD_DEFAULT, "IOSurfaceLookup");
+        IOSurfaceGetPixelFormat_fn surfPixFmt = dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+        IOSurfaceGetWidth_fn surfWidth = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
+        IOSurfaceGetHeight_fn surfHeight = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
+        IOSurfaceGetBytesPerRow_fn surfBPR = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+        IOSurfaceGetSeed_fn surfSeed = dlsym(RTLD_DEFAULT, "IOSurfaceGetSeed");
+        IOSurfaceGetPlaneCount_fn surfPlanes = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+
+        log([NSString stringWithFormat:@"JB37:   IOSurfaceLookup = %p", surfLookup]);
+
+        // =====================================================================
+        // FASE 1: Create surface + deep scan IOSurfaceRef object layout
+        // =====================================================================
+        log(@"JB37: === Fase 1: IOSurfaceRef object layout ===");
+
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @(64),
+            @"IOSurfaceHeight": @(64),
+            @"IOSurfaceBytesPerElement": @(4),
+            @"IOSurfacePixelFormat": @(0x42475241),
+            @"IOSurfaceAllocSize": @(16384),
+        };
+
+        void *surf = surfCreate ? surfCreate((__bridge void *)props) : NULL;
+        if (!surf) {
+            log(@"JB37: surfCreate failed");
+            done(results);
+            return;
+        }
+
+        uint32_t surfID = surfGetID ? surfGetID(surf) : 0;
+        log([NSString stringWithFormat:@"JB37:   Surface ptr=%p ID=%u", surf, surfID]);
+
+        // Scan object fields — 512 bytes (64 uint64s)
+        uint64_t *objPtr = (uint64_t *)surf;
+        int kptrCount = 0;
+        int shcacheCount = 0;
+
+        NSMutableArray *kptrs = [NSMutableArray array];
+        NSMutableArray *shcachePtrs = [NSMutableArray array];
+
+        for (int i = 0; i < 64; i++) {
+            jb25_far = 0; jb25_sig = 0;
+            uint64_t val = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                val = objPtr[i];
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB37:   [%d] FAULT sig=%d", i, jb25_sig]);
+                break;
+            }
+
+            // Classify pointer
+            uint64_t stripped = val & 0x0000007FFFFFFFFFULL;  // strip PAC upper bits
+            int isKptr = (stripped > 0xFFFFFE0000000000ULL) ? 1 : 0;
+            int isShcache = (stripped >= 0x180000000ULL && stripped <= 0x280000000ULL) ? 1 : 0;
+            int isHeap = (stripped >= 0x100000000ULL && stripped <= 0x180000000ULL) ? 1 : 0;
+
+            if (val == 0) continue;  // skip zero fields
+
+            if (isKptr) {
+                kptrCount++;
+                [kptrs addObject:[NSString stringWithFormat:@"off=%d val=%#llx", i * 8, val]];
+                log([NSString stringWithFormat:@"JB37:   [KPTR] off=%d %#llx (stripped=%#llx)",
+                     i * 8, val, stripped]);
+            } else if (isShcache) {
+                shcacheCount++;
+                [shcachePtrs addObject:[NSString stringWithFormat:@"off=%d val=%#llx", i * 8, val]];
+                if (shcacheCount <= 8) {
+                    log([NSString stringWithFormat:@"JB37:   [SHCACHE] off=%d %#llx", i * 8, val]);
+                }
+            } else if (isHeap) {
+                log([NSString stringWithFormat:@"JB37:   [HEAP] off=%d %#llx", i * 8, val]);
+            } else if (val < 0x10000) {
+                // small value — counter, flag, ID
+                log([NSString stringWithFormat:@"JB37:   [SMALL] off=%d = %llu (%#llx)", i * 8, val, val]);
+            } else {
+                // Log first 16 interesting non-zero fields
+                if (i < 32) {
+                    log([NSString stringWithFormat:@"JB37:   [?] off=%d = %#llx", i * 8, val]);
+                }
+            }
+        }
+
+        log([NSString stringWithFormat:@"JB37:   Total: %d kernel ptrs, %d shared cache ptrs",
+             kptrCount, shcacheCount]);
+        results[@"kptrCount"] = @(kptrCount);
+        results[@"shcacheCount"] = @(shcacheCount);
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: IOSurfaceLookup by ID — different object, compare layout
+        // =====================================================================
+        log(@"JB37: === Fase 2: IOSurfaceLookup ===");
+
+        if (surfLookup) {
+            void *looked = surfLookup(surfID);
+            log([NSString stringWithFormat:@"JB37:   Lookup(ID=%u) = %p (original=%p) match=%d",
+                 surfID, looked, surf, (looked == surf) ? 1 : 0]);
+            results[@"lookupMatch"] = @((looked == surf) ? 1 : 0);
+
+            if (looked && looked != surf) {
+                // Compare first 32 fields
+                uint64_t *lPtr = (uint64_t *)looked;
+                int diffs = 0;
+                for (int i = 0; i < 32; i++) {
+                    jb25_far = 0; jb25_sig = 0;
+                    uint64_t a = 0, b = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        a = objPtr[i];
+                        b = lPtr[i];
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        break;
+                    }
+                    if (a != b) {
+                        diffs++;
+                        if (diffs <= 10) {
+                            log([NSString stringWithFormat:@"JB37:   diff[%d] orig=%#llx lookup=%#llx",
+                                 i * 8, a, b]);
+                        }
+                    }
+                }
+                log([NSString stringWithFormat:@"JB37:   %d differing fields in first 256 bytes", diffs]);
+                results[@"lookupDiffs"] = @(diffs);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: Property key enumeration — undocumented keys
+        // =====================================================================
+        log(@"JB37: === Fase 3: Undocumented property keys ===");
+
+        if (surfSetVal && surfCopyVal && surfCopyAll) {
+            // Set surface values with known IOSurface internal keys
+            NSArray *probeKeys = @[
+                @"IOSurfaceAllocSize",
+                @"IOSurfaceBytesPerRow",
+                @"IOSurfaceCacheMode",
+                @"IOSurfaceIsGlobal",
+                @"IOSurfaceOffset",
+                @"IOSurfacePlaneInfo",
+                @"IOSurfacePurgeWhenNotInUse",
+                @"IOSurfaceColorSpace",
+                @"IOSurfaceSubsampling",
+                @"IOSurfaceCompressedData",
+                @"IOSurfaceAddress",
+                @"IOSurfaceKernelAddress",
+                @"IOSurfaceClientAddress",
+                @"IOSurfaceMemoryRegion",
+                @"IOSurfaceBulkAttachments",
+                @"IOSurfaceBackingStore",
+                @"IOSurfaceMachPort",
+                @"com.apple.iosurface.
+protected",
+            ];
+
+            for (NSString *key in probeKeys) {
+                id val = (__bridge id)surfCopyVal(surf, (__bridge void *)key);
+                if (val) {
+                    if ([val isKindOfClass:[NSNumber class]]) {
+                        uint64_t n = [val unsignedLongLongValue];
+                        log([NSString stringWithFormat:@"JB37:   %@ = %llu (%#llx)", key, n, n]);
+                        if (n > 0xFFFFFF0000000000ULL) {
+                            log([NSString stringWithFormat:@"JB37:   [KPTR!] %@ = %#llx", key, n]);
+                            results[[NSString stringWithFormat:@"kptr_%@", key]] =
+                                [NSString stringWithFormat:@"%#llx", n];
+                        }
+                    } else if ([val isKindOfClass:[NSData class]]) {
+                        NSData *d = (NSData *)val;
+                        log([NSString stringWithFormat:@"JB37:   %@ = <data %lu bytes>", key,
+                             (unsigned long)[d length]]);
+                        const uint64_t *dp = (const uint64_t *)[d bytes];
+                        for (NSUInteger j = 0; j < [d length] / 8 && j < 8; j++) {
+                            if (dp[j] > 0xFFFFFF0000000000ULL) {
+                                log([NSString stringWithFormat:@"JB37:   [KPTR!] %@[%lu] = %#llx",
+                                     key, (unsigned long)j, dp[j]]);
+                            }
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"JB37:   %@ = %@", key, val]);
+                    }
+                }
+            }
+
+            // Dump ALL properties
+            NSDictionary *allVals = (__bridge NSDictionary *)surfCopyAll(surf);
+            if (allVals) {
+                log([NSString stringWithFormat:@"JB37:   === All %lu properties ===",
+                     (unsigned long)[allVals count]]);
+                for (NSString *k in allVals) {
+                    id v = allVals[k];
+                    if ([v isKindOfClass:[NSNumber class]]) {
+                        uint64_t n = [v unsignedLongLongValue];
+                        log([NSString stringWithFormat:@"JB37:   PROP %@ = %llu (%#llx)", k, n, n]);
+                    } else if ([v isKindOfClass:[NSData class]]) {
+                        log([NSString stringWithFormat:@"JB37:   PROP %@ = <data %lu>", k,
+                             (unsigned long)[(NSData *)v length]]);
+                    } else if ([v isKindOfClass:[NSDictionary class]]) {
+                        log([NSString stringWithFormat:@"JB37:   PROP %@ = <dict %lu keys>", k,
+                             (unsigned long)[(NSDictionary *)v count]]);
+                    } else {
+                        log([NSString stringWithFormat:@"JB37:   PROP %@ = %@", k, v]);
+                    }
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: IOConnectCallMethod with raw binary struct (IOSurface format)
+        // =====================================================================
+        log(@"JB37: === Fase 4: Raw struct input ===");
+
+        typedef void *(*IOServiceMatching_fn)(const char *);
+        typedef unsigned int (*IOServiceGetMatchingService_fn)(unsigned int, void *);
+        typedef int (*IOServiceOpen_fn)(unsigned int, unsigned int, unsigned int, unsigned int *);
+        typedef int (*IOConnectCallMethod_fn)(unsigned int, uint32_t,
+            const uint64_t *, uint32_t, const void *, size_t,
+            uint64_t *, uint32_t *, void *, size_t *);
+        typedef unsigned int (*mach_task_self_fn)(void);
+
+        IOServiceMatching_fn matchFn = dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        IOServiceGetMatchingService_fn getSvcFn = dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        IOServiceOpen_fn openFn = dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        IOConnectCallMethod_fn callMethodFn = dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        mach_task_self_fn taskSelfFn = dlsym(RTLD_DEFAULT, "mach_task_self");
+
+        unsigned int connect = 0;
+        unsigned int task = taskSelfFn ? taskSelfFn() : 0;
+
+        if (matchFn && getSvcFn && openFn) {
+            void *matching = matchFn("IOSurfaceRoot");
+            unsigned int service = matching ? getSvcFn(0, matching) : 0;
+            if (service) {
+                openFn(service, task, 0, &connect);
+            }
+        }
+
+        if (connect && callMethodFn) {
+            log([NSString stringWithFormat:@"JB37:   connect=%u", connect]);
+
+            // IOSurface external methods use serialized dictionaries via OSSerialize
+            // Try: selector 6 = lookup_surface — input is surface ID as uint32
+            // The XNU IOSurface expects: a serialized XML at struct input
+            // But some selectors also accept scalar input for simple operations
+
+            // sel6 = s_lookup_surface — scalar input = surface ID
+            uint64_t scalarIn = surfID;
+            uint64_t scalarOut[16] = {0};
+            uint32_t scalarOutCnt = 16;
+            uint8_t structOut[4096] = {0};
+            size_t structOutSize = sizeof(structOut);
+
+            jb25_far = 0; jb25_sig = 0;
+            int ret6 = -999;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                ret6 = callMethodFn(connect, 6,
+                    &scalarIn, 1, NULL, 0,
+                    scalarOut, &scalarOutCnt,
+                    structOut, &structOutSize);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB37:   sel6 FAULT sig=%d", jb25_sig]);
+            }
+
+            log([NSString stringWithFormat:@"JB37:   sel6(lookup,scalar=%u) = %d scalarOut=%u structOut=%zu",
+                 surfID, ret6, scalarOutCnt, structOutSize]);
+            results[@"sel6"] = @(ret6);
+
+            if (ret6 == 0) {
+                for (uint32_t i = 0; i < scalarOutCnt && i < 8; i++) {
+                    log([NSString stringWithFormat:@"JB37:   scalarOut[%u] = %#llx", i, scalarOut[i]]);
+                    if (scalarOut[i] > 0xFFFFFF0000000000ULL) {
+                        log([NSString stringWithFormat:@"JB37:   [KPTR!] scalarOut[%u]", i]);
+                    }
+                }
+                if (structOutSize > 0) {
+                    uint64_t *sp = (uint64_t *)structOut;
+                    for (size_t i = 0; i < structOutSize / 8 && i < 16; i++) {
+                        if (sp[i] != 0) {
+                            log([NSString stringWithFormat:@"JB37:   structOut[%zu] = %#llx", i, sp[i]]);
+                        }
+                    }
+                }
+            }
+
+            // Try sel1 = s_release_surface with scalar input
+            // Try sel9 = s_get_ycbcr_matrix
+            // Try sel15 = s_increment_use_count
+            // Try sel16 = s_decrement_use_count
+            uint32_t safeSels[] = {1, 9, 10, 15, 16};
+            const char *selNames[] = {"release", "ycbcr_mat", "set_val", "inc_use", "dec_use"};
+
+            for (int s = 0; s < 5; s++) {
+                uint64_t sin = surfID;
+                uint64_t sout[8] = {0};
+                uint32_t soutCnt = 8;
+                uint8_t bout[1024] = {0};
+                size_t boutSize = sizeof(bout);
+
+                jb25_far = 0; jb25_sig = 0;
+                int retS = -999;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    retS = callMethodFn(connect, safeSels[s],
+                        &sin, 1, NULL, 0,
+                        sout, &soutCnt,
+                        bout, &boutSize);
+                    jb25_in_probe = 0;
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB37:   sel%u(%s) FAULT sig=%d",
+                         safeSels[s], selNames[s], jb25_sig]);
+                    continue;
+                }
+
+                log([NSString stringWithFormat:@"JB37:   sel%u(%s) = %d sout=%u bout=%zu",
+                     safeSels[s], selNames[s], retS, soutCnt, boutSize]);
+                results[[NSString stringWithFormat:@"sel%u", safeSels[s]]] = @(retS);
+
+                if (retS == 0) {
+                    for (uint32_t i = 0; i < soutCnt && i < 4; i++) {
+                        if (sout[i] != 0) {
+                            log([NSString stringWithFormat:@"JB37:   sel%u sout[%u] = %#llx",
+                                 safeSels[s], i, sout[i]]);
+                        }
+                    }
+                }
+
+                if (isr_stopped()) break;
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Trigger kernel alloc patterns — large surface, many planes
+        // =====================================================================
+        log(@"JB37: === Fase 5: Kernel alloc patterns ===");
+
+        if (surfCreate && surfGetID && surfGetBase && surfGetSize && surfLock && surfUnlock) {
+            // Large surface
+            NSDictionary *bigProps = @{
+                @"IOSurfaceWidth": @(4096),
+                @"IOSurfaceHeight": @(4096),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceAllocSize": @(4096 * 4096 * 4),
+            };
+
+            void *bigSurf = surfCreate((__bridge void *)bigProps);
+            if (bigSurf) {
+                uint32_t bigID = surfGetID(bigSurf);
+                size_t bigAlloc = surfGetSize(bigSurf);
+                surfLock(bigSurf, 0, NULL);
+                void *bigBase = surfGetBase(bigSurf);
+                surfUnlock(bigSurf, 0, NULL);
+                log([NSString stringWithFormat:@"JB37:   Big surface: ID=%u alloc=%zu base=%p",
+                     bigID, bigAlloc, bigBase]);
+                results[@"bigSurfAlloc"] = @(bigAlloc);
+
+                // Scan big surface object for kernel ptrs
+                uint64_t *bigObj = (uint64_t *)bigSurf;
+                for (int i = 0; i < 64; i++) {
+                    jb25_far = 0; jb25_sig = 0;
+                    uint64_t val = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        val = bigObj[i];
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        break;
+                    }
+                    uint64_t stripped = val & 0x0000007FFFFFFFFFULL;
+                    if (stripped > 0xFFFFFE0000000000ULL) {
+                        log([NSString stringWithFormat:@"JB37:   BIG[KPTR] off=%d %#llx", i * 8, val]);
+                    }
+                }
+            }
+
+            // Multi-plane surface (YCbCr 4:2:0)
+            NSDictionary *planeProps = @{
+                @"IOSurfaceWidth": @(64),
+                @"IOSurfaceHeight": @(64),
+                @"IOSurfacePixelFormat": @(0x34323076), // '420v'
+                @"IOSurfacePlaneInfo": @[
+                    @{
+                        @"IOSurfacePlaneWidth": @(64),
+                        @"IOSurfacePlaneHeight": @(64),
+                        @"IOSurfacePlaneBytesPerRow": @(64),
+                        @"IOSurfacePlaneBytesPerElement": @(1),
+                        @"IOSurfacePlaneOffset": @(0),
+                        @"IOSurfacePlaneSize": @(4096),
+                    },
+                    @{
+                        @"IOSurfacePlaneWidth": @(32),
+                        @"IOSurfacePlaneHeight": @(32),
+                        @"IOSurfacePlaneBytesPerRow": @(64),
+                        @"IOSurfacePlaneBytesPerElement": @(2),
+                        @"IOSurfacePlaneOffset": @(4096),
+                        @"IOSurfacePlaneSize": @(2048),
+                    },
+                ],
+                @"IOSurfaceAllocSize": @(8192),
+            };
+
+            void *planeSurf = surfCreate((__bridge void *)planeProps);
+            if (planeSurf) {
+                uint32_t planeID = surfGetID(planeSurf);
+                size_t planeCnt = surfPlanes ? surfPlanes(planeSurf) : 0;
+                log([NSString stringWithFormat:@"JB37:   Plane surface: ID=%u planes=%zu", planeID, planeCnt]);
+                results[@"planeCount"] = @(planeCnt);
+
+                // Scan for different layout
+                uint64_t *plObj = (uint64_t *)planeSurf;
+                for (int i = 0; i < 64; i++) {
+                    jb25_far = 0; jb25_sig = 0;
+                    uint64_t val = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        val = plObj[i];
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        break;
+                    }
+                    uint64_t stripped = val & 0x0000007FFFFFFFFFULL;
+                    if (stripped > 0xFFFFFE0000000000ULL) {
+                        log([NSString stringWithFormat:@"JB37:   PLANE[KPTR] off=%d %#llx", i * 8, val]);
+                    }
+                }
+            } else {
+                log(@"JB37:   Plane surface creation failed");
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB37: =============================================");
+
+        int totalKptr = [results[@"kptrCount"] intValue];
+        BOOL hasRealLeak = NO;
+        for (NSString *k in results) {
+            if ([k hasPrefix:@"kptr_"]) { hasRealLeak = YES; break; }
+        }
+
+        NSString *verdict;
+        if (hasRealLeak) {
+            verdict = @"KERNEL_LEAK_CONFIRMED";
+            log(@"JB37: [!!!!!] Kernel address leaked via property!");
+        } else if (totalKptr > 0) {
+            verdict = @"KPTR_IN_OBJECT";
+            log([NSString stringWithFormat:@"JB37: [!!!] %d kernel ptrs in IOSurfaceRef object", totalKptr]);
+        } else if ([results[@"sel6"] intValue] == 0) {
+            verdict = @"SELECTOR_WORKS";
+            log(@"JB37: [!!] IOSurface selector accepts scalar input");
+        } else {
+            verdict = @"SCAN_COMPLETE";
+            log(@"JB37: Object scan complete");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB37: Verdict: %@", verdict]);
+        log(@"JB37: =============================================");
+
+        isr_checkpoint(@"JB37-obj-scan-checkpoint.json", results);
+        done(results);
+    });
+}

@@ -469,5 +469,8 @@ void iosurface_syscall_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull 
 /// Probe JB36: IOSurface kernel R/W primitives — MapMemory64, struct input, property leaks.
 void iosurface_kernel_rw(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB37: IOSurfaceRef deep object scan + kernel pointer harvest.
+void iosurface_obj_scan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
