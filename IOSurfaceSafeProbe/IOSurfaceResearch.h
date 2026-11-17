@@ -472,5 +472,8 @@ void iosurface_kernel_rw(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB37: IOSurfaceRef deep object scan + kernel pointer harvest.
 void iosurface_obj_scan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB38: Kernel info leak vectors + OSSerialize format.
+void iosurface_kleak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

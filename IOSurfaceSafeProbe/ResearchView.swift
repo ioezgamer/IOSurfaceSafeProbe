@@ -456,6 +456,9 @@ struct ResearchView: View {
         ("objscan", "Obj Scan", "viewfinder",
          "IOSurfaceRef deep object scan + kernel ptr harvest + undoc properties",
          { log, done in iosurface_obj_scan({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kleak", "K-Leak", "eye.trianglebadge.exclamationmark",
+         "sysctl + proc_pidinfo + vm_region + OSSerialize + pipe/port spray",
+         { log, done in iosurface_kleak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
