@@ -31508,7 +31508,7 @@ void iosurface_got_redirect(ISRLogBlock log, ISRDoneBlock done) {
         } else {
             verdict = @"ZERO_WRITE_MISSED_GOT";
             log(@"JB30: Zero-write did not hit GOT — may need offset adjustment");
-            log(@"JB30: GOT at %@, write target needs precise alignment", results[@"gotAddr"]);
+            log([NSString stringWithFormat:@"JB30: GOT at %@, write target needs precise alignment", results[@"gotAddr"]]);
         }
 
         results[@"verdict"] = verdict;
