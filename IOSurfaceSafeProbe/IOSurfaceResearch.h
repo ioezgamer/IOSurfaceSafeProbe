@@ -460,5 +460,8 @@ void iosurface_jit_exec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB33: ROP execution via thread_create_running — call signed functions.
 void iosurface_rop_exec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB34: IOSurface kernel memory map + ObjC swizzle exec.
+void iosurface_kernel_map(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
