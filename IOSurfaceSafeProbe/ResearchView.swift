@@ -429,6 +429,10 @@ struct ResearchView: View {
         ("isaswizzle", "ISA Swizzle", "arrow.triangle.swap",
          "ObjC ISA corruption -> fake class -> controlled objc_msgSend -> code exec",
          { log, done in iosurface_isa_swizzle({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        // JB30 - GOT Redirect
+        ("gotredirect", "GOT Redirect", "arrow.uturn.right.circle",
+         "CVE-2026-112611 zero-write GOT entry -> redirect code flow to controlled page",
+         { log, done in iosurface_got_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {

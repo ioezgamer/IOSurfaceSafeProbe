@@ -448,5 +448,8 @@ void iosurface_direct_strike(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
 /// Probe JB29: ObjC ISA swizzle — fake class + corrupted ISA -> code exec via objc_msgSend.
 void iosurface_isa_swizzle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB30: GOT redirect — CVE-2026-112611 zero-write GOT entry -> redirect to controlled page.
+void iosurface_got_redirect(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

