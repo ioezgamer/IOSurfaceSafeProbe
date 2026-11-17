@@ -444,6 +444,9 @@ struct ResearchView: View {
         ("ropexec", "Exec Paths", "bolt.circle",
          "Safe exec paths: C fptr, ObjC IMP, swizzle, kernel ports, IOKit",
          { log, done in iosurface_rop_exec({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("kernmap", "Kernel Map", "memorychip",
+         "IOSurface kernel shared mem + ObjC swizzle exec + info leak",
+         { log, done in iosurface_kernel_map({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
