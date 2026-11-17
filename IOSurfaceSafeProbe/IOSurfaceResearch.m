@@ -34357,8 +34357,7 @@ void iosurface_obj_scan(ISRLogBlock log, ISRDoneBlock done) {
                 @"IOSurfaceBulkAttachments",
                 @"IOSurfaceBackingStore",
                 @"IOSurfaceMachPort",
-                @"com.apple.iosurface.
-protected",
+                @"com.apple.iosurface.protected",
             ];
 
             for (NSString *key in probeKeys) {
