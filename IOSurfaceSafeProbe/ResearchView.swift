@@ -447,6 +447,9 @@ struct ResearchView: View {
         ("kernmap", "Kernel Map", "memorychip",
          "IOSurface kernel shared mem + ObjC swizzle exec + info leak",
          { log, done in iosurface_kernel_map({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+        ("syscallrd", "Syscall Redir", "arrow.triangle.turn.up.right.circle",
+         "Syscall redirect via swizzle + IOKit probe + csops manipulation",
+         { log, done in iosurface_syscall_redirect({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
     ]
 
     var body: some View {
