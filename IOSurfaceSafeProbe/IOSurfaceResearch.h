@@ -478,5 +478,8 @@ void iosurface_kleak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB39: Exception ports + task_info + mach kobject leak.
 void iosurface_exc_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB40: KASLR side-channel + commpage + zone info + memory entry.
+void iosurface_kaslr_sidechan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
