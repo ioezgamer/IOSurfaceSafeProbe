@@ -35792,14 +35792,15 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
         // 2. Zone sizes reveal heap layout
         // 3. Memory entry object IDs can reveal allocation ordering
 
-        // Try vm_kernel_page_size / vm_kernel_page_shift
-        typedef kern_return_t (*hki_t)(mach_port_t, int, host_info_t, mach_msg_type_number_t *);
-        hki_t hki = (hki_t)dlsym(RTLD_DEFAULT, "host_kernel_version");
-        if (hki) {
+        // host_kernel_version — signature: (host_t, char[512])
+        typedef kern_return_t (*hkv_t)(mach_port_t, char *);
+        hkv_t hkv = (hkv_t)dlsym(RTLD_DEFAULT, "host_kernel_version");
+        log([NSString stringWithFormat:@"JB40:   host_kernel_version = %p", hkv]);
+        if (hkv) {
             char ver[512] = {0};
-            mach_msg_type_number_t verCnt = 512;
-            kern_return_t vkr = hki(mach_host_self(), 0, (host_info_t)ver, &verCnt);
+            kern_return_t vkr = hkv(mach_host_self(), ver);
             if (vkr == 0) {
+                ver[511] = '\0';
                 NSString *kver = [NSString stringWithUTF8String:ver];
                 log([NSString stringWithFormat:@"JB40:   Kernel version: %@", kver]);
                 results[@"kernelVersion"] = kver;
