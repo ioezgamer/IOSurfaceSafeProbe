@@ -474,6 +474,9 @@ struct ResearchView: View {
         ("kptrleak", "KPTR Leak", "eye.trianglebadge.exclamationmark",
          "JB43: Kernel pointer leak — passive oracle + IOSurface shmem + OOL spray + task_info",
          { log, done in iosurface_kptr_leak({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("regexploit", "Reg Exploit v2", "bolt.trianglebadge.exclamationmark",
+         "JB44: Registry selector fuzzing + property confusion + pipe oracle + timing",
+         { log, done in iosurface_registry_exploit_v2({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -527,13 +530,13 @@ struct ResearchView: View {
 
     private var probeCards: some View {
         LazyVStack(spacing: 10) {
-            Text("JB40-JB43 — UAF Exploit Chain")
+            Text("JB40-JB44 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
 
-            ForEach(probes[(probes.count - 4)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 5)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
@@ -905,11 +908,11 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 4], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 5], id: \.id) { probe in
                 probeCard(probe)
             }
 
-            // --- JB40-JB43: UAF EXPLOIT CHAIN ---
+            // --- JB40-JB44: UAF EXPLOIT CHAIN ---
             Text("NUEVO — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
@@ -917,7 +920,7 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 4)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 5)...], id: \.id) { probe in
                 probeCard(probe)
             }
 

