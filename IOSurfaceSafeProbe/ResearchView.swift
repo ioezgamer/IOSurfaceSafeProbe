@@ -468,6 +468,9 @@ struct ResearchView: View {
         ("uaf41", "UAF Registry", "bolt.shield",
          "CVE-2026-112477: IOSurfaceRoot registry UAF — sel17/sel18 state machine + stale-read oracle",
          { log, done in iosurface_registry_uaf({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("uafexploit", "UAF Exploit", "flame",
+         "JB42: Field mapping + refcnt decrement + output dump + kernel R/W primitives",
+         { log, done in iosurface_registry_uaf_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -521,13 +524,13 @@ struct ResearchView: View {
 
     private var probeCards: some View {
         LazyVStack(spacing: 10) {
-            Text("JB40/JB41 — KASLR + UAF Registry")
+            Text("JB40/JB41/JB42 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
 
-            ForEach(probes[(probes.count - 2)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 3)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
@@ -899,19 +902,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 2], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 3], id: \.id) { probe in
                 probeCard(probe)
             }
 
-            // --- JB40/JB41: NUEVA SUPERFICIE DE ATAQUE ---
-            Text("NUEVO — Superficie de Ataque IOKit")
+            // --- JB40/JB41/JB42: UAF EXPLOIT CHAIN ---
+            Text("NUEVO — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 2)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 3)...], id: \.id) { probe in
                 probeCard(probe)
             }
 

