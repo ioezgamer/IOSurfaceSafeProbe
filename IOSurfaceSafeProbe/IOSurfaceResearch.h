@@ -493,5 +493,8 @@ void iosurface_registry_uaf_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonn
 /// Probe JB43: Kernel pointer leak + KASLR defeat via UAF heap spray.
 void iosurface_kptr_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB44: Registry selector fuzzing + property confusion + pipe oracle + timing
+void iosurface_registry_exploit_v2(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
