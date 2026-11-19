@@ -499,5 +499,8 @@ void iosurface_registry_exploit_v2(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// JB45: Deep selector exploitation + timing KASLR + callback confusion
 void iosurface_deep_selector_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB46: Multi-threaded race condition UAF exploitation
+void iosurface_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

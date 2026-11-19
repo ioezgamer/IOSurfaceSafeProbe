@@ -480,6 +480,9 @@ struct ResearchView: View {
         ("deepsel", "Deep Selector", "cpu",
          "JB45: Deep selector exploitation + timing KASLR + callback confusion",
          { log, done in iosurface_deep_selector_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("raceexploit", "Race Exploit", "bolt.horizontal.circle",
+         "JB46: Multi-threaded race condition UAF exploitation via GCD",
+         { log, done in iosurface_race_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -533,7 +536,7 @@ struct ResearchView: View {
 
     private var probeCards: some View {
         LazyVStack(spacing: 10) {
-            Text("JB40-JB45 — UAF Exploit Chain")
+            Text("JB40-JB46 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -915,7 +918,7 @@ struct ResearchView: View {
                 probeCard(probe)
             }
 
-            // --- JB40-JB45: UAF EXPLOIT CHAIN ---
+            // --- JB40-JB46: UAF EXPLOIT CHAIN ---
             Text("NUEVO — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
