@@ -483,6 +483,9 @@ struct ResearchView: View {
         ("raceexploit", "Race Exploit", "bolt.horizontal.circle",
          "JB46: Multi-threaded race condition UAF exploitation via GCD",
          { log, done in iosurface_race_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("machspray", "Mach Spray", "shield.lefthalf.filled.trianglebadge.exclamationmark",
+         "JB47: Mach port spray + controlled decrement + callback confusion",
+         { log, done in iosurface_mach_spray_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -536,13 +539,13 @@ struct ResearchView: View {
 
     private var probeCards: some View {
         LazyVStack(spacing: 10) {
-            Text("JB40-JB46 — UAF Exploit Chain")
+            Text("JB40-JB47 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
 
-            ForEach(probes[(probes.count - 6)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 7)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
@@ -918,7 +921,7 @@ struct ResearchView: View {
                 probeCard(probe)
             }
 
-            // --- JB40-JB46: UAF EXPLOIT CHAIN ---
+            // --- JB40-JB47: UAF EXPLOIT CHAIN ---
             Text("NUEVO — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
