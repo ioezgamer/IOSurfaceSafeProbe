@@ -36563,7 +36563,7 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
             cnt = TASK_VM_INFO_COUNT;
             kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &cnt);
             if (kr == KERN_SUCCESS) {
-                log([NSString stringWithFormat:@"JB43: [F5] TASK_VM_INFO: virt=%llu res=%llu pmap_enter=%llu", (unsigned long long)vmInfo.virtual_size, (unsigned long long)vmInfo.resident_size, (unsigned long long)vmInfo.purgeable_count]);
+                log([NSString stringWithFormat:@"JB43: [F5] TASK_VM_INFO: virt=%llu res=%llu page_size=%d", (unsigned long long)vmInfo.virtual_size, (unsigned long long)vmInfo.resident_size, (int)vmInfo.page_size]);
                 if (vmInfo.min_address != 0) {
                     log([NSString stringWithFormat:@"JB43: [F5] min_addr=0x%llx max_addr=0x%llx", (unsigned long long)vmInfo.min_address, (unsigned long long)vmInfo.max_address]);
                 }
