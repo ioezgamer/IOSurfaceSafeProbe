@@ -496,5 +496,8 @@ void iosurface_kptr_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// JB44: Registry selector fuzzing + property confusion + pipe oracle + timing
 void iosurface_registry_exploit_v2(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB45: Deep selector exploitation + timing KASLR + callback confusion
+void iosurface_deep_selector_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
