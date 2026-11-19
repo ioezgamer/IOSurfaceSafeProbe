@@ -481,5 +481,8 @@ void iosurface_exc_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// Probe JB40: KASLR side-channel + commpage + zone info + memory entry.
 void iosurface_kaslr_sidechan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB40 test (renamed to rule out cache issues).
+void iosurface_jb40_test(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

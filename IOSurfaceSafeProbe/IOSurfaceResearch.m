@@ -35474,12 +35474,11 @@ void iosurface_exc_leak(ISRLogBlock log, ISRDoneBlock done) {
 
 #pragma mark - JB40: KASLR Side-Channel + Commpage + Zone Info
 
-void iosurface_kaslr_sidechan(ISRLogBlock log, ISRDoneBlock done) {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        NSMutableDictionary *results = [NSMutableDictionary dictionary];
-        log(@"JB40: === NOOP TEST (diagnostico de crash) ===");
-        results[@"verdict"] = @"NOOP";
-        log(@"JB40: Si ves esto, el crash NO esta en el cuerpo de la funcion");
-        done(results);
-    });
+void iosurface_jb40_test(ISRLogBlock log, ISRDoneBlock done) {
+    log(@"JB40: === NOOP v2 (renamed function) ===");
+    NSMutableDictionary *results = [NSMutableDictionary dictionary];
+    results[@"verdict"] = @"NOOP_V2";
+    results[@"anomalies"] = @"none";
+    log(@"JB40: Calling done now");
+    done(results);
 }
