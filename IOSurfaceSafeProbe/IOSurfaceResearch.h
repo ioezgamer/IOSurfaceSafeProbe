@@ -490,5 +490,8 @@ void iosurface_registry_uaf(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done
 /// Probe JB42: UAF Exploit — field mapping, refcnt decrement, output dump, kernel R/W primitives.
 void iosurface_registry_uaf_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB43: Kernel pointer leak + KASLR defeat via UAF heap spray.
+void iosurface_kptr_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
