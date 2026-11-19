@@ -463,8 +463,8 @@ struct ResearchView: View {
          "task_info + thread_info + exception ports + host_stats + mach_port_kobject",
          { log, done in iosurface_exc_leak({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
         ("kaslr", "KASLR SC", "waveform.path.ecg",
-         "commpage harvest + host_zone_info + memory entry + timing side-channel",
-         { log, done in iosurface_kaslr_sidechan({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
+         "NOOP test - diagnostico de crash",
+         { log, done in iosurface_jb40_test({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
