@@ -484,5 +484,8 @@ void iosurface_kaslr_sidechan(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull do
 /// Probe JB40 test (renamed to rule out cache issues).
 void iosurface_jb40_test(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// Probe JB41: IOSurfaceRoot Registry UAF (CVE-2026-112477) — sel17/sel18 state machine + stale-read oracle.
+void iosurface_registry_uaf(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
