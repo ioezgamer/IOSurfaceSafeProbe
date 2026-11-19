@@ -502,5 +502,8 @@ void iosurface_deep_selector_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Non
 /// JB46: Multi-threaded race condition UAF exploitation
 void iosurface_race_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB47: Mach port spray + controlled decrement + callback confusion
+void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
