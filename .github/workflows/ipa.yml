@@ -2,7 +2,7 @@ name: Compilar IPA para SideStore
 on:
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     runs-on: macos-latest
@@ -34,3 +34,13 @@ jobs:
           name: IOSurfaceSafeProbe-unsigned
           path: dist/IOSurfaceSafeProbe-unsigned.ipa
           if-no-files-found: error
+      - name: Crear Release con IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" \
+            dist/IOSurfaceSafeProbe-unsigned.ipa \
+            --title "Build #${{ github.run_number }}" \
+            --notes "Build automático #${{ github.run_number }}" \
+            --latest
