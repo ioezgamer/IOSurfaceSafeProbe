@@ -470,7 +470,7 @@ struct ResearchView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 16) {
+                LazyVStack(spacing: 16) {
                     headerSection
                     probeCards
                 }
@@ -517,7 +517,15 @@ struct ResearchView: View {
     }
 
     private var probeCards: some View {
-        VStack(spacing: 10) {
+        LazyVStack(spacing: 10) {
+            Text("JB40 — KASLR Side-Channel")
+                .font(.caption.bold())
+                .foregroundStyle(.green)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 4)
+
+            probeCard(probes[probes.count - 1])
+
             Text("Ronda 1 — Reconocimiento")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
