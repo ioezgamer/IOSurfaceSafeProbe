@@ -465,6 +465,9 @@ struct ResearchView: View {
         ("kaslr", "KASLR SC", "waveform.path.ecg",
          "NOOP test - diagnostico de crash",
          { log, done in iosurface_jb40_test({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("uaf41", "UAF Registry", "bolt.shield",
+         "CVE-2026-112477: IOSurfaceRoot registry UAF — sel17/sel18 state machine + stale-read oracle",
+         { log, done in iosurface_registry_uaf({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -518,13 +521,15 @@ struct ResearchView: View {
 
     private var probeCards: some View {
         LazyVStack(spacing: 10) {
-            Text("JB40 — KASLR Side-Channel")
+            Text("JB40/JB41 — KASLR + UAF Registry")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
 
-            probeCard(probes[probes.count - 1])
+            ForEach(probes[(probes.count - 2)...], id: \.id) { probe in
+                probeCard(probe)
+            }
 
             Text("Ronda 1 — Reconocimiento")
                 .font(.caption.weight(.semibold))
@@ -894,11 +899,11 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 1], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 2], id: \.id) { probe in
                 probeCard(probe)
             }
 
-            // --- JB23: NUEVA SUPERFICIE DE ATAQUE ---
+            // --- JB40/JB41: NUEVA SUPERFICIE DE ATAQUE ---
             Text("NUEVO — Superficie de Ataque IOKit")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
@@ -906,7 +911,9 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            probeCard(probes[probes.count - 1])
+            ForEach(probes[(probes.count - 2)...], id: \.id) { probe in
+                probeCard(probe)
+            }
 
             if !log.isEmpty { logSection }
         }

