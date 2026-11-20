@@ -483,8 +483,8 @@ struct ResearchView: View {
         ("raceexploit", "Race Exploit", "bolt.horizontal.circle",
          "JB46: Multi-threaded race condition UAF exploitation via GCD",
          { log, done in iosurface_race_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
-        ("machspray", "Mach Spray", "shield.lefthalf.filled.trianglebadge.exclamationmark",
-         "JB47: Mach port spray + controlled decrement + callback confusion",
+        ("machspray", "Cross-Conn", "network",
+         "JB47: Cross-connection UAF + refcount manipulation + output scan",
          { log, done in iosurface_mach_spray_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
