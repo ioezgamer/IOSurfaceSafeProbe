@@ -486,6 +486,9 @@ struct ResearchView: View {
         ("machspray", "Cross-Conn", "network",
          "JB47: Cross-connection UAF + refcount manipulation + output scan",
          { log, done in iosurface_mach_spray_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("xcrossext", "XCross-Ext", "arrow.triangle.branch",
+         "JB48: Cross-connection data extraction + dangling ref + selector scan",
+         { log, done in iosurface_xcross_extract({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -907,19 +910,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 8], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 9], id: \.id) { probe in
                 probeCard(probe)
             }
 
-            // --- JB40-JB47: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB47 — UAF Exploit Chain")
+            // --- JB40-JB48: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB48 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 8)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 9)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
