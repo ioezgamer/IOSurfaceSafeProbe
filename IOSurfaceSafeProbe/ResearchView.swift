@@ -933,7 +933,7 @@ struct ResearchView: View {
             }
 
             // --- JB40-JB50: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB53 — UAF Exploit Chain")
+            Text("JB40-JB54 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
