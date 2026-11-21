@@ -507,6 +507,9 @@ struct ResearchView: View {
         ("asynccallback", "Async Callback", "bolt.trianglebadge.exclamationmark.fill",
          "JB54: Async UAF callback + reverse reclaim + pipe zone + conn close exploit",
          { log, done in iosurface_async_callback_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("propcrossspray", "Prop Cross-Spray", "arrow.triangle.swap",
+         "JB55: Property cross-spray + notif port + input size + conn type sweep",
+         { log, done in iosurface_property_crossspray({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -928,19 +931,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 15], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 16], id: \.id) { probe in
                 probeCard(probe)
             }
 
-            // --- JB40-JB50: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB54 — UAF Exploit Chain")
+            // --- JB40-JB55: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB55 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 15)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 16)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
