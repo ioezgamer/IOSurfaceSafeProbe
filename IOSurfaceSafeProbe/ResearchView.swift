@@ -504,6 +504,9 @@ struct ResearchView: View {
         ("singleconnuaf", "SC-UAF Exploit", "flame.fill",
          "JB53: Single-conn UAF + field mapping + OOL reclaim + kernel write detect",
          { log, done in iosurface_singleconn_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("asynccallback", "Async Callback", "bolt.trianglebadge.exclamationmark.fill",
+         "JB54: Async UAF callback + reverse reclaim + pipe zone + conn close exploit",
+         { log, done in iosurface_async_callback_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -925,7 +928,7 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 14], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 15], id: \.id) { probe in
                 probeCard(probe)
             }
 
@@ -937,7 +940,7 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 14)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 15)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
