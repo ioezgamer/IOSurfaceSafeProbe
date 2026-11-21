@@ -517,5 +517,8 @@ void iosurface_aggressive_multivec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// JB51: Shared memory kernel oracle — IOSurface property spray + PDF OOB write + UAF combined attack
 void iosurface_shmem_kernel_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB52: Fixed UAF (arbitrary regId) + shared memory oracle + PDF OOB + property confusion
+void iosurface_fixed_shmem_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

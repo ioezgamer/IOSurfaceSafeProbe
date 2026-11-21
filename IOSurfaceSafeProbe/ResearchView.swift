@@ -498,6 +498,9 @@ struct ResearchView: View {
         ("shmemoracle", "SHMem Oracle", "memorychip.fill",
          "JB51: Property oracle + OOL spray fix + kernel write detect + PDF OOB + combined chain",
          { log, done in iosurface_shmem_kernel_oracle({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("fixedshmem", "Fixed SHMem", "wrench.and.screwdriver.fill",
+         "JB52: Fixed UAF (arbitrary regId) + SHMem oracle + PDF OOB + property confusion",
+         { log, done in iosurface_fixed_shmem_oracle({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -919,19 +922,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 12], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 13], id: \.id) { probe in
                 probeCard(probe)
             }
 
             // --- JB40-JB50: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB51 — UAF Exploit Chain")
+            Text("JB40-JB52 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 12)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 13)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
