@@ -41570,8 +41570,8 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
 
         typedef void*(*cfdictcreate_fn)(void*, const void**, const void**, long, const void*);
         typedef void*(*cfnumcreate_fn)(void*, int, const void*);
-        typedef void*(*cfstrcreate_fn)(void*, const void*, const char*, int);
-        typedef void*(*cfdatacreate_fn)(void*, const void*, const uint8_t*, long);
+        typedef void*(*cfstrcreate_fn)(void*, const char*, int);
+        typedef void*(*cfdatacreate_fn)(void*, const uint8_t*, long);
         typedef long(*cfdatalen_fn)(void*);
         typedef const uint8_t*(*cfdataptr_fn)(void*);
         typedef void(*cfrelease_fn)(void*);
@@ -41678,7 +41678,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_pre_%02d", i);
                     void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
-                    void *cfVal = sym_datacreate(NULL, NULL, propData, 24);
+                    void *cfVal = sym_datacreate(NULL, propData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
                     sym_cfrelease(cfKey);
                     sym_cfrelease(cfVal);
@@ -41693,7 +41693,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_post_%02d", i);
                     void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
-                    void *cfVal = sym_datacreate(NULL, NULL, reclaimData, 24);
+                    void *cfVal = sym_datacreate(NULL, reclaimData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
                     sym_cfrelease(cfKey);
                     sym_cfrelease(cfVal);
@@ -41753,7 +41753,7 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
                     char keyBuf[32];
                     snprintf(keyBuf, sizeof(keyBuf), "jb55_rev_%02d", i);
                     void *cfKey = sym_strcreate(NULL, keyBuf, 0x0600);
-                    void *cfVal = sym_datacreate(NULL, NULL, fillData, 24);
+                    void *cfVal = sym_datacreate(NULL, fillData, 24);
                     sym_surf_setval(surface, cfKey, cfVal);
                     sym_cfrelease(cfKey);
                     sym_cfrelease(cfVal);
