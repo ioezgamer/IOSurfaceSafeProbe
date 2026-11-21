@@ -511,5 +511,8 @@ void iosurface_xcross_extract(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull do
 /// JB49: Advanced UAF data extraction
 void iosurface_adv_extract(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB50: Aggressive multi-vector — MapMemory + IOSurface shared mem + OOL port spray + property confusion
+void iosurface_aggressive_multivec(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
