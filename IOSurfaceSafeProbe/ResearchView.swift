@@ -352,7 +352,7 @@ struct ResearchView: View {
          "Corrupcion controlada via alias stale — intenta OOB en propiedades IOSurface",
          { log, done in iosurface_controlled_corruption({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
         // Kernel object spray vectors
-        ("oolspray", "OOL Spray Alias", "envelope.fill",
+        ("oolspray2", "OOL Spray Alias", "envelope.fill",
          "Spray mensajes Mach OOL en paginas recicladas — busca objetos kalloc kernel",
          { log, done in iosurface_ool_spray_alias({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
         ("notifyuaf2", "Notify UAF+Alias", "bolt.shield.fill",
@@ -398,7 +398,7 @@ struct ResearchView: View {
         ("uaftrigger", "UAF Trigger", "bolt.fill",
          "Registro→Desregistro→Re-registro: crea puntero colgante en IOSurfaceRoot",
          { log, done in iosurface_pixelbuf_scan({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
-        ("uafexploit", "UAF Exploit", "flame.fill",
+        ("uafexploit0", "UAF Exploit", "flame.fill",
          "Heap spray + UAF dereference — intenta controlar memoria kernel liberada",
          { log, done in iosurface_pipe_primitive({ msg in log(msg as String) }, { res in done(res as! [String: Any]) }) }),
         // JB23 - Clean new probe
@@ -539,16 +539,6 @@ struct ResearchView: View {
 
     private var probeCards: some View {
         LazyVStack(spacing: 10) {
-            Text("JB40-JB47 — UAF Exploit Chain")
-                .font(.caption.bold())
-                .foregroundStyle(.green)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, 4)
-
-            ForEach(probes[(probes.count - 7)...], id: \.id) { probe in
-                probeCard(probe)
-            }
-
             Text("Ronda 1 — Reconocimiento")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
@@ -917,19 +907,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 6], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 8], id: \.id) { probe in
                 probeCard(probe)
             }
 
             // --- JB40-JB47: UAF EXPLOIT CHAIN ---
-            Text("NUEVO — UAF Exploit Chain")
+            Text("JB40-JB47 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 6)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 8)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
