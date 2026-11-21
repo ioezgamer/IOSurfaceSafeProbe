@@ -495,6 +495,9 @@ struct ResearchView: View {
         ("aggmulti", "Aggressive MV", "bolt.shield.fill",
          "JB50: MapMemory + IOSurface shared mem + OOL port spray + property confusion",
          { log, done in iosurface_aggressive_multivec({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("shmemoracle", "SHMem Oracle", "memorychip.fill",
+         "JB51: Property oracle + OOL spray fix + kernel write detect + PDF OOB + combined chain",
+         { log, done in iosurface_shmem_kernel_oracle({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -916,19 +919,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 11], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 12], id: \.id) { probe in
                 probeCard(probe)
             }
 
             // --- JB40-JB50: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB50 — UAF Exploit Chain")
+            Text("JB40-JB51 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 11)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 12)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
