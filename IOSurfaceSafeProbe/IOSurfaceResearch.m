@@ -41914,8 +41914,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         log(@"=== Zone Oracle ===");
         log(@"JB56: === Zone Oracle — Kernel Operation Detector ===");
 
-        typedef unsigned int (*ioservicematching_fn)(const char *);
-        typedef unsigned int (*ioservicegetmatching_fn)(unsigned int, unsigned int);
+        typedef void *(*matching_fn)(const char *);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void *);
         typedef int (*ioserviceopen_fn)(unsigned int, unsigned int, uint32_t, unsigned int *);
         typedef int (*ioserviceclose_fn)(unsigned int);
         typedef void (*ioobjectrelease_fn)(unsigned int);
@@ -41924,8 +41924,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         typedef int (*ioconnectsetcfprops_fn)(unsigned int, void *);
         typedef kern_return_t (*host_create_voucher_fn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_port_t *);
 
-        ioservicematching_fn sym_match = (ioservicematching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
-        ioservicegetmatching_fn sym_getMatch = (ioservicegetmatching_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        matching_fn sym_match = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getMatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
         ioserviceopen_fn sym_open = (ioserviceopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
         ioserviceclose_fn sym_close = (ioserviceclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
         ioobjectrelease_fn sym_release = (ioobjectrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
