@@ -529,6 +529,9 @@ void iosurface_async_callback_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _No
 /// JB55: Property cross-spray + notif port + input size + conn type sweep
 void iosurface_property_crossspray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB56: Zone oracle — use UAF hole as detector, trigger kernel operations, check which fills slot
+void iosurface_zone_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 
 /// Stop any running probe.
 void iosurface_research_stop(void);
