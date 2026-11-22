@@ -510,6 +510,9 @@ struct ResearchView: View {
         ("propcrossspray", "Prop Cross-Spray", "arrow.triangle.swap",
          "JB55: Property cross-spray + notif port + input size + conn type sweep",
          { log, done in iosurface_property_crossspray({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("zoneoracle", "Zone Oracle", "scope",
+         "JB56: Zone oracle — trigger kernel ops, detect which fills UAF slot",
+         { log, done in iosurface_zone_oracle({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -931,19 +934,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 16], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 17], id: \.id) { probe in
                 probeCard(probe)
             }
 
-            // --- JB40-JB55: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB55 — UAF Exploit Chain")
+            // --- JB40-JB56: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB56 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 16)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 17)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
