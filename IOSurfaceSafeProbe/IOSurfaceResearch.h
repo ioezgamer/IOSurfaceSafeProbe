@@ -538,6 +538,9 @@ void iosurface_gpt_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// JB58: DiskImages ObjC discovery + DASession GPT mount + UAF type confusion
 void iosurface_aggressive_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB59: CVE-2026-112554 GPT mount via DIAttachParams — kernel heap leak
+void iosurface_gpt_mount(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 
 /// Stop any running probe.
 void iosurface_research_stop(void);

