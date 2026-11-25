@@ -516,6 +516,9 @@ struct ResearchView: View {
         ("gptleak", "GPT Heap Leak", "lock.shield",
          "JB57: CVE-2026-112554 — GPT partition name over-read leaks kernel heap",
          { log, done in iosurface_gpt_leak({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("aggressiveexploit", "Aggressive Exploit", "flame",
+         "JB58: DiskImages ObjC discovery + DASession mount + UAF type confusion",
+         { log, done in iosurface_aggressive_exploit({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -937,19 +940,19 @@ struct ResearchView: View {
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[96..<probes.count - 18], id: \.id) { probe in
+            ForEach(probes[96..<probes.count - 19], id: \.id) { probe in
                 probeCard(probe)
             }
 
-            // --- JB40-JB57: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB57 — UAF Exploit Chain")
+            // --- JB40-JB58: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB58 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 18)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 19)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
