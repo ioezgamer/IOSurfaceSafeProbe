@@ -532,6 +532,9 @@ void iosurface_property_crossspray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnu
 /// JB56: Zone oracle — use UAF hole as detector, trigger kernel operations, check which fills slot
 void iosurface_zone_oracle(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB57: GPT kernel heap leak — CVE-2026-112554 IOStorageFamily partition name over-read
+void iosurface_gpt_leak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 
 /// Stop any running probe.
 void iosurface_research_stop(void);
