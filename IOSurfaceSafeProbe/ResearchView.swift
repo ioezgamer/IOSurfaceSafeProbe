@@ -528,6 +528,9 @@ struct ResearchView: View {
         ("deepdi", "Deep DiskImages", "externaldrive.fill.badge.questionmark",
          "JB61: DiskImages class methods + IORegistry KASLR pointer leak scan",
          { log, done in iosurface_deep_diskimages({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("directattach", "Direct Attach", "arrow.right.circle.fill",
+         "JB62: DICommonAttach + RAM disk + DIDeviceHandle + DIBlockDevice paths",
+         { log, done in iosurface_direct_attach({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -953,15 +956,15 @@ struct ResearchView: View {
                 probeCard(probe)
             }
 
-            // --- JB40-JB61: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB61 — UAF Exploit Chain")
+            // --- JB40-JB62: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB62 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 22)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 23)...], id: \.id) { probe in
                 probeCard(probe)
             }
 

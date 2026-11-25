@@ -547,6 +547,9 @@ void iosurface_sandbox_bypass(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull do
 /// JB61: Deep DiskImages class exploration + IORegistry KASLR leak hunt
 void iosurface_deep_diskimages(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB62: Direct attach paths — DICommonAttach, RAM disk, DIDeviceHandle, DIBlockDevice
+void iosurface_direct_attach(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 
 /// Stop any running probe.
 void iosurface_research_stop(void);
