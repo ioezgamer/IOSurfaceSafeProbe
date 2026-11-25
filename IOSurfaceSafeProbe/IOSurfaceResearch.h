@@ -541,6 +541,9 @@ void iosurface_aggressive_exploit(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnul
 /// JB59: CVE-2026-112554 GPT mount via DIAttachParams — kernel heap leak
 void iosurface_gpt_mount(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB60: Sandbox bypass — alternative GPT mount paths (DI1, bootstrap, IOKit, /dev)
+void iosurface_sandbox_bypass(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 
 /// Stop any running probe.
 void iosurface_research_stop(void);
