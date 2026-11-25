@@ -525,6 +525,9 @@ struct ResearchView: View {
         ("sandboxbypass", "Sandbox Bypass", "lock.open.fill",
          "JB60: Alternative GPT mount — DI1 legacy, bootstrap, IOKit, /dev direct",
          { log, done in iosurface_sandbox_bypass({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("deepdi", "Deep DiskImages", "externaldrive.fill.badge.questionmark",
+         "JB61: DiskImages class methods + IORegistry KASLR pointer leak scan",
+         { log, done in iosurface_deep_diskimages({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -950,15 +953,15 @@ struct ResearchView: View {
                 probeCard(probe)
             }
 
-            // --- JB40-JB60: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB60 — UAF Exploit Chain")
+            // --- JB40-JB61: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB61 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 21)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 22)...], id: \.id) { probe in
                 probeCard(probe)
             }
 

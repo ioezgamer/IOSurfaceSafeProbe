@@ -544,6 +544,9 @@ void iosurface_gpt_mount(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 /// JB60: Sandbox bypass — alternative GPT mount paths (DI1, bootstrap, IOKit, /dev)
 void iosurface_sandbox_bypass(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB61: Deep DiskImages class exploration + IORegistry KASLR leak hunt
+void iosurface_deep_diskimages(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 
 /// Stop any running probe.
 void iosurface_research_stop(void);
