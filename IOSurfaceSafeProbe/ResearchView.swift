@@ -522,6 +522,9 @@ struct ResearchView: View {
         ("gptmount", "GPT Mount", "externaldrive.fill.badge.exclamationmark",
          "JB59: CVE-2026-112554 — DIAttachParams GPT mount + kernel heap leak",
          { log, done in iosurface_gpt_mount({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("sandboxbypass", "Sandbox Bypass", "lock.open.fill",
+         "JB60: Alternative GPT mount — DI1 legacy, bootstrap, IOKit, /dev direct",
+         { log, done in iosurface_sandbox_bypass({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -947,15 +950,15 @@ struct ResearchView: View {
                 probeCard(probe)
             }
 
-            // --- JB40-JB59: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB59 — UAF Exploit Chain")
+            // --- JB40-JB60: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB60 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 20)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 21)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
