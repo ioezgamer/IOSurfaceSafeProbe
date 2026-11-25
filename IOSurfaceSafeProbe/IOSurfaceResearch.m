@@ -44350,3 +44350,305 @@ void iosurface_deep_diskimages(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB62: Direct Attach Paths + RAM Disk + RegEntryID
+
+void iosurface_direct_attach(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB62: === Direct Attach Paths + RAM Disk ===");
+
+        dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+
+        typedef id(*msgsend_fn)(id, SEL, ...);
+        msgsend_fn msg = (msgsend_fn)dlsym(RTLD_DEFAULT, "objc_msgSend");
+        typedef BOOL(*msgsend_bool_fn)(id, SEL, ...);
+        msgsend_bool_fn msgB = (msgsend_bool_fn)dlsym(RTLD_DEFAULT, "objc_msgSend");
+        typedef uint64_t(*msgsend_u64_fn)(id, SEL, ...);
+        msgsend_u64_fn msgU = (msgsend_u64_fn)dlsym(RTLD_DEFAULT, "objc_msgSend");
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*svcgetmatching_fn)(unsigned int, void*);
+        typedef void(*objrelease_fn)(unsigned int);
+        typedef int(*regentryid_fn)(unsigned int, uint64_t*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        svcgetmatching_fn sym_svcmatch = (svcgetmatching_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        regentryid_fn sym_regid = (regentryid_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetRegistryEntryID");
+
+        if (!msg) { results[@"verdict"] = @"NO_SYMBOLS"; done(results); return; }
+
+        // Z1: Get IODiskImageBlockStorageDeviceInKernel registry entry ID
+        log(@"JB62: --- Z1: Get kernel device regEntryID ---");
+        uint64_t diskImgRegID = 0;
+        {
+            unsigned int svc = (unsigned int)(uintptr_t)sym_svcmatch(0, sym_matching("IODiskImageBlockStorageDeviceInKernel"));
+            if (svc && sym_regid) {
+                int kr = sym_regid(svc, &diskImgRegID);
+                log([NSString stringWithFormat:@"JB62: Z1 svc=%u regEntryID=0x%llx kr=%d", svc, diskImgRegID, kr]);
+                sym_release(svc);
+            } else {
+                log(@"JB62: Z1 IODiskImageBlockStorageDeviceInKernel not found");
+            }
+        }
+        results[@"z1_regid"] = @(diskImgRegID);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Z2: Try DIDeviceHandle with regEntryID
+        log(@"JB62: --- Z2: DIDeviceHandle with regEntryID ---");
+        int z2_ok = 0;
+        id deviceHandle = nil;
+        {
+            Class dhClass = NSClassFromString(@"DIDeviceHandle");
+            if (dhClass && diskImgRegID > 0) {
+                @try {
+                    SEL initSel = sel_registerName("initWithRegEntryID:");
+                    id obj = [dhClass alloc];
+                    deviceHandle = ((id(*)(id, SEL, uint64_t))msg)(obj, initSel, diskImgRegID);
+                    if (deviceHandle) {
+                        z2_ok = 1;
+                        SEL bsdSel = sel_registerName("BSDName");
+                        id bsd = msg(deviceHandle, bsdSel);
+                        SEL regSel = sel_registerName("regEntryID");
+                        uint64_t rid = msgU(deviceHandle, regSel);
+                        SEL xpcSel = sel_registerName("xpcEndpoint");
+                        id xpc = msg(deviceHandle, xpcSel);
+                        SEL hrcSel = sel_registerName("handleRefCount");
+                        BOOL hrc = msgB(deviceHandle, hrcSel);
+                        log([NSString stringWithFormat:@"JB62: Z2 handle OK! bsd=%@ regID=0x%llx xpc=%@ hrc=%d", bsd, rid, xpc, hrc]);
+
+                        SEL c2ioSel = sel_registerName("client2IOhandler");
+                        id handler = msg(deviceHandle, c2ioSel);
+                        log([NSString stringWithFormat:@"JB62: Z2 client2IOhandler=%@ class=%@", handler, handler ? [handler class] : @"nil"]);
+                    } else {
+                        log(@"JB62: Z2 DIDeviceHandle init returned nil");
+                    }
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB62: Z2 exception: %@", ex.reason]);
+                }
+            } else {
+                log([NSString stringWithFormat:@"JB62: Z2 dhClass=%d regID=0x%llx", dhClass != nil, diskImgRegID]);
+            }
+        }
+        results[@"z2_handle"] = @(z2_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Z3: Try DICommonAttach class methods
+        log(@"JB62: --- Z3: DICommonAttach direct attach ---");
+        int z3_ok = 0;
+        {
+            Class caClass = NSClassFromString(@"DICommonAttach");
+            if (caClass) {
+                NSString *imgPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"jb62_test.dmg"];
+                unsigned char dmgHeader[512];
+                memset(dmgHeader, 0, 512);
+                dmgHeader[0] = 'k'; dmgHeader[1] = 'o'; dmgHeader[2] = 'l'; dmgHeader[3] = 'y';
+                NSData *dmgData = [NSData dataWithBytes:dmgHeader length:512];
+                [dmgData writeToFile:imgPath atomically:YES];
+
+                // Try DI1_attachWithDictionary
+                @try {
+                    SEL di1Sel = sel_registerName("DI1_attachWithDictionary:BSDName:error:");
+                    NSDictionary *params = @{@"image-path": imgPath, @"autodiskmount": @YES};
+                    NSError *err = nil;
+                    NSString *bsd = nil;
+                    id result = ((id(*)(id, SEL, id, id*, NSError**))msg)((id)caClass, di1Sel, params, &bsd, &err);
+                    log([NSString stringWithFormat:@"JB62: Z3 DI1_attach result=%@ bsd=%@ err=%@", result, bsd, err]);
+                    if (result) z3_ok = 1;
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB62: Z3 DI1 exception: %@", ex.reason]);
+                }
+
+                // Try diskImageAttach:readOnly:autoMount:BSDName:error:
+                if (!z3_ok) {
+                    @try {
+                        SEL attSel = sel_registerName("diskImageAttach:readOnly:autoMount:BSDName:error:");
+                        NSError *err2 = nil;
+                        NSString *bsd2 = nil;
+                        id result2 = ((id(*)(id, SEL, id, BOOL, BOOL, id*, NSError**))msg)((id)caClass, attSel, imgPath, YES, NO, &bsd2, &err2);
+                        log([NSString stringWithFormat:@"JB62: Z3 diskImageAttach result=%@ bsd=%@ err=%@", result2, bsd2, err2]);
+                        if (result2) z3_ok = 2;
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB62: Z3 attach exception: %@", ex.reason]);
+                    }
+                }
+
+                // Try defaultDiskImageAttach
+                if (!z3_ok) {
+                    @try {
+                        SEL defSel = sel_registerName("defaultDiskImageAttach:BSDName:error:");
+                        NSError *err3 = nil;
+                        NSString *bsd3 = nil;
+                        id result3 = ((id(*)(id, SEL, id, id*, NSError**))msg)((id)caClass, defSel, imgPath, &bsd3, &err3);
+                        log([NSString stringWithFormat:@"JB62: Z3 default result=%@ bsd=%@ err=%@", result3, bsd3, err3]);
+                        if (result3) z3_ok = 3;
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB62: Z3 default exception: %@", ex.reason]);
+                    }
+                }
+
+                [[NSFileManager defaultManager] removeItemAtPath:imgPath error:nil];
+            }
+        }
+        results[@"z3_attach"] = @(z3_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Z4: Try DiskImageParamsRAM_XPC createSinkDiskImage
+        log(@"JB62: --- Z4: RAM disk via DiskImageParamsRAM_XPC ---");
+        int z4_ok = 0;
+        {
+            Class ramClass = NSClassFromString(@"DiskImageParamsRAM_XPC");
+            if (ramClass) {
+                @try {
+                    NSURL *ramURL = [NSURL URLWithString:@"ram://8388608"];
+                    NSError *err = nil;
+                    SEL initSel = sel_registerName("initWithURL:error:");
+                    id ramParams = ((id(*)(id, SEL, id, NSError**))msg)([ramClass alloc], initSel, ramURL, &err);
+                    if (ramParams) {
+                        log([NSString stringWithFormat:@"JB62: Z4 ramParams created: %@ err=%@", [ramParams class], err]);
+                        SEL sizeSel = sel_registerName("ramSizeStr");
+                        id sizeStr = msg(ramParams, sizeSel);
+                        log([NSString stringWithFormat:@"JB62: Z4 ramSizeStr=%@", sizeStr]);
+
+                        SEL blkSel = sel_registerName("setBlockSize:");
+                        ((void(*)(id, SEL, uint64_t))msg)(ramParams, blkSel, 512);
+
+                        SEL createSel = sel_registerName("createSinkDiskImage");
+                        @try {
+                            msg(ramParams, createSel);
+                            log(@"JB62: Z4 createSinkDiskImage called (no crash)");
+                            z4_ok = 1;
+                        } @catch (NSException *ex2) {
+                            log([NSString stringWithFormat:@"JB62: Z4 createSink exception: %@", ex2.reason]);
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"JB62: Z4 ramParams init failed err=%@", err]);
+                    }
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB62: Z4 exception: %@", ex.reason]);
+                }
+            }
+        }
+        results[@"z4_ram"] = @(z4_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Z5: Try DIBlockDevice copyUnmatchedDiskImageWithRegEntryID
+        log(@"JB62: --- Z5: DIBlockDevice with regEntryID ---");
+        int z5_ok = 0;
+        {
+            Class bdClass = NSClassFromString(@"DIBlockDevice");
+            if (bdClass && diskImgRegID > 0) {
+                @try {
+                    SEL copySel = sel_registerName("copyUnmatchedDiskImageWithRegEntryID:error:");
+                    NSError *err = nil;
+                    id result = ((id(*)(id, SEL, uint64_t, NSError**))msg)((id)bdClass, copySel, diskImgRegID, &err);
+                    log([NSString stringWithFormat:@"JB62: Z5 copyUnmatched result=%@ class=%@ err=%@", result, result ? [result class] : @"nil", err]);
+                    if (result) {
+                        z5_ok = 1;
+                        SEL isDISel = sel_registerName("diskImageDevice");
+                        BOOL isDI = msgB(result, isDISel);
+                        SEL medSel = sel_registerName("mediumType");
+                        id medType = msg(result, medSel);
+                        log([NSString stringWithFormat:@"JB62: Z5 isDiskImage=%d mediumType=%@", isDI, medType]);
+
+                        SEL iomedSel = sel_registerName("copyIOMediaWithError:");
+                        NSError *err2 = nil;
+                        id iomedia = ((id(*)(id, SEL, NSError**))msg)(result, iomedSel, &err2);
+                        log([NSString stringWithFormat:@"JB62: Z5 ioMedia=%@ class=%@ err=%@", iomedia, iomedia ? [iomedia class] : @"nil", err2]);
+                    }
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB62: Z5 exception: %@", ex.reason]);
+                }
+            }
+        }
+        results[@"z5_block"] = @(z5_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Z6: DIDiskImageBridge materializeDiskImage
+        log(@"JB62: --- Z6: DIDiskImageBridge materialize ---");
+        int z6_ok = 0;
+        {
+            Class bridgeClass = NSClassFromString(@"DIDiskImageBridge");
+            if (bridgeClass) {
+                @try {
+                    id bridge = [[bridgeClass alloc] init];
+                    if (bridge) {
+                        SEL matSel = sel_registerName("materializeDiskImage");
+                        @try {
+                            msg(bridge, matSel);
+                            log(@"JB62: Z6 materializeDiskImage called (no crash)");
+                            z6_ok = 1;
+                        } @catch (NSException *ex) {
+                            log([NSString stringWithFormat:@"JB62: Z6 materialize exception: %@", ex.reason]);
+                        }
+
+                        SEL hdlSel = sel_registerName("handles");
+                        id handles = msg(bridge, hdlSel);
+                        log([NSString stringWithFormat:@"JB62: Z6 handles=%@ class=%@", handles, handles ? [handles class] : @"nil"]);
+                    }
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB62: Z6 bridge exception: %@", ex.reason]);
+                }
+            }
+        }
+        results[@"z6_bridge"] = @(z6_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Z7: DIIOMedia — try to access existing disk image media
+        log(@"JB62: --- Z7: DIIOMedia from disk image device ---");
+        int z7_ok = 0;
+        {
+            Class ioClass = NSClassFromString(@"DIIOMedia");
+            if (ioClass) {
+                @try {
+                    SEL initSel = sel_registerName("initWithDevName:error:");
+                    NSError *err = nil;
+                    id media = ((id(*)(id, SEL, id, NSError**))msg)([ioClass alloc], initSel, @"disk3", &err);
+                    log([NSString stringWithFormat:@"JB62: Z7 disk3 media=%@ err=%@", media, err]);
+                    if (media) {
+                        z7_ok = 1;
+                        SEL bsdSel = sel_registerName("BSDName");
+                        id bsd = msg(media, bsdSel);
+                        SEL bdSel = sel_registerName("copyBlockDeviceWithError:");
+                        NSError *err2 = nil;
+                        id bd = ((id(*)(id, SEL, NSError**))msg)(media, bdSel, &err2);
+                        log([NSString stringWithFormat:@"JB62: Z7 bsd=%@ blockDev=%@ err=%@", bsd, bd, err2]);
+                    }
+
+                    NSError *err2 = nil;
+                    id media2 = ((id(*)(id, SEL, id, NSError**))msg)([ioClass alloc], initSel, @"disk0", &err2);
+                    log([NSString stringWithFormat:@"JB62: Z7 disk0 media=%@ err=%@", media2, err2]);
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB62: Z7 exception: %@", ex.reason]);
+                }
+            }
+        }
+        results[@"z7_iomedia"] = @(z7_ok);
+
+        // Verdict
+        NSString *verdict = @"NO_ATTACH";
+        if (z3_ok > 0) {
+            verdict = [NSString stringWithFormat:@"ATTACH_OK_%d", z3_ok];
+        } else if (z5_ok) {
+            verdict = @"BLOCK_DEVICE_OK";
+        } else if (z2_ok) {
+            verdict = @"HANDLE_OK";
+        } else if (z7_ok) {
+            verdict = @"IOMEDIA_OK";
+        } else if (z4_ok) {
+            verdict = @"RAM_SINK_OK";
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB62: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB62-direct-attach-checkpoint.json", results);
+        done(results);
+    });
+}
