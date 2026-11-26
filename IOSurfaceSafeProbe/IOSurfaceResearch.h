@@ -563,5 +563,8 @@ void iosurface_kaslr_bypass(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done
 /// JB66: Sysctl + VM region + IOKit deep scan + IOSurface property readback
 void iosurface_sysctl_vmregion(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB67: UAF temporal read — kernel pointer harvest from freed slot
+void iosurface_uaf_kptr_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
