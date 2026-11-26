@@ -557,5 +557,8 @@ void iosurface_kernel_ptrleak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull do
 /// JB64: Zone reclaim via output buffer capture + multi-spray
 void iosurface_ool_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB65: KASLR bypass via mach traps, task_info, proc_info, kobject
+void iosurface_kaslr_bypass(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
