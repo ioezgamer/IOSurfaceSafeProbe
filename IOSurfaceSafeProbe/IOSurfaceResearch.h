@@ -566,5 +566,8 @@ void iosurface_sysctl_vmregion(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull d
 /// JB67: UAF temporal read — kernel pointer harvest from freed slot
 void iosurface_uaf_kptr_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB68: UAF harvest v2 — framework surface + serialized plist + multi-conn
+void iosurface_uaf_harvest_v2(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
