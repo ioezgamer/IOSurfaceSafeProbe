@@ -44756,8 +44756,8 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
 
         if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
 
-        // AA2: DIDeviceHandle with IODiskImage regEntryID
-        log(@"JB63: --- AA2: DIDeviceHandle with diskimg regEntryID ---");
+        // AA2: DIDeviceHandle read-only inspection (NO ref count changes)
+        log(@"JB63: --- AA2: DIDeviceHandle read-only inspect ---");
         int aa2_ok = 0;
         {
             dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
@@ -44772,34 +44772,27 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
                         SEL bsdSel = sel_registerName("BSDName");
                         SEL xpcSel = sel_registerName("xpcEndpoint");
                         SEL c2ioSel = sel_registerName("client2IOhandler");
-                        SEL regSel = sel_registerName("regEntryID");
-                        SEL hrcSel = sel_registerName("handleRefCount");
                         id bsd = msg(handle, bsdSel);
                         id xpc = msg(handle, xpcSel);
                         id c2io = msg(handle, c2ioSel);
-                        uint64_t regV = ((uint64_t(*)(id, SEL))msg)(handle, regSel);
-                        int64_t hrc = ((int64_t(*)(id, SEL))msg)(handle, hrcSel);
-                        log([NSString stringWithFormat:@"JB63: AA2 handle OK bsd=%@ xpc=%@ c2io=%@ regID=0x%llx hrc=%lld", bsd, xpc, c2io, regV, hrc]);
+                        log([NSString stringWithFormat:@"JB63: AA2 handle OK bsd=%@ xpc=%@ c2io=%@", bsd, xpc, c2io]);
 
-                        Class c2ioClass = object_getClass(c2io);
-                        log([NSString stringWithFormat:@"JB63: AA2 c2io class=%@", c2ioClass ? NSStringFromClass(c2ioClass) : @"nil"]);
-
-                        SEL addRefSel = sel_registerName("addToRefCountWithError:");
-                        NSError *err = nil;
-                        @try {
-                            ((void(*)(id, SEL, NSError**))msg)(handle, addRefSel, &err);
-                            log([NSString stringWithFormat:@"JB63: AA2 addToRefCount err=%@", err]);
-                        } @catch (NSException *ex) {
-                            log([NSString stringWithFormat:@"JB63: AA2 addToRefCount exc: %@", ex.reason]);
+                        unsigned int methodCount = 0;
+                        Method *methods = class_copyMethodList(object_getClass(handle), &methodCount);
+                        NSMutableArray *names = [NSMutableArray array];
+                        for (unsigned int m = 0; m < methodCount && m < 30; m++) {
+                            [names addObject:NSStringFromSelector(method_getName(methods[m]))];
                         }
+                        if (methods) free(methods);
+                        log([NSString stringWithFormat:@"JB63: AA2 methods=%u: %@", methodCount, [names componentsJoinedByString:@", "]]);
                     } else {
-                        log(@"JB63: AA2 handle=nil — init failed for diskimg regEntryID");
+                        log(@"JB63: AA2 handle=nil");
                     }
                 } @catch (NSException *ex) {
                     log([NSString stringWithFormat:@"JB63: AA2 exception: %@", ex.reason]);
                 }
             } else {
-                log([NSString stringWithFormat:@"JB63: AA2 skip — dhClass=%@ diskimg_regid=0x%llx", dhClass ? @"OK" : @"nil", diskimg_regid]);
+                log([NSString stringWithFormat:@"JB63: AA2 skip — dhClass=%@ regid=0x%llx", dhClass ? @"OK" : @"nil", diskimg_regid]);
             }
         }
         results[@"aa2_ok"] = @(aa2_ok);
@@ -44937,66 +44930,37 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
 
         if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
 
-        // AA5: DIIOMedia deep inspection
-        log(@"JB63: --- AA5: DIIOMedia deep disk inspection ---");
+        // AA5: DIIOMedia safe inspection (only disk0/disk3 — known working from JB62)
+        log(@"JB63: --- AA5: DIIOMedia safe disk inspection ---");
         int aa5_ok = 0;
         {
             Class ioClass = NSClassFromString(@"DIIOMedia");
             if (ioClass) {
-                NSArray *diskNames = @[@"disk0", @"disk1", @"disk2", @"disk3", @"disk4", @"disk0s1", @"disk0s2"];
+                NSArray *diskNames = @[@"disk0", @"disk3"];
                 for (NSString *name in diskNames) {
                     @try {
-                        SEL initSel = sel_registerName("initWithDevName:error:");
-                        NSError *err = nil;
-                        id media = ((id(*)(id, SEL, id, NSError**))msg)([ioClass alloc], initSel, name, &err);
+                        SEL initSel = sel_registerName("initWithDevName:");
+                        id media = ((id(*)(id, SEL, id))msg)([ioClass alloc], initSel, name);
                         if (media) {
                             aa5_ok++;
                             SEL bsdSel = sel_registerName("BSDName");
                             id bsd = msg(media, bsdSel);
+                            log([NSString stringWithFormat:@"JB63: AA5 %@ media=OK bsd=%@", name, bsd]);
 
                             SEL bdSel = sel_registerName("copyBlockDeviceWithError:");
                             NSError *err2 = nil;
                             id bd = ((id(*)(id, SEL, NSError**))msg)(media, bdSel, &err2);
                             NSString *bdClass = bd ? NSStringFromClass(object_getClass(bd)) : @"nil";
-
-                            log([NSString stringWithFormat:@"JB63: AA5 %@ media=OK bsd=%@ blockDev=%@ err=%@", name, bsd, bdClass, err2]);
-
-                            if (bd) {
-                                SEL diskImgDevSel = sel_registerName("diskImageDevice");
-                                @try {
-                                    id dev = msg(bd, diskImgDevSel);
-                                    log([NSString stringWithFormat:@"JB63: AA5 %@ diskImageDevice=%@", name, dev]);
-                                } @catch (NSException *ex) {
-                                    log([NSString stringWithFormat:@"JB63: AA5 %@ diskImageDevice exc: %@", name, ex.reason]);
-                                }
-
-                                SEL medTypeSel = sel_registerName("mediumType");
-                                @try {
-                                    id mt = msg(bd, medTypeSel);
-                                    log([NSString stringWithFormat:@"JB63: AA5 %@ mediumType=%@", name, mt]);
-                                } @catch (NSException *ex) { }
-
-                                SEL rootBDSel = sel_registerName("copyRootBlockDeviceWithError:");
-                                @try {
-                                    NSError *re = nil;
-                                    id rootBD = ((id(*)(id, SEL, NSError**))msg)(bd, rootBDSel, &re);
-                                    NSString *rootClass = rootBD ? NSStringFromClass(object_getClass(rootBD)) : @"nil";
-                                    log([NSString stringWithFormat:@"JB63: AA5 %@ rootBlockDev=%@ err=%@", name, rootClass, re]);
-                                } @catch (NSException *ex) {
-                                    log([NSString stringWithFormat:@"JB63: AA5 %@ rootBlockDev exc: %@", name, ex.reason]);
-                                }
-                            }
+                            log([NSString stringWithFormat:@"JB63: AA5 %@ blockDev=%@ err=%@", name, bdClass, err2]);
                         } else {
-                            if (err) {
-                                log([NSString stringWithFormat:@"JB63: AA5 %@ FAIL err=%@", name, err.localizedDescription]);
-                            }
+                            log([NSString stringWithFormat:@"JB63: AA5 %@ media=nil", name]);
                         }
                     } @catch (NSException *ex) {
-                        log([NSString stringWithFormat:@"JB63: AA5 %@ exception: %@", name, ex.reason]);
+                        log([NSString stringWithFormat:@"JB63: AA5 %@ exc: %@", name, ex.reason]);
                     }
                 }
             } else {
-                log(@"JB63: AA5 DIIOMedia class not found");
+                log(@"JB63: AA5 DIIOMedia not found");
             }
         }
         results[@"aa5_ok"] = @(aa5_ok);
