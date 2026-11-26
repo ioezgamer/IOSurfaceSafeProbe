@@ -44667,7 +44667,7 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
         typedef int(*objrelease_fn)(unsigned int);
         typedef int(*regentryid_fn)(unsigned int, uint64_t*);
         typedef int(*regcreate_fn)(unsigned int, void**, void*, unsigned int);
-        typedef unsigned int(*allocport_fn)(void);
+        typedef void*(*notifport_fn)(unsigned int);
 
         matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
         getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
@@ -44680,7 +44680,7 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
         objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
         regentryid_fn sym_regid = (regentryid_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetRegistryEntryID");
         regcreate_fn sym_regcreate = (regcreate_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperties");
-        allocport_fn sym_allocport = (allocport_fn)dlsym(RTLD_DEFAULT, "IONotificationPortCreate");
+        notifport_fn sym_notifport = (notifport_fn)dlsym(RTLD_DEFAULT, "IONotificationPortCreate");
 
         id(*msg)(id, SEL, ...) = (id(*)(id, SEL, ...))dlsym(RTLD_DEFAULT, "objc_msgSend");
 
@@ -44817,7 +44817,7 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
             if (surfSvc) sym_release(surfSvc);
 
             unsigned int wp = 0;
-            if (sym_allocport) wp = sym_allocport(0);
+            wp = jb41_newWakePort();
 
             if (openKr == 0) {
                 NSDictionary *surfProps = @{
@@ -44876,7 +44876,7 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
             if (surfSvc) sym_release(surfSvc);
 
             unsigned int wp = 0;
-            if (sym_allocport) wp = sym_allocport(0);
+            wp = jb41_newWakePort();
 
             if (openKr == 0) {
                 typedef void*(*cfcreate_fn)(void*);
