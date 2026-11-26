@@ -534,6 +534,9 @@ struct ResearchView: View {
         ("kptrleak63", "K-Ptr Leak63", "eye.slash.circle.fill",
          "JB63: UAF stale read + IODiskImage deep dive para leak de punteros kernel",
          { log, done in iosurface_kernel_ptrleak({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("oolspray64", "OOL Spray64", "square.grid.3x3.fill",
+         "JB64: Zone reclaim via output buffer capture + OOL/cross-conn/pipe/port spray",
+         { log, done in iosurface_ool_spray({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -959,15 +962,15 @@ struct ResearchView: View {
                 probeCard(probe)
             }
 
-            // --- JB40-JB63: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB63 — UAF Exploit Chain")
+            // --- JB40-JB64: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB64 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 24)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 25)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
