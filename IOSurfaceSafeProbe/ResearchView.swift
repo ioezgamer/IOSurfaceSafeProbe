@@ -531,6 +531,9 @@ struct ResearchView: View {
         ("directattach", "Direct Attach", "arrow.right.circle.fill",
          "JB62: DICommonAttach + RAM disk + DIDeviceHandle + DIBlockDevice paths",
          { log, done in iosurface_direct_attach({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("kptrleak63", "K-Ptr Leak63", "eye.slash.circle.fill",
+         "JB63: UAF stale read + IODiskImage deep dive para leak de punteros kernel",
+         { log, done in iosurface_kernel_ptrleak({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -956,15 +959,15 @@ struct ResearchView: View {
                 probeCard(probe)
             }
 
-            // --- JB40-JB62: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB62 — UAF Exploit Chain")
+            // --- JB40-JB63: UAF EXPLOIT CHAIN ---
+            Text("JB40-JB63 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 23)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 24)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
