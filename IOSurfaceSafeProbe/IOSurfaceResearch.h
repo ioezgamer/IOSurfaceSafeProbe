@@ -554,5 +554,8 @@ void iosurface_direct_attach(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
 /// JB63: Kernel pointer leak via UAF stale read + IODiskImage deep dive
 void iosurface_kernel_ptrleak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB64: Zone reclaim via output buffer capture + multi-spray
+void iosurface_ool_spray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

