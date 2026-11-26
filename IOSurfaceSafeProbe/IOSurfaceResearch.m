@@ -44498,8 +44498,8 @@ void iosurface_direct_attach(ISRLogBlock log, ISRDoneBlock done) {
 
         if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
 
-        // Z4: Try DiskImageParamsRAM_XPC createSinkDiskImage
-        log(@"JB62: --- Z4: RAM disk via DiskImageParamsRAM_XPC ---");
+        // Z4: DiskImageParamsRAM_XPC properties (skip createSinkDiskImage — C++ sret crash)
+        log(@"JB62: --- Z4: RAM disk params inspection ---");
         int z4_ok = 0;
         {
             Class ramClass = NSClassFromString(@"DiskImageParamsRAM_XPC");
@@ -44510,22 +44510,23 @@ void iosurface_direct_attach(ISRLogBlock log, ISRDoneBlock done) {
                     SEL initSel = sel_registerName("initWithURL:error:");
                     id ramParams = ((id(*)(id, SEL, id, NSError**))msg)([ramClass alloc], initSel, ramURL, &err);
                     if (ramParams) {
+                        z4_ok = 1;
                         log([NSString stringWithFormat:@"JB62: Z4 ramParams created: %@ err=%@", [ramParams class], err]);
                         SEL sizeSel = sel_registerName("ramSizeStr");
                         id sizeStr = msg(ramParams, sizeSel);
                         log([NSString stringWithFormat:@"JB62: Z4 ramSizeStr=%@", sizeStr]);
-
-                        SEL blkSel = sel_registerName("setBlockSize:");
-                        ((void(*)(id, SEL, uint64_t))msg)(ramParams, blkSel, 512);
-
-                        SEL createSel = sel_registerName("createSinkDiskImage");
-                        @try {
-                            msg(ramParams, createSel);
-                            log(@"JB62: Z4 createSinkDiskImage called (no crash)");
-                            z4_ok = 1;
-                        } @catch (NSException *ex2) {
-                            log([NSString stringWithFormat:@"JB62: Z4 createSink exception: %@", ex2.reason]);
-                        }
+                        SEL nbSel = sel_registerName("numBlocks");
+                        uint64_t nb = msgU(ramParams, nbSel);
+                        log([NSString stringWithFormat:@"JB62: Z4 numBlocks=%llu", nb]);
+                        SEL wrSel = sel_registerName("isWritableFormat");
+                        BOOL wr = msgB(ramParams, wrSel);
+                        SEL spSel = sel_registerName("isSparseFormat");
+                        BOOL sp = msgB(ramParams, spSel);
+                        log([NSString stringWithFormat:@"JB62: Z4 writable=%d sparse=%d", wr, sp]);
+                        unsigned int mcount = 0;
+                        Method *ms = class_copyMethodList([ramParams class], &mcount);
+                        log([NSString stringWithFormat:@"JB62: Z4 superclass=%@", [ramParams superclass]]);
+                        if (ms) free(ms);
                     } else {
                         log([NSString stringWithFormat:@"JB62: Z4 ramParams init failed err=%@", err]);
                     }
@@ -44571,8 +44572,8 @@ void iosurface_direct_attach(ISRLogBlock log, ISRDoneBlock done) {
 
         if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
 
-        // Z6: DIDiskImageBridge materializeDiskImage
-        log(@"JB62: --- Z6: DIDiskImageBridge materialize ---");
+        // Z6: DIDiskImageBridge properties (skip materializeDiskImage — C++ sret crash)
+        log(@"JB62: --- Z6: DIDiskImageBridge inspection ---");
         int z6_ok = 0;
         {
             Class bridgeClass = NSClassFromString(@"DIDiskImageBridge");
@@ -44580,18 +44581,14 @@ void iosurface_direct_attach(ISRLogBlock log, ISRDoneBlock done) {
                 @try {
                     id bridge = [[bridgeClass alloc] init];
                     if (bridge) {
-                        SEL matSel = sel_registerName("materializeDiskImage");
-                        @try {
-                            msg(bridge, matSel);
-                            log(@"JB62: Z6 materializeDiskImage called (no crash)");
-                            z6_ok = 1;
-                        } @catch (NSException *ex) {
-                            log([NSString stringWithFormat:@"JB62: Z6 materialize exception: %@", ex.reason]);
-                        }
-
+                        z6_ok = 1;
                         SEL hdlSel = sel_registerName("handles");
                         id handles = msg(bridge, hdlSel);
-                        log([NSString stringWithFormat:@"JB62: Z6 handles=%@ class=%@", handles, handles ? [handles class] : @"nil"]);
+                        log([NSString stringWithFormat:@"JB62: Z6 bridge OK handles=%@ class=%@", handles, handles ? [handles class] : @"nil"]);
+                        SEL setSel = sel_registerName("setHandles:");
+                        BOOL respondSet = [bridge respondsToSelector:setSel];
+                        log([NSString stringWithFormat:@"JB62: Z6 respondsTo setHandles=%d", respondSet]);
+                        log([NSString stringWithFormat:@"JB62: Z6 superclass=%@ conforms=%d", [bridge superclass], [bridge conformsToProtocol:@protocol(NSCoding)]]);
                     }
                 } @catch (NSException *ex) {
                     log([NSString stringWithFormat:@"JB62: Z6 bridge exception: %@", ex.reason]);
