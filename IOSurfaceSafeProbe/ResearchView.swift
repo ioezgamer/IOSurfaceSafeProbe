@@ -537,6 +537,9 @@ struct ResearchView: View {
         ("oolspray64", "OOL Spray64", "square.grid.3x3.fill",
          "JB64: Zone reclaim via output buffer capture + OOL/cross-conn/pipe/port spray",
          { log, done in iosurface_ool_spray({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("kaslr65", "KASLR Bypass65", "lock.open.rotation",
+         "JB65: KASLR bypass via task_info, thread_info, kobject, proc_info, IOSurface selectors",
+         { log, done in iosurface_kaslr_bypass({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -963,14 +966,14 @@ struct ResearchView: View {
             }
 
             // --- JB40-JB64: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB64 — UAF Exploit Chain")
+            Text("JB40-JB65 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 25)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 26)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
