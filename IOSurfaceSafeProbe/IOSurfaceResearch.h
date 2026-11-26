@@ -551,5 +551,8 @@ void iosurface_deep_diskimages(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull d
 void iosurface_direct_attach(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
 
+/// JB63: Kernel pointer leak via UAF stale read + IODiskImage deep dive
+void iosurface_kernel_ptrleak(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
