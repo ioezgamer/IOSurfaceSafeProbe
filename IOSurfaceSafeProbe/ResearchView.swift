@@ -543,6 +543,9 @@ struct ResearchView: View {
         ("sysctl66", "Sysctl+VMRegion66", "magnifyingglass.circle",
          "JB66: sysctl scan + vm_region walk + IOKit deep property scan + IOSurface readback",
          { log, done in iosurface_sysctl_vmregion({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("harvest67", "UAF Harvest67", "arrow.triangle.capsulepath",
+         "JB67: UAF temporal read — kernel pointer harvest from freed slot + IOSurface create output scan",
+         { log, done in iosurface_uaf_kptr_harvest({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -969,14 +972,14 @@ struct ResearchView: View {
             }
 
             // --- JB40-JB64: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB66 — UAF Exploit Chain")
+            Text("JB40-JB67 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 27)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 28)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
