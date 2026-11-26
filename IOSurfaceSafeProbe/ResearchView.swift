@@ -540,6 +540,9 @@ struct ResearchView: View {
         ("kaslr65", "KASLR Bypass65", "lock.open.rotation",
          "JB65: KASLR bypass via task_info, thread_info, kobject, proc_info, IOSurface selectors",
          { log, done in iosurface_kaslr_bypass({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("sysctl66", "Sysctl+VMRegion66", "magnifyingglass.circle",
+         "JB66: sysctl scan + vm_region walk + IOKit deep property scan + IOSurface readback",
+         { log, done in iosurface_sysctl_vmregion({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -966,14 +969,14 @@ struct ResearchView: View {
             }
 
             // --- JB40-JB64: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB65 — UAF Exploit Chain")
+            Text("JB40-JB66 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 26)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 27)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
