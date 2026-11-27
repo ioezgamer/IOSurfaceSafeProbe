@@ -32225,20 +32225,20 @@ void iosurface_jit_exec(ISRLogBlock log, ISRDoneBlock done) {
         jb25_far = 0; jb25_sig = 0;
         if (!jb25_jb_ptr || sigsetjmp(jb25_jb_ptr->b, 1) == 0) {
             jb25_in_probe = 1;
-            // PACIA x0, x1 — sign with IA key
+            // PACIA x0, x1 — raw .inst encoding (avoids -march=armv8.3-a requirement)
             __asm__ volatile(
                 "mov x0, %[val]\n"
                 "mov x1, #0\n"
-                "pacia x0, x1\n"
+                ".inst 0xDAC10C01\n"
                 "mov %[out], x0\n"
                 : [out] "=r" (pacSigned)
                 : [val] "r" (pacTest)
                 : "x0", "x1"
             );
-            // XPACI x0 — strip PAC bits
+            // XPACI x0 — raw .inst encoding
             __asm__ volatile(
                 "mov x0, %[val]\n"
-                "xpaci x0\n"
+                ".inst 0xDAC143E0\n"
                 "mov %[out], x0\n"
                 : [out] "=r" (pacStripped)
                 : [val] "r" (pacSigned)
