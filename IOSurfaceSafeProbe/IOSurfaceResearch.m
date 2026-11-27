@@ -46935,6 +46935,7 @@ void iosurface_shmem_timing(ISRLogBlock log, ISRDoneBlock done) {
         int gg1_mapped = 0;
         uint64_t gg1_base = 0;
         int gg1_kptrs = 0;
+        int gg4_found = 0;
         {
             if (surfRef && sym_getbase && sym_lock && sym_unlock) {
                 uint32_t seed = 0;
@@ -47108,7 +47109,6 @@ void iosurface_shmem_timing(ISRLogBlock log, ISRDoneBlock done) {
 
                 // GG4: Probe IOSurface sel2 (lookup), sel3-5, sel10-16 for data
                 log(@"JB69: --- GG4: Extended selector scan ---");
-                int gg4_found = 0;
                 {
                     uint32_t sels[] = {2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23};
                     for (int si = 0; si < 16; si++) {
