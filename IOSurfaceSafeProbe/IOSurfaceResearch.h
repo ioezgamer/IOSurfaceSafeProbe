@@ -569,5 +569,8 @@ void iosurface_uaf_kptr_harvest(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull 
 /// JB68: UAF harvest v2 — framework surface + serialized plist + multi-conn
 void iosurface_uaf_harvest_v2(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB69: IOSurface shared memory + timing side-channel + extended selector scan
+void iosurface_shmem_timing(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);
