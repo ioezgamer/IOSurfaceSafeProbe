@@ -47170,7 +47170,7 @@ void iosurface_shmem_timing(ISRLogBlock log, ISRDoneBlock done) {
 #pragma mark - JB70: UAF reclaim via IOSurface property spray
 
 void iosurface_uaf_propspray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
-    isr_reset_stop();
+    atomic_store(&g_isr_stop, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSMutableDictionary *results = [NSMutableDictionary dictionary];
         log(@"JB70: === UAF Reclaim via IOSurface Property Spray ===");
