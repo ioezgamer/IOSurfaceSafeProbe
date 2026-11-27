@@ -552,6 +552,9 @@ struct ResearchView: View {
         ("shmem69", "ShmemTiming69", "clock.arrow.circlepath",
          "JB69: IOSurface shmem + timing side-channel + extended selector scan (sel2-23)",
          { log, done in iosurface_shmem_timing({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
+        ("propspray70", "PropSpray70", "arrow.triangle.swap",
+         "JB70: UAF reclaim via IOSurface property spray with real surface",
+         { log, done in iosurface_uaf_propspray({ msg in log(msg as String) }, { res in done((res as? [String: Any]) ?? ["verdict": "bridge_nil"]) }) }),
     ]
 
     var body: some View {
@@ -978,14 +981,14 @@ struct ResearchView: View {
             }
 
             // --- JB40-JB64: UAF EXPLOIT CHAIN ---
-            Text("JB40-JB69 — UAF Exploit Chain")
+            Text("JB40-JB70 — UAF Exploit Chain")
                 .font(.caption.bold())
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, 4)
                 .padding(.top, 8)
 
-            ForEach(probes[(probes.count - 30)...], id: \.id) { probe in
+            ForEach(probes[(probes.count - 31)...], id: \.id) { probe in
                 probeCard(probe)
             }
 
