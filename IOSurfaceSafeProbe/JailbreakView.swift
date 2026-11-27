@@ -119,11 +119,7 @@ struct JailbreakView: View {
                 .padding(.horizontal, 12)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(prim.status == .confirmed
-                              ? Color.green.opacity(0.05)
-                              : prim.status == .pending
-                                ? Color.yellow.opacity(0.04)
-                                : Color.red.opacity(0.03))
+                        .fill(primRowColor(prim.status))
                 )
             }
         }
@@ -202,6 +198,14 @@ struct JailbreakView: View {
                         .stroke(Color.green.opacity(0.3), lineWidth: 1)
                 )
         )
+    }
+
+    private func primRowColor(_ status: PrimitiveStatus) -> Color {
+        switch status {
+        case .confirmed: return Color.green.opacity(0.05)
+        case .pending: return Color.yellow.opacity(0.04)
+        case .notFound: return Color.red.opacity(0.03)
+        }
     }
 
     private func appendLog(_ msg: String) {
